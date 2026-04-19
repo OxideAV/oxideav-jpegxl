@@ -60,12 +60,8 @@ pub fn extract_codestream<'a>(data: &'a [u8]) -> Result<std::borrow::Cow<'a, [u8
             let mut out: Vec<u8> = Vec::new();
             let mut pos = 0usize;
             while pos + 8 <= data.len() {
-                let size32 = u32::from_be_bytes([
-                    data[pos],
-                    data[pos + 1],
-                    data[pos + 2],
-                    data[pos + 3],
-                ]);
+                let size32 =
+                    u32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
                 let box_type = &data[pos + 4..pos + 8];
                 let (header_len, box_len) = match size32 {
                     1 => {

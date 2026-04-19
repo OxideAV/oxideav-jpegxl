@@ -14,7 +14,11 @@ pub struct BitReader<'a> {
 
 impl<'a> BitReader<'a> {
     pub fn new(data: &'a [u8]) -> Self {
-        Self { data, byte_pos: 0, bit_pos: 0 }
+        Self {
+            data,
+            byte_pos: 0,
+            bit_pos: 0,
+        }
     }
 
     pub fn bits_read(&self) -> usize {
@@ -111,7 +115,12 @@ mod tests {
         let data = [0b0000_0000];
         let mut br = BitReader::new(&data);
         let v = br
-            .read_u32([U32Dist::Val(7), U32Dist::Val(8), U32Dist::Val(9), U32Dist::Val(10)])
+            .read_u32([
+                U32Dist::Val(7),
+                U32Dist::Val(8),
+                U32Dist::Val(9),
+                U32Dist::Val(10),
+            ])
             .unwrap();
         assert_eq!(v, 7);
     }

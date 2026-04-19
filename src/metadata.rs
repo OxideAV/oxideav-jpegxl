@@ -23,15 +23,8 @@ use crate::container::{detect, extract_codestream, Signature, RAW_CODESTREAM_SIG
 /// `(numerator, denominator)` applied as `xsize = ysize * num / den`
 /// (integer truncation). Index 0 means "ratio not used, xsize is
 /// transmitted explicitly".
-pub const FIXED_ASPECT_RATIOS: [(u32, u32); 7] = [
-    (1, 1),
-    (12, 10),
-    (4, 3),
-    (3, 2),
-    (16, 9),
-    (5, 4),
-    (2, 1),
-];
+pub const FIXED_ASPECT_RATIOS: [(u32, u32); 7] =
+    [(1, 1), (12, 10), (4, 3), (3, 2), (16, 9), (5, 4), (2, 1)];
 
 /// Decoded JXL image size, with the raw encoding flags preserved for
 /// diagnostics.
@@ -96,9 +89,8 @@ pub struct Headers {
 /// from the start of `input`. `input` may be either a raw codestream or
 /// an ISOBMFF-wrapped JXL file; the wrapper is unpacked internally.
 pub fn parse_headers(input: &[u8]) -> Result<Headers> {
-    let signature = detect(input).ok_or_else(|| {
-        Error::InvalidData("not a JPEG XL file: signature mismatch".into())
-    })?;
+    let signature = detect(input)
+        .ok_or_else(|| Error::InvalidData("not a JPEG XL file: signature mismatch".into()))?;
     let codestream = extract_codestream(input)?;
     let cs = &*codestream;
     if cs.len() < 2 || cs[..2] != RAW_CODESTREAM_SIGNATURE {
@@ -109,7 +101,11 @@ pub fn parse_headers(input: &[u8]) -> Result<Headers> {
     let mut br = BitReader::new(&cs[2..]);
     let size = parse_size_header(&mut br)?;
     let metadata = parse_image_metadata(&mut br)?;
-    Ok(Headers { signature, size, metadata })
+    Ok(Headers {
+        signature,
+        size,
+        metadata,
+    })
 }
 
 /// Decode the JXL `SizeHeader` bundle.
@@ -146,7 +142,12 @@ pub fn parse_size_header(br: &mut BitReader<'_>) -> Result<SizeHeader> {
             "JXL SizeHeader: zero-dimensional image".into(),
         ));
     }
-    Ok(SizeHeader { width, height, small, ratio })
+    Ok(SizeHeader {
+        width,
+        height,
+        small,
+        ratio,
+    })
 }
 
 fn parse_bit_depth(br: &mut BitReader<'_>) -> Result<BitDepth> {
@@ -296,7 +297,12 @@ mod tests {
     }
 
     impl BitWriter {
-        fn new() -> Self { Self { out: Vec::new(), bit_pos: 0 } }
+        fn new() -> Self {
+            Self {
+                out: Vec::new(),
+                bit_pos: 0,
+            }
+        }
 
         fn write_bits(&mut self, value: u32, n: u32) {
             for i in 0..n {
@@ -310,7 +316,9 @@ mod tests {
             }
         }
 
-        fn finish(self) -> Vec<u8> { self.out }
+        fn finish(self) -> Vec<u8> {
+            self.out
+        }
     }
 
     #[test]
@@ -318,10 +326,10 @@ mod tests {
         // small=1; ysize_div8_minus_1=0 (→ 8); ratio=1 (1:1, xsize=ysize);
         // all_default=1.
         let mut bw = BitWriter::new();
-        bw.write_bits(1, 1);  // small
-        bw.write_bits(0, 5);  // ysize_div8_minus_1 → ysize = 8
-        bw.write_bits(1, 3);  // ratio = 1 (square)
-        bw.write_bits(1, 1);  // ImageMetadata.all_default
+        bw.write_bits(1, 1); // small
+        bw.write_bits(0, 5); // ysize_div8_minus_1 → ysize = 8
+        bw.write_bits(1, 3); // ratio = 1 (square)
+        bw.write_bits(1, 1); // ImageMetadata.all_default
         let bits = bw.finish();
         let full = with_signature(&bits);
         let h = parse_headers(&full).unwrap();
@@ -391,14 +399,14 @@ mod tests {
         bw.write_bits(1, 1);
         bw.write_bits(0, 5);
         bw.write_bits(1, 3);
-        bw.write_bits(0, 1);  // all_default
-        bw.write_bits(0, 1);  // extra_fields
-        bw.write_bits(0, 1);  // bit_depth all_default
-        bw.write_bits(0, 1);  // floating_point = false
-        bw.write_bits(3, 2);  // selector 3 → BitsOffset(6,1)
+        bw.write_bits(0, 1); // all_default
+        bw.write_bits(0, 1); // extra_fields
+        bw.write_bits(0, 1); // bit_depth all_default
+        bw.write_bits(0, 1); // floating_point = false
+        bw.write_bits(3, 2); // selector 3 → BitsOffset(6,1)
         bw.write_bits(15, 6); // bits_per_sample = 15+1 = 16
-        bw.write_bits(1, 1);  // modular_16_bit_buffer_sufficient
-        bw.write_bits(0, 2);  // num_extra_channels: selector 0 → Val(0)
+        bw.write_bits(1, 1); // modular_16_bit_buffer_sufficient
+        bw.write_bits(0, 2); // num_extra_channels: selector 0 → Val(0)
         let full = with_signature(&bw.finish());
         let h = parse_headers(&full).unwrap();
         assert!(!h.metadata.all_default);

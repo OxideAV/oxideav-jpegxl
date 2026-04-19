@@ -41,7 +41,7 @@ pub mod metadata;
 pub use container::{detect, extract_codestream, Signature};
 pub use metadata::{parse_headers, BitDepth, Headers, ImageMetadata, SizeHeader};
 
-use oxideav_codec::{CodecRegistry, Decoder, Encoder};
+use oxideav_codec::{CodecInfo, CodecRegistry, Decoder, Encoder};
 use oxideav_core::{CodecCapabilities, CodecId, CodecParameters, Error, Result};
 
 /// Public codec id string. Matches the aggregator feature name `jpegxl`.
@@ -53,13 +53,15 @@ pub fn register(reg: &mut CodecRegistry) {
     let caps = CodecCapabilities::video("jpegxl_headers_only")
         .with_lossy(true)
         .with_intra_only(true);
-    reg.register_decoder_impl(CodecId::new(CODEC_ID_STR), caps, make_decoder);
+    reg.register(
+        CodecInfo::new(CodecId::new(CODEC_ID_STR))
+            .capabilities(caps)
+            .decoder(make_decoder),
+    );
 }
 
 fn make_decoder(_params: &CodecParameters) -> Result<Box<dyn Decoder>> {
-    Err(Error::Unsupported(
-        "jxl decode not yet implemented".into(),
-    ))
+    Err(Error::Unsupported("jxl decode not yet implemented".into()))
 }
 
 /// Inspect a JXL file (raw codestream or ISOBMFF-wrapped) and return the
