@@ -41,8 +41,8 @@ pub mod metadata;
 pub use container::{detect, extract_codestream, Signature};
 pub use metadata::{parse_headers, BitDepth, Headers, ImageMetadata, SizeHeader};
 
-use oxideav_codec::{CodecInfo, CodecRegistry, Decoder, Encoder};
 use oxideav_core::{CodecCapabilities, CodecId, CodecParameters, Error, Result};
+use oxideav_core::{CodecInfo, CodecRegistry, Decoder, Encoder};
 
 /// Public codec id string. Matches the aggregator feature name `jpegxl`.
 pub const CODEC_ID_STR: &str = "jpegxl";
