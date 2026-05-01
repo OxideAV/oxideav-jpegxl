@@ -59,6 +59,81 @@ impl<'a> BitReader<'a> {
         Ok(out)
     }
 
+    /// Peek up to 16 bits ahead without advancing the read cursor.
+    ///
+    /// Required by the ANS distribution decoder (FDIS D.3.4): the
+    /// `kLogCountLut` lookup is keyed off `u(7)` worth of LSB-first bits,
+    /// then the bitstream is advanced by `kLogCountLut[h][0]` bits (which
+    /// is between 3 and 7), so a separate peek + advance step is needed.
+    /// Bits past EOF are read as zero — the caller must validate the
+    /// derived advance against the actual remaining bit budget.
+    pub fn peek_bits(&self, n: u32) -> Result<u32> {
+        if n == 0 {
+            return Ok(0);
+        }
+        if n > 16 {
+            return Err(Error::InvalidData(
+                "JXL peek_bits(): cannot peek more than 16 bits at once".into(),
+            ));
+        }
+        let mut out: u32 = 0;
+        let mut byte_pos = self.byte_pos;
+        let mut bit_pos = self.bit_pos;
+        for i in 0..n {
+            let bit = if byte_pos >= self.data.len() {
+                // Past EOF: treat as zero. Caller must validate the
+                // subsequent `advance_bits` against actual data length.
+                0
+            } else {
+                ((self.data[byte_pos] >> bit_pos) & 1) as u32
+            };
+            out |= bit << i;
+            bit_pos += 1;
+            if bit_pos == 8 {
+                bit_pos = 0;
+                byte_pos += 1;
+            }
+        }
+        Ok(out)
+    }
+
+    /// Advance the read cursor by exactly `n` bits, validating against
+    /// EOF. Used as the matching `advance` for [`peek_bits`].
+    pub fn advance_bits(&mut self, n: u32) -> Result<()> {
+        if n == 0 {
+            return Ok(());
+        }
+        let total_bits_remaining =
+            (self.data.len() * 8).saturating_sub(self.byte_pos * 8 + self.bit_pos as usize);
+        if (n as usize) > total_bits_remaining {
+            return Err(Error::InvalidData(
+                "JXL advance_bits(): unexpected end of bitstream".into(),
+            ));
+        }
+        let new_bit = self.bit_pos as u32 + n;
+        self.byte_pos += (new_bit / 8) as usize;
+        self.bit_pos = (new_bit % 8) as u8;
+        Ok(())
+    }
+
+    /// Total bits still available behind the read cursor. Used by
+    /// allocation-sizing checks to bound `Vec::with_capacity` against the
+    /// real input length.
+    pub fn bits_remaining(&self) -> usize {
+        (self.data.len() * 8).saturating_sub(self.byte_pos * 8 + self.bit_pos as usize)
+    }
+
+    /// JXL `U8()` per 9.2.5: 1-bit "is zero" flag, otherwise 3-bit
+    /// magnitude `n` followed by `u(n)` extra bits with implicit
+    /// leading 1.
+    pub fn read_u8_value(&mut self) -> Result<u32> {
+        if self.read_bit()? == 0 {
+            return Ok(0);
+        }
+        let n = self.read_bits(3)?;
+        Ok(self.read_bits(n)? + (1u32 << n))
+    }
+
     pub fn read_bool(&mut self) -> Result<bool> {
         Ok(self.read_bit()? != 0)
     }
@@ -74,6 +149,58 @@ impl<'a> BitReader<'a> {
             U32Dist::Bits(n) => self.read_bits(n),
             U32Dist::BitsOffset(n, off) => Ok(self.read_bits(n)? + off),
         }
+    }
+
+    /// `pu0()` per A.3.2.4: skip to the next byte boundary; the skipped
+    /// bits MUST all be zero, otherwise the codestream is ill-formed.
+    pub fn pu0(&mut self) -> Result<()> {
+        if self.bit_pos == 0 {
+            return Ok(());
+        }
+        let n = 8 - self.bit_pos;
+        let v = self.read_bits(n as u32)?;
+        if v != 0 {
+            return Err(Error::InvalidData(
+                "JXL pu0(): non-zero padding bits before byte boundary".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// `Varint()` per A.3.1.5: read a 7-bit-per-byte little-endian
+    /// variable-length unsigned integer of up to 63 bits.
+    pub fn read_varint(&mut self) -> Result<u64> {
+        let mut value: u64 = 0;
+        let mut shift: u32 = 0;
+        loop {
+            let b = self.read_bits(8)? as u64;
+            value |= (b & 0x7f) << shift;
+            if b <= 127 {
+                break;
+            }
+            shift += 7;
+            if shift >= 63 {
+                return Err(Error::InvalidData("JXL Varint(): shift overflow".into()));
+            }
+        }
+        Ok(value)
+    }
+
+    /// `pu()` per A.3.1.2: read enough bits to align to the next byte
+    /// boundary (returning their value). Unlike [`pu0`] this does NOT
+    /// require the skipped bits to be zero.
+    pub fn pu(&mut self) -> Result<u32> {
+        if self.bit_pos == 0 {
+            return Ok(0);
+        }
+        let n = 8 - self.bit_pos;
+        self.read_bits(n as u32)
+    }
+
+    /// Borrow the underlying byte slice (used by entropy coders that
+    /// switch from bit-level to byte-level reads after a `pu0()`).
+    pub fn data(&self) -> &'a [u8] {
+        self.data
     }
 }
 
@@ -173,6 +300,106 @@ mod tests {
         assert_eq!(br.bytes_consumed(), 1);
         let _ = br.read_bit().unwrap();
         assert_eq!(br.bytes_consumed(), 2);
+    }
+
+    #[test]
+    fn pu0_passes_at_byte_boundary() {
+        let data = [0x00];
+        let mut br = BitReader::new(&data);
+        br.pu0().unwrap();
+        assert_eq!(br.bits_read(), 0);
+    }
+
+    #[test]
+    fn pu0_passes_when_padding_zero() {
+        // Read 3 bits of zero, then pu0 should consume the rest with no error.
+        let data = [0x00];
+        let mut br = BitReader::new(&data);
+        let _ = br.read_bits(3).unwrap();
+        br.pu0().unwrap();
+        assert_eq!(br.bits_read(), 8);
+    }
+
+    #[test]
+    fn pu0_rejects_nonzero_padding() {
+        // Byte 0xF0 = bits 0..=3 are 0, bits 4..=7 are 1. After reading 3
+        // zero bits we are at bit pos 3; pu0 must read bits 3..=7 = 0,1,1,1,1
+        // which has value 0b11110 != 0 → error.
+        let data = [0xF0];
+        let mut br = BitReader::new(&data);
+        let _ = br.read_bits(3).unwrap();
+        assert!(br.pu0().is_err());
+    }
+
+    #[test]
+    fn read_varint_single_byte() {
+        // 0x42 = 0b0100_0010 → top bit clear, value = 0x42.
+        let data = [0x42];
+        let mut br = BitReader::new(&data);
+        assert_eq!(br.read_varint().unwrap(), 0x42);
+        assert_eq!(br.bytes_consumed(), 1);
+    }
+
+    #[test]
+    fn read_varint_multi_byte() {
+        // Encode 300 (0x12C). Two bytes: 0x80 | (0x2C) = 0xAC, then 0x02.
+        // Decoded: (0xAC & 0x7F) | (0x02 << 7) = 0x2C | 0x100 = 0x12C.
+        let data = [0xAC, 0x02];
+        let mut br = BitReader::new(&data);
+        assert_eq!(br.read_varint().unwrap(), 300);
+        assert_eq!(br.bytes_consumed(), 2);
+    }
+
+    #[test]
+    fn peek_then_advance_matches_read() {
+        let data = [0xB4, 0x5A];
+        let mut br1 = BitReader::new(&data);
+        let mut br2 = BitReader::new(&data);
+        let p = br1.peek_bits(7).unwrap();
+        br1.advance_bits(7).unwrap();
+        let r = br2.read_bits(7).unwrap();
+        assert_eq!(p, r);
+        assert_eq!(br1.bits_read(), 7);
+    }
+
+    #[test]
+    fn peek_past_eof_returns_zero_bits() {
+        // Two-byte input, peek 16 bits at offset 8 → upper byte is real,
+        // bits past the end (none here) would be zero.
+        let data = [0xAB, 0xCD];
+        let br = BitReader::new(&data);
+        let v = br.peek_bits(16).unwrap();
+        assert_eq!(v, 0xCDAB);
+    }
+
+    #[test]
+    fn advance_bits_rejects_past_eof() {
+        let data = [0u8; 1];
+        let mut br = BitReader::new(&data);
+        assert!(br.advance_bits(9).is_err());
+    }
+
+    #[test]
+    fn read_u8_value_zero() {
+        // bit0 = 0 → value 0.
+        let data = [0u8];
+        let mut br = BitReader::new(&data);
+        assert_eq!(br.read_u8_value().unwrap(), 0);
+    }
+
+    #[test]
+    fn read_u8_value_three() {
+        // Decode value 3 with the JXL `U8()` LSB-first read order:
+        //   u(1) = 1                    → not-zero flag
+        //   u(3) = 1                    → n = 1
+        //   u(1) = 1                    → extra; value = 1 + (1<<1) = 3
+        // LSB-first packing: bit0=1, bit1=1, bit2=0, bit3=0, bit4=1.
+        // → byte = 0b00010011 = 0x13.
+        // (The spec's section 9.2.5 example "bits 10011 in value 3"
+        // lists the same five bits in MSB-first display order.)
+        let data = [0x13];
+        let mut br = BitReader::new(&data);
+        assert_eq!(br.read_u8_value().unwrap(), 3);
     }
 
     #[test]

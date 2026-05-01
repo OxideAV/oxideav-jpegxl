@@ -18,25 +18,60 @@
 //!   [`metadata::ImageMetadata`] fields up to `num_extra_channels`
 //!   (bit depth, orientation, preview/animation flags). Fuller
 //!   ColorEncoding + ToneMapping decoding is deferred.
+//! * Modular sub-bitstream pixel decode (per the 2019 committee draft,
+//!   Annexes C.9 + D.7), made of:
+//!   - [`abrac::Abrac`] — the bit-level adaptive range coder (D.7);
+//!   - [`begabrac::Begabrac`] — bounded-Exp-Golomb integer coder over a
+//!     known signed range (D.7.1);
+//!   - [`matree::MaTree`] — the meta-adaptive decision tree that picks
+//!     a per-context BEGABRAC for each pixel (D.7.2 / D.7.3);
+//!   - [`predictors`] — the five named pixel predictors (Zero, Average,
+//!     Gradient, Left, Top) from C.9.3.1;
+//!   - [`modular`] — the channel header parser plus the per-pixel
+//!     property + predictor + entropy decode loop.
 //!
-//! No pixel decoding is performed yet. The registered decoder reports
-//! [`Error::Unsupported`] when instantiated; programs that only need
+//! The integrated registered decoder is not yet wired: the registered
+//! `make_decoder` reports [`Error::Unsupported`] because the surrounding
+//! codestream framing (FrameHeader + TOC + frame-byte alignment) is not
+//! yet wired to the per-channel path. Programs that only need
 //! probe-level information (dimensions, bit depth) should call
-//! [`probe`] directly.
+//! [`probe`] directly; programs that want to drive the per-channel
+//! Modular decode end-to-end should instantiate
+//! [`modular::decode_single_channel`] against a hand-built fixture
+//! (unit tests in `modular` show the expected wire format).
 //!
 //! Follow-up work (tracked for the eventual landing PR):
 //!
-//! * Full ImageMetadata decode (ColorEncoding, ToneMapping, extra
-//!   channels, intrinsic/preview sub-bundles).
-//! * FrameHeader bundle + TOC.
-//! * Modular-path decoder (Weighted + Gradient predictor + MA-tree
-//!   range coder) — suitable for lossless 8-bit grayscale + RGB(A).
+//! * FrameHeader (C.2) + TOC (C.3) + the modular-image header
+//!   (`max_extra_properties`, transforms) so that whole-image
+//!   codestreams (not just isolated channels) decode.
+//! * Squeeze inverse transform (I.3) for multi-resolution Modular
+//!   images.
 //! * VarDCT-path decoder (variable-size DCT + LF/HF, Chroma-from-Luma,
-//!   Gaborish smoothing, EPF).
+//!   Gaborish smoothing, EPF) — out of scope for this round.
+//! * MABrotli / MAANS entropy coders (the 2019 committee draft's
+//!   `entropy_coder` ∈ {1, 2}); only MABEGABRAC (`entropy_coder == 0`)
+//!   is implemented today.
+//!
+//! ## FDIS 18181-1:2021 entropy layer
+//!
+//! In addition to the committee-draft pipeline above, the [`ans`]
+//! module ships the FDIS 18181-1:2021 Annex D entropy decoder
+//! (prefix codes, ANS, distribution clustering, hybrid integer
+//! coding). It is **additive**: the registered `make_decoder` does
+//! not yet drive it; future rounds will replace the committee-draft
+//! Modular entry point with the FDIS path that wires through
+//! FrameHeader + TOC into [`ans`].
 
+pub mod abrac;
+pub mod ans;
+pub mod begabrac;
 pub mod bitreader;
 pub mod container;
+pub mod matree;
 pub mod metadata;
+pub mod modular;
+pub mod predictors;
 
 pub use container::{detect, extract_codestream, Signature};
 pub use metadata::{parse_headers, BitDepth, Headers, ImageMetadata, SizeHeader};
