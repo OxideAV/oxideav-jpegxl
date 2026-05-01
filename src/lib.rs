@@ -42,9 +42,8 @@
 //!
 //! Follow-up work (tracked for the eventual landing PR):
 //!
-//! * FrameHeader (C.2) + TOC (C.3) + the modular-image header
-//!   (`max_extra_properties`, transforms) so that whole-image
-//!   codestreams (not just isolated channels) decode.
+//! * GlobalModular wiring (C.4.8) so the FDIS path can actually drive
+//!   the Modular sub-bitstream end-to-end.
 //! * Squeeze inverse transform (I.3) for multi-resolution Modular
 //!   images.
 //! * VarDCT-path decoder (variable-size DCT + LF/HF, Chroma-from-Luma,
@@ -53,25 +52,39 @@
 //!   `entropy_coder` ∈ {1, 2}); only MABEGABRAC (`entropy_coder == 0`)
 //!   is implemented today.
 //!
-//! ## FDIS 18181-1:2021 entropy layer
+//! ## FDIS 18181-1:2021 layer
 //!
-//! In addition to the committee-draft pipeline above, the [`ans`]
-//! module ships the FDIS 18181-1:2021 Annex D entropy decoder
-//! (prefix codes, ANS, distribution clustering, hybrid integer
-//! coding). It is **additive**: the registered `make_decoder` does
-//! not yet drive it; future rounds will replace the committee-draft
-//! Modular entry point with the FDIS path that wires through
-//! FrameHeader + TOC into [`ans`].
+//! In addition to the committee-draft pipeline above, the FDIS layer
+//! is being built up additively across rounds:
+//!
+//! * Round 1: [`ans`] — FDIS Annex D entropy decoder (prefix codes,
+//!   ANS, distribution clustering, hybrid integer coding).
+//! * Round 2: [`extensions`] — A.5 Extensions; [`metadata_fdis`] —
+//!   full A.6 ImageMetadata refresh including ColorEncoding,
+//!   ToneMapping, ExtraChannelInfo, AnimationHeader, OpsinInverseMatrix,
+//!   PreviewHeader; [`frame_header`] — C.2 FrameHeader bundle including
+//!   Passes, BlendingInfo, RestorationFilter; [`toc`] — C.3 TOC with
+//!   Lehmer-code permutation decoder driven by the round-1 ANS layer;
+//!   [`ans::cluster::read_general_clustering`] — D.3.5 general path.
+//! * Round 3 (planned): GlobalModular wiring + cjxl fixture decode.
+//!
+//! It is **additive**: the registered `make_decoder` does not yet drive
+//! it; future rounds will replace the committee-draft Modular entry
+//! point with the FDIS path.
 
 pub mod abrac;
 pub mod ans;
 pub mod begabrac;
 pub mod bitreader;
 pub mod container;
+pub mod extensions;
+pub mod frame_header;
 pub mod matree;
 pub mod metadata;
+pub mod metadata_fdis;
 pub mod modular;
 pub mod predictors;
+pub mod toc;
 
 pub use container::{detect, extract_codestream, Signature};
 pub use metadata::{parse_headers, BitDepth, Headers, ImageMetadata, SizeHeader};

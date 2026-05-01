@@ -9,16 +9,22 @@
 //!    one-distribution ANS stream (D.3.6 + D.3.4), optionally followed
 //!    by an inverse move-to-front transform (Listing D.5).
 //!
-//! Round-1 ships only the *simple* path and the MTF helper. The
-//! general path needs a fully wired ANS decoder over a sub-distribution
-//! and is decoded inline by future rounds (it requires
-//! `DecodeHybridVarLenUint` from [`crate::ans::hybrid`] which expects a
-//! prebuilt ANS context array — exactly what this routine constructs).
-//! The MTF transform itself is exercised end-to-end by the unit tests
-//! below so that round-2 only has to wire it up.
+//! Round 1 shipped the *simple* path + MTF helper; round 2 adds the
+//! *general* path, which reads each cluster index via a one-distribution
+//! ANS sub-stream (`is_simple == 0`). The sub-stream's own clustering
+//! step is skipped per D.3.1's "unless only one distribution is to be
+//! decoded" clause, leaving exactly one
+//! ANS distribution + one [`crate::ans::hybrid::HybridUintConfig`]
+//! to drive [`HybridUintState::decode`] across `num_distributions`
+//! integer reads.
 
 use oxideav_core::{Error, Result};
 
+use crate::ans::alias::AliasTable;
+use crate::ans::distribution::read_distribution;
+use crate::ans::hybrid::{HybridUintState, Lz77Params};
+use crate::ans::hybrid_config::HybridUintConfig;
+use crate::ans::symbol::AnsDecoder;
 use crate::bitreader::BitReader;
 
 /// `MTF(v[256], index)` per FDIS Listing D.5.
@@ -88,6 +94,139 @@ pub fn read_simple_clustering(
 /// histograms to read after the clustering map.
 pub fn num_clusters(clusters: &[u32]) -> u32 {
     clusters.iter().copied().max().map(|m| m + 1).unwrap_or(0)
+}
+
+/// Read the general clustering map (the `is_simple == 0` branch of
+/// D.3.5).
+///
+/// Per D.3.5, each cluster index is read via a one-distribution ANS
+/// sub-stream:
+///
+/// * one `HybridUintConfig` (D.3.7),
+/// * one ANS distribution (D.3.4),
+/// * one alias table (D.3.2),
+/// * one `AnsDecoder` state init (D.3.3),
+/// * `num_distributions` calls to `DecodeHybridVarLenUint` (D.3.6).
+///
+/// `use_mtf` toggles the inverse-MTF post-pass.
+///
+/// LZ77 is **not enabled** in the cluster sub-stream: the spec doesn't
+/// allow LZ77 in a one-distribution stream because there is no
+/// distinct "distance" context. The implementation therefore feeds
+/// `Lz77Params { enabled: false, .. }` to `HybridUintState::new`.
+pub fn read_general_clustering(
+    br: &mut BitReader<'_>,
+    num_distributions: usize,
+) -> Result<Vec<u32>> {
+    if num_distributions == 0 {
+        return Ok(Vec::new());
+    }
+    if num_distributions > super::distribution::ALPHABET_SIZE_MAX {
+        return Err(Error::InvalidData(
+            "JXL clustering: num_distributions absurdly large".into(),
+        ));
+    }
+    if num_distributions > br.bits_remaining() {
+        // Each cluster-index decode reads at least one bit; refuse if
+        // the input could not even supply trivial reads.
+        return Err(Error::InvalidData(
+            "JXL clustering: num_distributions exceeds remaining input".into(),
+        ));
+    }
+
+    let use_mtf = br.read_bit()? == 1;
+
+    // D.3.5 sub-stream is a one-distribution ANS stream. Per D.3.1, the
+    // sub-stream itself begins with LZ77Params; if that signals
+    // lz77.enabled then num_dist becomes 2 and D.3.5 would be invoked
+    // recursively — a hostile-input attack vector. Reject the recursive
+    // case rather than risk an unbounded recursion.
+    let lz77_enabled = br.read_bit()? == 1;
+    if lz77_enabled {
+        return Err(Error::InvalidData(
+            "JXL D.3.5 general clustering: LZ77-enabled sub-stream not supported (recursive clustering disallowed)".into(),
+        ));
+    }
+
+    // num_dist == 1 → D.3.5 is skipped for the sub-stream. Proceed
+    // straight to use_prefix_code + HybridUintConfig + distribution.
+    let use_prefix_code = br.read_bit()? == 1;
+    let log_alphabet_size = if use_prefix_code {
+        5 + br.read_bits(2)?
+    } else {
+        15
+    };
+
+    let cfg = HybridUintConfig::read(br, log_alphabet_size)?;
+
+    if use_prefix_code {
+        // Sub-stream uses prefix codes (D.2). For the cluster-index
+        // case in practice we don't see this branch on real codestreams
+        // — the spec permits it but it requires a full prefix-code
+        // histogram on top of the HybridUintConfig. Defer to a
+        // follow-up round: error out cleanly so callers don't get
+        // silently wrong data.
+        return Err(Error::Unsupported(
+            "JXL D.3.5 general clustering: prefix-coded sub-stream not yet supported".into(),
+        ));
+    }
+
+    // ANS sub-stream: read one distribution, build alias table, init
+    // state, decode num_distributions integers.
+    let dist = read_distribution(br, log_alphabet_size)?;
+    let alias = AliasTable::build(&dist, log_alphabet_size)?;
+    let mut ans = AnsDecoder::new(br)?;
+    let mut state = HybridUintState::new(
+        Lz77Params {
+            enabled: false,
+            min_symbol: 224,
+            min_length: 3,
+        },
+        cfg,
+    );
+
+    let mut clusters = Vec::with_capacity(num_distributions);
+    for _ in 0..num_distributions {
+        let value = state.decode(
+            br,
+            0,
+            0,
+            0,
+            |br_inner, _ctx| Ok(ans.decode_symbol(br_inner, &dist, &alias)? as u32),
+            |_ctx| cfg,
+        )?;
+        clusters.push(value);
+    }
+
+    if use_mtf {
+        inverse_mtf(&mut clusters);
+    }
+
+    // Per D.3.5: "All integers in [0, num_clusters) are present in this
+    // array." We don't enforce surjectivity here (it would force a
+    // double pass over potentially large arrays); the caller relies on
+    // num_clusters() returning max+1 which is correct for any cluster
+    // map regardless of whether intermediate values are skipped.
+    Ok(clusters)
+}
+
+/// Top-level entry point for D.3.5 clustering map reading. Dispatches
+/// between the simple (`is_simple == 1`) and general paths.
+///
+/// `num_distributions == 1` skips D.3.5 entirely per D.3.1, and the
+/// caller should not invoke this routine in that case.
+pub fn read_clustering(br: &mut BitReader<'_>, num_distributions: usize) -> Result<Vec<u32>> {
+    if num_distributions <= 1 {
+        return Err(Error::InvalidData(
+            "JXL clustering: read_clustering called with num_distributions <= 1 (caller must skip D.3.5)".into(),
+        ));
+    }
+    let is_simple = br.read_bit()? == 1;
+    if is_simple {
+        read_simple_clustering(br, num_distributions)
+    } else {
+        read_general_clustering(br, num_distributions)
+    }
 }
 
 #[cfg(test)]

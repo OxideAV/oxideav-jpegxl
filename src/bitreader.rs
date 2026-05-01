@@ -202,6 +202,103 @@ impl<'a> BitReader<'a> {
     pub fn data(&self) -> &'a [u8] {
         self.data
     }
+
+    /// `U64()` per FDIS 18181-1 §9.2.3 (Listing 9.1).
+    ///
+    /// 2-bit selector:
+    ///   * 0 → value = 0
+    ///   * 1 → value = `BitsOffset(4, 1)`
+    ///   * 2 → value = `BitsOffset(8, 17)`
+    ///   * 3 → value = `u(12)` followed by zero or more 8-bit
+    ///     continuations gated on a 1-bit "more" flag, plus an optional
+    ///     final 4-bit chunk when shift would otherwise reach 60.
+    ///
+    /// Bounds: shift never advances past 60 (the listing's terminating
+    /// branch caps the final chunk at 4 bits) so the result fits in 64
+    /// bits unconditionally.
+    pub fn read_u64(&mut self) -> Result<u64> {
+        let sel = self.read_bits(2)?;
+        match sel {
+            0 => Ok(0),
+            1 => Ok(self.read_bits(4)? as u64 + 1),
+            2 => Ok(self.read_bits(8)? as u64 + 17),
+            _ => {
+                let mut value: u64 = self.read_bits(12)? as u64;
+                let mut shift: u32 = 12;
+                loop {
+                    if self.read_bit()? == 0 {
+                        break;
+                    }
+                    if shift == 60 {
+                        let chunk = self.read_bits(4)? as u64;
+                        value |= chunk << shift;
+                        break;
+                    }
+                    let chunk = self.read_bits(8)? as u64;
+                    value |= chunk << shift;
+                    shift += 8;
+                }
+                Ok(value)
+            }
+        }
+    }
+
+    /// `F16()` per FDIS 18181-1 §9.2.6 (Listing 9.5).
+    ///
+    /// Reads 16 bits and interprets them as IEEE-754 binary16. Per the
+    /// listing's normative rule the biased exponent must not be 31
+    /// (NaN/infinity rejected); this is enforced.
+    pub fn read_f16(&mut self) -> Result<f32> {
+        let bits16 = self.read_bits(16)? as u16;
+        let biased_exp = (bits16 >> 10) & 0x1F;
+        if biased_exp == 31 {
+            return Err(Error::InvalidData(
+                "JXL F16(): biased_exp == 31 (NaN/Inf disallowed)".into(),
+            ));
+        }
+        Ok(interpret_as_f16(bits16))
+    }
+}
+
+/// Decode an IEEE-754 binary16 bit pattern as an `f32`. NaN/Inf values
+/// are decoded as the corresponding `f32` representation, but
+/// [`BitReader::read_f16`] rejects them upstream.
+pub fn interpret_as_f16(bits16: u16) -> f32 {
+    let sign = (bits16 >> 15) & 1;
+    let exp = ((bits16 >> 10) & 0x1F) as i32;
+    let mant = (bits16 & 0x3FF) as u32;
+    let f32_bits: u32 = if exp == 0 && mant == 0 {
+        (sign as u32) << 31
+    } else if exp == 0 {
+        // Subnormal: convert by shifting until normal.
+        let mut m = mant;
+        let mut e: i32 = -14;
+        while (m & 0x400) == 0 {
+            m <<= 1;
+            e -= 1;
+        }
+        m &= 0x3FF;
+        let f32_exp = (e + 127) as u32;
+        ((sign as u32) << 31) | (f32_exp << 23) | (m << 13)
+    } else if exp == 31 {
+        // NaN/Inf: emit float NaN/Inf with same sign.
+        ((sign as u32) << 31) | (0xFF << 23) | (mant << 13)
+    } else {
+        let f32_exp = (exp - 15 + 127) as u32;
+        ((sign as u32) << 31) | (f32_exp << 23) | (mant << 13)
+    };
+    f32::from_bits(f32_bits)
+}
+
+/// `UnpackSigned(u)` per FDIS §5.2: `u/2` if u is even, `-(u+1)/2` if u
+/// is odd. Used by `Customxy` (A.4) and a handful of other JXL fields
+/// that store signed integers as ZigZag-encoded unsigned ones.
+pub fn unpack_signed(u: u32) -> i32 {
+    if u & 1 == 0 {
+        (u >> 1) as i32
+    } else {
+        -((u >> 1) as i32 + 1)
+    }
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -400,6 +497,118 @@ mod tests {
         let data = [0x13];
         let mut br = BitReader::new(&data);
         assert_eq!(br.read_u8_value().unwrap(), 3);
+    }
+
+    #[test]
+    fn u64_selector_zero() {
+        // 2-bit selector = 0 → value = 0 unconditionally.
+        let data = [0u8];
+        let mut br = BitReader::new(&data);
+        assert_eq!(br.read_u64().unwrap(), 0);
+    }
+
+    #[test]
+    fn u64_selector_one_bits_offset_4_1() {
+        // sel = 1 → BitsOffset(4, 1). Pick raw bits = 5 → value = 6.
+        // LSB-first: sel bits are bit0=1, bit1=0; payload bits are 1,0,1,0.
+        let mut bw = BitWriterTest::new();
+        bw.w(1, 2); // sel
+        bw.w(5, 4); // raw
+        let bytes = bw.finish();
+        let mut br = BitReader::new(&bytes);
+        assert_eq!(br.read_u64().unwrap(), 6);
+    }
+
+    #[test]
+    fn u64_selector_three_no_continuation() {
+        // sel = 3, then u(12) = 0xABC, then 0-bit terminator.
+        let mut bw = BitWriterTest::new();
+        bw.w(3, 2);
+        bw.w(0xABC, 12);
+        bw.w(0, 1);
+        let bytes = bw.finish();
+        let mut br = BitReader::new(&bytes);
+        assert_eq!(br.read_u64().unwrap(), 0xABC);
+    }
+
+    #[test]
+    fn u64_selector_three_one_continuation() {
+        // sel = 3, u(12) = 0x123, 1-bit "more", u(8) = 0xCD, 0-bit "stop".
+        // value = 0x123 | (0xCD << 12) = 0x000C_D123.
+        let mut bw = BitWriterTest::new();
+        bw.w(3, 2);
+        bw.w(0x123, 12);
+        bw.w(1, 1);
+        bw.w(0xCD, 8);
+        bw.w(0, 1);
+        let bytes = bw.finish();
+        let mut br = BitReader::new(&bytes);
+        assert_eq!(br.read_u64().unwrap(), 0x000C_D123);
+    }
+
+    #[test]
+    fn f16_zero_and_one() {
+        // 0x0000 → +0.0 ; 0x3C00 → 1.0 ; 0xC000 → -2.0
+        let bytes = pack_u16(&[0x0000, 0x3C00, 0xC000]);
+        let mut br = BitReader::new(&bytes);
+        assert_eq!(br.read_f16().unwrap(), 0.0);
+        assert_eq!(br.read_f16().unwrap(), 1.0);
+        assert_eq!(br.read_f16().unwrap(), -2.0);
+    }
+
+    #[test]
+    fn f16_rejects_inf() {
+        // 0x7C00 → +inf ; biased_exp == 31, must error.
+        let bytes = pack_u16(&[0x7C00]);
+        let mut br = BitReader::new(&bytes);
+        assert!(br.read_f16().is_err());
+    }
+
+    #[test]
+    fn unpack_signed_round_trip() {
+        assert_eq!(unpack_signed(0), 0);
+        assert_eq!(unpack_signed(1), -1);
+        assert_eq!(unpack_signed(2), 1);
+        assert_eq!(unpack_signed(3), -2);
+        assert_eq!(unpack_signed(4), 2);
+        assert_eq!(unpack_signed(5), -3);
+    }
+
+    /// LSB-first bit writer for tests.
+    struct BitWriterTest {
+        out: Vec<u8>,
+        bit_pos: u8,
+    }
+    impl BitWriterTest {
+        fn new() -> Self {
+            Self {
+                out: Vec::new(),
+                bit_pos: 0,
+            }
+        }
+        fn w(&mut self, value: u32, n: u32) {
+            for i in 0..n {
+                if self.bit_pos == 0 {
+                    self.out.push(0);
+                }
+                let bit = ((value >> i) & 1) as u8;
+                let last = self.out.len() - 1;
+                self.out[last] |= bit << self.bit_pos;
+                self.bit_pos = (self.bit_pos + 1) % 8;
+            }
+        }
+        fn finish(self) -> Vec<u8> {
+            self.out
+        }
+    }
+
+    fn pack_u16(values: &[u16]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(values.len() * 2);
+        for &v in values {
+            out.push((v & 0xFF) as u8);
+            out.push((v >> 8) as u8);
+        }
+        out
     }
 
     #[test]
