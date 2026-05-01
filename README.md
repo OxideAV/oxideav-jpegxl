@@ -62,6 +62,18 @@ parsing not yet implemented")` rather than silent misparse.
 - No animation, preview, or intrinsic-size sub-bundle decoding (parsing
   stops at the `have_*` flags).
 
+### Why pixel decode is blocked
+
+Pixel-decoder work is gated on having the normative ISO/IEC 18181-1
+(JPEG XL Core Coding System) text in `docs/image/jxl/`. As of this
+release the workspace does not carry the spec — it is listed in the
+project-wide `docs/README.md` "Known gaps — ISO/IEC (paid)" section.
+Workspace policy forbids consulting third-party source (libjxl,
+jxlatte, jxl-rs, FUIF, brunsli) as a substitute. See
+[`SPEC_BLOCKED.md`](SPEC_BLOCKED.md) for the audit, the documents
+checked, and the unblock procedure + planned work-order for when the
+ISO PDF lands.
+
 ## Usage
 
 ```rust

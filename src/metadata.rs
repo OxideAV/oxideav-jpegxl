@@ -8,10 +8,11 @@
 //!     bit-depth `all_default` flags. Full ColorEncoding decoding is not
 //!     attempted here.
 //!
-//! Bit layout mirrors the reference libjxl implementation
-//! (`lib/jxl/headers.cc`, `lib/jxl/image_metadata.cc`): LSB-first bit
-//! packing, `U32` fields with 2-bit selectors, and `Bundle::AllDefault`
-//! shortcut bits.
+//! Bit layout follows ISO/IEC 18181-1 (the JPEG XL core coding system):
+//! LSB-first bit packing, `U32` fields with 2-bit selectors, and
+//! `Bundle::AllDefault` shortcut bits. Per workspace policy the normative
+//! ISO text is the only acceptable reference; `SPEC_BLOCKED.md` in this
+//! crate documents that the spec is not currently in `docs/image/jxl/`.
 
 use oxideav_core::{Error, Result};
 

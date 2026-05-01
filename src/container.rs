@@ -159,6 +159,70 @@ mod tests {
     }
 
     #[test]
+    fn extracts_isobmff_jxlp_payload_strips_index() {
+        // Signature box (12) + jxlp box (size=16, 4-byte index prefix +
+        // 4 bytes of codestream).
+        let mut buf = ISOBMFF_SIGNATURE.to_vec();
+        buf.extend_from_slice(&[0, 0, 0, 16, b'j', b'x', b'l', b'p']);
+        // 4-byte index (high bit = last partial), then 4 codestream bytes.
+        buf.extend_from_slice(&[0x80, 0, 0, 0, 0xFF, 0x0A, 0x42, 0x42]);
+        let cs = extract_codestream(&buf).unwrap();
+        assert_eq!(&*cs, &[0xFF, 0x0A, 0x42, 0x42]);
+    }
+
+    #[test]
+    fn extracts_isobmff_jxlp_concatenates_in_order() {
+        // Two jxlp boxes back-to-back; payloads must concatenate after each
+        // 4-byte index is stripped.
+        let mut buf = ISOBMFF_SIGNATURE.to_vec();
+        buf.extend_from_slice(&[0, 0, 0, 14, b'j', b'x', b'l', b'p', 0, 0, 0, 0, 0xFF, 0x0A]);
+        buf.extend_from_slice(&[
+            0, 0, 0, 14, b'j', b'x', b'l', b'p', 0x80, 0, 0, 1, 0xAB, 0xCD,
+        ]);
+        let cs = extract_codestream(&buf).unwrap();
+        assert_eq!(&*cs, &[0xFF, 0x0A, 0xAB, 0xCD]);
+    }
+
+    #[test]
+    fn rejects_jxlp_too_short_for_index() {
+        let mut buf = ISOBMFF_SIGNATURE.to_vec();
+        // jxlp box with payload length 2 (less than the required 4-byte index).
+        buf.extend_from_slice(&[0, 0, 0, 10, b'j', b'x', b'l', b'p', 0, 0]);
+        let err = extract_codestream(&buf).unwrap_err();
+        assert!(matches!(err, Error::InvalidData(_)));
+    }
+
+    #[test]
+    fn extracts_isobmff_large_size_box() {
+        // size32=1 → 64-bit large size follows. Carry a single 4-byte jxlc.
+        let mut buf = ISOBMFF_SIGNATURE.to_vec();
+        buf.extend_from_slice(&[0, 0, 0, 1, b'j', b'x', b'l', b'c']);
+        // 8-byte big-endian large size = 4 (header) + 8 (size64) + 4 (payload) = 20.
+        buf.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 20]);
+        buf.extend_from_slice(&[0xFF, 0x0A, 0x33, 0x44]);
+        let cs = extract_codestream(&buf).unwrap();
+        assert_eq!(&*cs, &[0xFF, 0x0A, 0x33, 0x44]);
+    }
+
+    #[test]
+    fn rejects_truncated_large_size_header() {
+        let mut buf = ISOBMFF_SIGNATURE.to_vec();
+        // Box says size32=1 but supplies fewer than 8 bytes for size64.
+        buf.extend_from_slice(&[0, 0, 0, 1, b'j', b'x', b'l', b'c', 0, 0, 0]);
+        let err = extract_codestream(&buf).unwrap_err();
+        assert!(matches!(err, Error::InvalidData(_)));
+    }
+
+    #[test]
+    fn rejects_box_overrunning_file() {
+        let mut buf = ISOBMFF_SIGNATURE.to_vec();
+        // Claims size 1024 but only 8 bytes follow.
+        buf.extend_from_slice(&[0, 0, 4, 0, b'j', b'x', b'l', b'c']);
+        let err = extract_codestream(&buf).unwrap_err();
+        assert!(matches!(err, Error::InvalidData(_)));
+    }
+
+    #[test]
     fn rejects_isobmff_without_codestream() {
         let mut buf = ISOBMFF_SIGNATURE.to_vec();
         // ftyp-ish box with no jxlc/jxlp.

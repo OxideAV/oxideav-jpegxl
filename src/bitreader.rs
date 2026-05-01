@@ -126,6 +126,56 @@ mod tests {
     }
 
     #[test]
+    fn read_zero_bits_is_noop() {
+        let data = [0xAA];
+        let mut br = BitReader::new(&data);
+        assert_eq!(br.read_bits(0).unwrap(), 0);
+        assert_eq!(br.bits_read(), 0);
+    }
+
+    #[test]
+    fn read_more_than_32_bits_rejected() {
+        let data = [0xFF; 8];
+        let mut br = BitReader::new(&data);
+        assert!(br.read_bits(33).is_err());
+    }
+
+    #[test]
+    fn read_full_32_bits_round_trips() {
+        // Bits LSB-first: 0xDEADBEEF in field order. Encode by writing the
+        // value low-byte-first (LSB inside each byte).
+        let v: u32 = 0xDEAD_BEEF;
+        let bytes = v.to_le_bytes();
+        let mut br = BitReader::new(&bytes);
+        assert_eq!(br.read_bits(32).unwrap(), v);
+        // After consuming 32 bits we should be exactly 4 bytes in.
+        assert_eq!(br.bits_read(), 32);
+        assert_eq!(br.bytes_consumed(), 4);
+    }
+
+    #[test]
+    fn eof_returns_invalid_data() {
+        let data = [0u8; 1];
+        let mut br = BitReader::new(&data);
+        let _ = br.read_bits(8).unwrap();
+        let err = br.read_bit().unwrap_err();
+        assert!(matches!(err, Error::InvalidData(_)));
+    }
+
+    #[test]
+    fn bytes_consumed_tracks_partial_byte() {
+        let data = [0xF0, 0x0F];
+        let mut br = BitReader::new(&data);
+        let _ = br.read_bits(4).unwrap();
+        // 4 bits read out of byte 0 → still consuming byte 0.
+        assert_eq!(br.bytes_consumed(), 1);
+        let _ = br.read_bits(4).unwrap();
+        assert_eq!(br.bytes_consumed(), 1);
+        let _ = br.read_bit().unwrap();
+        assert_eq!(br.bytes_consumed(), 2);
+    }
+
+    #[test]
     fn u32_selector_bits_offset() {
         // Two-bit selector = 2 → BitsOffset(3, 1). LSB-first we need bits 0,1
         // to be "01" (selector=2, since bit-pos-0 is LSB of selector) → wait:
