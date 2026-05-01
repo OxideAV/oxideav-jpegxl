@@ -297,17 +297,15 @@ fn read_simple_prefix(br: &mut BitReader<'_>, alphabet_size: u32) -> Result<Pref
             code_lengths[symbols[1] as usize] = 1;
         }
         3 => {
-            // Three symbols: lengths 1, 2, 2. Symbols 1 and 2 (the last
-            // two) sorted ascending.
-            // RFC 7932 §3.4 says "For NSYM = 3, the symbols are sorted
-            // for code length assignment". The first symbol gets length
-            // 1, the second and third (sorted) get length 2.
-            let first = symbols[0];
-            let mut rest = [symbols[1], symbols[2]];
-            rest.sort();
-            code_lengths[first as usize] = 1;
-            code_lengths[rest[0] as usize] = 2;
-            code_lengths[rest[1] as usize] = 2;
+            // RFC 7932 §3.4: "For NSYM = 3, the bit lengths are 1, 2, 2."
+            // Canonical Huffman assigns lengths in ascending symbol-id
+            // order: sorted_symbols[0] → length 1, [1] → length 2,
+            // [2] → length 2. Sort ALL three (not just the last two —
+            // round-3 typo fix #5; see project_jpegxl_fdis_typos.md).
+            symbols.sort();
+            code_lengths[symbols[0] as usize] = 1;
+            code_lengths[symbols[1] as usize] = 2;
+            code_lengths[symbols[2] as usize] = 2;
         }
         4 => {
             // Read tree-select bit.
@@ -590,6 +588,38 @@ mod tests {
         let mut br2 = BitReader::new(&decode_bytes);
         assert_eq!(code.decode(&mut br2).unwrap(), 1);
         assert_eq!(code.decode(&mut br2).unwrap(), 3);
+    }
+
+    #[test]
+    fn read_simple_prefix_three_symbols_canonical_lengths() {
+        // Round-3 regression: NSYM=3 must assign length 1 to the
+        // *smallest* sorted symbol, not the first-read symbol. With
+        // alphabet_size=64, bits=6, encode symbols [50, 7, 33]: read
+        // order [50, 7, 33] → sorted [7, 33, 50] → lengths [1, 2, 2].
+        let bytes = pack_lsb(&[
+            (1, 2),  // kind = simple
+            (2, 2),  // nsym - 1 = 2 → nsym = 3
+            (50, 6), // first symbol
+            (7, 6),  // second symbol
+            (33, 6), // third symbol
+        ]);
+        let mut br = BitReader::new(&bytes);
+        let code = read_prefix_code(&mut br, 64).unwrap();
+        // Decoding bit "0" should give symbol 7 (the smallest sorted).
+        let bytes2 = pack_lsb(&[(0, 1)]);
+        let mut br2 = BitReader::new(&bytes2);
+        assert_eq!(code.decode(&mut br2).unwrap(), 7);
+        // Decoding bits "10" (LSB-first → first bit 0, second bit 1
+        // → raw=2 → in lookup table this maps to a stride replication
+        // of the length-1 entry. Decoding "01" = LSB-first 1, 0 →
+        // raw=1 → sym 33 (length 2).
+        let bytes3 = pack_lsb(&[(1, 1), (0, 1)]);
+        let mut br3 = BitReader::new(&bytes3);
+        assert_eq!(code.decode(&mut br3).unwrap(), 33);
+        // "11" → raw=3 → sym 50.
+        let bytes4 = pack_lsb(&[(1, 1), (1, 1)]);
+        let mut br4 = BitReader::new(&bytes4);
+        assert_eq!(code.decode(&mut br4).unwrap(), 50);
     }
 
     #[test]

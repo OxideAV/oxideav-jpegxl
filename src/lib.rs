@@ -68,9 +68,27 @@
 //!   [`ans::cluster::read_general_clustering`] — D.3.5 general path.
 //! * Round 3 (planned): GlobalModular wiring + cjxl fixture decode.
 //!
-//! It is **additive**: the registered `make_decoder` does not yet drive
-//! it; future rounds will replace the committee-draft Modular entry
-//! point with the FDIS path.
+//! ## Round-3 status (this commit)
+//!
+//! `make_decoder` now returns a live FDIS decoder ([`JxlDecoder`]) that
+//! handles the *narrow envelope* needed by the simplest cjxl Modular
+//! lossless output:
+//!
+//! * Raw codestream OR ISOBMFF wrapping;
+//! * Single-channel Grey 8 bpp;
+//! * Single-group, single-pass frame (`num_groups == 1 &&
+//!   num_passes == 1`);
+//! * `nb_transforms == 0` (no Squeeze / Palette / RCT);
+//! * Single-leaf MA tree (no decision-node evaluation);
+//! * No Patches / Splines / NoiseParameters;
+//! * `use_global_tree == false`;
+//! * No ICC profile (Annex B);
+//! * No weighted predictor (Annex E predictor `6`).
+//!
+//! Anything outside this envelope returns
+//! [`Error::Unsupported`](oxideav_core::Error::Unsupported) at the
+//! relevant gate point. Wider coverage (RGB, VarDCT, Squeeze, ICC,
+//! weighted predictor, multi-leaf trees) lands in round 4.
 
 pub mod abrac;
 pub mod ans;
@@ -79,10 +97,13 @@ pub mod bitreader;
 pub mod container;
 pub mod extensions;
 pub mod frame_header;
+pub mod global_modular;
+pub mod lf_global;
 pub mod matree;
 pub mod metadata;
 pub mod metadata_fdis;
 pub mod modular;
+pub mod modular_fdis;
 pub mod predictors;
 pub mod toc;
 
@@ -90,7 +111,15 @@ pub use container::{detect, extract_codestream, Signature};
 pub use metadata::{parse_headers, BitDepth, Headers, ImageMetadata, SizeHeader};
 
 use oxideav_core::{CodecCapabilities, CodecId, CodecParameters, Error, Result};
-use oxideav_core::{CodecInfo, CodecRegistry, Decoder, Encoder};
+use oxideav_core::{
+    CodecInfo, CodecRegistry, Decoder, Encoder, Frame, Packet, VideoFrame, VideoPlane,
+};
+
+use crate::bitreader::BitReader;
+use crate::frame_header::{FrameDecodeParams, FrameHeader};
+use crate::lf_global::LfGlobal;
+use crate::metadata_fdis::{ColourSpace, ImageMetadataFdis, SizeHeaderFdis};
+use crate::toc::Toc;
 
 /// Public codec id string. Matches the aggregator feature name `jpegxl`.
 pub const CODEC_ID_STR: &str = "jpegxl";
@@ -108,8 +137,223 @@ pub fn register(reg: &mut CodecRegistry) {
     );
 }
 
-fn make_decoder(_params: &CodecParameters) -> Result<Box<dyn Decoder>> {
-    Err(Error::Unsupported("jxl decode not yet implemented".into()))
+fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
+    let codec_id = params.codec_id.clone();
+    Ok(Box::new(JxlDecoder {
+        codec_id,
+        pending: None,
+        eof: false,
+    }))
+}
+
+/// Round-3 JXL decoder. Drives `decode_one_frame` per packet.
+///
+/// Limitations (round 3):
+/// * Only Modular-encoded frames with a single Grey channel.
+/// * Only single-group frames (`num_groups == 1 && num_passes == 1`).
+/// * No transforms (kPalette / kRCT / kSqueeze).
+/// * No global tree (`use_global_tree == false`).
+/// * MA tree must be a single leaf (no decision nodes evaluated).
+/// * No Patches / Splines / Noise.
+///
+/// Anything outside this envelope returns `Error::Unsupported` from a
+/// well-defined point in the bitstream rather than panicking. Round 4
+/// will widen the envelope to RGB / VarDCT / Squeeze.
+struct JxlDecoder {
+    codec_id: CodecId,
+    pending: Option<Packet>,
+    eof: bool,
+}
+
+impl Decoder for JxlDecoder {
+    fn codec_id(&self) -> &CodecId {
+        &self.codec_id
+    }
+
+    fn send_packet(&mut self, packet: &Packet) -> Result<()> {
+        if self.pending.is_some() {
+            return Err(Error::other(
+                "jxl decoder: receive_frame must be called before sending another packet",
+            ));
+        }
+        self.pending = Some(packet.clone());
+        Ok(())
+    }
+
+    fn receive_frame(&mut self) -> Result<Frame> {
+        let Some(pkt) = self.pending.take() else {
+            return if self.eof {
+                Err(Error::Eof)
+            } else {
+                Err(Error::NeedMore)
+            };
+        };
+        let vf = decode_one_frame(&pkt.data, pkt.pts)?;
+        Ok(Frame::Video(vf))
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        self.eof = true;
+        Ok(())
+    }
+}
+
+/// Decode the entire JXL packet (raw codestream OR ISOBMFF-wrapped) and
+/// return the first frame as a [`VideoFrame`]. Round-3 envelope.
+pub fn decode_one_frame(input: &[u8], pts: Option<i64>) -> Result<VideoFrame> {
+    let sig = container::detect(input)
+        .ok_or_else(|| Error::InvalidData("jxl decoder: no JXL signature".into()))?;
+    match sig {
+        container::Signature::RawCodestream => decode_codestream(&input[2..], pts),
+        container::Signature::Isobmff => {
+            let codestream_owned = container::extract_codestream(input)?;
+            decode_codestream(&codestream_owned, pts)
+        }
+    }
+}
+
+fn decode_codestream(codestream: &[u8], pts: Option<i64>) -> Result<VideoFrame> {
+    let mut br = BitReader::new(codestream);
+
+    // 1. SizeHeader (FDIS A.3).
+    let size = SizeHeaderFdis::read(&mut br)?;
+
+    // 2. ImageMetadata (FDIS A.6).
+    let metadata = ImageMetadataFdis::read(&mut br)?;
+
+    // 3. ICC profile is gated on `metadata.colour_encoding.want_icc`. We
+    //    reject any frame that wants an ICC profile in round 3 — the
+    //    Annex B decoder is not wired.
+    if metadata.colour_encoding.want_icc {
+        return Err(Error::Unsupported(
+            "jxl decoder (round 3): want_icc=true (Annex B ICC stream) not yet wired".into(),
+        ));
+    }
+
+    // 4. Byte-align before frame data per FDIS 6.3.
+    br.pu0()?;
+
+    // 5. FrameHeader (FDIS C.2).
+    let fh_params = FrameDecodeParams {
+        xyb_encoded: metadata.xyb_encoded,
+        num_extra_channels: metadata.num_extra_channels,
+        have_animation: metadata.have_animation,
+        have_animation_timecodes: metadata
+            .animation
+            .map(|a| a.have_timecodes)
+            .unwrap_or(false),
+        image_width: size.width,
+        image_height: size.height,
+    };
+    let fh = FrameHeader::read(&mut br, &fh_params)?;
+
+    // 6. TOC (FDIS C.3) — entries byte-aligned per spec.
+    let toc = Toc::read(&mut br, &fh)?;
+
+    // 7. Single-group frames have a single TOC entry containing all
+    //    frame data. Round 3 only handles that case.
+    if toc.entries.len() != 1 {
+        return Err(Error::Unsupported(format!(
+            "jxl decoder (round 3): TOC with {} entries; only single-group frames supported",
+            toc.entries.len()
+        )));
+    }
+    // Diagnostic on unhandled features.
+    if fh.encoding != crate::frame_header::Encoding::Modular {
+        return Err(Error::Unsupported(format!(
+            "jxl decoder (round 3): encoding {:?} not supported (Modular only)",
+            fh.encoding
+        )));
+    }
+    if fh.width == 0 || fh.height == 0 {
+        return Err(Error::InvalidData("jxl decoder: zero-dim frame".into()));
+    }
+
+    // 8. LfGlobal (FDIS C.4) — for a single-group Modular frame the TOC
+    //    points at one section that begins with LfGlobal and contains
+    //    nothing else (no LfGroup / HfGlobal / PassGroup follow).
+    let lf_global = LfGlobal::read(&mut br, &fh, &metadata)?;
+
+    // 9. Map the decoded modular image to a VideoFrame. Only Grey
+    //    8-bit-per-sample is wired in round 3.
+    if metadata.colour_encoding.colour_space != ColourSpace::Grey {
+        return Err(Error::Unsupported(format!(
+            "jxl decoder (round 3): colour_space {:?} not supported (Grey only)",
+            metadata.colour_encoding.colour_space
+        )));
+    }
+    if metadata.bit_depth.float_sample {
+        return Err(Error::Unsupported(
+            "jxl decoder (round 3): float bit depth not supported".into(),
+        ));
+    }
+    if metadata.bit_depth.bits_per_sample != 8 {
+        return Err(Error::Unsupported(format!(
+            "jxl decoder (round 3): bits_per_sample {} not supported (8 only)",
+            metadata.bit_depth.bits_per_sample
+        )));
+    }
+    let img = lf_global.global_modular.image;
+    if img.channels.len() != 1 {
+        return Err(Error::Unsupported(format!(
+            "jxl decoder (round 3): {} channels not supported (1 only)",
+            img.channels.len()
+        )));
+    }
+    let desc = img.descs[0];
+    let w = desc.width as usize;
+    let h = desc.height as usize;
+    let mut bytes = Vec::with_capacity(w * h);
+    for &v in img.channels[0].iter() {
+        bytes.push(v.clamp(0, 255) as u8);
+    }
+    let plane = VideoPlane {
+        stride: w,
+        data: bytes,
+    };
+    Ok(VideoFrame {
+        pts,
+        planes: vec![plane],
+    })
+}
+
+/// FDIS-side `Headers` returned by [`probe_fdis`]. Mirrors the
+/// committee-draft [`Headers`] but uses the FDIS bundle types.
+#[derive(Debug, Clone)]
+pub struct HeadersFdis {
+    pub signature: container::Signature,
+    pub size: SizeHeaderFdis,
+    pub metadata: ImageMetadataFdis,
+}
+
+/// FDIS-side probe: parse SizeHeader + full A.6 ImageMetadata. Falls
+/// back to the committee-draft probe if the FDIS path errors (so that
+/// container detection still works on edge cases the committee-draft
+/// path tolerates).
+pub fn probe_fdis(input: &[u8]) -> Result<HeadersFdis> {
+    let signature = container::detect(input)
+        .ok_or_else(|| Error::InvalidData("jxl probe: no JXL signature".into()))?;
+    match signature {
+        container::Signature::RawCodestream => probe_fdis_codestream(&input[2..], signature),
+        container::Signature::Isobmff => {
+            let codestream_owned = container::extract_codestream(input)?;
+            probe_fdis_codestream(&codestream_owned, signature)
+        }
+    }
+}
+
+fn probe_fdis_codestream(
+    codestream: &[u8],
+    signature: container::Signature,
+) -> Result<HeadersFdis> {
+    let mut br = BitReader::new(codestream);
+    let size = SizeHeaderFdis::read(&mut br)?;
+    let metadata = ImageMetadataFdis::read(&mut br)?;
+    Ok(HeadersFdis {
+        signature,
+        size,
+        metadata,
+    })
 }
 
 /// Inspect a JXL file (raw codestream or ISOBMFF-wrapped) and return the
@@ -135,17 +379,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn decoder_reports_unsupported() {
+    fn decoder_factory_returns_live_decoder() {
         let mut reg = CodecRegistry::new();
         register(&mut reg);
         let params = CodecParameters::video(CodecId::new(CODEC_ID_STR));
-        match reg.make_decoder(&params) {
-            Err(Error::Unsupported(msg)) => {
-                assert!(msg.contains("jxl decode not yet implemented"), "{msg}");
-            }
-            Err(other) => panic!("expected Error::Unsupported, got {other:?}"),
-            Ok(_) => panic!("expected Error::Unsupported, got a live decoder"),
-        }
+        let dec = reg.make_decoder(&params).expect("expected live decoder");
+        assert_eq!(dec.codec_id().as_str(), CODEC_ID_STR);
     }
 
     #[test]
