@@ -409,10 +409,7 @@ mod tests {
         // bits zero), then U32 entry. Pick distribution selector 0
         // (Bits(10)) with raw value = 5 → entry size = 5 bytes.
         // After entry, ZeroPad again.
-        let mut bytes = Vec::new();
-        // bit 0: permuted_toc = 0
-        // bits 1..=7: zero pad
-        bytes.push(0u8);
+        // bit 0: permuted_toc = 0; bits 1..=7: zero pad.
         // U32 entry: selector u(2) = 0 (Bits(10)) → bit0,bit1 = 0,0
         // followed by u(10) = 5 → bits 1,0,1,0,0,0,0,0,0,0
         // packed LSB-first across 12 bits: bits 0..1 selector=00,
@@ -422,8 +419,7 @@ mod tests {
         // We want u(10) value 5 = 0000000101 LSB-first → bits: 1,0,1,0,0,0,0,0,0,0
         // byte1 bits: 0,0,1,0,1,0,0,0  → 0b0001_0100 = 0x14
         // byte2 bits: 0,0,0,0, 0,0,0,0 (4 leftover u(10) bits = 0, 4 zero pad) → 0x00
-        bytes.push(0x14);
-        bytes.push(0x00);
+        let bytes = vec![0u8, 0x14, 0x00];
         let mut br = BitReader::new(&bytes);
         let toc = Toc::read(&mut br, &fh).unwrap();
         assert!(!toc.permuted);
@@ -450,11 +446,8 @@ mod tests {
     fn rejects_zero_entry_size() {
         // Single TOC entry whose value decodes to 0 → invalid.
         let fh = build_test_frame_header(128, 128);
-        let mut bytes = Vec::new();
-        bytes.push(0u8); // permuted=0 + zero pad
-                         // U32 sel=0 (Bits(10)) value 0
-        bytes.push(0x00);
-        bytes.push(0x00);
+        // permuted=0 + zero pad, then U32 sel=0 (Bits(10)) value 0.
+        let bytes = vec![0u8, 0x00, 0x00];
         let mut br = BitReader::new(&bytes);
         assert!(Toc::read(&mut br, &fh).is_err());
     }

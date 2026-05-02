@@ -7,6 +7,67 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed (round 7, 2026-05-02)
+
+- **Round-6 typo #6 unblocked.** The `log_alpha_size_minus_5` 2-bit
+  field in the FDIS D.3.1 EntropyStream prelude was being read on the
+  WRONG branch of `use_prefix_code`. Per
+  `docs/image/jpegxl/libjxl-trace-reverse-engineering.md` §3.6, the field
+  belongs to the ANS branch (`use_prefix_code == 0` → `log_alpha_size =
+  5 + u(2)`); the Prefix-code branch fixes `log_alpha_size = 15`. We
+  had it inverted. With this fix, the cjxl 8x8 grey lossless fixture's
+  MA-tree T-stream prelude now decodes a 4-symbol prefix code with the
+  correct HybridUintConfig (split=1, msb=0, lsb=0), and the MA tree
+  itself decodes cleanly to 7 nodes (3 decision nodes on property 0
+  with values 2/4/0, then 4 leaves all using predictor=5/Gradient with
+  offset=0, multiplier=1).
+- **RFC 7932 §3.5 CLCL VL table corrected.** The fixed Brotli
+  code-length-code symbol-to-bits table had four of six entries swapped
+  (sym 1's code was `0111` instead of `1110`, sym 2's was `011` instead
+  of `110`, sym 3 / sym 4 swapped, etc.) — the table was not even a
+  valid Huffman code (`01` was a prefix of `0111`). Round 7 restores
+  the canonical Huffman assignment per RFC 7932 §3.5.
+- **`read_general_clustering` prefix-coded sub-stream wired.** The D.3.5
+  general clustering path that calls into a sub-D.3.1 entropy stream
+  with `use_prefix_code == 1` was previously stubbed as
+  `Error::Unsupported`. Round 7 implements it: read the symbol count
+  selector, read the prefix code, then drive `HybridUintState::decode`
+  for `num_distributions` integers. The same `log_alpha_size_minus_5`
+  inversion typo fix applies here too.
+- Pre-existing clippy warnings in `extensions.rs` and `toc.rs` test
+  modules (unusual byte groupings, vec-init-then-push) cleaned up so
+  `cargo clippy --tests -D warnings` is now clean.
+
+### Added (round 7, 2026-05-02)
+
+- **Multi-leaf MA-tree decode** in `modular_fdis::decode_channels` —
+  per-pixel property-vector computation per FDIS Table D.2 + Listing D.8,
+  decision-node tree walk, and per-leaf-context symbol decode. Prior
+  rounds only supported single-leaf trees.
+- **`gradient_64x64.lossless` and `palette_32x32.lossless` fixtures**
+  generated locally via cjxl 0.11.1 (96 B / 119 B) for round-7+ testing
+  against `docs/image/jpegxl/libjxl-trace-reverse-engineering.md` §4.1
+  and §4.3 byte traces. These are RGB Modular fixtures with
+  `nb_transforms != 0`; full decode requires Squeeze / Palette / RCT
+  inverse transforms which round 8+ will land.
+- **`tests/gradient_64x64_trace.rs`** — round-7 trace test capturing
+  `[TRACE/sig|hdr|frame|dc|modular|ans]` events for the
+  `gradient_64x64.lossless` fixture, comparable to the doc's reference
+  byte trace.
+
+### Round 7 stop point
+
+The cjxl 8x8 grey lossless fixture's decode now stops at the SECOND
+per-cluster prefix code in the symbol stream's prelude with `"JXL prefix:
+code lengths grossly overflow Kraft sum (kraft=135104, alphabet_size=257,
+max_length=13)"`. djxl decodes the same fixture without trouble, so cjxl
+is emitting valid bits; our complex-prefix decoder has a subtle bug not
+covered by the trace doc — the cl_code from the second 257-symbol code's
+18-clcl array sums to Kraft 37 (should be 32), producing a downstream
+Huffman lookup with Kraft 4×. Bisection harness lives in
+`tests/cjxl_grey_8x8_trace.rs`. See `project_jpegxl_pixel_blocked.md`
+and `project_jpegxl_fdis_typos.md` memos for the round-8 unblock plan.
+
 ### Added
 
 - New `ans` module implementing the FDIS 18181-1:2021 Annex D entropy

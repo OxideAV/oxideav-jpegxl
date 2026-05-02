@@ -183,7 +183,7 @@ mod tests {
         // continuation bytes available — but we want a mask claiming
         // many extensions and no follow-on input.
         // Use sel=1 raw=14 → mask = 15, then no bits left → must error.
-        let bytes = vec![0b00_1110_01u8]; // sel=1, raw=14
+        let bytes = vec![0b0011_1001u8]; // sel=1, raw=14
         let mut br = BitReader::new(&bytes);
         // mask = 15 (4 extensions). bits_remaining after mask read = 0.
         // n_ext = 4, 4 * 2 = 8 > 0 → must reject.

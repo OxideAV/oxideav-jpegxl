@@ -1,29 +1,31 @@
 //! Diagnostic trace for the cjxl 8x8 grey lossless fixture.
 //!
-//! Round 4 (this commit): the fixture's MA-tree T sub-stream prelude
-//! parses correctly (1 cluster, simple-prefix code over a 115-symbol
-//! alphabet emitting symbols {8, 14, 113}, HybridUintConfig with
-//! split=16/msb=1/lsb=2). With this code, the prefix decode of token
-//! 113 (a length-2 code, second-most-common in the stream) hybrid-
-//! expands to ~552965 — far outside any property index for a single
-//! Grey channel (max 15 per FDIS Table D.2).
+//! Round 7 (this commit) unblocked typo #6: the round-6 stop point
+//! ("property 552964 too large") was caused by the
+//! `log_alpha_size_minus_5` flag being read on the WRONG branch of
+//! `use_prefix_code`. Per `docs/image/jpegxl/libjxl-trace-reverse-engineering.md`
+//! §3.6, the 2-bit field belongs to the ANS branch; the Prefix-code
+//! branch fixes `log_alpha_size = 15`. With this fix, the MA-tree
+//! prelude decodes a 4-symbol prefix code (alphabet sym 0/1/2/3 →
+//! values 0/2/4/8 etc.), and the tree itself decodes cleanly to 7
+//! nodes (3 decisions on prop 0 with values 2/4/0 + 4 leaves all
+//! using predictor=5/Gradient).
 //!
-//! The decode failure at "JXL MA tree: property 552964 too large"
-//! happens after 3 successful (prop=7 left, value=4) decision-node
-//! reads: every fourth tree iteration's T[1] read pulls a token-113
-//! from the prefix code, which the spec's ReadUint formula
-//! (`n = split_exp + ((token-split) >> (msb+lsb))`) blows up to
-//! ~552k. This rules out the obvious bugs (HybridUintConfig field
-//! order, prefix code length assignment for NSYM=3 — both
-//! interpretations gave the same problem; see typo memo #5 + RFC
-//! 7932 §3.4 cross-check) but does not isolate the actual divergence.
+//! Round 7 stop point: the symbol stream's per-leaf prefix code
+//! (count=257) decodes via `read_complex_prefix`, but the SECOND
+//! cluster's clcl array sums to Kraft 37 (instead of the required 32),
+//! producing a downstream Huffman lookup table whose Kraft
+//! sum is ~135104 (4× the 1<<15 budget). Our `from_lengths` rejects
+//! this as grossly oversubscribed. djxl decodes this fixture, so cjxl
+//! is emitting valid bits — our `read_clcl_symbol` /
+//! `K_CODE_LENGTH_CODE_ORDER` / Kraft early-stop semantic must be
+//! subtly off in a way the trace doc doesn't fully cover. Round 8 work.
 //!
 //! Trace output (run with `cargo test --offline -j 4 --test
-//! cjxl_grey_8x8_trace -- --nocapture`) is the round-5 starting
+//! cjxl_grey_8x8_trace -- --nocapture`) is the round-8 starting
 //! point. The test asserts NOTHING; it just prints the prelude bit
-//! positions, the prefix code mapping, and the first 30 MA-tree
-//! decode iterations so a follow-up agent can bisect against a
-//! known-good decoder reference once one is found.
+//! positions, the prefix code mapping, and the MA-tree decode
+//! iterations so a follow-up agent can bisect against djxl bit-by-bit.
 
 use oxideav_jpegxl::ans::cluster::{num_clusters, read_clustering};
 use oxideav_jpegxl::ans::hybrid_config::HybridUintConfig;
@@ -165,10 +167,12 @@ fn trace_prelude_step_by_step() {
     );
 
     let use_prefix_code = br.read_bit().unwrap() == 1;
+    // Per the new clean-room behavioural-trace doc §3.6: ANS-only
+    // reads `log_alpha_size_minus_5` (2 bits); Prefix branch fixes 15.
     let log_alphabet_size = if use_prefix_code {
-        5 + br.read_bits(2).unwrap()
-    } else {
         15
+    } else {
+        5 + br.read_bits(2).unwrap()
     };
     eprintln!(
         "MA tree use_prefix_code={} log_alphabet_size={} bits_read={}",
@@ -238,7 +242,7 @@ fn trace_prelude_step_by_step() {
         }
         eprintln!("after prefix codes: bits_read={}", br.bits_read());
 
-        // Simulate MA tree decode iterations (Listing D.9). Stops at 30
+        // Simulate MA tree decode iterations (Listing D.9). Stops at 50
         // iterations or first error — whichever comes first.
         let cfg = configs[0];
         let code = &codes[0];
@@ -252,7 +256,7 @@ fn trace_prelude_step_by_step() {
         };
         let mut nodes_left = 1u32;
         let mut node_no = 0u32;
-        while nodes_left > 0 && node_no < 30 {
+        while nodes_left > 0 && node_no < 50 {
             let bits_before = br.bits_read();
             let prop_plus_1 = match read_uint(&mut br) {
                 Ok(v) => v,
@@ -294,5 +298,170 @@ fn trace_prelude_step_by_step() {
             }
             node_no += 1;
         }
+        eprintln!(
+            "after MA-tree decode: bits_read={} nodes_left={}",
+            br.bits_read(),
+            nodes_left
+        );
+
+        // Now the SYMBOL stream's entropy prelude (`num_dist = num_leaves`).
+        let symbol_num_dist = (node_no / 2) as usize + 1; // tree.size = node_no, leaves = (size+1)/2
+        eprintln!(
+            "symbol-stream: starting prelude with num_dist={} bits_read={}",
+            symbol_num_dist,
+            br.bits_read()
+        );
+        let lz77_enabled2 = br.read_bit().unwrap() == 1;
+        eprintln!("  symbol lz77_enabled={}", lz77_enabled2);
+        if lz77_enabled2 {
+            let min_symbol = br
+                .read_u32([
+                    U32Dist::Val(224),
+                    U32Dist::Val(512),
+                    U32Dist::Val(4096),
+                    U32Dist::BitsOffset(15, 8),
+                ])
+                .unwrap();
+            let min_length = br
+                .read_u32([
+                    U32Dist::Val(3),
+                    U32Dist::Val(4),
+                    U32Dist::BitsOffset(2, 5),
+                    U32Dist::BitsOffset(8, 9),
+                ])
+                .unwrap();
+            let _lz_len_conf = HybridUintConfig::read(&mut br, 8).unwrap();
+            eprintln!(
+                "    symbol lz77 min_symbol={} min_length={} bits_read={}",
+                min_symbol,
+                min_length,
+                br.bits_read()
+            );
+        }
+        let effective_num_dist2 = if lz77_enabled2 {
+            symbol_num_dist + 1
+        } else {
+            symbol_num_dist
+        };
+        let cluster_map2 = if effective_num_dist2 > 1 {
+            read_clustering(&mut br, effective_num_dist2).unwrap()
+        } else {
+            vec![0u32; effective_num_dist2]
+        };
+        let n_clusters2 = if effective_num_dist2 > 1 {
+            num_clusters(&cluster_map2) as usize
+        } else {
+            1
+        };
+        eprintln!(
+            "  symbol cluster_map={:?} n_clusters={} bits_read={}",
+            cluster_map2,
+            n_clusters2,
+            br.bits_read()
+        );
+        let use_prefix_code2 = br.read_bit().unwrap() == 1;
+        let log_alphabet_size2 = if use_prefix_code2 {
+            15
+        } else {
+            5 + br.read_bits(2).unwrap()
+        };
+        eprintln!(
+            "  symbol use_prefix_code={} log_alphabet_size={} bits_read={}",
+            use_prefix_code2,
+            log_alphabet_size2,
+            br.bits_read()
+        );
+    }
+
+    // Re-decode the entire symbol stream using EntropyStream::read so we
+    // catch where the round-7 decode actually fails.
+    eprintln!("---");
+    eprintln!("--- end-to-end full EntropyStream::read of the symbol stream:");
+    let mut br2 = BitReader::new(codestream);
+    let _ = SizeHeaderFdis::read(&mut br2).unwrap();
+    let _ = ImageMetadataFdis::read(&mut br2).unwrap();
+    br2.pu0().unwrap();
+    let _ = FrameHeader::read(&mut br2, &fh_params).unwrap();
+    let _ = Toc::read(&mut br2, &fh).unwrap();
+    let _ = LfChannelDequantization::read(&mut br2).unwrap();
+    let _global_use_tree2 = br2.read_bool().unwrap();
+    // Walk MaTreeFdis::read manually so we can pinpoint where the
+    // symbol-stream prelude fails after the tree decodes.
+    let tree_stream = oxideav_jpegxl::modular_fdis::EntropyStream::read(&mut br2, 6);
+    eprintln!(
+        "  tree_stream EntropyStream::read OK={} bits_read={}",
+        tree_stream.is_ok(),
+        br2.bits_read()
+    );
+    if tree_stream.is_err() {
+        eprintln!("  tree_stream FAIL: {:?}", tree_stream.err().unwrap());
+        return;
+    }
+    let mut tree_stream = tree_stream.unwrap();
+    // Decode tree (we know our trace shows 7 nodes, ends at bit 181).
+    use oxideav_jpegxl::ans::hybrid::HybridUintState;
+    let tree_hybrid = HybridUintState::new(tree_stream.lz77, tree_stream.lz_len_conf);
+    let mut nodes_left = 1u32;
+    let mut node_no = 0u32;
+    let mut leaves = 0u32;
+    while nodes_left > 0 && node_no < 30 {
+        let prop_p1 = tree_stream.decode_symbol(&mut br2, 1).unwrap_or(99999);
+        // Hybrid uint expand
+        let cfg = tree_stream.config_for_ctx(1);
+        let prop_p1_full = if prop_p1 < cfg.split {
+            prop_p1
+        } else {
+            cfg.read_uint(&mut br2, prop_p1).unwrap_or(99999)
+        };
+        let prop = prop_p1_full as i64 - 1;
+        if prop < 0 {
+            // leaf: read pred, uoff, mul_log, mul_bits
+            for ctx in [2u32, 3, 4, 5] {
+                let t = tree_stream.decode_symbol(&mut br2, ctx).unwrap_or(99);
+                let cfg = tree_stream.config_for_ctx(ctx);
+                let _ = if t < cfg.split {
+                    t
+                } else {
+                    cfg.read_uint(&mut br2, t).unwrap_or(99)
+                };
+            }
+            leaves += 1;
+            nodes_left -= 1;
+        } else {
+            let t = tree_stream.decode_symbol(&mut br2, 0).unwrap_or(99);
+            let cfg = tree_stream.config_for_ctx(0);
+            let _ = if t < cfg.split {
+                t
+            } else {
+                cfg.read_uint(&mut br2, t).unwrap_or(99)
+            };
+            nodes_left += 1;
+        }
+        node_no += 1;
+    }
+    let _ = tree_hybrid;
+    eprintln!(
+        "  manual tree decode: {} nodes, {} leaves, bits_read={}",
+        node_no,
+        leaves,
+        br2.bits_read()
+    );
+    let num_ctx = leaves as usize;
+    eprintln!(
+        "  about to read symbol EntropyStream with num_ctx={}",
+        num_ctx
+    );
+    let symbol_es = oxideav_jpegxl::modular_fdis::EntropyStream::read(&mut br2, num_ctx);
+    match symbol_es {
+        Ok(es) => eprintln!(
+            "  symbol EntropyStream::read OK; n_clusters={} bits_read={}",
+            es.entropies.len(),
+            br2.bits_read()
+        ),
+        Err(e) => eprintln!(
+            "  symbol EntropyStream::read FAIL at bits_read={}: {}",
+            br2.bits_read(),
+            e
+        ),
     }
 }

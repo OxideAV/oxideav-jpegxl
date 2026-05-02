@@ -234,10 +234,15 @@ impl EntropyStream {
         }
 
         let use_prefix_code = br.read_bit()? == 1;
+        // Per `docs/image/jpegxl/libjxl-trace-reverse-engineering.md`
+        // §3.6: `log_alpha_size_minus_5` is a 2-bit field (0..3) read
+        // ONLY in the ANS branch. The Prefix(Huffman) branch fixes
+        // `log_alpha_size = 15`. Round 6 had this inverted; round 7
+        // restores the correct mapping.
         let log_alphabet_size = if use_prefix_code {
-            5 + br.read_bits(2)?
-        } else {
             15
+        } else {
+            5 + br.read_bits(2)?
         };
         let _alphabet_size_max = 1u32 << log_alphabet_size;
 
@@ -644,12 +649,167 @@ fn median3(a: i32, b: i32, c: i32) -> i32 {
     }
 }
 
-/// Round-3 channel decode loop — Listing C.17.
+/// Compute the FDIS Table-D.2 + Listing-D.8 property vector for sample
+/// `(x, y)` of channel `i`. Returns a Vec of property values indexed
+/// by property id (0..16 + 4 per applicable prior channel).
 ///
-/// Constraints: the MA tree must be a single leaf (no decision nodes).
-/// With a single leaf the per-pixel context is constant; per the spec
-/// `D[leaf_node.ctx]` is a single distribution. We avoid the property
-/// computation entirely.
+/// Properties (FDIS Table D.2):
+/// * 0 = c (channel index)
+/// * 1 = stream index (= 0 for GlobalModular round-7 single-group)
+/// * 2 = y, 3 = x
+/// * 4 = abs(top), 5 = abs(left)
+/// * 6 = top, 7 = left
+/// * 8 = if x>0: left - prop9_at_(x-1,y) else: left
+/// * 9 = left + top - topleft (gradient)
+/// * 10 = left - topleft
+/// * 11 = topleft - top
+/// * 12 = top - topright
+/// * 13 = top - toptop
+/// * 14 = left - leftleft
+/// * 15 = max_error (E.1; 0 when weighted predictor disabled)
+/// * 16+ = extra-channel properties (Listing D.8)
+fn compute_properties_fdis(img: &ModularImage, i: usize, x: i32, y: i32) -> Vec<i32> {
+    let desc = img.descs[i];
+    let left = if x > 0 {
+        img.get(i, x - 1, y)
+    } else if y > 0 {
+        img.get(i, x, y - 1)
+    } else {
+        0
+    };
+    let top = if y > 0 { img.get(i, x, y - 1) } else { left };
+    let topleft = if x > 0 && y > 0 {
+        img.get(i, x - 1, y - 1)
+    } else {
+        left
+    };
+    let topright = if y > 0 && (x + 1) < desc.width as i32 {
+        img.get(i, x + 1, y - 1)
+    } else {
+        top
+    };
+    let leftleft = if x > 1 { img.get(i, x - 2, y) } else { left };
+    let toptop = if y > 1 { img.get(i, x, y - 2) } else { top };
+
+    // Property 8: "if x > 0: left - (the value of property 9 at position (x-1,y))".
+    // Property 9 at (x-1,y) = left_at(x-1) + top_at(x-1) - topleft_at(x-1).
+    // For (x-1,y), left_at = sample at (x-2,y) = leftleft, top_at = sample at (x-1,y-1) = topleft,
+    // topleft_at = sample at (x-2,y-1).
+    let prop8 = if x > 0 {
+        let topleftleft = if x > 1 && y > 0 {
+            img.get(i, x - 2, y - 1)
+        } else {
+            0
+        };
+        let p9_at_xm1 = leftleft.wrapping_add(topleft).wrapping_sub(topleftleft);
+        left.wrapping_sub(p9_at_xm1)
+    } else {
+        left
+    };
+
+    let prop9 = left.wrapping_add(top).wrapping_sub(topleft); // gradient
+
+    let mut props: Vec<i32> = Vec::with_capacity(16);
+    props.push(i as i32); // 0: c
+    props.push(0); // 1: stream index (round-7: GlobalModular = 0)
+    props.push(y); // 2
+    props.push(x); // 3
+    props.push(top.unsigned_abs() as i32); // 4
+    props.push(left.unsigned_abs() as i32); // 5
+    props.push(top); // 6
+    props.push(left); // 7
+    props.push(prop8); // 8
+    props.push(prop9); // 9
+    props.push(left.wrapping_sub(topleft)); // 10
+    props.push(topleft.wrapping_sub(top)); // 11
+    props.push(top.wrapping_sub(topright)); // 12
+    props.push(top.wrapping_sub(toptop)); // 13
+    props.push(left.wrapping_sub(leftleft)); // 14
+    props.push(0); // 15: max_error (weighted predictor disabled)
+
+    // Listing D.8 extras: channels < i with matching dims/shifts.
+    let cur = img.descs[i];
+    for prev_i in (0..i).rev() {
+        let prev = img.descs[prev_i];
+        if prev.width != cur.width
+            || prev.height != cur.height
+            || prev.hshift != cur.hshift
+            || prev.vshift != cur.vshift
+        {
+            continue;
+        }
+        let rv = img.get(prev_i, x, y);
+        let rleft = if x > 0 { img.get(prev_i, x - 1, y) } else { 0 };
+        let rtop = if y > 0 {
+            img.get(prev_i, x, y - 1)
+        } else {
+            rleft
+        };
+        let rtopleft = if x > 0 && y > 0 {
+            img.get(prev_i, x - 1, y - 1)
+        } else {
+            rleft
+        };
+        let rp = median3(rleft.wrapping_add(rtop).wrapping_sub(rtopleft), rleft, rtop);
+        props.push(rv.unsigned_abs() as i32);
+        props.push(rv);
+        props.push(rv.wrapping_sub(rp).unsigned_abs() as i32);
+        props.push(rv.wrapping_sub(rp));
+    }
+    props
+}
+
+/// Walk an MA tree against a property vector, returning the MaLeaf
+/// found at the terminal leaf node.
+fn walk_tree(nodes: &[MaNode], props: &[i32]) -> Result<MaLeaf> {
+    let mut idx: usize = 0;
+    let mut steps: usize = 0;
+    let max_steps = nodes.len().saturating_add(8); // bounded by tree depth
+    loop {
+        if idx >= nodes.len() {
+            return Err(Error::InvalidData(
+                "JXL MA-tree walk: child index out of range".into(),
+            ));
+        }
+        steps += 1;
+        if steps > max_steps {
+            return Err(Error::InvalidData(
+                "JXL MA-tree walk: exceeded depth bound (cycle in tree)".into(),
+            ));
+        }
+        match nodes[idx] {
+            MaNode::Leaf(l) => return Ok(l),
+            MaNode::Decision {
+                property,
+                value,
+                left_child,
+                right_child,
+            } => {
+                let p_idx = property as usize;
+                let p = props.get(p_idx).copied().unwrap_or(0);
+                idx = if p > value {
+                    left_child as usize
+                } else {
+                    right_child as usize
+                };
+            }
+        }
+    }
+}
+
+/// FDIS C.16/C.17 channel decode loop with full MA-tree property
+/// evaluation and per-leaf context decode.
+///
+/// Per `docs/image/jpegxl/libjxl-trace-reverse-engineering.md` §3.7,
+/// each leaf carries a histogram context_index (`leaf.ctx`) into the
+/// SYMBOL entropy stream (separate from the tree's prefix code). For
+/// each pixel:
+///   1. Compute properties (Table D.2 + Listing D.8).
+///   2. Walk the tree to find the leaf.
+///   3. Decode one hybrid uint from the symbol stream at ctx = leaf.ctx.
+///   4. Unpack signed → diff.
+///   5. Compute prediction(x, y) per leaf.predictor (Listing C.16).
+///   6. Sample = diff * leaf.multiplier + leaf.offset + prediction.
 pub fn decode_channels(
     br: &mut BitReader<'_>,
     descs: &[ChannelDesc],
@@ -668,24 +828,8 @@ pub fn decode_channels(
             MAX_CHANNELS
         )));
     }
-    if tree.nodes.len() != 1 {
-        return Err(Error::Unsupported(format!(
-            "JXL Modular: MA tree with {} nodes not supported (round 3 needs single-leaf tree)",
-            tree.nodes.len()
-        )));
-    }
-    let leaf = match tree.nodes[0] {
-        MaNode::Leaf(l) => l,
-        MaNode::Decision { .. } => {
-            return Err(Error::InvalidData(
-                "JXL Modular: single-node tree is decision, not leaf".into(),
-            ));
-        }
-    };
-    if (leaf.ctx as usize) >= tree.num_ctx {
-        return Err(Error::InvalidData(
-            "JXL Modular: leaf ctx out of bounds".into(),
-        ));
+    if tree.nodes.is_empty() {
+        return Err(Error::InvalidData("JXL Modular: empty MA tree".into()));
     }
 
     // Pre-validate channel sizes.
@@ -723,9 +867,21 @@ pub fn decode_channels(
         descs: descs.to_vec(),
     };
 
+    // Snapshot the MA-tree nodes so we can walk them while still
+    // mutably borrowing `tree.entropy` / `tree.hybrid`.
+    let nodes = tree.nodes.clone();
+
     for (i, desc) in descs.iter().enumerate() {
         for y in 0..desc.height {
             for x in 0..desc.width {
+                let props = compute_properties_fdis(&img, i, x as i32, y as i32);
+                let leaf = walk_tree(&nodes, &props)?;
+                if (leaf.ctx as usize) >= tree.num_ctx {
+                    return Err(Error::InvalidData(format!(
+                        "JXL Modular: leaf.ctx {} >= num_ctx {}",
+                        leaf.ctx, tree.num_ctx
+                    )));
+                }
                 let token = decode_uint_in(&mut tree.hybrid, &mut tree.entropy, br, leaf.ctx)?;
                 let diff = unpack_signed(token);
                 let p = predict(&img, i, x as i32, y as i32, leaf.predictor)?;
