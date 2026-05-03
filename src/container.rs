@@ -43,6 +43,56 @@ pub fn detect(data: &[u8]) -> Option<Signature> {
     None
 }
 
+/// Wrap a raw JPEG XL codestream in a minimal ISOBMFF container per
+/// ISO/IEC 18181-2 §3.2.
+///
+/// Output structure (in order):
+///   1. JXL signature box (12 bytes): the same `ISOBMFF_SIGNATURE`
+///      constant used for detection.
+///   2. `ftyp` box (20 bytes): major-brand `jxl `, minor 0, compatible
+///      brands `jxl `.
+///   3. `jxlc` box: 8-byte header (`size`, `jxlc`) + the codestream
+///      payload. We always use the 32-bit `size` field; codestreams
+///      bigger than `2^32 - 9` bytes (~4 GiB) would need the
+///      `largesize` (size32 == 1) escape, which we error out on for
+///      simplicity — no real JXL frame is anywhere near that size.
+///
+/// Returns the wrapped bytes. The output starts with `ISOBMFF_SIGNATURE`
+/// so [`detect`] sees it as `Signature::Isobmff` and
+/// [`extract_codestream`] round-trips it back to the original codestream.
+pub fn wrap_codestream(codestream: &[u8]) -> Result<Vec<u8>> {
+    // 12 (sig) + 20 (ftyp) + 8 (jxlc header) + codestream.
+    let total = 12usize
+        .checked_add(20)
+        .and_then(|n| n.checked_add(8))
+        .and_then(|n| n.checked_add(codestream.len()))
+        .ok_or_else(|| Error::other("JXL ISOBMFF wrap: total size overflow"))?;
+    let jxlc_box_size = 8usize
+        .checked_add(codestream.len())
+        .ok_or_else(|| Error::other("JXL ISOBMFF wrap: jxlc box size overflow"))?;
+    if jxlc_box_size > u32::MAX as usize {
+        return Err(Error::other(
+            "JXL ISOBMFF wrap: codestream too large for 32-bit jxlc box (use largesize escape)",
+        ));
+    }
+    let mut out = Vec::with_capacity(total);
+    // Signature box.
+    out.extend_from_slice(&ISOBMFF_SIGNATURE);
+    // ftyp box: 4-byte size (20) + 4-byte type (`ftyp`) + 4-byte
+    // major brand (`jxl `) + 4-byte minor version (0) + 4-byte
+    // compatible brand (`jxl `).
+    out.extend_from_slice(&[0, 0, 0, 20]);
+    out.extend_from_slice(b"ftyp");
+    out.extend_from_slice(b"jxl ");
+    out.extend_from_slice(&[0, 0, 0, 0]);
+    out.extend_from_slice(b"jxl ");
+    // jxlc box: 4-byte size + 4-byte type + payload.
+    out.extend_from_slice(&(jxlc_box_size as u32).to_be_bytes());
+    out.extend_from_slice(b"jxlc");
+    out.extend_from_slice(codestream);
+    Ok(out)
+}
+
 /// Extract the codestream bytes from a JXL input regardless of wrapping.
 ///
 /// For raw inputs this is a zero-copy slice of `data`. For ISOBMFF inputs
@@ -220,6 +270,36 @@ mod tests {
         buf.extend_from_slice(&[0, 0, 4, 0, b'j', b'x', b'l', b'c']);
         let err = extract_codestream(&buf).unwrap_err();
         assert!(matches!(err, Error::InvalidData(_)));
+    }
+
+    #[test]
+    fn wrap_codestream_roundtrips_via_extract() {
+        let payload = vec![0xFFu8, 0x0A, 0x12, 0x34, 0x56, 0x78];
+        let wrapped = wrap_codestream(&payload).unwrap();
+        // Wrapped output is detected as ISOBMFF.
+        assert_eq!(detect(&wrapped), Some(Signature::Isobmff));
+        // Extract recovers the codestream bytes.
+        let cs = extract_codestream(&wrapped).unwrap();
+        assert_eq!(&*cs, &payload[..]);
+    }
+
+    #[test]
+    fn wrap_codestream_starts_with_signature_and_ftyp_jxl() {
+        let payload = vec![0xFFu8, 0x0A];
+        let wrapped = wrap_codestream(&payload).unwrap();
+        // Layout: 12B sig + 20B ftyp + 8B jxlc-header + 2B payload = 42B.
+        assert_eq!(wrapped.len(), 12 + 20 + 8 + 2);
+        assert_eq!(&wrapped[..12], &ISOBMFF_SIGNATURE);
+        // ftyp box at bytes [12..32]: size, "ftyp", "jxl ", minor, "jxl ".
+        assert_eq!(&wrapped[12..16], &[0, 0, 0, 20]);
+        assert_eq!(&wrapped[16..20], b"ftyp");
+        assert_eq!(&wrapped[20..24], b"jxl ");
+        assert_eq!(&wrapped[24..28], &[0, 0, 0, 0]);
+        assert_eq!(&wrapped[28..32], b"jxl ");
+        // jxlc box at bytes [32..]: size, "jxlc", payload.
+        assert_eq!(&wrapped[32..36], &[0, 0, 0, 10]); // 8B header + 2B payload
+        assert_eq!(&wrapped[36..40], b"jxlc");
+        assert_eq!(&wrapped[40..42], &[0xFF, 0x0A]);
     }
 
     #[test]

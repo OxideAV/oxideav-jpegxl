@@ -141,6 +141,27 @@ pub fn encode_one_frame(
     Ok(bw.finish())
 }
 
+/// Like [`encode_one_frame`] but emits an ISOBMFF-wrapped codestream
+/// (signature box + `ftyp jxl ` + `jxlc`). The output starts with the
+/// 12-byte ISOBMFF signature (`00 00 00 0C 4A 58 4C 20 0D 0A 87 0A`)
+/// and is round-trippable through both [`crate::decode_one_frame`]
+/// (which transparently extracts the codestream) and external tools
+/// like `djxl`.
+///
+/// Use this when emitting `.jxl` files that need to be recognised by
+/// applications expecting the wrapped form (web browsers, image
+/// viewers); use [`encode_one_frame`] when bandwidth matters and the
+/// consumer accepts raw codestreams.
+pub fn encode_one_frame_isobmff(
+    width: u32,
+    height: u32,
+    pixels: &[u8],
+    format: InputFormat,
+) -> Result<Vec<u8>> {
+    let codestream = encode_one_frame(width, height, pixels, format)?;
+    crate::container::wrap_codestream(&codestream)
+}
+
 /// FDIS A.3 SizeHeader. We always take the `small=0` path for
 /// simplicity (covers the full 1..=2^30 range via the four U32
 /// distributions).

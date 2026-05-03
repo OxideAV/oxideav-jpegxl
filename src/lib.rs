@@ -109,7 +109,7 @@ pub mod modular_fdis;
 pub mod predictors;
 pub mod toc;
 
-pub use container::{detect, extract_codestream, Signature};
+pub use container::{detect, extract_codestream, wrap_codestream, Signature};
 pub use metadata::{parse_headers, BitDepth, Headers, ImageMetadata, SizeHeader};
 
 use oxideav_core::{CodecCapabilities, CodecId, CodecParameters, Error, PixelFormat, Result};
