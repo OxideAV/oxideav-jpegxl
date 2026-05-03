@@ -582,7 +582,7 @@ fn round9_symbol_prelude_per_cluster_dump() {
 
     let lz77_enabled = br.read_bit().unwrap() == 1;
     eprintln!("[R9] symbol lz77_enabled={}", lz77_enabled);
-    let _lz77_tail = if lz77_enabled {
+    if lz77_enabled {
         let _min_sym = br
             .read_u32([
                 U32Dist::Val(224),
@@ -600,8 +600,7 @@ fn round9_symbol_prelude_per_cluster_dump() {
             ])
             .unwrap();
         let _ = HybridUintConfig::read(&mut br, 8).unwrap();
-        ()
-    };
+    }
 
     let eff = if lz77_enabled { num_dist + 1 } else { num_dist };
     let cmap = if eff > 1 {
