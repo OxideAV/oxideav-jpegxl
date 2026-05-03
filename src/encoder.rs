@@ -685,14 +685,6 @@ fn write_hybrid_uint_config(
     Ok(())
 }
 
-/// Emit a `count=1` prefix code prelude. Decoder side reads `read_bit() == 0`
-/// → count = 1, then short-circuits to a 0-bit code that always returns
-/// symbol 0. (No per-cluster prefix-code body bits are emitted here.)
-fn write_prefix_code_count_one(bw: &mut BitWriter) -> Result<()> {
-    bw.write_bit(0); // count == 1 selector
-    Ok(())
-}
-
 /// Walk the input pixels in (channel, y, x) order and emit one symbol
 /// per pixel using the symbol-stream prefix code (token T = packed
 /// gradient residual, with extra bits when packed >= 1).
