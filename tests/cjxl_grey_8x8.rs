@@ -107,3 +107,23 @@ fn cjxl_grey_8x8_round7_kraft_error_is_resolved() {
         );
     }
 }
+
+/// **TEMPORARY** round-8 diagnostic: this test PANICS with the
+/// current decode error so a CI run reveals exactly where the
+/// round-8 fixes' new stop point lies. Once the round-9 agent has
+/// captured the new error and added it to the CHANGELOG / memos,
+/// this test should be removed (or its `panic!` softened to an
+/// `eprintln!` like `cjxl_grey_8x8_decode_attempt` above).
+#[test]
+fn cjxl_grey_8x8_round9_diagnostic_panics_with_new_stop_point() {
+    use oxideav_jpegxl::decode_one_frame;
+    match decode_one_frame(FIXTURE, None) {
+        Ok(_) => {
+            // Decode succeeded! Round 8 fully unblocked the fixture.
+            // Future rounds can promote this to a strict-assert test.
+        }
+        Err(e) => {
+            panic!("round-8 decoder stops at: {e}");
+        }
+    }
+}
