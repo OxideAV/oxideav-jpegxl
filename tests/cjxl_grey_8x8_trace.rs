@@ -462,3 +462,229 @@ fn trace_prelude_step_by_step() {
         ),
     }
 }
+
+/// Round-9 instrumentation: walks the SYMBOL EntropyStream prelude
+/// MANUALLY (mirroring `EntropyStream::read` step-by-step) and dumps
+/// per-cluster prefix-code bit positions. Independent Python re-decoder
+/// at /tmp/jxl_redecode.py (round 9) finds all 5 prefix codes decode
+/// successfully:
+///   bp=294: cluster 0 count selector → bp=299 (5b)
+///   bp=299: cluster 0 simple NSYM=1 sym=[1] → bp=304 ... actually
+///   the layout is: counts come first (0..4 = 5*13b range), then codes.
+///   counts: bp=237→294 (5b + 4×13b)
+///   code 0 (count=2):  bp=294→299 (5b)   simple NSYM=1
+///   code 1 (count=257): bp=299→563 (264b) complex hskip=0, kraft 8208
+///   code 2 (count=257): bp=563→1205 (642b) complex hskip=3, kraft 30089
+///   code 3 (count=257): bp=1205→1218 (13b) simple NSYM=1
+///   code 4 (count=257): bp=1218→1240 (22b) simple NSYM=2
+///
+/// Hypothesis: Rust diverges from Python somewhere — Rust's reported
+/// stop-point is "kraft=33776, max_length=13" which doesn't match
+/// either of Python's two over-budget codes (8208 or 30089).
+///
+/// This test consumes prelude bits via the SAME ENTRY POINTS the
+/// production decoder uses (`MaTreeFdis::read` calls `EntropyStream::
+/// read` internally), and reports each per-cluster prefix-code outcome.
+#[test]
+fn round9_symbol_prelude_per_cluster_dump() {
+    let sig = container::detect(FIXTURE).expect("signature");
+    let codestream: &[u8] = match sig {
+        container::Signature::RawCodestream => &FIXTURE[2..],
+        _ => panic!("not raw codestream"),
+    };
+    let mut br = BitReader::new(codestream);
+    let _ = SizeHeaderFdis::read(&mut br).unwrap();
+    let metadata = ImageMetadataFdis::read(&mut br).unwrap();
+    br.pu0().unwrap();
+    let fh_params = FrameDecodeParams {
+        xyb_encoded: metadata.xyb_encoded,
+        num_extra_channels: metadata.num_extra_channels,
+        have_animation: metadata.have_animation,
+        have_animation_timecodes: metadata
+            .animation
+            .map(|a| a.have_timecodes)
+            .unwrap_or(false),
+        image_width: 8,
+        image_height: 8,
+    };
+    let fh = FrameHeader::read(&mut br, &fh_params).unwrap();
+    let _ = Toc::read(&mut br, &fh).unwrap();
+    let _ = LfChannelDequantization::read(&mut br).unwrap();
+    let _global_use_tree = br.read_bool().unwrap();
+
+    // === STEP 1: MA-tree EntropyStream (num_dist=6) ===
+    let tree_es = oxideav_jpegxl::modular_fdis::EntropyStream::read(&mut br, 6);
+    eprintln!(
+        "[R9] tree EntropyStream: ok={} bits_read={}",
+        tree_es.is_ok(),
+        br.bits_read()
+    );
+    let mut tree_es = match tree_es {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("[R9] tree EntropyStream FAIL: {}", e);
+            return;
+        }
+    };
+
+    // === STEP 2: MA tree decode (we don't need the result, just the
+    // bit consumption + leaf count). Mirror Listing D.9 manually.
+    use oxideav_jpegxl::ans::hybrid::HybridUintState;
+    let _ = HybridUintState::new(tree_es.lz77, tree_es.lz_len_conf);
+    let mut nodes_left = 1u32;
+    let mut node_no = 0u32;
+    let mut leaves = 0u32;
+    while nodes_left > 0 && node_no < 50 {
+        let read_uint = |es: &mut oxideav_jpegxl::modular_fdis::EntropyStream,
+                         br: &mut BitReader<'_>,
+                         ctx: u32|
+         -> Result<u32, String> {
+            let token = es.decode_symbol(br, ctx).map_err(|e| e.to_string())?;
+            let cfg = es.config_for_ctx(ctx);
+            if token < cfg.split {
+                Ok(token)
+            } else {
+                cfg.read_uint(br, token).map_err(|e| e.to_string())
+            }
+        };
+        let prop_p1 = match read_uint(&mut tree_es, &mut br, 1) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("[R9] tree node {} prop_p1 read FAIL: {}", node_no, e);
+                return;
+            }
+        };
+        let prop = prop_p1 as i64 - 1;
+        if prop < 0 {
+            for ctx in [2u32, 3, 4, 5] {
+                let _ = read_uint(&mut tree_es, &mut br, ctx).unwrap_or(0);
+            }
+            leaves += 1;
+            nodes_left -= 1;
+        } else {
+            let _ = read_uint(&mut tree_es, &mut br, 0).unwrap_or(0);
+            nodes_left += 1;
+        }
+        node_no += 1;
+    }
+    eprintln!(
+        "[R9] tree decode done: nodes={} leaves={} bits_read={}",
+        node_no,
+        leaves,
+        br.bits_read()
+    );
+
+    // === STEP 3: SYMBOL EntropyStream prelude — manually, mirroring
+    // EntropyStream::read so we can log each per-cluster prefix code's
+    // bit consumption. Python reference: see test docstring above.
+    let num_dist = leaves as usize;
+    eprintln!("[R9] === SYMBOL prelude num_dist={} ===", num_dist);
+
+    let lz77_enabled = br.read_bit().unwrap() == 1;
+    eprintln!("[R9] symbol lz77_enabled={}", lz77_enabled);
+    let _lz77_tail = if lz77_enabled {
+        let _min_sym = br
+            .read_u32([
+                U32Dist::Val(224),
+                U32Dist::Val(512),
+                U32Dist::Val(4096),
+                U32Dist::BitsOffset(15, 8),
+            ])
+            .unwrap();
+        let _min_len = br
+            .read_u32([
+                U32Dist::Val(3),
+                U32Dist::Val(4),
+                U32Dist::BitsOffset(2, 5),
+                U32Dist::BitsOffset(8, 9),
+            ])
+            .unwrap();
+        let _ = HybridUintConfig::read(&mut br, 8).unwrap();
+        ()
+    };
+
+    let eff = if lz77_enabled { num_dist + 1 } else { num_dist };
+    let cmap = if eff > 1 {
+        read_clustering(&mut br, eff).unwrap()
+    } else {
+        vec![0u32; eff]
+    };
+    let n_clusters = num_clusters(&cmap) as usize;
+    eprintln!(
+        "[R9] symbol cluster_map={:?} n_clusters={} bits_read={}",
+        cmap,
+        n_clusters,
+        br.bits_read()
+    );
+
+    let upc = br.read_bit().unwrap() == 1;
+    let log_alpha = if upc { 15 } else { 5 + br.read_bits(2).unwrap() };
+    eprintln!(
+        "[R9] symbol use_prefix={} log_alpha={} bits_read={}",
+        upc,
+        log_alpha,
+        br.bits_read()
+    );
+
+    let mut configs = Vec::new();
+    for i in 0..n_clusters {
+        let cfg = HybridUintConfig::read(&mut br, log_alpha).unwrap();
+        eprintln!(
+            "[R9] symbol cluster {} HUC: split_exp={} msb={} lsb={} (bits_read={})",
+            i,
+            cfg.split_exponent,
+            cfg.msb_in_token,
+            cfg.lsb_in_token,
+            br.bits_read()
+        );
+        configs.push(cfg);
+    }
+
+    if !upc {
+        eprintln!("[R9] symbol uses ANS path — not handled by this dump");
+        return;
+    }
+
+    let mut counts = Vec::new();
+    for i in 0..n_clusters {
+        let bit = br.read_bit().unwrap();
+        let cnt = if bit == 0 {
+            1u32
+        } else {
+            let n = br.read_bits(4).unwrap();
+            1 + (1 << n) + br.read_bits(n).unwrap()
+        };
+        eprintln!(
+            "[R9] symbol cluster {} count={} (bits_read={})",
+            i,
+            cnt,
+            br.bits_read()
+        );
+        counts.push(cnt);
+    }
+
+    for (i, &c) in counts.iter().enumerate() {
+        let bp_before = br.bits_read();
+        let result = read_prefix_code(&mut br, c);
+        match result {
+            Ok(code) => eprintln!(
+                "[R9] symbol cluster {} READ-PREFIX OK alphabet={} consumed {}b (bits_read={})",
+                i,
+                code.alphabet_size,
+                br.bits_read() - bp_before,
+                br.bits_read()
+            ),
+            Err(e) => {
+                eprintln!(
+                    "[R9] symbol cluster {} READ-PREFIX FAIL at bp_before={} bits_read={}: {}",
+                    i,
+                    bp_before,
+                    br.bits_read(),
+                    e
+                );
+                return;
+            }
+        }
+    }
+    eprintln!("[R9] all 5 symbol prefix codes read OK!");
+}
