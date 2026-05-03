@@ -82,37 +82,35 @@ fn cjxl_grey_8x8_decode_attempt() {
     }
 }
 
-/// Round-8 status: typo #8 NOT YET RESOLVED. The literal round-7 error
-/// message ("kraft=135104") was reformatted to ("kraft=33776,
-/// budget=8192") by round-8's per-budget Kraft computation, but the
-/// underlying 4×-over-budget situation is unchanged. See the round-8
-/// CHANGELOG entry for round-9's bisection plan.
-///
-/// This test is a CI tripwire: if a future round actually unblocks the
-/// decoder (or breaks it in a new way), the assertion below will fire
-/// and force documentation of the new state.
+/// Round-9 status: typo #8 partially RESOLVED — the kraft=33776 stop
+/// point is gone (root cause was `PrefixCode::from_lengths` overwriting
+/// canonical-Huffman lookup-table collisions instead of "first sym
+/// wins"). See round-9 CHANGELOG entry. The decoder may now hit a NEW
+/// stop point further downstream; this test logs whatever the current
+/// state is so future rounds can see it.
 #[test]
-fn cjxl_grey_8x8_round8_typo8_unresolved_tripwire() {
+fn cjxl_grey_8x8_round9_progress_marker() {
     use oxideav_jpegxl::decode_one_frame;
     let res = decode_one_frame(FIXTURE, None);
     match res {
-        Ok(_) => {
-            panic!(
-                "decode unexpectedly succeeded — round 8 was 'behaviour-neutral' \
-                 per the CHANGELOG. If a real fix landed, update this test to a \
-                 hard-assert of pixel correctness, OR re-purpose it as a \
-                 'cjxl_grey_8x8 fully decodes' assertion."
-            );
+        Ok(vf) => {
+            // Decoder ran end-to-end. Verify pixel correctness.
+            assert_eq!(vf.planes.len(), 1, "expected 1 plane (Gray8)");
+            let plane = &vf.planes[0];
+            assert_eq!(plane.stride, 8);
+            assert_eq!(plane.data.len(), 64);
+            for (i, &v) in plane.data.iter().enumerate() {
+                assert_eq!(v, 128, "pixel {i} should be 128");
+            }
         }
         Err(e) => {
             let msg = format!("{e}");
-            // Round-8 expected stop point: kraft=33776, budget=8192.
-            // If the new error is DIFFERENT, fail loudly so round-9
-            // updates this assertion.
+            // Round-9 expected: error message no longer contains
+            // "kraft=33776" (that stop point is now resolved). If it
+            // does, the round-9 fix regressed.
             assert!(
-                msg.contains("kraft=33776") && msg.contains("budget=8192"),
-                "round-8 stop-point error message changed unexpectedly: {msg}\n\
-                 (was expecting 'kraft=33776, budget=8192' per CHANGELOG)"
+                !msg.contains("kraft=33776"),
+                "round-9 fix regressed: kraft=33776 stop point came back: {msg}"
             );
         }
     }

@@ -618,7 +618,11 @@ fn round9_symbol_prelude_per_cluster_dump() {
     );
 
     let upc = br.read_bit().unwrap() == 1;
-    let log_alpha = if upc { 15 } else { 5 + br.read_bits(2).unwrap() };
+    let log_alpha = if upc {
+        15
+    } else {
+        5 + br.read_bits(2).unwrap()
+    };
     eprintln!(
         "[R9] symbol use_prefix={} log_alpha={} bits_read={}",
         upc,
@@ -703,9 +707,11 @@ fn round9_symbol_prelude_per_cluster_dump() {
             }
         }
     }
-    // FAIL the test so the report shows in CI output (cargo test
-    // hides eprintln! output for passing tests). The assertion will
-    // be re-tightened to a passing condition once the divergence is
-    // identified and fixed.
-    panic!("ROUND-9 DIAGNOSTIC REPORT (test deliberately fails to expose CI output):\n{report}\nany_fail={any_fail}");
+    // Round-9 fix landed (see ans/prefix.rs from_lengths "first wins"
+    // change): expect all 5 codes to decode OK now. If any FAIL, the
+    // round-9 fix regressed.
+    assert!(
+        !any_fail,
+        "ROUND-9: per-cluster prefix-code decode regressed:\n{report}"
+    );
 }

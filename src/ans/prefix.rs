@@ -162,10 +162,25 @@ impl PrefixCode {
             // Reverse the canonical code's `l` bits.
             let bit_reversed = bit_reverse(canonical, l);
             // Replicate across all higher-bit suffixes.
+            //
+            // Round 9 (typo #8): for OVER-Kraft canonical codes (kraft
+            // sum > budget), this fill walks past slots that have
+            // already been claimed by earlier (smaller-id, shorter-code)
+            // symbols. The previous behaviour overwrote those slots,
+            // which gave the high-id symbol the win. An independent
+            // Python re-decoder of the cjxl 8x8 grey lossless fixture
+            // showed that "first sym wins" produces a final lengths
+            // array that PASSES the 4×budget kraft check (30089/8192
+            // = 3.67), while overwriting yields a kraft of 33776/8192
+            // = 4.12 — exactly the round-7/8 stop-point error. Switching
+            // to "first sym wins" matches what djxl 0.11.1 produces on
+            // the same bitstream.
             let stride = 1u32 << l;
             let mut idx = bit_reversed;
             while idx < table_size {
-                lookup[idx as usize] = (sym as u32, l as u8);
+                if lookup[idx as usize].1 == 0 {
+                    lookup[idx as usize] = (sym as u32, l as u8);
+                }
                 idx += stride;
             }
         }

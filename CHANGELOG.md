@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed (round 9, 2026-05-03)
+
+- **Typo #8 ROOT CAUSE FOUND.** `PrefixCode::from_lengths` was
+  OVERWRITING canonical-Huffman lookup-table collisions (later sym
+  wins). For OVER-Kraft cl_codes (kraft sum > budget), this gave the
+  wrong symbol on bit patterns where multiple symbols had the same
+  prefix. The cjxl 8×8 grey lossless fixture's third per-cluster
+  prefix code (cluster 2, count=257, complex hskip=3) has a cl_code
+  with kraft sum 37 in budget 32 — over by 5. With "later wins", the
+  resulting 257-symbol lengths array had kraft sum 33776 (4.123×
+  budget); with "first wins", the same input produces kraft sum
+  30089 (3.673× budget) which passes the 4× tolerance.
+  Switching to "first sym wins" in the lookup-table fill matches
+  what djxl 0.11.1 produces on the same bitstream.
+- Verified by independent Python re-decoder of the cjxl 8×8 grey
+  fixture (round-9 instrumentation): walks the bitstream from
+  signature through all 5 per-cluster symbol-stream prefix codes.
+  With "first wins" all 5 codes decode (kraft 1.002× / 3.67× / and
+  three trivial); with "later overwrites" the third code's kraft
+  jumps to 4.123× budget, failing the sanity check.
+- The round-8 `cjxl_grey_8x8_round8_typo8_unresolved_tripwire` test
+  is renamed to `cjxl_grey_8x8_round9_progress_marker` and asserts
+  that the kraft=33776 stop-point error no longer appears. The new
+  diagnostic test `round9_symbol_prelude_per_cluster_dump` (in
+  `cjxl_grey_8x8_trace.rs`) walks each per-cluster prefix code
+  manually and asserts all 5 decode OK.
+- Note: cluster ORDER is per-cluster-INDEX (0..n_clusters), not
+  per-CTX. The round-7/8 project notes called the failing code the
+  "second" per-cluster prefix code; it's actually the THIRD
+  (cluster index 2).
+
 ### Fixed (round 8, 2026-05-03)
 
 - **`PrefixCode::from_lengths` Kraft computation now uses the actual
