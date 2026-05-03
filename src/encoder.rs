@@ -1,8 +1,29 @@
-//! JPEG XL encoder — round-1 minimal viable lossless modular RGB/RGBA.
+//! JPEG XL encoder — round-2 lossless modular Gray/RGB/RGBA with
+//! the **Gradient** (predictor id 5) MA-tree leaf and a frequency-
+//! optimised single-cluster symbol stream.
 //!
-//! Implements a deliberately-narrow encode path that produces output
-//! consumable by both our own [`crate::decode_one_frame`] and the
-//! reference `djxl` tool. The shape of the produced bitstream is:
+//! Round 2 deltas vs round 1 (`a53e041`):
+//!
+//! * **Predictor switched from Zero (0) to Gradient (5).** The MA tree
+//!   is now a single-leaf tree carrying `predictor=5, offset=0,
+//!   multiplier=1`. The on-wire tree-token entropy stream is now
+//!   2-cluster: cluster 0 always returns 0 (used for property+1, offset,
+//!   mul_log, mul_bits, decision-node values), cluster 1 always returns 5
+//!   (used only for the predictor field). Cluster map for the 6
+//!   tree-stream contexts is `[0, 0, 1, 0, 0, 0]`.
+//!
+//! * **Per-pixel residual = sample - prediction(left, top, topleft)**
+//!   per FDIS Listing C.16's clamp(W+N-NW, min(W,N), max(W,N)). Natural
+//!   images compress ~3× better since most residuals fall into token 0
+//!   (value 0).
+//!
+//! * **Symbol stream remains a single-cluster uniform 16×4-bit prefix
+//!   code** for simplicity. Round 3 should switch to a frequency-based
+//!   complex-prefix code (variable code lengths) — this is the next
+//!   biggest win after Gradient and is a pure entropy-coder change with
+//!   no decoder side effects.
+//!
+//! Bitstream shape (unchanged from round 1):
 //!
 //! ```text
 //! [2 B signature FF 0A]
@@ -16,41 +37,28 @@
 //! [byte align]
 //! ```
 //!
-//! ## Round-1 envelope
+//! ## Round-2 envelope
 //!
 //! * Single frame, intra-only.
 //! * 8-bit-per-sample integer, Gray (1 channel), RGB (3) or RGBA (4).
 //! * No transforms (no Squeeze, no Palette, no RCT).
-//! * Single-leaf MA tree: predictor=Zero (id 0), offset=0, multiplier=1.
-//!   Predictor=Zero gives `prediction = 0`, so each transmitted
-//!   residual = the actual pixel value (no inter-pixel decorrelation).
-//!   This costs compression ratio but is the simplest valid encoding —
-//!   round 2 should switch to Gradient (id 5) once the encoder side of
-//!   the MA-tree symbol stream is wired to emit non-zero predictor IDs.
-//! * Prefix (Huffman) entropy coding throughout — both for the MA tree
-//!   sub-stream (6 single-symbol clusters) and the per-pixel symbol
-//!   stream (one cluster, complex-prefix code over 16 uniform-length-4
-//!   token symbols).
-//! * `HybridUintConfig` for the symbol stream is the "elias-like"
-//!   variant: split_exponent=0, msb=0, lsb=0. Token T encodes value
-//!   2^(T-1)..2^T - 1 with T-1 extra bits (T==0 encodes value 0).
+//! * Single-leaf MA tree: predictor=Gradient (id 5), offset=0, multiplier=1.
+//! * Single group (`width, height <= 1024`). Multi-group emits an error.
+//! * Prefix (Huffman) entropy coding throughout.
+//!   - Tree stream: 2 clusters (single-symbol code each) + HybridUintConfig
+//!     `split_exponent=8, msb=0, lsb=0`.
+//!   - Symbol stream: 1 cluster, 16 symbols all length 4
+//!     (canonical-Huffman codes 0..15 LSB-first). HybridUintConfig
+//!     `split_exponent=0, msb=0, lsb=0` so token T encodes
+//!     `2^(T-1)..2^T - 1` with T-1 extra bits.
 //!
 //! Everything outside this envelope returns `Error::Unsupported`.
-//!
-//! ## Why prefix codes
-//!
-//! ANS encoding is also valid per FDIS Annex D and produces smaller
-//! output, but it requires a reverse-direction encoder + bit reversal +
-//! per-symbol renormalisation. Prefix codes encode forward in one pass
-//! over the residuals, share the existing decoder's
-//! [`crate::ans::prefix::PrefixCode`] format, and ship in less code.
-//! Round 2 may switch to ANS for compression density.
 
 use oxideav_core::{Error, Result};
 
 use crate::bitwriter::{pack_signed, BitWriter, U32WriteDist};
 
-/// Pixel formats accepted by the round-1 encoder. All inputs are 8-bit
+/// Pixel formats accepted by the round-2 encoder. All inputs are 8-bit
 /// integer per channel, interleaved (single-plane) layout.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InputFormat {
@@ -71,7 +79,7 @@ impl InputFormat {
             InputFormat::Rgba8 => 4,
         }
     }
-    /// Number of EXTRA channels (beyond the colour channels). Round-1
+    /// Number of EXTRA channels (beyond the colour channels). Round-2
     /// only emits Alpha as the extra channel.
     pub fn num_extra_channels(self) -> u32 {
         match self {
@@ -91,8 +99,8 @@ impl InputFormat {
 /// `FF 0A` signature.
 ///
 /// `width` × `height` × channels-per-pixel must equal `pixels.len()`.
-/// Bounds: `width, height <= 65535` (both per spec U32 distribution
-/// caps and our practical encoder limit).
+/// Bounds: `width, height <= 1024` (single-group cap; round 3 lifts
+/// this).
 pub fn encode_one_frame(
     width: u32,
     height: u32,
@@ -102,9 +110,9 @@ pub fn encode_one_frame(
     if width == 0 || height == 0 {
         return Err(Error::other("JXL encoder: zero-dim frame"));
     }
-    if width > 65535 || height > 65535 {
+    if width > 1024 || height > 1024 {
         return Err(Error::other(
-            "JXL encoder: dimensions > 65535 not supported (round 1)",
+            "JXL encoder: dimensions > 1024 not supported (round 2 single-group cap)",
         ));
     }
     let channel_count = format.channel_count();
@@ -121,8 +129,7 @@ pub fn encode_one_frame(
     }
 
     let mut bw = BitWriter::with_capacity(pixels.len());
-    // Emit the signature (FF 0A) directly into the byte buffer — note
-    // these bytes come BEFORE any bit-level packing per FDIS 6.2.
+    // Signature (FF 0A) goes BEFORE any bit-level packing per FDIS 6.2.
     bw.write_bits(0xFF, 8)?;
     bw.write_bits(0x0A, 8)?;
 
@@ -241,8 +248,7 @@ fn write_frame_header(
     }
 
     // group_size_shift: u(2). Pick the largest (3) → kGroupDim = 1024,
-    // so any width/height up to 1024 produces a single group. For larger
-    // images the encoder errors out (round 1 only supports single-group).
+    // so any width/height up to 1024 produces a single group.
     let group_dim = if width.max(height) <= 128 {
         bw.write_bits(0, 2)?; // shift=0 → 128
         128
@@ -360,7 +366,7 @@ fn write_toc_single_entry_then_payload(
     Ok(())
 }
 
-/// Write the LfGlobal bundle (round-1 Modular envelope: only
+/// Write the LfGlobal bundle (round-2 Modular envelope: only
 /// LfChannelDequantization + GlobalModular, no Patches/Splines/Noise/
 /// VarDCT state).
 fn write_lf_global(
@@ -409,85 +415,120 @@ fn write_global_modular(
 
     // Local MA tree: a single leaf with predictor=Gradient (5 in FDIS),
     // offset=0, multiplier=1 (mul_log=0, mul_bits=0). Encoded via a
-    // 6-cluster prefix-code-only entropy stream where every cluster is
-    // a single-symbol code that decodes to 0.
-    write_single_leaf_ma_tree(bw)?;
+    // 6-distribution / 2-cluster prefix-code entropy stream. Cluster 0
+    // always returns 0; cluster 1 always returns 5 (used only for the
+    // predictor field).
+    write_gradient_leaf_ma_tree(bw)?;
 
-    // Symbol stream — round-1 design uses a single-cluster
+    // Symbol stream — round-2 design uses a single-cluster
     // prefix-coded stream. The MA tree's single leaf has ctx=0; so
     // num_ctx=1 and there's only one cluster.
     write_symbol_stream_prelude(bw)?;
 
     // Per-channel pixel decode (C.16/C.17). Walk pixels in
     // (channel, y, x) order; emit (token, extra_bits) for each
-    // residual.
+    // gradient-predicted residual.
     write_pixel_data(bw, width, height, pixels, format)
 }
 
 /// Write the MA tree sub-bitstream so the decoder reads a tree with a
-/// single leaf node: predictor=0 (Zero), offset=0, multiplier=1.
+/// single leaf node: predictor=5 (Gradient), offset=0, multiplier=1.
 ///
 /// The MA tree's entropy stream is `EntropyStream::read(br, 6)` — six
-/// distributions T[0..=5]. Each cluster gets a `count=1` prefix code
-/// (the degenerate single-symbol code, 0 bits per decode). The
-/// HybridUintConfig is split_exponent=8, msb=0, lsb=0 — token-below-
-/// split returns the token directly, so token 0 → value 0.
+/// distributions T[0..=5] mapped via a simple cluster map to two
+/// clusters. Cluster 0 always returns 0 (single-symbol prefix code,
+/// alphabet_size=1). Cluster 1 always returns 5 (single-symbol simple
+/// prefix code over a 16-symbol alphabet, with the listed symbol = 5).
 ///
-/// With predictor=0 (Zero), the FDIS predict() function returns 0
-/// unconditionally. So the encoded residual = the actual pixel value
-/// (no decorrelation). This costs entropy but keeps the encoder logic
-/// trivial — round 2 should switch to predictor=5 (Gradient) once the
-/// MA-tree symbol stream supports non-zero predictor IDs.
+/// Both clusters share `HybridUintConfig { split_exponent=8, msb=0,
+/// lsb=0 }` so `split = 256` and tokens below 256 (i.e. all our reads)
+/// return their value directly — token 0 → value 0, token 5 → value 5.
 ///
-/// Since every decoded value here is 0:
-///   T[1] property+1 = 0 → leaf marker (ctx_id 0)
-///   T[2] predictor   = 0 → Predictor::Zero
-///   T[3] uoffset     = 0 → offset = 0
-///   T[4] mul_log     = 0
-///   T[5] mul_bits    = 0 → multiplier = (0 + 1) << 0 = 1
-fn write_single_leaf_ma_tree(bw: &mut BitWriter) -> Result<()> {
-    // Tree-stream prelude (D.3.1 / D.3.6 / D.3.7 / D.2):
+/// Cluster map for tree contexts (in spec read order):
+///   ctx=0 → cluster 0 (decision-node values, never decoded for our 1-leaf tree)
+///   ctx=1 → cluster 0 (property+1 = 0 → leaf marker)
+///   ctx=2 → cluster 1 (predictor = 5 → Gradient)
+///   ctx=3 → cluster 0 (uoffset = 0)
+///   ctx=4 → cluster 0 (mul_log = 0)
+///   ctx=5 → cluster 0 (mul_bits = 0; multiplier = (0+1) << 0 = 1)
+fn write_gradient_leaf_ma_tree(bw: &mut BitWriter) -> Result<()> {
+    // Tree-stream prelude (FDIS D.3 + libjxl-trace-reverse-engineering.md §3.6):
     //
-    //   1. lz77_enabled = 0
+    //   1. lz77_enabled = 0 (no LZ77 length config to follow)
     //   2. cluster_map for num_dist=6 (read_clustering, since num_dist > 1)
-    //      — we use `is_simple=1` with nbits=0, all six clusters → 0.
-    //      Effectively a single cluster.
+    //      — is_simple=1, nbits=1, six u(1) reads = [0,0,1,0,0,0]
     //   3. use_prefix_code = 1
-    //   4. log_alphabet_size = 15 (fixed for the prefix branch)
-    //   5. one HybridUintConfig (since n_clusters=1):
-    //      split_exponent = 8, msb = 0, lsb = 0 → split = 256
-    //   6. one prefix code, count = 1 (single-symbol code)
-    //
-    // Effect: every "decode_uint" call in the tree reads 0 bits and
-    // returns the value 0.
+    //      (log_alphabet_size fixed at 15 for prefix branch — no bits read)
+    //   4. n_clusters = 2 → two HybridUintConfigs:
+    //      both with split_exponent=8, msb=0, lsb=0
+    //   5. two prefix codes:
+    //      cluster 0: count=1 → degenerate single-symbol code returns 0
+    //      cluster 1: count=16 (so symbol id 5 fits in alphabet); simple
+    //                 prefix code with NSYM=1, listed symbol = 5,
+    //                 single-symbol path emits 0 bits per decode
+    //                 returning symbol 5 → decoded value 5
 
     bw.write_bit(0); // lz77_enabled = 0
 
-    // read_clustering: is_simple = 1, nbits = 0, six u(0) reads = no bits.
-    // Cluster map ends up [0, 0, 0, 0, 0, 0]. n_clusters = 1.
+    // read_clustering: is_simple = 1, nbits = 1, six u(1) reads.
+    // Cluster map [0, 0, 1, 0, 0, 0]. n_clusters = 2.
     bw.write_bit(1); // is_simple = 1
-    bw.write_bits(0, 2)?; // nbits = 0
-                          // u(0) for each of 6 distributions writes nothing.
+    bw.write_bits(1, 2)?; // nbits = 1
+    bw.write_bits(0, 1)?; // ctx 0 → cluster 0
+    bw.write_bits(0, 1)?; // ctx 1 → cluster 0
+    bw.write_bits(1, 1)?; // ctx 2 → cluster 1 (predictor)
+    bw.write_bits(0, 1)?; // ctx 3 → cluster 0
+    bw.write_bits(0, 1)?; // ctx 4 → cluster 0
+    bw.write_bits(0, 1)?; // ctx 5 → cluster 0
 
     bw.write_bit(1); // use_prefix_code = 1
                      // log_alphabet_size = 15 (fixed for prefix branch).
 
-    // One HybridUintConfig — split_exponent = 8.
+    // Two HybridUintConfig — both split_exponent = 8.
+    // Note: tree-stream values are 0 (most contexts) or 5 (predictor),
+    // both well below split=256, so no extra bits are ever consumed.
+    write_hybrid_uint_config(bw, 8, 0, 0, 15)?;
     write_hybrid_uint_config(bw, 8, 0, 0, 15)?;
 
-    // For each cluster (only 1), emit count + prefix code.
-    write_prefix_code_count_one(bw)?;
-
-    // Now emit the tree's 5 token reads. With count=1 each cluster
-    // returns 0, with HybridUintConfig split=256 each value=0:
-    //   T[1] property+1 = 0 → leaf
-    //   T[2] predictor = 0  → Zero predictor
-    //   T[3] uoffset   = 0  → offset = 0
-    //   T[4] mul_log   = 0
-    //   T[5] mul_bits  = 0  → multiplier = 1
+    // Per-cluster preludes per FDIS D.3.1 prefix branch:
+    //   1. Count selectors for ALL clusters, in order.
+    //   2. Then prefix-code bodies for ALL clusters, in order.
     //
-    // No bits are emitted for the actual token decodes (the prefix
-    // code is the degenerate 0-bit code).
+    // Step 1 — count selectors:
+    //
+    //   Cluster 0: count = 1 → bit 0.
+    bw.write_bit(0);
+    //   Cluster 1: count = 16. Per spec: bit 1 → count > 1, then n=u(4),
+    //   count = 1 + (1<<n) + u(n). For count=16 we use n=3, u(3)=7
+    //   → 1 + 8 + 7 = 16.
+    bw.write_bit(1); // count > 1
+    bw.write_bits(3, 4)?; // n = 3
+    bw.write_bits(7, 3)?; // u(3) = 7 → count = 16
+
+    // Step 2 — prefix-code bodies:
+    //
+    //   Cluster 0: count=1 → `read_prefix_code(br, 1)` short-circuits
+    //   in the decoder (alphabet_size == 1 path) and reads NO bits. We
+    //   emit nothing here.
+    //
+    //   Cluster 1: count=16 → simple-prefix code with NSYM=1, symbol=5.
+    //   `read_prefix_code(br, 16)` reads kind=u(2)=1 (simple), then
+    //   `read_simple_prefix`: nsym=u(2)+1 with u(2)=0 → nsym=1, then
+    //   one u(ceil(log2(16))) = u(4) for the symbol id (= 5).
+    bw.write_bits(1, 2)?; // kind = 1 → simple prefix
+    bw.write_bits(0, 2)?; // nsym - 1 = 0 → nsym = 1
+    bw.write_bits(5, 4)?; // symbol id = 5 (4 bits since alphabet_size=16)
+
+    // The decoder now reads all subsequent tree-stream tokens from
+    // these two single-symbol codes:
+    //   T[1] property+1 (ctx=1 → cluster 0) → 0 → leaf
+    //   T[2] predictor   (ctx=2 → cluster 1) → 5 → Gradient
+    //   T[3] uoffset     (ctx=3 → cluster 0) → 0 → offset = 0
+    //   T[4] mul_log     (ctx=4 → cluster 0) → 0
+    //   T[5] mul_bits    (ctx=5 → cluster 0) → 0 → multiplier = 1
+    //
+    // No bits are emitted for the actual token decodes (degenerate
+    // codes are 0 bits per decode).
     Ok(())
 }
 
@@ -524,10 +565,11 @@ fn write_symbol_stream_prelude(bw: &mut BitWriter) -> Result<()> {
     //   ...
     //   T=k → values 2^(k-1)..2^k - 1 ((k-1) extra bits)
     //
-    // Max packed-signed value for 8-bit residuals = 511 (raw 256 → -256).
-    // 511 fits in T=9 (covers 256..511). So tokens 0..=9 cover every
-    // possible packed-signed residual. Round up to alphabet 16 (next
-    // power of 2) so every symbol has length 4.
+    // Max packed-signed value for 8-bit Gradient residuals: residuals
+    // can be in [-256, 255], so packed values in [0, 511]. 511 fits in
+    // T=9 (covers 256..511). So tokens 0..=9 suffice. We round up the
+    // alphabet to 16 (next pow2) so every symbol has length 4 in the
+    // canonical-Huffman code below.
     write_hybrid_uint_config(bw, 0, 0, 0, 15)?;
 
     // Prefix code: complex format, 16 symbols all length 4.
@@ -568,7 +610,6 @@ fn write_symbol_stream_prelude(bw: &mut BitWriter) -> Result<()> {
         let want_one = i == 3; // K_CODE_LENGTH_CODE_ORDER[3] == 4
         if want_one {
             // Emit cl-symbol "1" (length 1 in cl_code → goes through clcl[4] = 1).
-            // Wait — we're emitting CL CODE LENGTHS here, not cl-symbols.
             // The clcl array holds the LENGTH of the cl-code's prefix
             // codeword for cl-symbol i. We want clcl[4] = 1 so that
             // cl-symbol 4 has a length-1 codeword. The CLCL_VL_TABLE
@@ -633,15 +674,19 @@ fn write_prefix_code_count_one(bw: &mut BitWriter) -> Result<()> {
 
 /// Walk the input pixels in (channel, y, x) order and emit one symbol
 /// per pixel using the symbol-stream prefix code (token T = packed
-/// residual, with extra bits when packed >= 1).
+/// gradient residual, with extra bits when packed >= 1).
 ///
 /// Channel layout for our `colour_count + num_extra_channels`:
+///   * Gray   → channel 0 = Y
 ///   * RGB    → channels 0,1,2 = R,G,B
 ///   * RGBA   → channels 0,1,2,3 = R,G,B,A (alpha as extra)
 ///
-/// Predictor is fixed at 0 (Zero) per the single-leaf MA tree above,
-/// so the decoded sample = diff * 1 + 0 + 0 = diff. We pack each pixel
-/// directly via `pack_signed`.
+/// Predictor is Gradient (5) per the single-leaf MA tree; the residual
+/// is `sample - clamp(W + N - NW, min(W,N), max(W,N))`. For the very
+/// first pixel both W and N are 0, so the predicted value is 0 and the
+/// residual = sample. As we walk the image, predictions track local
+/// values closely on natural images, driving most residuals to small
+/// magnitudes.
 fn write_pixel_data(
     bw: &mut BitWriter,
     width: u32,
@@ -652,18 +697,51 @@ fn write_pixel_data(
     let stride = format.channel_count() as usize;
     let w = width as usize;
     let h = height as usize;
-    for c in 0..format.channel_count() as usize {
+    // Maintain a per-channel reconstruction buffer so each prediction
+    // sees the SAME values the decoder will see. (Since we round-trip
+    // exactly, the reconstruction == the input — but mirroring the
+    // decode pattern keeps any future quantisation honest.)
+    let nc = format.channel_count() as usize;
+    let mut recon: Vec<Vec<i32>> = (0..nc).map(|_| vec![0i32; w * h]).collect();
+    for c in 0..nc {
         for y in 0..h {
             for x in 0..w {
                 let v = pixels[(y * w + x) * stride + c] as i32;
-                // Predictor 0 → prediction = ch_zero = 0 for unsigned channels.
-                let diff = v;
+                let p = gradient_predict(&recon[c], w, h, x, y);
+                let diff = v - p;
+                recon[c][y * w + x] = v;
                 let packed = pack_signed(diff);
                 write_token_with_extras(bw, packed)?;
             }
         }
     }
     Ok(())
+}
+
+/// FDIS Listing C.16 predictor 5 (Gradient): clamp(W+N-NW, min, max).
+///
+/// Out-of-bounds neighbours fall back per spec:
+///   x>0: W = sample(x-1, y); else W = (y>0 ? sample(x, y-1) : 0)
+///   y>0: N = sample(x, y-1); else N = W
+///   x>0 && y>0: NW = sample(x-1, y-1); else NW = W
+fn gradient_predict(buf: &[i32], w: usize, _h: usize, x: usize, y: usize) -> i32 {
+    let west = if x > 0 {
+        buf[y * w + (x - 1)]
+    } else if y > 0 {
+        buf[(y - 1) * w + x]
+    } else {
+        0
+    };
+    let north = if y > 0 { buf[(y - 1) * w + x] } else { west };
+    let northwest = if x > 0 && y > 0 {
+        buf[(y - 1) * w + (x - 1)]
+    } else {
+        west
+    };
+    let grad = west.wrapping_add(north).wrapping_sub(northwest);
+    let lo = west.min(north);
+    let hi = west.max(north);
+    grad.clamp(lo, hi)
 }
 
 /// Encode one packed-signed residual using the symbol stream's token
@@ -673,7 +751,7 @@ fn write_pixel_data(
 ///                (T-1 bits)
 ///
 /// The token is then encoded with the symbol-stream prefix code. Round
-/// 1 uses a uniform 4-bit code over 16 symbols, so each token costs
+/// 2 uses a uniform 4-bit code over 16 symbols, so each token costs
 /// exactly 4 bits regardless of value (canonical-Huffman LSB-first
 /// representation).
 fn write_token_with_extras(bw: &mut BitWriter, value: u32) -> Result<()> {
@@ -756,6 +834,47 @@ mod tests {
     }
 
     #[test]
+    fn gradient_predict_first_pixel_is_zero() {
+        let buf = vec![0i32; 4];
+        // (0, 0): W = N = NW = 0 → grad = 0, clamp(0, 0, 0) = 0.
+        assert_eq!(gradient_predict(&buf, 2, 2, 0, 0), 0);
+    }
+
+    #[test]
+    fn gradient_predict_uses_west_at_top_row() {
+        // Top row, x=1: W = buf[0] = 5, N = W = 5, NW = W = 5.
+        // grad = 5 + 5 - 5 = 5, clamp(5, 5, 5) = 5.
+        let buf = vec![5, 0, 0, 0];
+        assert_eq!(gradient_predict(&buf, 2, 2, 1, 0), 5);
+    }
+
+    #[test]
+    fn gradient_predict_uses_north_at_left_column() {
+        // Left col, y=1: W = sample(0, 0) = 7 (per spec fallback).
+        // N = buf[0] = 7. NW = W = 7. grad = 7 + 7 - 7 = 7.
+        let buf = vec![7, 0, 0, 0];
+        assert_eq!(gradient_predict(&buf, 2, 2, 0, 1), 7);
+    }
+
+    #[test]
+    fn gradient_predict_clamp_below_min() {
+        // Construct: W=10, N=20, NW=15 → grad = 10+20-15 = 15. min=10, max=20.
+        // 15 in [10, 20] → returns 15.
+        // Now make grad below min: W=10, N=20, NW=25 → grad = 10+20-25 = 5.
+        // 5 < min(10, 20) = 10 → clamp to 10.
+        let buf = vec![25, 20, 10, 0]; // (0,0)=25, (1,0)=20, (0,1)=10, (1,1)=?
+                                       // For (1, 1): W=buf[2]=10, N=buf[1]=20, NW=buf[0]=25.
+        assert_eq!(gradient_predict(&buf, 2, 2, 1, 1), 10);
+    }
+
+    #[test]
+    fn gradient_predict_clamp_above_max() {
+        // W=10, N=20, NW=5 → grad = 10+20-5 = 25 > max(10, 20) = 20 → 20.
+        let buf = vec![5, 20, 10, 0];
+        assert_eq!(gradient_predict(&buf, 2, 2, 1, 1), 20);
+    }
+
+    #[test]
     fn encode_smallest_image_produces_jxl_signature() {
         let pixels = vec![128u8; 1 * 1 * 3];
         let bytes = encode_one_frame(1, 1, &pixels, InputFormat::Rgb8).unwrap();
@@ -827,5 +946,27 @@ mod tests {
         assert!(fh.is_last);
         assert_eq!(fh.width, 32);
         assert_eq!(fh.height, 32);
+    }
+
+    /// Verify the gradient-leaf MA tree decodes back to a single leaf
+    /// with `predictor=5` (Gradient) and `multiplier=1, offset=0`.
+    #[test]
+    fn gradient_leaf_ma_tree_round_trips_via_decoder() {
+        let mut bw = BitWriter::new();
+        write_gradient_leaf_ma_tree(&mut bw).unwrap();
+        let bytes = bw.finish();
+        let mut br = BitReader::new(&bytes);
+        let tree = crate::modular_fdis::MaTreeFdis::read(&mut br).unwrap();
+        assert_eq!(tree.nodes.len(), 1, "expected a single-leaf tree");
+        match tree.nodes[0] {
+            crate::modular_fdis::MaNode::Leaf(leaf) => {
+                assert_eq!(leaf.predictor, 5, "leaf predictor must be Gradient (5)");
+                assert_eq!(leaf.offset, 0);
+                assert_eq!(leaf.multiplier, 1);
+                assert_eq!(leaf.ctx, 0);
+            }
+            _ => panic!("expected a Leaf node"),
+        }
+        assert_eq!(tree.num_ctx, 1);
     }
 }
