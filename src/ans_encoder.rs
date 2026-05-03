@@ -337,6 +337,121 @@ pub fn encode_symbols_with_dist(
     encode_symbols(bw, symbols, d, &inv)
 }
 
+/// One token to emit through ANS + extra-bits.
+#[derive(Debug, Clone, Copy)]
+pub struct AnsTokenWithExtras {
+    /// The ANS-coded symbol (the bare token before hybrid uint extras).
+    pub token: u16,
+    /// Extra bits to emit after the ANS token (interleaved with refills).
+    /// `n_bits` may be 0; `value` must fit in `n_bits`.
+    pub extra_value: u32,
+    pub extra_bits: u32,
+}
+
+/// Encode a sequence of `(token, extra_bits)` pairs through ANS into the
+/// supplied bit writer. The decoder reads the bitstream in order:
+///
+/// ```text
+/// state (u32) | for each symbol i: [u(16) refill if any] [u(extra_bits_i)]
+/// ```
+///
+/// Algorithmically: process symbols in REVERSE order, pushing onto a
+/// stack:
+///
+/// 1. The extras for symbol i (decoder reads LAST during iteration i),
+/// 2. Apply inverse ANS update — if renorm fires, push the u(16)
+///    refill (decoder reads FIRST during iteration i).
+///
+/// After all symbols are processed, pop the stack (LIFO → wire order)
+/// and emit each chunk.
+pub fn encode_symbols_with_extras(
+    bw: &mut BitWriter,
+    tokens: &[AnsTokenWithExtras],
+    d: &[u16],
+    inv_alias: &[Vec<u16>],
+) -> Result<()> {
+    let sum: u32 = d.iter().map(|&v| v as u32).sum();
+    if sum != ANS_TAB_SIZE {
+        return Err(Error::other(format!(
+            "ANS encoder: distribution does not sum to 4096 (got {sum})"
+        )));
+    }
+    if inv_alias.len() != d.len() {
+        return Err(Error::other(format!(
+            "ANS encoder: inv_alias len {} != d.len() {}",
+            inv_alias.len(),
+            d.len()
+        )));
+    }
+
+    let mut state: u32 = ANS_FINAL_STATE;
+    // Stack entries: (value, width). Width can be up to 32 bits since
+    // `read_uint` extra-bit reads are at most ~30 bits in practice.
+    let mut stack: Vec<(u32, u32)> = Vec::with_capacity(tokens.len() * 2);
+
+    for tok in tokens.iter().rev() {
+        let s = tok.token as usize;
+        if s >= d.len() {
+            return Err(Error::other(format!(
+                "ANS encoder: token {} out of distribution range {}",
+                tok.token,
+                d.len()
+            )));
+        }
+        let p = d[s] as u32;
+        if p == 0 {
+            return Err(Error::other(format!(
+                "ANS encoder: token {} has zero probability",
+                tok.token
+            )));
+        }
+        // Sanity: extra_value fits in extra_bits.
+        if tok.extra_bits > 32 {
+            return Err(Error::other(format!(
+                "ANS encoder: extra_bits {} > 32",
+                tok.extra_bits
+            )));
+        }
+        if tok.extra_bits < 32 && tok.extra_value >= (1u32 << tok.extra_bits) {
+            return Err(Error::other(format!(
+                "ANS encoder: extra_value {} doesn't fit in {} bits",
+                tok.extra_value, tok.extra_bits
+            )));
+        }
+
+        // Push extras FIRST (decoder reads them LAST in iteration i).
+        if tok.extra_bits > 0 {
+            stack.push((tok.extra_value, tok.extra_bits));
+        }
+
+        // Renormalise: while state >= p << 20, push refill u(16).
+        let max_state: u64 = (p as u64) << 20;
+        while (state as u64) >= max_state {
+            stack.push(((state & 0xFFFF) as u32, 16));
+            state >>= ANS_REFILL_BITS;
+        }
+        // Apply inverse update.
+        let q = state / p;
+        let r = state - q * p;
+        if (r as usize) >= inv_alias[s].len() {
+            return Err(Error::other(format!(
+                "ANS encoder: inv_alias[{s}] index {r} out of bounds (len {})",
+                inv_alias[s].len()
+            )));
+        }
+        let alias_index = inv_alias[s][r as usize] as u32;
+        state = (q << ANS_LOG_TAB_SIZE) | alias_index;
+    }
+
+    // Emit leading u(32) state.
+    bw.write_bits(state, 32)?;
+    // Pop stack (LIFO) → wire order.
+    while let Some((val, width)) = stack.pop() {
+        bw.write_bits(val, width)?;
+    }
+    Ok(())
+}
+
 /// Emit an ANS distribution preamble per FDIS D.3.4.
 ///
 /// Round-3 uses the simplest encoding the decoder accepts:
@@ -785,6 +900,114 @@ mod tests {
         let mut br = BitReader::new(&bytes);
         let d_decoded = read_distribution(&mut br, log_alpha).unwrap();
         assert_eq!(d, d_decoded);
+    }
+
+    /// Round-trip with EXTRA BITS interleaved between ANS tokens. This
+    /// exercises the encoder's stack-based ordering — extras get pushed
+    /// before their preceding renormalisation, so they appear in the
+    /// wire stream after refills (matching the decoder's read order).
+    #[test]
+    fn extras_interleaved_round_trip() {
+        use crate::ans::hybrid_config::HybridUintConfig;
+        let log_alpha = 5u32;
+        let table_size = 1usize << log_alpha;
+
+        // 3-symbol distribution.
+        let mut counts = vec![0u32; table_size];
+        counts[0] = 80;
+        counts[1] = 15;
+        counts[2] = 5;
+        let d = quantise_distribution(&counts, log_alpha).unwrap();
+        let alias = AliasTable::build(&d, log_alpha).unwrap();
+        let inv = build_inverse_alias(&d, &alias).unwrap();
+
+        // Each token carries some extra bits (a small u8 payload).
+        let cfg = HybridUintConfig {
+            split_exponent: 0,
+            msb_in_token: 0,
+            lsb_in_token: 0,
+            split: 1,
+        };
+
+        // Build tokens. Token T (>= 1) carries (T - 1) extra bits via
+        // ReadUint with split=1, msb=0, lsb=0.
+        let mut tokens: Vec<AnsTokenWithExtras> = Vec::new();
+        let plain_symbols: Vec<u16> = vec![0u16, 1, 0, 0, 2, 0, 1, 0];
+        // For symbol s in {0, 1, 2}, with split_exp=0 the token IS
+        // computed from the value to encode. Token 0 → value 0 (no
+        // extras). Token 1 → value 1 (no extras). Token 2 → value
+        // 2..3 (1 extra bit). To exercise extras, we encode tokens
+        // with predetermined extras.
+        // Use explicit encode helper:
+        let values_to_encode: Vec<u32> = vec![0, 1, 0, 0, 5, 0, 1, 0];
+        for &v in &values_to_encode {
+            // For split_exp=0, token = floor(log2(v)) + 1 for v >= 1,
+            // else 0. We'll only encode values 0/1/5 — token 0/1/3 with
+            // 0/0/2 extras.
+            let (token, extra, n_extra) = encode_uint_for_test(&cfg, v);
+            // Map token → symbol (we have only 3 symbols available).
+            // For simplicity, clamp token to alphabet [0, 3) — only
+            // tokens 0, 1, 3 occur but we map 3 → 2.
+            let sym = if (token as usize) < table_size && d[token as usize] > 0 {
+                token as u16
+            } else if d[2] > 0 {
+                2u16
+            } else {
+                token as u16
+            };
+            tokens.push(AnsTokenWithExtras {
+                token: sym,
+                extra_value: extra,
+                extra_bits: n_extra,
+            });
+        }
+        let _ = plain_symbols; // kept for reference
+
+        let mut bw = BitWriter::new();
+        encode_symbols_with_extras(&mut bw, &tokens, &d, &inv).unwrap();
+        let bytes = bw.finish();
+
+        // Decode: AnsDecoder reads state, then for each token read
+        // refill (if any) + then ReadUint extras.
+        let mut br = BitReader::new(&bytes);
+        let mut dec = AnsDecoder::new(&mut br).unwrap();
+        for tok in &tokens {
+            let s = dec.decode_symbol(&mut br, &d, &alias).unwrap();
+            assert_eq!(s, tok.token);
+            // Read the extras directly (we don't need ReadUint's
+            // formula; we just need to consume the same number of bits).
+            let extra = if tok.extra_bits > 0 {
+                br.read_bits(tok.extra_bits).unwrap()
+            } else {
+                0
+            };
+            assert_eq!(extra, tok.extra_value);
+        }
+        assert!(dec.final_state());
+    }
+
+    /// Helper: mirror of `HybridUintConfig::encode_uint` (which is
+    /// `cfg(test)`-only inside the ans module). Returns
+    /// `(token, extra_value, n_extra_bits)`.
+    fn encode_uint_for_test(
+        cfg: &crate::ans::hybrid_config::HybridUintConfig,
+        value: u32,
+    ) -> (u32, u32, u32) {
+        if value < cfg.split {
+            return (value, 0, 0);
+        }
+        let lsb_bits = value & ((1u32 << cfg.lsb_in_token).wrapping_sub(1));
+        let v = value >> cfg.lsb_in_token;
+        let top_bit_pos = 31 - v.leading_zeros();
+        let n = top_bit_pos - cfg.msb_in_token;
+        let n_above = n - cfg.split_exponent;
+        let below_leading_1 = v ^ (1u32 << top_bit_pos);
+        let extra_bits = below_leading_1 & ((1u32 << n).wrapping_sub(1));
+        let msb_part = below_leading_1 >> n;
+        let total_in_token = cfg.msb_in_token + cfg.lsb_in_token;
+        let token =
+            cfg.split + ((n_above << total_in_token) | (msb_part << cfg.lsb_in_token) | lsb_bits);
+        (token, extra_bits, n)
     }
 
     /// End-to-end: distribution preamble + encoded symbols, both round-tripped.
