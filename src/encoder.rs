@@ -889,7 +889,7 @@ mod tests {
 
     #[test]
     fn encode_smallest_image_produces_jxl_signature() {
-        let pixels = vec![128u8; 1 * 1 * 3];
+        let pixels = vec![128u8; 3]; // 1x1 RGB
         let bytes = encode_one_frame(1, 1, &pixels, InputFormat::Rgb8).unwrap();
         assert_eq!(&bytes[0..2], &[0xFF, 0x0A]);
     }

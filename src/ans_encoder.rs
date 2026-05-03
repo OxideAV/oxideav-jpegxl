@@ -472,7 +472,7 @@ pub fn encode_symbols_with_extras(
 
         let max_state: u64 = (p as u64) << 20;
         while (state as u64) >= max_state {
-            stack.push(((state & 0xFFFF) as u32, 16));
+            stack.push((state & 0xFFFF, 16));
             state >>= ANS_REFILL_BITS;
         }
         state = inverse_update(state, s, p, inv_alias, alias)?;
@@ -844,7 +844,7 @@ mod tests {
         let alias = AliasTable::build(&d, log_alpha).unwrap();
         let inv = build_inverse_alias(&d, &alias).unwrap();
 
-        let symbols: Vec<u16> = (0..50u16).map(|i| (i % 8) as u16).collect();
+        let symbols: Vec<u16> = (0..50u16).map(|i| i % 8).collect();
         let mut bw = BitWriter::new();
         encode_symbols(&mut bw, &symbols, &d, &inv, &alias).unwrap();
         let bytes = bw.finish();
