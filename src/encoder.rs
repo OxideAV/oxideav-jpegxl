@@ -1,26 +1,27 @@
-//! JPEG XL encoder — round-3 lossless modular Gray/RGB/RGBA with
+//! JPEG XL encoder — round-2 lossless modular Gray/RGB/RGBA with
 //! the **Gradient** (predictor id 5) MA-tree leaf and a frequency-
-//! adapted ANS-coded symbol stream.
+//! optimised single-cluster symbol stream.
 //!
-//! Round 3 deltas vs round 2 (`089af88`):
+//! Round 2 deltas vs round 1 (`a53e041`):
 //!
-//! * **Symbol stream switched from prefix code to ANS.** Round 2 emitted
-//!   exactly 4 bits per token regardless of frequency; round 3 quantises
-//!   the actual token histogram into a 4096-summing distribution and
-//!   feeds it through the new [`crate::ans_encoder`] (the inverse of
-//!   the existing [`crate::ans::symbol::AnsDecoder`]). On natural
-//!   images where ~80% of Gradient residuals are zero, this approaches
-//!   the entropy bound `H(D) = -sum(p_i * log2(p_i))` ≈ 0.7 bits/pixel
-//!   — a ~5–6× compression improvement vs round 2 once the ~30 byte
-//!   distribution preamble is amortised.
+//! * **Predictor switched from Zero (0) to Gradient (5).** The MA tree
+//!   is now a single-leaf tree carrying `predictor=5, offset=0,
+//!   multiplier=1`. The on-wire tree-token entropy stream is now
+//!   2-cluster: cluster 0 always returns 0 (used for property+1, offset,
+//!   mul_log, mul_bits, decision-node values), cluster 1 always returns 5
+//!   (used only for the predictor field). Cluster map for the 6
+//!   tree-stream contexts is `[0, 0, 1, 0, 0, 0]`.
 //!
-//! Round 2 baseline (kept for reference — still used internally for the
-//! tree stream which only emits 6 fixed-value tokens):
-//!
-//! * **Predictor: Gradient (id 5).** Single-leaf MA tree with
-//!   `predictor=5, offset=0, multiplier=1`.
 //! * **Per-pixel residual = sample - prediction(left, top, topleft)**
-//!   per FDIS Listing C.16's clamp(W+N-NW, min(W,N), max(W,N)).
+//!   per FDIS Listing C.16's clamp(W+N-NW, min(W,N), max(W,N)). Natural
+//!   images compress ~3× better since most residuals fall into token 0
+//!   (value 0).
+//!
+//! * **Symbol stream remains a single-cluster uniform 16×4-bit prefix
+//!   code** for simplicity. Round 3 should switch to a frequency-based
+//!   complex-prefix code (variable code lengths) — this is the next
+//!   biggest win after Gradient and is a pure entropy-coder change with
+//!   no decoder side effects.
 //!
 //! Bitstream shape (unchanged from round 1):
 //!
@@ -55,11 +56,6 @@
 
 use oxideav_core::{Error, Result};
 
-use crate::ans::alias::AliasTable;
-use crate::ans_encoder::{
-    build_inverse_alias, encode_symbols_with_extras, quantise_distribution, write_distribution,
-    AnsTokenWithExtras,
-};
 use crate::bitwriter::{pack_signed, BitWriter, U32WriteDist};
 
 /// Pixel formats accepted by the round-2 encoder. All inputs are 8-bit
@@ -445,18 +441,15 @@ fn write_global_modular(
     // predictor field).
     write_gradient_leaf_ma_tree(bw)?;
 
-    // Round-3: ANS-coded symbol stream. We do a two-pass walk over the
-    // pixels:
-    //
-    // 1. First pass — compute the (token, extra_bits) sequence WITHOUT
-    //    writing to the bitstream, building a token histogram.
-    // 2. Quantise the histogram into a 4096-summing ANS distribution.
-    // 3. Emit the ANS prelude (lz77=0, use_prefix_code=0, log_alpha=5,
-    //    HybridUintConfig, distribution).
-    // 4. Emit the ANS-coded tokens with interleaved extras via
-    //    [`encode_symbols_with_extras`].
-    let tokens = collect_pixel_tokens(width, height, pixels, format)?;
-    write_ans_symbol_stream(bw, &tokens)
+    // Symbol stream — round-2 design uses a single-cluster
+    // prefix-coded stream. The MA tree's single leaf has ctx=0; so
+    // num_ctx=1 and there's only one cluster.
+    write_symbol_stream_prelude(bw)?;
+
+    // Per-channel pixel decode (C.16/C.17). Walk pixels in
+    // (channel, y, x) order; emit (token, extra_bits) for each
+    // gradient-predicted residual.
+    write_pixel_data(bw, width, height, pixels, format)
 }
 
 /// Write the MA tree sub-bitstream so the decoder reads a tree with a
@@ -560,75 +553,105 @@ fn write_gradient_leaf_ma_tree(bw: &mut BitWriter) -> Result<()> {
     Ok(())
 }
 
-/// Round-3 ANS symbol stream: prelude + ANS-encoded (token, extras)
-/// pairs.
+/// Emit the symbol-stream prelude (one cluster, complex prefix code
+/// over 16 uniform-length-4 token symbols, hybrid config split_exponent=0).
 ///
-/// Prelude shape (matches `EntropyStream::read(br, num_dist=1)` in the
-/// ANS branch):
-///
-/// ```text
-/// u(1) lz77_enabled = 0
-/// u(1) use_prefix_code = 0  (ANS branch)
-/// u(2) log_alphabet_size_minus_5 = 0  (log_alphabet_size = 5)
-/// HybridUintConfig:
-///     split_exp_bits = ceil(log2(5+1)) = 3 → u(3) = 0  (split_exponent = 0)
-///     since split_exponent != log_alphabet_size, read msb_bits + lsb_bits.
-///     msb_bits = ceil(log2(0+1)) = 0 → no read; msb=0
-///     lsb_bits = ceil(log2(0-0+1)) = 0 → no read; lsb=0
-/// ANS distribution (D.3.4)
-/// ANS state init u(32) + per-symbol decode interleaved with refills + extras
-/// ```
-///
-/// `log_alphabet_size = 5` gives a 32-symbol alphabet which comfortably
-/// covers the round-3 token range:
-/// * Gradient-residual `pack_signed` outputs in `[0, 511]`
-/// * Token T = floor(log2(value)) + 1 for value >= 1, else 0
-/// * Tokens 0..=9 cover [0, 512) → 10 tokens, well under 32.
-fn write_ans_symbol_stream(bw: &mut BitWriter, tokens: &[AnsTokenWithExtras]) -> Result<()> {
-    // 1. Build the histogram of bare ANS tokens (NOT extras).
-    let log_alpha: u32 = 5;
-    let table_size: usize = 1usize << log_alpha;
-    let mut counts = vec![0u32; table_size];
-    for tok in tokens {
-        if (tok.token as usize) >= table_size {
-            return Err(Error::other(format!(
-                "JXL encoder: token {} >= alphabet_size {}",
-                tok.token, table_size
-            )));
-        }
-        counts[tok.token as usize] = counts[tok.token as usize].saturating_add(1);
-    }
-    let total: u32 = counts.iter().sum();
-    if total == 0 {
-        return Err(Error::other(
-            "JXL encoder: ANS symbol stream has zero tokens",
-        ));
-    }
-
-    // 2. Quantise the histogram → 4096-summing distribution.
-    let d = quantise_distribution(&counts, log_alpha)?;
-    let alias = AliasTable::build(&d, log_alpha)?;
-    let inv = build_inverse_alias(&d, &alias)?;
-
-    // 3. Emit the prelude.
+/// This stream is parsed by `EntropyStream::read(br, num_dist=1)`. With
+/// num_dist=1 the cluster map step is skipped per D.3.1; n_clusters=1.
+fn write_symbol_stream_prelude(bw: &mut BitWriter) -> Result<()> {
     bw.write_bit(0); // lz77_enabled = 0
-                     // num_dist = 1 → cluster_map skipped.
-    bw.write_bit(0); // use_prefix_code = 0 (ANS branch)
-                     // log_alphabet_size_minus_5: 2 bits, we pick 0 → log_alphabet_size = 5.
-    bw.write_bits(0, 2)?;
+                     // num_dist=1 → cluster_map skipped.
 
-    // HybridUintConfig: log_alphabet_size = 5.
-    // split_exp_bits = ceil(log2(5 + 1)) = 3.
-    // We pick split_exponent = 0 → token T < 1 returns T directly,
-    // tokens >= 1 carry their value bit-decomposed: token T encodes
-    // values in [2^(T-1), 2^T) with (T-1) extra bits.
-    write_hybrid_uint_config(bw, 0, 0, 0, log_alpha)?;
+    bw.write_bit(1); // use_prefix_code = 1
+                     // log_alphabet_size = 15 (fixed for prefix branch).
 
-    // 4. Emit the ANS distribution preamble.
-    write_distribution(bw, &d, log_alpha)?;
+    // Hybrid uint config for the single cluster:
+    //   split_exponent = 0, msb = 0, lsb = 0 → split = 1
+    // Token T <  1: returns T directly. (Only T==0 takes this branch
+    //                → returns 0.)
+    // Token T >= 1: ReadUint formula. With msb=lsb=0:
+    //   above = T - 1
+    //   n_extra = above >> 0 = T - 1
+    //   n = split_exponent + n_extra = 0 + (T - 1) = T - 1
+    //   tok = (T >> 0) & 0 | (1 << 0) = 1
+    //   shifted = 1 << n = 1 << (T - 1)
+    //   combined = (shifted | extra) << 0 = (1 << (T-1)) | extra
+    //   value = combined | 0 = (1 << (T-1)) | extra
+    // So token T encodes values in [2^(T-1), 2^T) with (T-1) extra bits.
+    //
+    //   T=0 → value = 0 (no extra)
+    //   T=1 → value = 1 (no extra)
+    //   T=2 → values 2..3 (1 extra bit)
+    //   T=3 → values 4..7 (2 extra bits)
+    //   ...
+    //   T=k → values 2^(k-1)..2^k - 1 ((k-1) extra bits)
+    //
+    // Max packed-signed value for 8-bit Gradient residuals: residuals
+    // can be in [-256, 255], so packed values in [0, 511]. 511 fits in
+    // T=9 (covers 256..511). So tokens 0..=9 suffice. We round up the
+    // alphabet to 16 (next pow2) so every symbol has length 4 in the
+    // canonical-Huffman code below.
+    write_hybrid_uint_config(bw, 0, 0, 0, 15)?;
 
-    // 5. Emit the ANS-coded tokens with interleaved extras.
-    encode_symbols_with_extras(bw, tokens, &d, &inv, &alias)?;
+    // Prefix code: complex format, 16 symbols all length 4.
+    // Count selector: u(1)=1 (count > 1), then n=u(4), count = 1 + (1<<n) + u(n).
+    // We want count = 16. Try n = 3: 1 + 8 + u(3) = 9 + u(3). Max value
+    // with n=3 is 9 + 7 = 16. So n=3, u(3)=7 → count=16.
+    bw.write_bit(1); // count > 1
+    bw.write_bits(3, 4)?; // n = 3
+    bw.write_bits(7, 3)?; // u(3) = 7 → count = 16
+                          //
+                          // Then read_prefix_code(br, 16) takes the kind branch:
+                          //   kind = u(2) (0 → complex HSKIP=0, 2 → complex HSKIP=2,
+                          //                3 → complex HSKIP=3, 1 → simple).
+                          // We use kind=0 (complex, HSKIP=0).
+    bw.write_bits(0, 2)?; // kind = 0 → complex HSKIP=0
+
+    // Emit 18 cl_code-length values via the CLCL_VL_TABLE codes:
+    //   CLCL_VL_TABLE entries (sym, code, len):
+    //     (0, 0b00, 2)     LSB-first integer 0b00 = 0  (2 bits)
+    //     (3, 0b01, 2)     LSB-first integer 0b10 = 2  (2 bits)
+    //     (4, 0b10, 2)     LSB-first integer 0b01 = 1  (2 bits)
+    //     (2, 0b110, 3)    LSB-first integer 0b011 = 3 (3 bits)
+    //     (1, 0b1110, 4)   LSB-first integer 0b0111 = 7 (4 bits)
+    //     (5, 0b1111, 4)   LSB-first integer 0b1111 = 15 (4 bits)
+    //
+    // We want only clcl[4] = 1 (single non-zero entry → degenerate
+    // cl_code that always returns sym 4 with 0 bits, satisfying the
+    // RFC 7932 §3.5 special case the decoder handles in
+    // read_complex_prefix).
+    //
+    // K_CODE_LENGTH_CODE_ORDER = [1, 2, 3, 4, 0, 5, 17, 6, 16, ...].
+    // Index 3 → clcl[4]. Indices 0..2, 4..17 → other clcl positions.
+    //
+    // So we emit 17 zeros + 1 one in the right slot.
+    for i in 0..18 {
+        // Position in K_CODE_LENGTH_CODE_ORDER: i. Target clcl index =
+        // K_CODE_LENGTH_CODE_ORDER[i]. We want clcl[4] = 1, all others = 0.
+        let want_one = i == 3; // K_CODE_LENGTH_CODE_ORDER[3] == 4
+        if want_one {
+            // Emit cl-symbol "1" (length 1 in cl_code → goes through clcl[4] = 1).
+            // The clcl array holds the LENGTH of the cl-code's prefix
+            // codeword for cl-symbol i. We want clcl[4] = 1 so that
+            // cl-symbol 4 has a length-1 codeword. The CLCL_VL_TABLE
+            // entry for the literal length value 1 is (1, 0b1110, 4).
+            // LSB-first bits to emit: bit_reverse(0b1110, 4) = 0b0111.
+            bw.write_bits(0b0111, 4)?;
+        } else {
+            // Emit cl-symbol "0" (cl-code length 0). CLCL_VL_TABLE entry
+            // (0, 0b00, 2). LSB-first: 0b00.
+            bw.write_bits(0b00, 2)?;
+        }
+    }
+
+    // Now the cl_code (with single non-zero clcl[4]=1) is the
+    // degenerate single-symbol cl_code that returns cl-symbol 4 with
+    // 0 bits per decode. The decoder then reads `count`=16 cl-symbol
+    // decodes to populate the per-symbol code-length array. Each
+    // returns 4, so all 16 symbols get length 4. We emit zero bits
+    // here.
+
+    // Done with prelude.
     Ok(())
 }
 
@@ -662,8 +685,9 @@ fn write_hybrid_uint_config(
     Ok(())
 }
 
-/// Walk the input pixels in (channel, y, x) order and produce the
-/// (token, extras) sequence the ANS symbol stream will encode.
+/// Walk the input pixels in (channel, y, x) order and emit one symbol
+/// per pixel using the symbol-stream prefix code (token T = packed
+/// gradient residual, with extra bits when packed >= 1).
 ///
 /// Channel layout for our `colour_count + num_extra_channels`:
 ///   * Gray   → channel 0 = Y
@@ -676,24 +700,22 @@ fn write_hybrid_uint_config(
 /// residual = sample. As we walk the image, predictions track local
 /// values closely on natural images, driving most residuals to small
 /// magnitudes.
-///
-/// Token encoding (matches the symbol-stream `HybridUintConfig` with
-/// split_exponent=0, msb=0, lsb=0):
-///   value 0    → token 0, no extra bits
-///   value k>=1 → token T = floor(log2(k)) + 1, extra bits = k - 2^(T-1)
-///                ((T-1) extra bits)
-fn collect_pixel_tokens(
+fn write_pixel_data(
+    bw: &mut BitWriter,
     width: u32,
     height: u32,
     pixels: &[u8],
     format: InputFormat,
-) -> Result<Vec<AnsTokenWithExtras>> {
+) -> Result<()> {
     let stride = format.channel_count() as usize;
     let w = width as usize;
     let h = height as usize;
+    // Maintain a per-channel reconstruction buffer so each prediction
+    // sees the SAME values the decoder will see. (Since we round-trip
+    // exactly, the reconstruction == the input — but mirroring the
+    // decode pattern keeps any future quantisation honest.)
     let nc = format.channel_count() as usize;
     let mut recon: Vec<Vec<i32>> = (0..nc).map(|_| vec![0i32; w * h]).collect();
-    let mut out: Vec<AnsTokenWithExtras> = Vec::with_capacity(w * h * nc);
     for c in 0..nc {
         for y in 0..h {
             for x in 0..w {
@@ -702,45 +724,11 @@ fn collect_pixel_tokens(
                 let diff = v - p;
                 recon[c][y * w + x] = v;
                 let packed = pack_signed(diff);
-                let (token, extra, n_extra) = encode_packed_to_token(packed)?;
-                out.push(AnsTokenWithExtras {
-                    token: token as u16,
-                    extra_value: extra,
-                    extra_bits: n_extra,
-                });
+                write_token_with_extras(bw, packed)?;
             }
         }
     }
-    Ok(out)
-}
-
-/// Map a packed-signed residual `value` to `(token, extra_value, extra_bits)`
-/// using the symbol-stream HybridUintConfig (split_exponent=0, msb=0,
-/// lsb=0). This is the inverse of `read_uint` for that specific config.
-///
-/// * `value == 0` → `(0, 0, 0)` — token 0, no extras.
-/// * `value >= 1` → token T = floor(log2(value)) + 1, extra =
-///   `value - 2^(T-1)` in `T - 1` bits.
-///
-/// Tokens > 31 are rejected (round-3 alphabet is 32 = `1 << 5`).
-fn encode_packed_to_token(value: u32) -> Result<(u32, u32, u32)> {
-    if value == 0 {
-        return Ok((0, 0, 0));
-    }
-    let n = 32 - value.leading_zeros(); // floor(log2(value)) + 1
-    if n > 31 {
-        return Err(Error::other(format!(
-            "JXL encoder: residual value {value} produces token {n} > 31 (alphabet cap)"
-        )));
-    }
-    let token = n;
-    let n_extra = n - 1;
-    let extra = if n_extra == 0 {
-        0
-    } else {
-        value & ((1u32 << n_extra) - 1)
-    };
-    Ok((token, extra, n_extra))
+    Ok(())
 }
 
 /// FDIS Listing C.16 predictor 5 (Gradient): clamp(W+N-NW, min, max).
@@ -769,6 +757,63 @@ fn gradient_predict(buf: &[i32], w: usize, _h: usize, x: usize, y: usize) -> i32
     grad.clamp(lo, hi)
 }
 
+/// Encode one packed-signed residual using the symbol stream's token
+/// distribution:
+///   value 0    → token 0, no extra bits
+///   value k>=1 → token T = floor(log2(k)) + 1, extra bits = k - 2^(T-1)
+///                (T-1 bits)
+///
+/// The token is then encoded with the symbol-stream prefix code. Round
+/// 2 uses a uniform 4-bit code over 16 symbols, so each token costs
+/// exactly 4 bits regardless of value (canonical-Huffman LSB-first
+/// representation).
+fn write_token_with_extras(bw: &mut BitWriter, value: u32) -> Result<()> {
+    let (token, extra, n_extra) = if value == 0 {
+        (0u32, 0u32, 0u32)
+    } else {
+        let n = 32 - value.leading_zeros(); // floor(log2(value)) + 1
+        if n > 16 {
+            return Err(Error::other(format!(
+                "JXL encoder: residual value {value} exceeds token alphabet"
+            )));
+        }
+        let token = n;
+        let n_extra = n - 1;
+        let extra = if n_extra == 0 {
+            0
+        } else {
+            value & ((1u32 << n_extra) - 1)
+        };
+        (token, extra, n_extra)
+    };
+    if token > 15 {
+        return Err(Error::other(format!(
+            "JXL encoder: token {token} exceeds 16-symbol alphabet"
+        )));
+    }
+    // Emit the token's prefix-code codeword. Canonical Huffman with all
+    // 16 symbols at length 4 produces codes 0..15 in symbol-id order,
+    // and JXL reads bits LSB-first → the lookup-table index is the
+    // BIT-REVERSED canonical code. So the bits we emit are
+    // bit_reverse(token, 4).
+    let lsb_first = bit_reverse_4(token);
+    bw.write_bits(lsb_first, 4)?;
+    if n_extra > 0 {
+        bw.write_bits(extra, n_extra)?;
+    }
+    Ok(())
+}
+
+fn bit_reverse_4(x: u32) -> u32 {
+    let mut out = 0u32;
+    for i in 0..4 {
+        if (x >> i) & 1 != 0 {
+            out |= 1 << (3 - i);
+        }
+    }
+    out
+}
+
 fn ceil_log2(x: u32) -> u32 {
     if x <= 1 {
         0
@@ -793,32 +838,12 @@ mod tests {
     }
 
     #[test]
-    fn encode_packed_to_token_zero() {
-        let (t, e, n) = encode_packed_to_token(0).unwrap();
-        assert_eq!(t, 0);
-        assert_eq!(e, 0);
-        assert_eq!(n, 0);
-    }
-
-    #[test]
-    fn encode_packed_to_token_round_trip_small_values() {
-        // Mirror the decoder's ReadUint formula for split=1, msb=0,
-        // lsb=0: token T (T >= 1) → value = (1 << (T-1)) | extra,
-        // where `extra` is read as `T - 1` bits.
-        for v in [0u32, 1, 2, 3, 4, 7, 16, 100, 200, 511] {
-            let (token, extra, n_extra) = encode_packed_to_token(v).unwrap();
-            let recovered: u32 = if v == 0 {
-                assert_eq!(token, 0);
-                assert_eq!(n_extra, 0);
-                0
-            } else {
-                assert_eq!(token, 32 - v.leading_zeros());
-                assert_eq!(n_extra, token - 1);
-                let base = 1u32 << (token - 1);
-                base | extra
-            };
-            assert_eq!(recovered, v, "token round-trip failed for {v}");
-        }
+    fn bit_reverse_4_known_values() {
+        assert_eq!(bit_reverse_4(0b0000), 0b0000);
+        assert_eq!(bit_reverse_4(0b0001), 0b1000);
+        assert_eq!(bit_reverse_4(0b1000), 0b0001);
+        assert_eq!(bit_reverse_4(0b1100), 0b0011);
+        assert_eq!(bit_reverse_4(0b1111), 0b1111);
     }
 
     #[test]
@@ -936,41 +961,25 @@ mod tests {
         assert_eq!(fh.height, 32);
     }
 
-    // (Removed `gradient_leaf_ma_tree_round_trips_via_decoder`: the
-    // round-2 version tried to call `MaTreeFdis::read` on just the tree
-    // bits, but MaTreeFdis::read reads both the tree AND the symbol
-    // stream prelude — so it always failed with "unexpected end of JXL
-    // bitstream". The full-pipeline round-trip in
-    // `ans_coded_grey_8x8_round_trips_through_decoder` exercises the
-    // tree end-to-end via the actual decoder path.)
-
-    /// Round-3: verify the full ANS-coded encoder output decodes back
-    /// to the original pixel buffer via `decode_one_frame`. Exercises
-    /// the entire round-3 ANS pipeline (quantise → preamble → state-
-    /// stream emission → decoder ingest).
+    /// Verify the gradient-leaf MA tree decodes back to a single leaf
+    /// with `predictor=5` (Gradient) and `multiplier=1, offset=0`.
     #[test]
-    fn ans_coded_grey_8x8_round_trips_through_decoder() {
-        // 8x8 deterministic ramp.
-        let mut pixels = Vec::with_capacity(64);
-        for y in 0..8u8 {
-            for x in 0..8u8 {
-                pixels.push(x.wrapping_mul(16).wrapping_add(y * 4));
+    fn gradient_leaf_ma_tree_round_trips_via_decoder() {
+        let mut bw = BitWriter::new();
+        write_gradient_leaf_ma_tree(&mut bw).unwrap();
+        let bytes = bw.finish();
+        let mut br = BitReader::new(&bytes);
+        let tree = crate::modular_fdis::MaTreeFdis::read(&mut br).unwrap();
+        assert_eq!(tree.nodes.len(), 1, "expected a single-leaf tree");
+        match tree.nodes[0] {
+            crate::modular_fdis::MaNode::Leaf(leaf) => {
+                assert_eq!(leaf.predictor, 5, "leaf predictor must be Gradient (5)");
+                assert_eq!(leaf.offset, 0);
+                assert_eq!(leaf.multiplier, 1);
+                assert_eq!(leaf.ctx, 0);
             }
+            _ => panic!("expected a Leaf node"),
         }
-        let bytes = encode_one_frame(8, 8, &pixels, InputFormat::Gray8).unwrap();
-        let frame = crate::decode_one_frame(&bytes, None).unwrap();
-        assert_eq!(frame.planes.len(), 1);
-        assert_eq!(frame.planes[0].data, pixels);
-    }
-
-    /// Round-3: even a constant grey image should round-trip — the ANS
-    /// path's single-symbol short branch should kick in (all token=0).
-    #[test]
-    fn ans_coded_grey_constant_round_trips() {
-        let pixels = vec![128u8; 64];
-        let bytes = encode_one_frame(8, 8, &pixels, InputFormat::Gray8).unwrap();
-        let frame = crate::decode_one_frame(&bytes, None).unwrap();
-        assert_eq!(frame.planes.len(), 1);
-        assert_eq!(frame.planes[0].data, pixels);
+        assert_eq!(tree.num_ctx, 1);
     }
 }
