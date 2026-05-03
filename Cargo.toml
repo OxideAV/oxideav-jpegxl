@@ -6,7 +6,7 @@ rust-version = "1.80"
 license = "MIT"
 repository = "https://github.com/OxideAV/oxideav-jpegxl"
 authors = ["Mark Karpeles"]
-description = "Pure-Rust JPEG XL (JXL) codec — signature + container detection, SizeHeader + partial ImageMetadata parsing, plus Modular sub-bitstream channel decode (ABRAC + BEGABRAC + MA-tree + named predictors per the 2019 committee draft); full whole-image decode pending FrameHeader/TOC wiring"
+description = "Pure-Rust JPEG XL (JXL) codec — signature + container detection, SizeHeader + ImageMetadata + FrameHeader + TOC + Modular sub-bitstream decode (FDIS Annex D ANS / prefix entropy + MA-tree + named predictors); round-1 lossless modular encoder for Gray/RGB/RGBA at 8 bpp"
 
 readme = "README.md"
 homepage = "https://github.com/OxideAV/oxideav-jpegxl"

@@ -94,7 +94,9 @@ pub mod abrac;
 pub mod ans;
 pub mod begabrac;
 pub mod bitreader;
+pub mod bitwriter;
 pub mod container;
+pub mod encoder;
 pub mod extensions;
 pub mod frame_header;
 pub mod global_modular;
@@ -110,10 +112,12 @@ pub mod toc;
 pub use container::{detect, extract_codestream, Signature};
 pub use metadata::{parse_headers, BitDepth, Headers, ImageMetadata, SizeHeader};
 
-use oxideav_core::{CodecCapabilities, CodecId, CodecParameters, Error, Result};
+use oxideav_core::{CodecCapabilities, CodecId, CodecParameters, Error, PixelFormat, Result};
 use oxideav_core::{
-    CodecInfo, CodecRegistry, Decoder, Encoder, Frame, Packet, VideoFrame, VideoPlane,
+    CodecInfo, CodecRegistry, Decoder, Encoder, Frame, Packet, TimeBase, VideoFrame, VideoPlane,
 };
+
+use crate::encoder::{encode_one_frame as encoder_encode_one_frame, InputFormat};
 
 use crate::bitreader::BitReader;
 use crate::frame_header::{FrameDecodeParams, FrameHeader};
@@ -124,8 +128,8 @@ use crate::toc::Toc;
 /// Public codec id string. Matches the aggregator feature name `jpegxl`.
 pub const CODEC_ID_STR: &str = "jpegxl";
 
-/// Register the JPEG XL decoder stub. The encoder slot is intentionally
-/// left unregistered: the crate is decoder-side only.
+/// Register the JPEG XL codec — decoder + round-1 lossless modular
+/// encoder.
 pub fn register(reg: &mut CodecRegistry) {
     let caps = CodecCapabilities::video("jpegxl_headers_only")
         .with_lossy(true)
@@ -133,7 +137,8 @@ pub fn register(reg: &mut CodecRegistry) {
     reg.register(
         CodecInfo::new(CodecId::new(CODEC_ID_STR))
             .capabilities(caps)
-            .decoder(make_decoder),
+            .decoder(make_decoder)
+            .encoder(make_encoder),
     );
 }
 
@@ -365,13 +370,126 @@ pub fn probe(input: &[u8]) -> Result<Headers> {
     parse_headers(input)
 }
 
-/// Encoder slot, always rejected. Exposed for completeness so callers
-/// that wire an `Encoder` factory by codec id get a clean `Unsupported`
-/// error instead of `CodecNotFound`.
-pub fn make_encoder(_params: &CodecParameters) -> Result<Box<dyn Encoder>> {
-    Err(Error::Unsupported(
-        "jxl encode is out of scope for this crate".into(),
-    ))
+/// Round-1 minimal lossless modular JPEG XL encoder.
+///
+/// Accepts `pixel_format ∈ {Gray8, Rgb24, Rgba}` at any width/height up
+/// to 1024×1024 (the single-group cap of the round-1 implementation).
+/// Larger images return [`Error::Unsupported`].
+pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
+    let codec_id = params.codec_id.clone();
+    let pixel_format = params
+        .pixel_format
+        .ok_or_else(|| Error::other("jxl encoder: pixel_format required (Gray8, Rgb24 or Rgba)"))?;
+    let input_format = match pixel_format {
+        PixelFormat::Gray8 => InputFormat::Gray8,
+        PixelFormat::Rgb24 => InputFormat::Rgb8,
+        PixelFormat::Rgba => InputFormat::Rgba8,
+        other => {
+            return Err(Error::Unsupported(format!(
+                "jxl encoder: pixel_format {other:?} not supported (round 1 is Gray8/Rgb24/Rgba only)"
+            )));
+        }
+    };
+    let width = params
+        .width
+        .ok_or_else(|| Error::other("jxl encoder: width required in CodecParameters"))?;
+    let height = params
+        .height
+        .ok_or_else(|| Error::other("jxl encoder: height required in CodecParameters"))?;
+    let output_params = params.clone();
+    Ok(Box::new(JxlEncoder {
+        codec_id,
+        input_format,
+        width,
+        height,
+        output_params,
+        pending_packet: None,
+        eof: false,
+    }))
+}
+
+/// Round-1 JPEG XL encoder. Accepts one [`Frame`] per call to
+/// [`Encoder::send_frame`] and emits exactly one [`Packet`] containing
+/// the full codestream from [`Encoder::receive_packet`].
+struct JxlEncoder {
+    codec_id: CodecId,
+    input_format: InputFormat,
+    width: u32,
+    height: u32,
+    output_params: CodecParameters,
+    pending_packet: Option<Packet>,
+    eof: bool,
+}
+
+impl Encoder for JxlEncoder {
+    fn codec_id(&self) -> &CodecId {
+        &self.codec_id
+    }
+
+    fn output_params(&self) -> &CodecParameters {
+        &self.output_params
+    }
+
+    fn send_frame(&mut self, frame: &Frame) -> Result<()> {
+        if self.pending_packet.is_some() {
+            return Err(Error::other(
+                "jxl encoder: receive_packet must be called before sending another frame",
+            ));
+        }
+        let vf = match frame {
+            Frame::Video(vf) => vf,
+            _ => {
+                return Err(Error::other("jxl encoder: only Video frames are supported"));
+            }
+        };
+        if vf.planes.len() != 1 {
+            return Err(Error::Unsupported(format!(
+                "jxl encoder: expected 1 interleaved plane, got {}",
+                vf.planes.len()
+            )));
+        }
+        let plane = &vf.planes[0];
+        let channels = self.input_format.channel_count() as usize;
+        let expected_stride = self.width as usize * channels;
+        if plane.stride != expected_stride {
+            return Err(Error::other(format!(
+                "jxl encoder: plane stride {} != expected {} for {}x{} {:?}",
+                plane.stride, expected_stride, self.width, self.height, self.input_format
+            )));
+        }
+        let expected_len = expected_stride * self.height as usize;
+        if plane.data.len() != expected_len {
+            return Err(Error::other(format!(
+                "jxl encoder: plane data len {} != expected {}",
+                plane.data.len(),
+                expected_len
+            )));
+        }
+        let data =
+            encoder_encode_one_frame(self.width, self.height, &plane.data, self.input_format)?;
+        self.pending_packet = Some(
+            Packet::new(0, TimeBase::new(1, 1), data)
+                .with_keyframe(true)
+                .with_pts(vf.pts.unwrap_or(0)),
+        );
+        Ok(())
+    }
+
+    fn receive_packet(&mut self) -> Result<Packet> {
+        if let Some(pkt) = self.pending_packet.take() {
+            return Ok(pkt);
+        }
+        if self.eof {
+            Err(Error::Eof)
+        } else {
+            Err(Error::NeedMore)
+        }
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        self.eof = true;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -407,8 +525,30 @@ mod tests {
     }
 
     #[test]
-    fn encoder_factory_rejects_cleanly() {
+    fn encoder_factory_requires_pixel_format() {
+        // Round-1 encoder rejects the bare-minimum params: no pixel
+        // format set, no width, no height — we expect a descriptive
+        // error pointing the caller at the missing fields.
         let params = CodecParameters::video(CodecId::new(CODEC_ID_STR));
+        assert!(make_encoder(&params).is_err());
+    }
+
+    #[test]
+    fn encoder_factory_accepts_rgb24_with_dimensions() {
+        let mut params = CodecParameters::video(CodecId::new(CODEC_ID_STR));
+        params.width = Some(8);
+        params.height = Some(8);
+        params.pixel_format = Some(PixelFormat::Rgb24);
+        let enc = make_encoder(&params).expect("expected live encoder");
+        assert_eq!(enc.codec_id().as_str(), CODEC_ID_STR);
+    }
+
+    #[test]
+    fn encoder_factory_rejects_unsupported_pixel_format() {
+        let mut params = CodecParameters::video(CodecId::new(CODEC_ID_STR));
+        params.width = Some(8);
+        params.height = Some(8);
+        params.pixel_format = Some(PixelFormat::Yuv420P);
         assert!(matches!(make_encoder(&params), Err(Error::Unsupported(_))));
     }
 }
