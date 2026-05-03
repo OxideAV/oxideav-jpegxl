@@ -55,10 +55,10 @@ fn cjxl_grey_8x8_dump_first_bytes() {
 ///   3. RFC 7932 §3.4 simple-prefix length assignment reverted to
 ///      per-RFC (first-read gets length 1, NOT smallest-sorted).
 ///
-/// CI will reveal whether these three fixes together unblock the
-/// fixture; we cannot run the bisection harness locally per workspace
-/// policy. See `tests/cjxl_grey_8x8_trace.rs` for the bit-by-bit
-/// trace harness used for round-8 starting-point analysis.
+/// See `tests/cjxl_grey_8x8_trace.rs` for the bit-by-bit trace
+/// harness used for round-8 starting-point analysis.
+/// `cjxl_grey_8x8_round7_kraft_error_is_resolved` (below) hard-asserts
+/// the round-7 error message no longer appears.
 #[test]
 fn cjxl_grey_8x8_decode_attempt() {
     use oxideav_jpegxl::decode_one_frame;
@@ -79,5 +79,31 @@ fn cjxl_grey_8x8_decode_attempt() {
             // interpretation rules.
             eprintln!("cjxl_grey_8x8 round-3 stop point: {e}");
         }
+    }
+}
+
+/// Hard-asserts the round-7 stop-point error ("code lengths grossly
+/// overflow Kraft sum (kraft=135104, alphabet_size=257, max_length=13)")
+/// does NOT appear when decoding the cjxl 8x8 grey lossless fixture.
+/// Round 8 (`from_lengths` per-alphabet Kraft budget + RFC §3.5
+/// single-non-zero clcl + RFC §3.4 simple-prefix length assignment
+/// reverted to per-RFC) was specifically targeted at this error. This
+/// test fails loudly if a regression brings the error back, OR if a
+/// later round breaks the symbol-stream-prelude in a way that
+/// reintroduces the same Kraft overshoot.
+///
+/// The decode itself is allowed to fail with a DIFFERENT error
+/// (round 9 will pick up wherever the new stop point is). Only the
+/// specific round-7 error message is rejected.
+#[test]
+fn cjxl_grey_8x8_round7_kraft_error_is_resolved() {
+    use oxideav_jpegxl::decode_one_frame;
+    let res = decode_one_frame(FIXTURE, None);
+    if let Err(e) = res {
+        let msg = format!("{e}");
+        assert!(
+            !msg.contains("kraft=135104"),
+            "round-7 error message reappeared: {msg}"
+        );
     }
 }
