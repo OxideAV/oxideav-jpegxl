@@ -82,48 +82,38 @@ fn cjxl_grey_8x8_decode_attempt() {
     }
 }
 
-/// Hard-asserts the round-7 stop-point error ("code lengths grossly
-/// overflow Kraft sum (kraft=135104, alphabet_size=257, max_length=13)")
-/// does NOT appear when decoding the cjxl 8x8 grey lossless fixture.
-/// Round 8 (`from_lengths` per-alphabet Kraft budget + RFC §3.5
-/// single-non-zero clcl + RFC §3.4 simple-prefix length assignment
-/// reverted to per-RFC) was specifically targeted at this error. This
-/// test fails loudly if a regression brings the error back, OR if a
-/// later round breaks the symbol-stream-prelude in a way that
-/// reintroduces the same Kraft overshoot.
+/// Round-8 status: typo #8 NOT YET RESOLVED. The literal round-7 error
+/// message ("kraft=135104") was reformatted to ("kraft=33776,
+/// budget=8192") by round-8's per-budget Kraft computation, but the
+/// underlying 4×-over-budget situation is unchanged. See the round-8
+/// CHANGELOG entry for round-9's bisection plan.
 ///
-/// The decode itself is allowed to fail with a DIFFERENT error
-/// (round 9 will pick up wherever the new stop point is). Only the
-/// specific round-7 error message is rejected.
+/// This test is a CI tripwire: if a future round actually unblocks the
+/// decoder (or breaks it in a new way), the assertion below will fire
+/// and force documentation of the new state.
 #[test]
-fn cjxl_grey_8x8_round7_kraft_error_is_resolved() {
+fn cjxl_grey_8x8_round8_typo8_unresolved_tripwire() {
     use oxideav_jpegxl::decode_one_frame;
     let res = decode_one_frame(FIXTURE, None);
-    if let Err(e) = res {
-        let msg = format!("{e}");
-        assert!(
-            !msg.contains("kraft=135104"),
-            "round-7 error message reappeared: {msg}"
-        );
-    }
-}
-
-/// **TEMPORARY** round-8 diagnostic: this test PANICS with the
-/// current decode error so a CI run reveals exactly where the
-/// round-8 fixes' new stop point lies. Once the round-9 agent has
-/// captured the new error and added it to the CHANGELOG / memos,
-/// this test should be removed (or its `panic!` softened to an
-/// `eprintln!` like `cjxl_grey_8x8_decode_attempt` above).
-#[test]
-fn cjxl_grey_8x8_round9_diagnostic_panics_with_new_stop_point() {
-    use oxideav_jpegxl::decode_one_frame;
-    match decode_one_frame(FIXTURE, None) {
+    match res {
         Ok(_) => {
-            // Decode succeeded! Round 8 fully unblocked the fixture.
-            // Future rounds can promote this to a strict-assert test.
+            panic!(
+                "decode unexpectedly succeeded — round 8 was 'behaviour-neutral' \
+                 per the CHANGELOG. If a real fix landed, update this test to a \
+                 hard-assert of pixel correctness, OR re-purpose it as a \
+                 'cjxl_grey_8x8 fully decodes' assertion."
+            );
         }
         Err(e) => {
-            panic!("round-8 decoder stops at: {e}");
+            let msg = format!("{e}");
+            // Round-8 expected stop point: kraft=33776, budget=8192.
+            // If the new error is DIFFERENT, fail loudly so round-9
+            // updates this assertion.
+            assert!(
+                msg.contains("kraft=33776") && msg.contains("budget=8192"),
+                "round-8 stop-point error message changed unexpectedly: {msg}\n\
+                 (was expecting 'kraft=33776, budget=8192' per CHANGELOG)"
+            );
         }
     }
 }

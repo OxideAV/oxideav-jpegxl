@@ -37,28 +37,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   test was asserting the round-3 (incorrect) behaviour and has been
   updated to assert the per-RFC behaviour.
 
-### Round 8 stop point
+### Round 8 outcome — typo #8 NOT YET RESOLVED, fixes were behaviour-neutral
 
-Round 8's three fixes together (Kraft budget per max_length, single-non-zero
-clcl special case, simple-prefix per-RFC length assignment) MAY unblock
-the cjxl 8x8 grey lossless fixture's second per-cluster prefix code
-decode — but with no ability to run the cjxl_grey_8x8_trace bisection
-harness in this round (workspace policy: agents cannot run cargo), the
-fix is committed for CI to verify. If CI shows the round-7 stop point
-is gone but a NEW failure appears further into the symbol-stream
-decode (e.g. ANS state init, MA tree pixel walk, or Palette/RCT
-inverse transforms), that's the round-9 starting point.
+CI confirms the LITERAL round-7 error message (`kraft=135104, alphabet_size=257,
+max_length=13`) no longer appears, but the underlying stop point is
+unchanged. The new error message is:
 
-If CI still shows kraft=135104 (the round-7 error), then the actual
-bug is something OTHER than what round 8 changed — likely a
-bit-position misalignment earlier in the decode that this round didn't
-catch. Future agent should:
-1. Build a Python re-decoder of the cjxl 8x8 fixture bitstream up to
-   the failing prefix code (we tried and got partway through metadata
-   parsing — see notes in this task's transcript).
-2. Compare the bit positions before each per-cluster prefix code
-   against the test's `eprintln!`'d cluster boundaries.
-3. Bisect down to the off-by-N-bits offender.
+```
+JXL prefix: code lengths grossly overflow Kraft sum (kraft=33776, budget=8192, alphabet_size=257, max_length=13)
+```
+
+33776 / 8192 = 4.123 — the SAME 4× over-budget ratio as before
+(135104 / 32768 = 4.123), just expressed in the new per-max_length
+budget (8192 = 1<<13). So the decoder still hits the exact same
+malformed-symbol-code situation, only the error format changed.
+
+Implications:
+- All three round-8 fixes were "behaviour-neutral" for this fixture:
+  the simple-prefix change only matters for NSYM=3/4 (cluster 0 here
+  is NSYM=2), the single-non-zero clcl case never triggered (so the
+  cl_code was built canonically as before), and the per-budget Kraft
+  computation only changes error message phrasing.
+- The actual root cause is STILL one of the five hypotheses listed in
+  `project_jpegxl_fdis_typos.md` (typo #8 entry). Round 9 should
+  pursue:
+  1. **Bit-position misalignment earlier in the decode pipeline.** Try
+     adding a Python re-decoder that walks the entire bitstream up to
+     the second prefix code, comparing bit positions against the
+     trace test's `eprintln!`'d cluster boundaries.
+  2. **Non-trivial cl_code interpretation difference.** Consider
+     whether libjxl applies any additional normalization to cl_code
+     lengths beyond what RFC 7932 §3.5 specifies.
+  3. **`HybridUintConfig` reading off-by-one.** Check D.3.7 against
+     the trace doc's §3.6 description.
+- The diagnostic test `cjxl_grey_8x8_round9_diagnostic_panics_with_new_stop_point`
+  remains in the test suite as a CI tripwire that surfaces the new
+  error message on every push. Round 9 should soften / remove it
+  once a real fix lands.
 
 ### Fixed (round 7, 2026-05-02)
 
