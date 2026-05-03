@@ -1,0 +1,38 @@
+[package]
+name = "oxideav-jpegxl-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+oxideav-core = "0.1"
+# libloading is the only libjxl interop: the cross-decode harness
+# `dlopen`s the system-installed libjxl at startup. No `*-sys` crate,
+# no libjxl source pulled into the dep tree (workspace policy bars
+# external library code as reference). The harness skips silently
+# when libjxl isn't installed (see fuzz/src/lib.rs).
+libloading = "0.8"
+
+[dependencies.oxideav-jpegxl]
+path = ".."
+
+[lib]
+name = "oxideav_jpegxl_fuzz"
+path = "src/lib.rs"
+
+# Prevent this from interfering with workspaces
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "libjxl_encode_oxideav_decode"
+path = "fuzz_targets/libjxl_encode_oxideav_decode.rs"
+test = false
+doc = false
