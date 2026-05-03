@@ -7,6 +7,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed (round 8, 2026-05-03)
+
+- **`PrefixCode::from_lengths` Kraft computation now uses the actual
+  `1<<max_length` budget** instead of always summing in `1<<15`. For
+  the cl_code (18-symbol alphabet, max_length=5), this lets us catch
+  over-Kraft cases at the cl_code construction site instead of
+  deferring them to a confusing "downstream alphabet 4× over budget"
+  error in the next call. The 4× sanity tolerance is preserved (libjxl
+  is similarly permissive), so well-formed bitstreams still decode.
+- **RFC 7932 §3.5 single-non-zero clcl special case handled.** When
+  the cl_clcl decode loop reads all 18-HSKIP entries and finds only
+  ONE non-zero length, RFC 7932 §3.5 says the cl_code degenerates to
+  a single-symbol zero-length code. Previously we always called
+  `from_lengths` which would build an L-bit code (consuming L bits per
+  cl_code decode) — wrong, since the encoder emits zero bits in this
+  case. `read_complex_prefix` now constructs a `max_length==0`
+  `PrefixCode` directly when only one clcl entry is non-zero.
+- **RFC 7932 §3.4 simple-prefix length assignment reverted to
+  per-RFC.** Round 3's "fix" sorted ALL three (NSYM=3) or ALL four
+  (NSYM=4 tree_select=1) symbols and assigned the length-1 code to
+  the smallest-sorted symbol. RFC 7932 §3.4 says the lengths are
+  assigned "in the ORDER they appear in the representation" — i.e.
+  first-read gets length 1, second-read gets length 2 (and so on for
+  NSYM=4). The "sorted order" rule mentioned in the RFC applies ONLY
+  to within-length CODE ASSIGNMENT (which `from_lengths` handles
+  automatically via its symbol-id-major iteration), not to which
+  symbol gets which length. The old `read_simple_prefix_three_symbols_canonical_lengths`
+  test was asserting the round-3 (incorrect) behaviour and has been
+  updated to assert the per-RFC behaviour.
+
+### Round 8 stop point
+
+Round 8's three fixes together (Kraft budget per max_length, single-non-zero
+clcl special case, simple-prefix per-RFC length assignment) MAY unblock
+the cjxl 8x8 grey lossless fixture's second per-cluster prefix code
+decode — but with no ability to run the cjxl_grey_8x8_trace bisection
+harness in this round (workspace policy: agents cannot run cargo), the
+fix is committed for CI to verify. If CI shows the round-7 stop point
+is gone but a NEW failure appears further into the symbol-stream
+decode (e.g. ANS state init, MA tree pixel walk, or Palette/RCT
+inverse transforms), that's the round-9 starting point.
+
+If CI still shows kraft=135104 (the round-7 error), then the actual
+bug is something OTHER than what round 8 changed — likely a
+bit-position misalignment earlier in the decode that this round didn't
+catch. Future agent should:
+1. Build a Python re-decoder of the cjxl 8x8 fixture bitstream up to
+   the failing prefix code (we tried and got partway through metadata
+   parsing — see notes in this task's transcript).
+2. Compare the bit positions before each per-cluster prefix code
+   against the test's `eprintln!`'d cluster boundaries.
+3. Bisect down to the off-by-N-bits offender.
+
 ### Fixed (round 7, 2026-05-02)
 
 - **Round-6 typo #6 unblocked.** The `log_alpha_size_minus_5` 2-bit

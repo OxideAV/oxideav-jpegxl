@@ -44,20 +44,21 @@ fn cjxl_grey_8x8_dump_first_bytes() {
 /// does NOT fail the suite if it's an expected error. A successful
 /// decode asserts pixel-perfect equality with the source PGM (all 128s).
 ///
-/// Round-7 status (this commit, after typo-#6 fix): the decoder now
-/// gets ALL THE WAY through SizeHeader, ImageMetadata, FrameHeader,
-/// TOC, LfChannelDequantization, GlobalModular preamble + the MA tree
-/// itself (7 nodes correctly decoded — 3 decisions on property 0 with
-/// values 2/4/0, then 4 leaves all using predictor=5 / Gradient),
-/// symbol-stream entropy prelude (lz77 enabled, cluster_map decode,
-/// 5 HybridUintConfigs, 5 prefix-code counts). It STOPS at the SECOND
-/// per-cluster prefix code's complex-prefix decode: cjxl emits a clcl
-/// array whose Brotli-§3.5 cl_code Kraft sum is 37 (over 32), which
-/// produces a downstream Huffman lookup whose Kraft sum is ~4×. djxl
-/// decodes this fixture, so cjxl is well-formed — our complex-prefix
-/// reader has a subtle interpretation bug not fully covered by
-/// `docs/image/jpegxl/libjxl-trace-reverse-engineering.md`. See
-/// `tests/cjxl_grey_8x8_trace.rs` for a bit-by-bit bisection.
+/// Round-8 status (this commit): three fixes attempted to unblock the
+/// round-7 stop point (cl_code Kraft 37 in the second per-cluster
+/// prefix code):
+///   1. `PrefixCode::from_lengths` now sums Kraft in the actual
+///      `1<<max_length` budget instead of always `1<<15`.
+///   2. RFC 7932 §3.5 single-non-zero clcl special case (degenerate
+///      single-symbol zero-length code) is now handled in
+///      `read_complex_prefix`.
+///   3. RFC 7932 §3.4 simple-prefix length assignment reverted to
+///      per-RFC (first-read gets length 1, NOT smallest-sorted).
+///
+/// CI will reveal whether these three fixes together unblock the
+/// fixture; we cannot run the bisection harness locally per workspace
+/// policy. See `tests/cjxl_grey_8x8_trace.rs` for the bit-by-bit
+/// trace harness used for round-8 starting-point analysis.
 #[test]
 fn cjxl_grey_8x8_decode_attempt() {
     use oxideav_jpegxl::decode_one_frame;

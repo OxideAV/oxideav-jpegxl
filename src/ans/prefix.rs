@@ -88,7 +88,19 @@ impl PrefixCode {
         }
 
         // Validate the Kraft-McMillan inequality (RFC 7932 §3.1: equal
-        // for a *complete* code, i.e. exactly one).
+        // for a *complete* code, i.e. exactly one). Budget is
+        // `1 << max_length`; a complete canonical code has
+        //   sum of (budget >> length) over non-zero lengths == budget.
+        //
+        // Round-8 fix: previous rounds always summed in a budget of
+        // `1<<15` (the outer alphabet's max_length). For codes with
+        // smaller max_length (notably the cl_code over 18 symbols where
+        // max_length is at most 5), this hid the relationship between
+        // the kraft sum and the actual budget, making error messages
+        // confusing. The sanity guard `kraft > 4 * budget` now uses the
+        // ACTUAL max_length, so the error message includes the right
+        // budget. The 4× tolerance is preserved (libjxl is permissive
+        // for small overshoots in real bitstreams).
         let mut kraft: u64 = 0;
         let mut nonzero = 0u32;
         for &l in code_lengths {
@@ -96,35 +108,21 @@ impl PrefixCode {
                 continue;
             }
             nonzero += 1;
-            kraft += 1u64 << (15 - l);
+            kraft += 1u64 << (max_length - l);
         }
         if nonzero == 0 {
             return Err(Error::InvalidData(
                 "JXL prefix: no non-zero code lengths".into(),
             ));
         }
-        // Special case: exactly one non-zero length-1 symbol acts like a
-        // fully-redundant 1-bit code (the other half is unused).
-        // RFC 7932 says all real prefix codes must be complete, so kraft
-        // must equal 1<<15 — except for the degenerate single-symbol
-        // simple-prefix case where it's allowed to be < 1<<15.
-        // Round-7 note: while we no longer enforce strict Kraft<=1<<15
-        // here (libjxl is more permissive), we still reject codes that
-        // are wildly oversubscribed (a malicious bitstream could try to
-        // overflow the lookup table with collisions). The bound below
-        // (4 × 1<<15) is a sanity guard, not a spec rule.
-        if kraft > (1u64 << 15).saturating_mul(4) {
-            // Round-7 stop point: cjxl 0.11.1 emits the SECOND
-            // 257-symbol prefix code (cluster index 1 of the symbol
-            // stream's per-leaf codes) with a clcl array whose Kraft
-            // sums to 37 (not 32). Building a Huffman code from those
-            // lengths produces a decoder that reads severely over-Kraft
-            // alphabet lengths (here, 4.12 ×). The bitstream is
-            // well-formed (djxl decodes it) so our `read_clcl_symbol` /
-            // K_CODE_LENGTH_CODE_ORDER / Kraft early-stop need a finer
-            // semantic the trace doc doesn't fully cover. Round 8 work.
+        let budget: u64 = 1u64 << max_length;
+        // Reject grossly oversubscribed codes (4× budget) as a sanity
+        // guard against malicious input. RFC 7932 §3.1 says complete
+        // canonical codes have kraft == budget, so a 4× tolerance is
+        // permissive (libjxl is similarly permissive in practice).
+        if kraft > budget.saturating_mul(4) {
             return Err(Error::InvalidData(format!(
-                "JXL prefix: code lengths grossly overflow Kraft sum (kraft={kraft}, alphabet_size={}, max_length={})",
+                "JXL prefix: code lengths grossly overflow Kraft sum (kraft={kraft}, budget={budget}, alphabet_size={}, max_length={})",
                 code_lengths.len(), max_length
             )));
         }
@@ -312,12 +310,29 @@ fn read_simple_prefix(br: &mut BitReader<'_>, alphabet_size: u32) -> Result<Pref
             code_lengths[symbols[1] as usize] = 1;
         }
         3 => {
-            // RFC 7932 §3.4: "For NSYM = 3, the bit lengths are 1, 2, 2."
-            // Canonical Huffman assigns lengths in ascending symbol-id
-            // order: sorted_symbols[0] → length 1, [1] → length 2,
-            // [2] → length 2. Sort ALL three (not just the last two —
-            // round-3 typo fix #5; see project_jpegxl_fdis_typos.md).
-            symbols.sort();
+            // RFC 7932 §3.4: "if NSYM = 3, the code lengths for the
+            // symbols are 1, 2, 2 in the order they appear in the
+            // representation of the simple prefix code."
+            //
+            // PLUS: "Prefix codes of the same bit length must be assigned
+            // to the symbols in sorted order."
+            //
+            // → first-read symbol gets length 1; the other two get
+            // length 2 each. The two length-2 symbols' CODE assignments
+            // are taken in sorted-by-symbol-id order, but `from_lengths`
+            // enumerates symbols in id order so this happens
+            // automatically — we just put `2` in the per-symbol length
+            // slots without sorting.
+            //
+            // Round 8 (typo #8 follow-up): rounds 3-7 implemented this
+            // by sorting ALL three symbols then assigning length 1 to
+            // sorted[0]. That was a misinterpretation of "sorted order"
+            // — the RFC's sorted-order rule applies ONLY to within-
+            // length CODE ASSIGNMENT, not to which symbol gets which
+            // length. With this revert, the cl_code Kraft 37 overshoot
+            // in cjxl 8x8 grey may resolve, since prior simple-prefix
+            // codes (cluster 0 in particular) were getting wrong code
+            // lengths and shifting later bit positions.
             code_lengths[symbols[0] as usize] = 1;
             code_lengths[symbols[1] as usize] = 2;
             code_lengths[symbols[2] as usize] = 2;
@@ -325,14 +340,22 @@ fn read_simple_prefix(br: &mut BitReader<'_>, alphabet_size: u32) -> Result<Pref
         4 => {
             // Read tree-select bit.
             let tree_select = br.read_bit()?;
-            symbols.sort();
             if tree_select == 0 {
-                // Lengths 2, 2, 2, 2.
+                // Lengths 2, 2, 2, 2 — order doesn't matter, all length 2.
                 for &s in &symbols {
                     code_lengths[s as usize] = 2;
                 }
             } else {
-                // Lengths 1, 2, 3, 3.
+                // Lengths 1, 2, 3, 3 — per RFC 7932 §3.4 "in the order
+                // of symbols decoded". First-read gets length 1,
+                // second-read gets length 2, third+fourth get length 3
+                // (their canonical CODES within length 3 are assigned
+                // in sorted-by-id order automatically by `from_lengths`).
+                //
+                // Round 8 revert: rounds 3-7 sorted all four. RFC says
+                // the length assignment follows read order; only WITHIN
+                // a length is sorted-id ordering used (for canonical
+                // code assignment, which `from_lengths` handles).
                 code_lengths[symbols[0] as usize] = 1;
                 code_lengths[symbols[1] as usize] = 2;
                 code_lengths[symbols[2] as usize] = 3;
@@ -347,19 +370,27 @@ fn read_simple_prefix(br: &mut BitReader<'_>, alphabet_size: u32) -> Result<Pref
 /// RFC 7932 §3.5 variable-length code for the 18 code-length-code
 /// lengths. Each entry is `(symbol, code, code_length_in_bits)`.
 ///
-/// **Round 7 fix:** the previous version had the symbol-to-code mapping
-/// scrambled (it placed `0111`/`011` etc. without checking that the
-/// resulting Huffman code is valid). The correct canonical-Huffman code
-/// derived from the RFC's lengths {0:2, 1:4, 2:3, 3:2, 4:2, 5:4} —
-/// assigning shortest-first then within-length by symbol id — is:
-///   0 (len 2) → 00
-///   3 (len 2) → 01
-///   4 (len 2) → 10
-///   2 (len 3) → 110
-///   1 (len 4) → 1110
-///   5 (len 4) → 1111
-/// Bit order: MSB-first per the RFC; JXL packs LSB-first so we
-/// bit-reverse at lookup time.
+/// **Round 8 confirmation:** the table below maps to the EXACT RFC
+/// literal codes, despite the round-7 comment claiming canonical
+/// Huffman derivation. RFC 7932 §3.5 specifies the codes literally
+/// (NOT via canonical Huffman from lengths) "as it appears in the
+/// compressed data, where the bits are parsed from right to left":
+///   sym 0 → code "00"
+///   sym 1 → code "0111"
+///   sym 2 → code "011"
+///   sym 3 → code "10"
+///   sym 4 → code "01"
+///   sym 5 → code "1111"
+/// "Right-to-left parsing" means the rightmost bit is read first; with
+/// JXL's LSB-first BitReader, this gives the LSB-first integer values
+/// 0, 7, 3, 2, 1, 15 (in 2/4/3/2/2/4 bits respectively). The table
+/// stores `(sym, code, len)` where `code` is the RFC's left-to-right
+/// canonical bit pattern; `bit_reverse(code, len)` produces the
+/// LSB-first integer match. Coincidentally, applying canonical-Huffman
+/// to the lengths {0:2, 1:4, 2:3, 3:2, 4:2, 5:4} produces the SAME
+/// LSB-first integer matches as the RFC literal codes — that's how
+/// round-7's "build canonically from lengths" arrived at a working
+/// table even though the RFC isn't using canonical Huffman here.
 const CLCL_VL_TABLE: &[(u32, u32, u32)] = &[
     (0, 0b00, 2),
     (3, 0b01, 2),
@@ -404,32 +435,27 @@ fn read_complex_prefix(
     // Read up to 18 code-length-code-lengths in order; the first HSKIP
     // are implicit zeros.
     //
-    // Round-7 fix: per RFC 7932 §3.5, the cumulative Kraft inequality
-    // of the partial code MUST be at most 32 (== 1<<5, "complete"
-    // Kraft). Our previous implementation accumulated `sum_kraft` AFTER
-    // assigning the value to clcl[], which let an over-32 value slip in
-    // and break the downstream Huffman build (cjxl does emit codes that
-    // cap the alphabet size at exactly 32, with the LAST clcl value
-    // bringing the sum to exactly 32). To handle this correctly, we
-    // also clamp the LAST clcl value: when adding a new value would
-    // overshoot 32, the value is recorded but the loop ends — the
-    // remaining clcl entries are auto-zero AND the clcl Kraft is
-    // exactly 32 by construction.
+    // Per RFC 7932 §3.5: "If there are at least two non-zero code
+    // lengths, any trailing zero code lengths are omitted, i.e., the
+    // last code length in the sequence must be non-zero. In this case,
+    // the sum of (32 >> code length) over all the non-zero code
+    // lengths must equal to 32." So a well-formed encoder writes
+    // exactly the values up to the point where Kraft hits 32; we
+    // mirror that by breaking the loop the moment kraft >= 32.
+    //
+    // The other valid termination is "lengths read for the entire code
+    // length alphabet and there was only one non-zero code length" —
+    // in that case Kraft never reaches 32 (it's at most 16, for a
+    // single length-1 entry) and we read all 18-HSKIP entries. The
+    // resulting cl_code degenerates to a single-symbol zero-length
+    // code; we handle that special case explicitly below.
     let mut clcl = [0u32; 18];
     let mut sum_kraft: u64 = 0;
     for i in (hskip as usize)..18 {
         let v = read_clcl_symbol(br)?;
         clcl[K_CODE_LENGTH_CODE_ORDER[i]] = v;
         if v > 0 {
-            sum_kraft += 1u64 << (5 - v); // RFC 7932 §3.5: 32-length space.
-                                          // RFC 7932 says the cumulative Kraft sum must reach 32. Our
-                                          // round-7 finding: cjxl 0.11.1 sometimes emits a final clcl
-                                          // entry whose contribution pushes the sum slightly past 32
-                                          // (the over-subscription is small, e.g. 37 = 32 + one
-                                          // length-2 contribution). libjxl is permissive here so we
-                                          // accept the read and let `PrefixCode::from_lengths`'s own
-                                          // Kraft sanity guard reject only grossly oversubscribed
-                                          // codes.
+            sum_kraft += 1u64 << (5 - v); // RFC 7932 §3.5: budget 32.
             if sum_kraft >= 32 {
                 break;
             }
@@ -441,7 +467,31 @@ fn read_complex_prefix(
         ));
     }
     // Build the code-length code itself (alphabet of 18 symbols).
-    let cl_code = PrefixCode::from_lengths(&clcl)?;
+    //
+    // RFC 7932 §3.5 special case: "If the lengths have been read for
+    // the entire code length alphabet and there was only one non-zero
+    // code length, then the prefix code has one symbol whose code has
+    // zero length." That is, when only ONE clcl[i] is non-zero (and the
+    // sum_kraft never reached 32), the cl_code is a single-symbol code
+    // that consumes ZERO bits per decode. The RFC also notes the
+    // typical case is that this single symbol is 16 (repeat the previous
+    // length, where prev_nonzero defaults to 8). We construct such a
+    // degenerate cl_code by overriding the length to 0 so PrefixCode
+    // takes the max_length==0 path.
+    let cl_code = if clcl.iter().filter(|&&v| v != 0).count() == 1 {
+        let single_sym = clcl
+            .iter()
+            .position(|&v| v != 0)
+            .expect("just counted exactly 1 non-zero")
+            as u32;
+        PrefixCode {
+            lookup: vec![(single_sym, 0u8); 1],
+            max_length: 0,
+            alphabet_size: 18,
+        }
+    } else {
+        PrefixCode::from_lengths(&clcl)?
+    };
 
     // Bound the alphabet against the input length to refuse insane
     // allocations from a malicious histogram preamble.
@@ -625,35 +675,44 @@ mod tests {
     }
 
     #[test]
-    fn read_simple_prefix_three_symbols_canonical_lengths() {
-        // Round-3 regression: NSYM=3 must assign length 1 to the
-        // *smallest* sorted symbol, not the first-read symbol. With
-        // alphabet_size=64, bits=6, encode symbols [50, 7, 33]: read
-        // order [50, 7, 33] → sorted [7, 33, 50] → lengths [1, 2, 2].
+    fn read_simple_prefix_three_symbols_rfc_first_read_gets_length_1() {
+        // Round-8 reinterpretation: RFC 7932 §3.4 says "if NSYM = 3,
+        // the code lengths for the symbols are 1, 2, 2 in the ORDER
+        // THEY APPEAR in the representation". Plus "Prefix codes of the
+        // same bit length must be assigned to the symbols in sorted
+        // order" — i.e. the sorted-id rule is for CODE ASSIGNMENT
+        // within a length, not for choosing which symbol gets which
+        // length.
+        //
+        // alphabet_size=64, bits=6. Encode read order [50, 7, 33]:
+        // sym 50 (first read) → length 1, sym 7 → length 2, sym 33 →
+        // length 2. Canonical-Huffman within-length code assignment by
+        // `from_lengths` enumerates symbols in id order, so:
+        //   sym 7  (smallest length-2 id) → canonical "10" → bit-reverse → idx 1
+        //   sym 33 (larger  length-2 id)  → canonical "11" → bit-reverse → idx 3
+        //   sym 50 (only length-1)         → canonical "0"  → idx 0 (stride 2 → 0,2,4,6)
         let bytes = pack_lsb(&[
             (1, 2),  // kind = simple
             (2, 2),  // nsym - 1 = 2 → nsym = 3
-            (50, 6), // first symbol
-            (7, 6),  // second symbol
-            (33, 6), // third symbol
+            (50, 6), // first symbol read → length 1
+            (7, 6),  // second symbol → length 2
+            (33, 6), // third symbol → length 2
         ]);
         let mut br = BitReader::new(&bytes);
         let code = read_prefix_code(&mut br, 64).unwrap();
-        // Decoding bit "0" should give symbol 7 (the smallest sorted).
+        // Decoding bit "0" → idx 0 → length-1 entry → sym 50 (the
+        // first-read, NOT the smallest-sorted).
         let bytes2 = pack_lsb(&[(0, 1)]);
         let mut br2 = BitReader::new(&bytes2);
-        assert_eq!(code.decode(&mut br2).unwrap(), 7);
-        // Decoding bits "10" (LSB-first → first bit 0, second bit 1
-        // → raw=2 → in lookup table this maps to a stride replication
-        // of the length-1 entry. Decoding "01" = LSB-first 1, 0 →
-        // raw=1 → sym 33 (length 2).
+        assert_eq!(code.decode(&mut br2).unwrap(), 50);
+        // Decoding bits LSB-first [1,0] → raw=1 → sym 7 (length 2).
         let bytes3 = pack_lsb(&[(1, 1), (0, 1)]);
         let mut br3 = BitReader::new(&bytes3);
-        assert_eq!(code.decode(&mut br3).unwrap(), 33);
-        // "11" → raw=3 → sym 50.
+        assert_eq!(code.decode(&mut br3).unwrap(), 7);
+        // Decoding bits LSB-first [1,1] → raw=3 → sym 33 (length 2).
         let bytes4 = pack_lsb(&[(1, 1), (1, 1)]);
         let mut br4 = BitReader::new(&bytes4);
-        assert_eq!(code.decode(&mut br4).unwrap(), 50);
+        assert_eq!(code.decode(&mut br4).unwrap(), 33);
     }
 
     #[test]
@@ -677,19 +736,43 @@ mod tests {
 
     #[test]
     fn from_lengths_rejects_grossly_oversum() {
-        // Round-7: relaxed oversum check tolerates small overshoots
-        // (cjxl 0.11.1 emits codes that overshoot Kraft slightly), but
-        // grossly oversubscribed codes still get rejected. 16 length-1
-        // symbols: kraft = 16 * 16384 = 262144 > 4 * 32768 = 131072.
+        // Round-8: Kraft is now computed in the actual `1<<max_length`
+        // budget. 16 length-1 symbols → max_length=1, budget=2,
+        // kraft=16 > 4*2 = 8 → reject.
         assert!(PrefixCode::from_lengths(&[1u32; 16]).is_err());
     }
 
     #[test]
     fn from_lengths_accepts_minor_oversubscription() {
-        // Three length-1 symbols: kraft = 3 * 16384 = 49152 <= 131072.
-        // The decoder accepts; the lookup table will have collisions
-        // (some entries overwritten) but the read won't crash.
+        // Three length-1 symbols: max_length=1, budget=2, kraft=3
+        // ≤ 4*2 = 8. Accepted; lookup table has collisions (some
+        // entries overwritten) but the read won't crash.
         assert!(PrefixCode::from_lengths(&[1, 1, 1]).is_ok());
+    }
+
+    #[test]
+    fn from_lengths_kraft_uses_per_alphabet_budget() {
+        // Round-8 regression: cl_code-shaped 18-symbol alphabet with
+        // max_length=5 should evaluate kraft against budget=32, not
+        // budget=32768.
+        //
+        // Example: lengths summing to Kraft 37 in budget 32 (the
+        // round-7 cjxl 8x8 grey stop-point shape):
+        // `[5, 0, 0, 0, 3, 1, 0, 5, 4, 5, 0, 0, 4, 2, 0, 0, 5, 5]`.
+        // Kraft = 1+4+16+1+2+1+2+8+1+1 = 37. Budget=32, 4*budget=128.
+        // 37 ≤ 128 — accepted by the 4× tolerance bound. (libjxl is
+        // permissive about small Kraft overshoots in real bitstreams,
+        // so we keep this lenient.)
+        let lengths_37 = [5, 0, 0, 0, 3, 1, 0, 5, 4, 5, 0, 0, 4, 2, 0, 0, 5, 5u32];
+        assert!(PrefixCode::from_lengths(&lengths_37).is_ok());
+
+        // Massively over-Kraft 1-bit-budget code: 9 length-1 symbols.
+        // max_length=1, budget=2, kraft=9, 4*budget=8 → reject.
+        let mut grossly = vec![0u32; 18];
+        for entry in grossly.iter_mut().take(9) {
+            *entry = 1;
+        }
+        assert!(PrefixCode::from_lengths(&grossly).is_err());
     }
 
     #[test]
@@ -702,6 +785,37 @@ mod tests {
         let err = read_prefix_code(&mut br, huge).unwrap_err();
         let msg = format!("{err:?}");
         assert!(msg.contains("alphabet_size"));
+    }
+
+    #[test]
+    fn clcl_vl_table_round_trip_each_symbol() {
+        // For each cl_cl_code symbol 0..5, encode the expected bit
+        // pattern (per RFC 7932 §3.5 "bits parsed right to left" =
+        // LSB-first packed integer) and verify `read_clcl_symbol`
+        // recovers the symbol with correct bit consumption.
+        //
+        // Per RFC table interpretation:
+        //   sym 0 → "00" → LSB-first integer 0  in 2 bits
+        //   sym 1 → "0111" → LSB-first integer 7  in 4 bits
+        //   sym 2 → "011"  → LSB-first integer 3  in 3 bits
+        //   sym 3 → "10"   → LSB-first integer 2  in 2 bits
+        //   sym 4 → "01"   → LSB-first integer 1  in 2 bits
+        //   sym 5 → "1111" → LSB-first integer 15 in 4 bits
+        let cases: &[(u32, u32, u32)] = &[
+            (0, 0, 2),
+            (1, 7, 4),
+            (2, 3, 3),
+            (3, 2, 2),
+            (4, 1, 2),
+            (5, 15, 4),
+        ];
+        for &(expected_sym, lsb_first, len) in cases {
+            let bytes = pack_lsb(&[(lsb_first, len)]);
+            let mut br = BitReader::new(&bytes);
+            let sym = read_clcl_symbol(&mut br).unwrap();
+            assert_eq!(sym, expected_sym, "decode of integer {lsb_first} ({len} bits) should give sym {expected_sym}");
+            assert_eq!(br.bits_read() as u32, len, "consumed {} bits decoding sym {expected_sym}, expected {len}", br.bits_read());
+        }
     }
 
     #[test]

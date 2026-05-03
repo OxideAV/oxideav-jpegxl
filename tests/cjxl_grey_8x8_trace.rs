@@ -1,31 +1,28 @@
 //! Diagnostic trace for the cjxl 8x8 grey lossless fixture.
 //!
-//! Round 7 (this commit) unblocked typo #6: the round-6 stop point
-//! ("property 552964 too large") was caused by the
-//! `log_alpha_size_minus_5` flag being read on the WRONG branch of
-//! `use_prefix_code`. Per `docs/image/jpegxl/libjxl-trace-reverse-engineering.md`
-//! §3.6, the 2-bit field belongs to the ANS branch; the Prefix-code
-//! branch fixes `log_alpha_size = 15`. With this fix, the MA-tree
-//! prelude decodes a 4-symbol prefix code (alphabet sym 0/1/2/3 →
-//! values 0/2/4/8 etc.), and the tree itself decodes cleanly to 7
-//! nodes (3 decisions on prop 0 with values 2/4/0 + 4 leaves all
-//! using predictor=5/Gradient).
+//! Round 7 unblocked typo #6 (`log_alpha_size_minus_5` on wrong branch
+//! of `use_prefix_code`) and #7 (CLCL VL table swapped). Round 7 stop
+//! point: SECOND per-cluster prefix code's `read_complex_prefix` decode
+//! produces a cl_code with Kraft 37 (over the RFC budget of 32),
+//! cascading to a downstream symbol-code Kraft of ~135104 (4× over
+//! 1<<15). The round-7 final-state error was `"JXL prefix: code
+//! lengths grossly overflow Kraft sum (kraft=135104, alphabet_size=257,
+//! max_length=13)"`.
 //!
-//! Round 7 stop point: the symbol stream's per-leaf prefix code
-//! (count=257) decodes via `read_complex_prefix`, but the SECOND
-//! cluster's clcl array sums to Kraft 37 (instead of the required 32),
-//! producing a downstream Huffman lookup table whose Kraft
-//! sum is ~135104 (4× the 1<<15 budget). Our `from_lengths` rejects
-//! this as grossly oversubscribed. djxl decodes this fixture, so cjxl
-//! is emitting valid bits — our `read_clcl_symbol` /
-//! `K_CODE_LENGTH_CODE_ORDER` / Kraft early-stop semantic must be
-//! subtly off in a way the trace doc doesn't fully cover. Round 8 work.
+//! Round 8 (this commit) attempted three fixes:
+//!   1. `PrefixCode::from_lengths` Kraft computation now uses
+//!      `1<<max_length` budget instead of always `1<<15`.
+//!   2. RFC 7932 §3.5 single-non-zero clcl special case (degenerate
+//!      single-symbol zero-length code) now handled in
+//!      `read_complex_prefix`.
+//!   3. RFC 7932 §3.4 simple-prefix length assignment reverted to
+//!      per-RFC (first-read gets length 1, not smallest-sorted —
+//!      undoes round-3's misinterpretation).
 //!
-//! Trace output (run with `cargo test --offline -j 4 --test
-//! cjxl_grey_8x8_trace -- --nocapture`) is the round-8 starting
-//! point. The test asserts NOTHING; it just prints the prelude bit
-//! positions, the prefix code mapping, and the MA-tree decode
-//! iterations so a follow-up agent can bisect against djxl bit-by-bit.
+//! CI verifies whether these fixes unblock the fixture. The test
+//! asserts NOTHING; it just prints the prelude bit positions, the
+//! prefix code mapping, and the MA-tree decode iterations so a
+//! follow-up agent can bisect against djxl bit-by-bit.
 
 use oxideav_jpegxl::ans::cluster::{num_clusters, read_clustering};
 use oxideav_jpegxl::ans::hybrid_config::HybridUintConfig;
