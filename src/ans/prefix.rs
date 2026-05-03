@@ -482,8 +482,7 @@ fn read_complex_prefix(
         let single_sym = clcl
             .iter()
             .position(|&v| v != 0)
-            .expect("just counted exactly 1 non-zero")
-            as u32;
+            .expect("just counted exactly 1 non-zero") as u32;
         PrefixCode {
             lookup: vec![(single_sym, 0u8); 1],
             max_length: 0,
@@ -813,8 +812,16 @@ mod tests {
             let bytes = pack_lsb(&[(lsb_first, len)]);
             let mut br = BitReader::new(&bytes);
             let sym = read_clcl_symbol(&mut br).unwrap();
-            assert_eq!(sym, expected_sym, "decode of integer {lsb_first} ({len} bits) should give sym {expected_sym}");
-            assert_eq!(br.bits_read() as u32, len, "consumed {} bits decoding sym {expected_sym}, expected {len}", br.bits_read());
+            assert_eq!(
+                sym, expected_sym,
+                "decode of integer {lsb_first} ({len} bits) should give sym {expected_sym}"
+            );
+            assert_eq!(
+                br.bits_read() as u32,
+                len,
+                "consumed {} bits decoding sym {expected_sym}, expected {len}",
+                br.bits_read()
+            );
         }
     }
 
