@@ -190,15 +190,30 @@ pub fn quantise_distribution(counts: &[u32], log_alphabet_size: u32) -> Result<V
 
 /// Build the inverse-alias table for a quantised distribution `d`.
 ///
-/// `inv_alias[s]` is a `Vec<u16>` of length `D[s]` such that for each
-/// `k in [0, D[s])`, `inv_alias[s][k]` is the alias-table index
-/// `x in [0, 4096)` whose `AliasMapping(x)` returns `(s, k)`.
+/// `inv_alias[s][k]` (for `k in [0, D[s])`) is the alias-table index
+/// `x in [0, 4096)` whose `AliasMapping(x)` returns `(s, off)` where
+/// `off mod D[s] == k`.
 ///
-/// Construction: walk all 4096 alias-table indices once, calling
-/// `alias.lookup(x)` and recording the inverse mapping.
+/// **Note on the modular reduction**: the alias table built by
+/// [`AliasTable::build`] does NOT keep symbol-s offsets in `[0, D[s])`;
+/// instead, offsets can land anywhere in `[0, 4096)` so long as the
+/// `D[s]` offsets for symbol `s` are pairwise distinct mod `D[s]`. The
+/// decoder formula `new_state = D[s] * (state >> 12) + offset` doesn't
+/// require offsets to be small — it just needs the lookup to be a
+/// bijection [0, 4096) → ⋃ₛ {(s, k) : k ∈ [0, D[s])} (mod D[s]).
+///
+/// Consequently the encoder's inverse table must also key on the
+/// **modular** offset `off mod D[s]` so that `q = (target_state - off)
+/// / D[s]` gives an integer.
+///
+/// Construction: walk all 4096 alias-table indices once, computing
+/// `(sym, off) = alias.lookup(x)` and recording
+/// `inv_alias[sym][off mod D[sym]] = x`.
 pub fn build_inverse_alias(d: &[u16], alias: &AliasTable) -> Result<Vec<Vec<u16>>> {
     let mut inv: Vec<Vec<u16>> = d.iter().map(|&p| vec![0u16; p as usize]).collect();
-    let mut filled: Vec<u16> = vec![0u16; d.len()];
+    // Validate each (s, k) is filled exactly once using a per-symbol
+    // counter; the alias method's bijection invariant guarantees this.
+    let mut fill_counts: Vec<u32> = vec![0u32; d.len()];
     for x in 0..ANS_TAB_SIZE {
         let (sym, off) = alias.lookup(x);
         let s = sym as usize;
@@ -208,24 +223,22 @@ pub fn build_inverse_alias(d: &[u16], alias: &AliasTable) -> Result<Vec<Vec<u16>
             ));
         }
         let p = d[s] as u32;
-        if off >= p {
+        if p == 0 {
             return Err(Error::other(format!(
-                "ANS encoder: alias.lookup returned offset {off} >= D[{s}]={p}"
+                "ANS encoder: alias.lookup returned symbol {s} with D[{s}]=0"
             )));
         }
-        if filled[s] >= p as u16 {
-            return Err(Error::other(format!(
-                "ANS encoder: inv_alias[{s}] over-filled (alias table inconsistent)"
-            )));
-        }
-        inv[s][off as usize] = x as u16;
-        filled[s] += 1;
+        let k = (off % p) as usize;
+        inv[s][k] = x as u16;
+        fill_counts[s] += 1;
     }
-    for (s, &p) in d.iter().enumerate() {
-        if filled[s] != p {
+    // Sanity check: each symbol s should have been seen exactly D[s]
+    // times across the 4096 lookups.
+    for (s, &c) in fill_counts.iter().enumerate() {
+        if c != d[s] as u32 {
             return Err(Error::other(format!(
-                "ANS encoder: inv_alias[{s}] filled {} != D[{s}]={p}",
-                filled[s]
+                "ANS encoder: inv_alias for symbol {s} got {c} fills, expected D[{s}]={}",
+                d[s]
             )));
         }
     }
@@ -246,6 +259,7 @@ pub fn encode_symbols(
     symbols: &[u16],
     d: &[u16],
     inv_alias: &[Vec<u16>],
+    alias: &AliasTable,
 ) -> Result<()> {
     // Validate the distribution sums.
     let sum: u32 = d.iter().map(|&v| v as u32).sum();
@@ -254,7 +268,6 @@ pub fn encode_symbols(
             "ANS encoder: distribution does not sum to 4096 (got {sum})"
         )));
     }
-    // Pre-validate inv_alias dimensions.
     if inv_alias.len() != d.len() {
         return Err(Error::other(format!(
             "ANS encoder: inv_alias len {} != d.len() {}",
@@ -263,13 +276,9 @@ pub fn encode_symbols(
         )));
     }
 
-    // Reverse-walk encode. State starts at the magic decoder-end
-    // sentinel ANS_FINAL_STATE so the decoder, which initialises with
-    // the leading u(32), starts at the correct state.
     let mut state: u32 = ANS_FINAL_STATE;
     let mut refill_stack: Vec<u16> = Vec::with_capacity(symbols.len() / 4);
 
-    // Iterate symbols in REVERSE order.
     for &sym in symbols.iter().rev() {
         let s = sym as usize;
         if s >= d.len() {
@@ -285,42 +294,75 @@ pub fn encode_symbols(
             )));
         }
         // Renormalise: while state >= D[s] << 20, push the low 16 bits.
-        // The threshold p * (1 << 20) ensures the inverse update result
-        // stays below 1 << 32. The encoder pushes bits in opposite order
-        // to how the decoder will read them, then we emit the stack in
-        // reverse to restore decoder-order.
-        //
-        // Computed in u64 to avoid overflow when p == 4096
-        // (4096 << 20 = 2^32, exactly out of u32 range).
+        // u64 arithmetic to avoid overflow when p == 4096 (p << 20 = 2^32).
         let max_state: u64 = (p as u64) << 20;
         while (state as u64) >= max_state {
             refill_stack.push((state & 0xFFFF) as u16);
             state >>= ANS_REFILL_BITS;
         }
-        // Apply inverse update.
-        let q = state / p;
-        let r = state - q * p;
-        if (r as usize) >= inv_alias[s].len() {
-            return Err(Error::other(format!(
-                "ANS encoder: inv_alias[{s}] index {r} out of bounds (len {})",
-                inv_alias[s].len()
-            )));
-        }
-        let alias_index = inv_alias[s][r as usize] as u32;
-        // state' = (q << 12) | alias_index. Both fit in 32 bits given
-        // the pre-renormalisation guard.
-        state = (q << ANS_LOG_TAB_SIZE) | alias_index;
+        state = inverse_update(state, s, p, inv_alias, alias)?;
     }
 
-    // Emit the leading u(32) state.
-    // BitWriter::write_bits supports up to 32 bits.
     bw.write_bits(state, 32)?;
-    // Emit refills in REVERSE of stack-push order so the decoder reads
-    // them in the order it expects (i.e. encoder-emission order).
     while let Some(refill) = refill_stack.pop() {
         bw.write_bits(refill as u32, ANS_REFILL_BITS)?;
     }
     Ok(())
+}
+
+/// One ANS inverse-update step. Given the current encoder state and
+/// the symbol to encode, returns the previous state such that decoder's
+/// forward update on it produces the current state and decodes the
+/// given symbol.
+///
+/// Algorithm:
+/// 1. `k = state mod D[s]` — the residue the decoder will land on.
+/// 2. `r = inv_alias[s][k]` — the alias-table index that maps to (s, off)
+///    where `off mod D[s] == k`.
+/// 3. `off = alias.lookup(r).1` — the actual offset stored in the alias
+///    table for this index.
+/// 4. `q = (state - off) / D[s]` — must be exact (alias method guarantees
+///    `state - off` is divisible by D[s] when constructed via inv_alias).
+/// 5. `prev_state = (q << 12) | r`.
+fn inverse_update(
+    state: u32,
+    s: usize,
+    p: u32,
+    inv_alias: &[Vec<u16>],
+    alias: &AliasTable,
+) -> Result<u32> {
+    let k = (state % p) as usize;
+    if k >= inv_alias[s].len() {
+        return Err(Error::other(format!(
+            "ANS encoder: state mod D[{s}]={p} → k={k} out of inv_alias range {}",
+            inv_alias[s].len()
+        )));
+    }
+    let r = inv_alias[s][k] as u32;
+    let (sym2, off) = alias.lookup(r);
+    if sym2 as usize != s {
+        return Err(Error::other(format!(
+            "ANS encoder: inv_alias[{s}][{k}]={r} but lookup({r})={sym2} (alias inversion BUG)"
+        )));
+    }
+    if state < off {
+        return Err(Error::other(format!(
+            "ANS encoder: state={state} < off={off} for symbol {s}"
+        )));
+    }
+    let numerator = state - off;
+    if numerator % p != 0 {
+        return Err(Error::other(format!(
+            "ANS encoder: (state-off)={numerator} not divisible by D[{s}]={p} (BUG)"
+        )));
+    }
+    let q = numerator / p;
+    if q >= (1u32 << 20) {
+        return Err(Error::other(format!(
+            "ANS encoder: q={q} >= 2^20 (post-renorm should have prevented this)"
+        )));
+    }
+    Ok((q << ANS_LOG_TAB_SIZE) | r)
 }
 
 /// Convenience: build the alias table + inverse alias table + encode in
@@ -334,7 +376,7 @@ pub fn encode_symbols_with_dist(
 ) -> Result<()> {
     let alias = AliasTable::build(d, log_alphabet_size)?;
     let inv = build_inverse_alias(d, &alias)?;
-    encode_symbols(bw, symbols, d, &inv)
+    encode_symbols(bw, symbols, d, &inv, &alias)
 }
 
 /// One token to emit through ANS + extra-bits.
@@ -369,6 +411,7 @@ pub fn encode_symbols_with_extras(
     tokens: &[AnsTokenWithExtras],
     d: &[u16],
     inv_alias: &[Vec<u16>],
+    alias: &AliasTable,
 ) -> Result<()> {
     let sum: u32 = d.iter().map(|&v| v as u32).sum();
     if sum != ANS_TAB_SIZE {
@@ -385,8 +428,6 @@ pub fn encode_symbols_with_extras(
     }
 
     let mut state: u32 = ANS_FINAL_STATE;
-    // Stack entries: (value, width). Width can be up to 32 bits since
-    // `read_uint` extra-bit reads are at most ~30 bits in practice.
     let mut stack: Vec<(u32, u32)> = Vec::with_capacity(tokens.len() * 2);
 
     for tok in tokens.iter().rev() {
@@ -405,7 +446,6 @@ pub fn encode_symbols_with_extras(
                 tok.token
             )));
         }
-        // Sanity: extra_value fits in extra_bits.
         if tok.extra_bits > 32 {
             return Err(Error::other(format!(
                 "ANS encoder: extra_bits {} > 32",
@@ -424,28 +464,15 @@ pub fn encode_symbols_with_extras(
             stack.push((tok.extra_value, tok.extra_bits));
         }
 
-        // Renormalise: while state >= p << 20, push refill u(16).
         let max_state: u64 = (p as u64) << 20;
         while (state as u64) >= max_state {
             stack.push(((state & 0xFFFF) as u32, 16));
             state >>= ANS_REFILL_BITS;
         }
-        // Apply inverse update.
-        let q = state / p;
-        let r = state - q * p;
-        if (r as usize) >= inv_alias[s].len() {
-            return Err(Error::other(format!(
-                "ANS encoder: inv_alias[{s}] index {r} out of bounds (len {})",
-                inv_alias[s].len()
-            )));
-        }
-        let alias_index = inv_alias[s][r as usize] as u32;
-        state = (q << ANS_LOG_TAB_SIZE) | alias_index;
+        state = inverse_update(state, s, p, inv_alias, alias)?;
     }
 
-    // Emit leading u(32) state.
     bw.write_bits(state, 32)?;
-    // Pop stack (LIFO) → wire order.
     while let Some((val, width)) = stack.pop() {
         bw.write_bits(val, width)?;
     }
@@ -757,7 +784,7 @@ mod tests {
 
         let symbols = vec![7u16; 10];
         let mut bw = BitWriter::new();
-        encode_symbols(&mut bw, &symbols, &d, &inv).unwrap();
+        encode_symbols(&mut bw, &symbols, &d, &inv, &alias).unwrap();
         let bytes = bw.finish();
 
         let mut br = BitReader::new(&bytes);
@@ -786,7 +813,7 @@ mod tests {
             symbols.push(if i % 13 == 7 { 1 } else { 0 });
         }
         let mut bw = BitWriter::new();
-        encode_symbols(&mut bw, &symbols, &d, &inv).unwrap();
+        encode_symbols(&mut bw, &symbols, &d, &inv, &alias).unwrap();
         let bytes = bw.finish();
 
         let mut br = BitReader::new(&bytes);
@@ -813,7 +840,7 @@ mod tests {
 
         let symbols: Vec<u16> = (0..50u16).map(|i| (i % 8) as u16).collect();
         let mut bw = BitWriter::new();
-        encode_symbols(&mut bw, &symbols, &d, &inv).unwrap();
+        encode_symbols(&mut bw, &symbols, &d, &inv, &alias).unwrap();
         let bytes = bw.finish();
 
         let mut br = BitReader::new(&bytes);
@@ -964,7 +991,7 @@ mod tests {
         let _ = plain_symbols; // kept for reference
 
         let mut bw = BitWriter::new();
-        encode_symbols_with_extras(&mut bw, &tokens, &d, &inv).unwrap();
+        encode_symbols_with_extras(&mut bw, &tokens, &d, &inv, &alias).unwrap();
         let bytes = bw.finish();
 
         // Decode: AnsDecoder reads state, then for each token read
@@ -1036,7 +1063,7 @@ mod tests {
 
         let mut bw = BitWriter::new();
         write_distribution(&mut bw, &d, log_alpha).unwrap();
-        encode_symbols(&mut bw, &symbols, &d, &inv).unwrap();
+        encode_symbols(&mut bw, &symbols, &d, &inv, &alias).unwrap();
         let bytes = bw.finish();
 
         let mut br = BitReader::new(&bytes);

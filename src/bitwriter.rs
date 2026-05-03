@@ -84,24 +84,24 @@ impl BitWriter {
     /// Write JXL `U8()` per FDIS §9.2.5: 1-bit zero flag, otherwise
     /// 3-bit magnitude `n` followed by `u(n)` extra bits with implicit
     /// leading 1.
+    ///
+    /// Decoder side: `read_u8_value` returns `(1 << n) + u(n)`. We pick
+    /// `n = floor(log2(value))` so that `1 << n` is the largest power
+    /// of 2 ≤ value, and `extra = value - (1 << n)` fits in `n` bits.
+    /// Range: value ∈ [1, 2^7 + 2^7 - 1] = [1, 255].
     pub fn write_u8_value(&mut self, value: u32) -> Result<()> {
         if value == 0 {
             self.write_bit(0);
             return Ok(());
         }
-        if value > 256 {
+        if value > 255 {
             return Err(Error::other(
-                "BitWriter::write_u8_value: value > 256 not representable",
+                "BitWriter::write_u8_value: value > 255 not representable",
             ));
         }
         self.write_bit(1);
-        // Find n such that value = (1 << n) + extra, 0 <= extra < (1 << n),
-        // and n in [0, 7].
-        let n = if value == 1 {
-            0
-        } else {
-            31 - (value - 1).leading_zeros()
-        };
+        // n = floor(log2(value)) — guaranteed in [0, 7] since value <= 255.
+        let n = 31 - value.leading_zeros();
         let extra = value - (1u32 << n);
         self.write_bits(n, 3)?;
         self.write_bits(extra, n)?;
@@ -278,13 +278,19 @@ mod tests {
 
     #[test]
     fn u8_value_round_trip() {
-        for v in [0u32, 1, 2, 3, 5, 7, 8, 15, 16, 31, 100, 255, 256] {
+        // U8 alphabet: u(1) flag + u(3) n + u(n) extra. Max representable
+        // value = (1<<7) + ((1<<7) - 1) = 255. (Spec doc-comment said 256
+        // but that value is unreachable; the round-trip rejects it.)
+        for v in [0u32, 1, 2, 3, 5, 7, 8, 15, 16, 31, 100, 255] {
             let mut bw = BitWriter::new();
             bw.write_u8_value(v).unwrap();
             let bytes = bw.finish();
             let mut br = BitReader::new(&bytes);
             assert_eq!(br.read_u8_value().unwrap(), v, "round-trip failed for {v}");
         }
+        // Out-of-range value rejected.
+        let mut bw = BitWriter::new();
+        assert!(bw.write_u8_value(256).is_err());
     }
 
     #[test]
@@ -301,7 +307,9 @@ mod tests {
             U32Dist::BitsOffset(4, 2),
             U32Dist::BitsOffset(12, 1),
         ];
-        for v in [0u32, 1, 2, 5, 17, 100, 1000, 4097] {
+        // Distribution 3 (BitsOffset(12, 1)) covers values 1..=4096; 4097
+        // is unreachable for this distribution set, so we test up to 4096.
+        for v in [0u32, 1, 2, 5, 17, 100, 1000, 4096] {
             let mut bw = BitWriter::new();
             bw.write_u32(dists_w, v).unwrap();
             let bytes = bw.finish();
@@ -312,6 +320,9 @@ mod tests {
                 "round-trip failed for {v}"
             );
         }
+        // Out-of-range value rejected (4097 exceeds all four dists).
+        let mut bw = BitWriter::new();
+        assert!(bw.write_u32(dists_w, 4097).is_err());
     }
 
     #[test]
