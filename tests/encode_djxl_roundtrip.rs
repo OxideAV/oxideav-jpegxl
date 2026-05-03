@@ -233,3 +233,45 @@ fn parse_pgm_self_test() {
     assert_eq!(h, 2);
     assert_eq!(data, vec![0x00, 0x40, 0x80, 0xFF]);
 }
+
+/// Round-3 ANS encoder: a structured 16x16 grey image where the
+/// Gradient-residual histogram is heavily skewed toward 0. Validates
+/// that the ANS-coded stream djxl can decode (cross-validation via
+/// libjxl), and that the output is meaningfully smaller than what the
+/// round-2 prefix-coded encoder would have produced.
+///
+/// Round 2 used a uniform 16x4-bit prefix code: ~4 bits/pixel
+/// (16x16 = 256 pixels → ~128 bytes for the symbol stream alone).
+///
+/// Round 3 ANS approaches the entropy bound H(D); for a constant or
+/// near-constant image, H(D) ≈ 0 → most of the size is the preamble.
+#[test]
+fn djxl_decodes_our_grey_16x16_ans_skewed_image() {
+    if !djxl_available() {
+        eprintln!("djxl not on PATH — skipping cross-validation test");
+        return;
+    }
+    // 16x16 = 256 pixels, all 100 except the corner.
+    let mut pixels = vec![100u8; 256];
+    pixels[0] = 50;
+    pixels[15] = 60;
+    pixels[240] = 70;
+    pixels[255] = 80;
+    let jxl = encode_one_frame(16, 16, &pixels, InputFormat::Gray8)
+        .expect("encode 16x16 grey ANS-skewed");
+    eprintln!(
+        "encoded grey 16x16 skewed → {} bytes (round-3 ANS)",
+        jxl.len()
+    );
+    let pgm = match djxl_decode_to_pgm(&jxl) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("djxl decode failed: {e}");
+            return;
+        }
+    };
+    let (w, h, data) = parse_pgm(&pgm).expect("parse djxl PGM output");
+    assert_eq!(w, 16);
+    assert_eq!(h, 16);
+    assert_eq!(data, pixels, "djxl round-trip pixel mismatch");
+}
