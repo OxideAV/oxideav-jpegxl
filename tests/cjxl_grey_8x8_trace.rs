@@ -663,28 +663,49 @@ fn round9_symbol_prelude_per_cluster_dump() {
         counts.push(cnt);
     }
 
+    let mut report = String::new();
+    use std::fmt::Write;
+    writeln!(
+        report,
+        "[R9] === per-cluster prefix-code dump (Python expects all OK) ==="
+    )
+    .ok();
+    let mut any_fail = false;
     for (i, &c) in counts.iter().enumerate() {
         let bp_before = br.bits_read();
         let result = read_prefix_code(&mut br, c);
         match result {
-            Ok(code) => eprintln!(
-                "[R9] symbol cluster {} READ-PREFIX OK alphabet={} consumed {}b (bits_read={})",
-                i,
-                code.alphabet_size,
-                br.bits_read() - bp_before,
-                br.bits_read()
-            ),
-            Err(e) => {
-                eprintln!(
-                    "[R9] symbol cluster {} READ-PREFIX FAIL at bp_before={} bits_read={}: {}",
+            Ok(code) => {
+                writeln!(
+                    report,
+                    "[R9] cluster {} count={} READ-PREFIX OK alphabet={} consumed {}b (bp now={})",
                     i,
+                    c,
+                    code.alphabet_size,
+                    br.bits_read() - bp_before,
+                    br.bits_read()
+                )
+                .ok();
+            }
+            Err(e) => {
+                writeln!(
+                    report,
+                    "[R9] cluster {} count={} READ-PREFIX FAIL at bp_before={} bp_now={}: {}",
+                    i,
+                    c,
                     bp_before,
                     br.bits_read(),
                     e
-                );
-                return;
+                )
+                .ok();
+                any_fail = true;
+                break;
             }
         }
     }
-    eprintln!("[R9] all 5 symbol prefix codes read OK!");
+    // FAIL the test so the report shows in CI output (cargo test
+    // hides eprintln! output for passing tests). The assertion will
+    // be re-tightened to a passing condition once the divergence is
+    // identified and fixed.
+    panic!("ROUND-9 DIAGNOSTIC REPORT (test deliberately fails to expose CI output):\n{report}\nany_fail={any_fail}");
 }
