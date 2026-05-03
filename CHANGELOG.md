@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.5](https://github.com/OxideAV/oxideav-jpegxl/compare/v0.0.4...v0.0.5) - 2026-05-03
+
+### Other
+
+- fix clippy unneeded-unit-expression warning
+- round-9 progress milestone — clusters 0..3 OK, cluster 4 next
+- round 9 — typo #8 ROOT CAUSE — first-sym-wins on collisions
+- round-9 diagnostic deliberately panics so report shows in CI
+- round-9 per-cluster symbol-prefix instrumentation
+- round-8 was behaviour-neutral; consolidate stop-point tripwire
+- add round-9 diagnostic that panics with new stop-point
+- hard-assert round-7 kraft=135104 error is resolved
+- rustfmt round-8 follow-up
+- round 8 typo #8 — three RFC 7932 fixes for cl_code Kraft 37
+- replace never-match regex with semver_check = false
+- migrate to centralized OxideAV/.github reusable workflows
+- round 7 — typo #6 + #7 resolved, MA-tree decodes
+- round 4 diagnostic — capture cjxl 8x8 fixture MA-tree T-stream
+- FDIS migration round 3 — LfGlobal + GlobalModular + Modular sub-bitstream wiring
+- FDIS migration round 2 — FrameHeader + TOC + ImageMetadata refresh + D.3.5 general clustering
+- add FDIS Annex D ANS entropy decoder (round 1) + commit committee-draft Modular path
+- document ISO/IEC 18181-1 spec block + harden plumbing tests
+- pin release-plz to patch-only bumps
+
 ### Fixed (round 9, 2026-05-03)
 
 - **Typo #8 ROOT CAUSE FOUND.** `PrefixCode::from_lengths` was
