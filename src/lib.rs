@@ -92,6 +92,7 @@
 
 pub mod abrac;
 pub mod ans;
+pub mod ans_encoder;
 pub mod begabrac;
 pub mod bitreader;
 pub mod bitwriter;
