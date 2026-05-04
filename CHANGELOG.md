@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **prefix code: `read_complex_prefix` now matches libjxl's
+  `ReadHuffmanCodeLengths` early-termination on `space <= 0`.** The
+  loop that decodes per-symbol code lengths from the cl_code Huffman
+  is supposed to stop the moment its 32768-budget Kraft counter hits
+  zero (per Appendix A.6 of `libjxl-trace-reverse-engineering.md` and
+  the libjxl reference implementation). Prior rounds 7-9 kept iterating
+  until `idx == alphabet_size`, which over-consumed bit input by
+  ~14 bits per cluster whose code-length bitstream over-filled the
+  budget. On the cjxl 8x8 grey lossless fixture this desync surfaced
+  as `sym=341 > alphabet=257` at the symbol-stream cluster-4 prefix
+  prelude (the slid bit position landed in a 0x55 0x55 ... filler
+  region). With the fix the prelude now lands at bit 1341 (matches a
+  libjxl-exact Python re-decoder) and all five per-cluster prefix
+  codes read successfully, unblocking the modular sub-bitstream.
+  A strict `space != 0` post-check is now also enforced as libjxl
+  does. Regression assertion in
+  `tests/cjxl_grey_8x8_trace.rs::round9_symbol_prelude_per_cluster_dump`
+  (now requires all 5 clusters to decode).
 - **#382 — relax `pixels > bits_remaining` pre-validation for ANS-coded
   streams.** The pre-check in `modular_fdis::decode_channels` rejected
   any frame whose entropy-coded symbol stream was smaller than 1 bit

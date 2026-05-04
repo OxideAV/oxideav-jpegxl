@@ -525,78 +525,85 @@ fn read_complex_prefix(
         ));
     }
 
+    // ReadHuffmanCodeLengths per libjxl's `dec_huffman.cc` (which is the
+    // authoritative implementation; see Appendix A.6 of
+    // `docs/image/jpegxl/libjxl-trace-reverse-engineering.md`).
+    //
+    // Round-8 fix (the resolving insight from Appendix A.6 / A.5.3): the
+    // loop terminates EARLY as soon as the Kraft budget `space` reaches
+    // zero (or below). Prior rounds kept consuming cl_code symbols until
+    // `idx == alphabet_size`, which over-consumed bits and desynced
+    // every subsequent prefix-code prelude by tens of bits. The
+    // bitstream pattern that surfaced this was the cjxl 8x8 grey
+    // fixture's symbol-stream cluster 4 reading from a
+    // `0x55 0x55 0x55 ...` filler region (literal `1010101010...`)
+    // because clusters 1-3 had each been over-consumed by ~14 bits.
+    //
+    // libjxl's algorithm uses the budget formulation
+    //   space = 32768 = 1 << MAX_SYMBOL_CODE_LENGTH
+    //   space -= 32768 >> code_len   (per literal non-zero length)
+    //   space -= delta << (15 - rcl) (per repeat of length rcl)
+    // Strict equality `space == 0` is required at the end. Symbols past
+    // the early break are implicit zero (already initialised).
+    //
+    // The repeat-code chain is keyed on `repeat_code_len` (the length
+    // currently being repeated), NOT on `last_was_16/17`. That matters
+    // when a `16 17 17 16` sequence would otherwise extend the wrong
+    // chain — libjxl resets the repeat counter whenever the target
+    // length changes. (Code 16 targets `prev_code_len`; code 17 targets
+    // 0.)
     let mut lengths = vec![0u32; alphabet_size as usize];
-    let mut idx: usize = 0;
-    let mut prev_nonzero: u32 = 8;
-    let mut _iter_no = 0u32; // RFC 7932 §3.5: "If first code or all previous lengths are zero, repeats length 8".
-    let mut last_was_16 = false;
-    let mut last_was_17 = false;
-    let mut repeat_count_16: u32 = 0;
-    let mut repeat_count_17: u32 = 0;
-    while idx < alphabet_size as usize {
-        let sym = cl_code.decode(br)?;
-        _iter_no += 1;
-        if sym <= 15 {
-            lengths[idx] = sym;
-            idx += 1;
-            if sym != 0 {
-                prev_nonzero = sym;
+    let mut symbol: usize = 0;
+    let mut prev_code_len: u32 = 8; // Brotli kDefaultCodeLength.
+    let mut repeat: u32 = 0;
+    let mut repeat_code_len: u32 = 0;
+    let mut space: i64 = 32768;
+    while symbol < alphabet_size as usize && space > 0 {
+        let code_len = cl_code.decode(br)?;
+        if code_len < 16 {
+            repeat = 0;
+            lengths[symbol] = code_len;
+            symbol += 1;
+            if code_len != 0 {
+                prev_code_len = code_len;
+                space -= 32768i64 >> code_len;
             }
-            last_was_16 = false;
-            last_was_17 = false;
-        } else if sym == 16 {
-            // Repeat previous non-zero code length 3..6 times.
-            let extra = br.read_bits(2)?;
-            let new_count = if last_was_16 {
-                4 * (repeat_count_16 - 2) + 3 + extra
-            } else {
-                3 + extra
-            };
-            let delta = new_count.saturating_sub(repeat_count_16);
-            for _ in 0..delta {
-                if idx >= alphabet_size as usize {
-                    return Err(Error::InvalidData(
-                        "JXL prefix (complex): repeat-16 overruns alphabet".into(),
-                    ));
-                }
-                lengths[idx] = prev_nonzero;
-                idx += 1;
+        } else if code_len == 16 || code_len == 17 {
+            let extra_bits = code_len - 14; // 2 for code 16, 3 for code 17.
+            let new_len = if code_len == 16 { prev_code_len } else { 0 };
+            if repeat_code_len != new_len {
+                repeat = 0;
+                repeat_code_len = new_len;
             }
-            repeat_count_16 = new_count;
-            last_was_16 = true;
-            last_was_17 = false;
-        } else if sym == 17 {
-            // Repeat zero 3..10 times.
-            let extra = br.read_bits(3)?;
-            let new_count = if last_was_17 {
-                8 * (repeat_count_17 - 2) + 3 + extra
-            } else {
-                3 + extra
-            };
-            let delta = new_count.saturating_sub(repeat_count_17);
-            for _ in 0..delta {
-                if idx >= alphabet_size as usize {
-                    return Err(Error::InvalidData(
-                        "JXL prefix (complex): repeat-17 overruns alphabet".into(),
-                    ));
-                }
-                lengths[idx] = 0;
-                idx += 1;
+            let old_repeat = repeat;
+            if repeat > 0 {
+                repeat -= 2;
+                repeat <<= extra_bits;
             }
-            repeat_count_17 = new_count;
-            last_was_17 = true;
-            last_was_16 = false;
+            repeat += br.read_bits(extra_bits)? + 3;
+            let repeat_delta = repeat - old_repeat;
+            if symbol + repeat_delta as usize > alphabet_size as usize {
+                return Err(Error::InvalidData(
+                    "JXL prefix (complex): repeat overruns alphabet".into(),
+                ));
+            }
+            for k in 0..repeat_delta as usize {
+                lengths[symbol + k] = repeat_code_len;
+            }
+            symbol += repeat_delta as usize;
+            if repeat_code_len != 0 {
+                space -= (repeat_delta as i64) << (15 - repeat_code_len);
+            }
         } else {
             return Err(Error::InvalidData(
                 "JXL prefix (complex): code-length symbol out of range".into(),
             ));
         }
-        if !last_was_16 {
-            repeat_count_16 = 0;
-        }
-        if !last_was_17 {
-            repeat_count_17 = 0;
-        }
+    }
+    if space != 0 {
+        return Err(Error::InvalidData(format!(
+            "JXL prefix (complex): symbol code lengths Kraft mismatch (space={space} != 0, symbol={symbol}/{alphabet_size})"
+        )));
     }
 
     PrefixCode::from_lengths(&lengths)

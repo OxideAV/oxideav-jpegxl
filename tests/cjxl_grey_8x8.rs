@@ -82,12 +82,23 @@ fn cjxl_grey_8x8_decode_attempt() {
     }
 }
 
-/// Round-9 status: typo #8 partially RESOLVED — the kraft=33776 stop
-/// point is gone (root cause was `PrefixCode::from_lengths` overwriting
-/// canonical-Huffman lookup-table collisions instead of "first sym
-/// wins"). See round-9 CHANGELOG entry. The decoder may now hit a NEW
-/// stop point further downstream; this test logs whatever the current
-/// state is so future rounds can see it.
+/// Round-8 status: cl_code Kraft mismatch RESOLVED. Root cause was that
+/// `read_complex_prefix` did not implement libjxl's early-termination
+/// rule for the symbol-code-lengths loop — once the Kraft budget
+/// `space` reaches 0, the loop must stop and any remaining symbols
+/// stay length 0. Per Appendix A.6 of
+/// `docs/image/jpegxl/libjxl-trace-reverse-engineering.md` and the
+/// libjxl reference (`while symbol < num_symbols && space > 0` plus
+/// strict `space == 0` post-check). Without this, ~14 bits per
+/// over-Kraft cluster were over-consumed, desyncing the prelude and
+/// surfacing as `sym=341 > alphabet=257` at S[4] of the symbol-stream
+/// cluster prelude (where the bitstream reaches the 0x55 0x55 ...
+/// filler region).
+///
+/// With the fix the cjxl 8x8 grey symbol prelude reads cleanly to
+/// bit 1341 (matches a libjxl-exact Python re-decoder) and the
+/// decoder hits a new stop point at `nb_transforms = 1` (round 4
+/// territory: kRCT/kPalette/kSqueeze transform handling).
 #[test]
 fn cjxl_grey_8x8_round9_progress_marker() {
     use oxideav_jpegxl::decode_one_frame;
@@ -111,6 +122,18 @@ fn cjxl_grey_8x8_round9_progress_marker() {
             assert!(
                 !msg.contains("kraft=33776"),
                 "round-9 fix regressed: kraft=33776 stop point came back: {msg}"
+            );
+            // Round-8 expected: error message no longer contains
+            // the cl_code Kraft mismatch / "symbol out of alphabet"
+            // pattern from the symbol-stream prelude. We're now past
+            // the prelude and into transform handling.
+            assert!(
+                !msg.contains("symbol out of alphabet"),
+                "round-8 fix regressed: simple-prefix symbol-out-of-alphabet stop point came back: {msg}"
+            );
+            assert!(
+                !msg.contains("Kraft mismatch"),
+                "round-8 fix regressed: Kraft mismatch came back: {msg}"
             );
         }
     }

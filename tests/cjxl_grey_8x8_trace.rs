@@ -706,17 +706,17 @@ fn round9_symbol_prelude_per_cluster_dump() {
             }
         }
     }
-    // Round 9 progress milestone: clusters 0..3 decode OK now (the
-    // round-7/8 stop point at cluster 2 with kraft=33776 is resolved).
-    // Cluster 4 still hits "JXL prefix (simple): symbol out of alphabet"
-    // — sym=341 vs alphabet=257. The likely root cause is that the
-    // over-Kraft cl_code in cluster 2 produces an ambiguous lengths
-    // array; while our lookup-table fix lets it decode, the resulting
-    // 257-symbol table also has unfilled slots which downstream cluster
-    // reads then mismatch against. Round 10 should investigate djxl's
-    // actual interpretation of over-Kraft cl_codes.
+    // Round-8 final milestone: ALL FIVE per-cluster prefix codes now
+    // read successfully. Root cause of the prior cluster-4 failure was
+    // `read_complex_prefix` not implementing libjxl's early-termination
+    // on `space <= 0` in `ReadHuffmanCodeLengths`. Without it, each
+    // over-Kraft cluster (1, 2) over-consumed ~14 bits, sliding the
+    // cluster-4 prefix-code prelude into a 0x55 0x55 ... filler region
+    // and decoding 9-bit symbol values like 341 that aren't in the
+    // 257-entry alphabet. With the fix, the prelude lands at bit 1341
+    // (matches a libjxl-exact Python re-decoder).
     assert!(
-        clusters_ok >= 4,
-        "ROUND-9: only {clusters_ok} clusters OK (expected >= 4 after round-9 fix):\n{report}"
+        clusters_ok >= 5,
+        "ROUND-8: only {clusters_ok} clusters OK (expected 5 after libjxl-aligned ReadHuffmanCodeLengths early-termination fix):\n{report}"
     );
 }
