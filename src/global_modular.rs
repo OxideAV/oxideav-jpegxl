@@ -23,11 +23,14 @@
 
 use oxideav_core::{Error, Result};
 
-use crate::bitreader::{BitReader, U32Dist};
+use crate::bitreader::BitReader;
 use crate::frame_header::{Encoding, FrameHeader};
 use crate::metadata_fdis::{ColourSpace, ImageMetadataFdis};
 use crate::modular_fdis::{
     decode_channels, ChannelDesc, MaTreeFdis, ModularImage, WpHeader, MAX_CHANNELS,
+};
+use crate::transforms::{
+    apply_transforms_forward, apply_transforms_inverse_expanded, read_transforms, TransformInfo,
 };
 
 /// Decoded `GlobalModular` — the channel descriptions and the actual
@@ -43,6 +46,7 @@ pub struct GlobalModular {
     pub inner_used_global_tree: bool,
     pub wp_header: WpHeader,
     pub nb_transforms: u32,
+    pub transforms: Vec<TransformInfo>,
     pub image: ModularImage,
 }
 
@@ -84,20 +88,36 @@ impl GlobalModular {
         let inner_use_global_tree = br.read_bool()?;
         let wp_header = WpHeader::read(br)?;
 
-        let nb_transforms = br.read_u32([
-            U32Dist::Val(0),
-            U32Dist::Val(1),
-            U32Dist::BitsOffset(4, 2),
-            U32Dist::BitsOffset(8, 18),
-        ])?;
-        if nb_transforms != 0 {
-            return Err(Error::Unsupported(format!(
-                "JXL GlobalModular: nb_transforms = {nb_transforms} not supported (round 3 needs 0)"
+        // Per Table C.22, `nb_transforms` and the `TransformInfo[]`
+        // come BEFORE the (optional) MA tree. We parse them first so we
+        // can derive the post-transform channel list that the pixel
+        // loop will decode INTO.
+        let transforms = read_transforms(br)?;
+        let nb_transforms = transforms.len() as u32;
+
+        // Derive initial channel layout from frame metadata.
+        let initial_descs = derive_channel_descs(fh, metadata)?;
+        if initial_descs.is_empty() {
+            return Err(Error::InvalidData(
+                "JXL GlobalModular: zero channels — VarDCT path not yet supported".into(),
+            ));
+        }
+        if initial_descs.len() > MAX_CHANNELS {
+            return Err(Error::InvalidData(format!(
+                "JXL GlobalModular: {} channels exceeds cap {}",
+                initial_descs.len(),
+                MAX_CHANNELS
             )));
         }
 
-        // 3. Local MA tree + per-context distributions, OR reuse the
-        //    global tree.
+        // Apply transforms forward to obtain the channel list as it
+        // will appear in the bitstream (per C.9.2: "Their dimensions
+        // and subsampling factors are derived from the series of
+        // transforms and their parameters").
+        let (decoded_descs, nb_meta) = apply_transforms_forward(&initial_descs, &transforms)?;
+
+        // Local MA tree + per-context distributions, OR reuse the
+        // global tree. Read AFTER the transform list per Table C.22.
         let mut tree = if inner_use_global_tree {
             global_tree.ok_or_else(|| {
                 Error::InvalidData(
@@ -109,29 +129,21 @@ impl GlobalModular {
             MaTreeFdis::read(br)?
         };
 
-        // 4. Channel layout.
-        let descs = derive_channel_descs(fh, metadata)?;
-        if descs.is_empty() {
-            return Err(Error::InvalidData(
-                "JXL GlobalModular: zero channels — VarDCT path not yet supported".into(),
-            ));
-        }
-        if descs.len() > MAX_CHANNELS {
-            return Err(Error::InvalidData(format!(
-                "JXL GlobalModular: {} channels exceeds cap {}",
-                descs.len(),
-                MAX_CHANNELS
-            )));
-        }
+        // Pixel decode (Listing C.17) using the post-forward-transform
+        // channel descriptions.
+        let mut image = decode_channels(br, &decoded_descs, &mut tree, nb_meta)?;
 
-        // 5. Pixel decode (Listing C.17).
-        let image = decode_channels(br, &descs, &mut tree)?;
+        // Inverse transforms (last → first). Bit depth is needed by
+        // the palette branch (Listing L.6).
+        let bit_depth = metadata.bit_depth.bits_per_sample;
+        apply_transforms_inverse_expanded(&mut image, &transforms, bit_depth)?;
 
         Ok(Self {
             global_tree_present: global_use_tree,
             inner_used_global_tree: inner_use_global_tree,
             wp_header,
             nb_transforms,
+            transforms,
             image,
         })
     }

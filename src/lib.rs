@@ -78,7 +78,10 @@
 //! * Single-channel Grey 8 bpp;
 //! * Single-group, single-pass frame (`num_groups == 1 &&
 //!   num_passes == 1`);
-//! * `nb_transforms == 0` (no Squeeze / Palette / RCT);
+//! * `nb_transforms` parsed for kRCT / kPalette / kSqueeze; inverse
+//!   transforms wired but the kPalette inverse on cjxl's grey 8x8
+//!   `nb_colours=3 nb_deltas=0` fixture currently produces 0 instead
+//!   of 128 (round-10 spec gap — see `transforms.rs`);
 //! * Single-leaf MA tree (no decision-node evaluation);
 //! * No Patches / Splines / NoiseParameters;
 //! * `use_global_tree == false`;
@@ -109,6 +112,7 @@ pub mod modular;
 pub mod modular_fdis;
 pub mod predictors;
 pub mod toc;
+pub mod transforms;
 
 pub use container::{detect, extract_codestream, wrap_codestream, Signature};
 pub use metadata::{parse_headers, BitDepth, Headers, ImageMetadata, SizeHeader};

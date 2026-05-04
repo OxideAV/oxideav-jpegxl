@@ -397,25 +397,25 @@ impl MaTreeFdis {
                     MAX_NODES
                 )));
             }
-            let property_plus_1 = decode_uint_in(&mut tree_hybrid, &mut tree_stream, br, 1)?;
+            let property_plus_1 = decode_uint_in(&mut tree_hybrid, &mut tree_stream, br, 1, 6, 0)?;
             let property = property_plus_1 as i64 - 1;
             if property < 0 {
                 // Leaf.
-                let predictor = decode_uint_in(&mut tree_hybrid, &mut tree_stream, br, 2)?;
+                let predictor = decode_uint_in(&mut tree_hybrid, &mut tree_stream, br, 2, 6, 0)?;
                 if predictor > 13 {
                     return Err(Error::InvalidData(format!(
                         "JXL MA tree: predictor {predictor} out of range [0, 13]"
                     )));
                 }
-                let uoffset = decode_uint_in(&mut tree_hybrid, &mut tree_stream, br, 3)?;
+                let uoffset = decode_uint_in(&mut tree_hybrid, &mut tree_stream, br, 3, 6, 0)?;
                 let offset = unpack_signed(uoffset);
-                let mul_log = decode_uint_in(&mut tree_hybrid, &mut tree_stream, br, 4)?;
+                let mul_log = decode_uint_in(&mut tree_hybrid, &mut tree_stream, br, 4, 6, 0)?;
                 if mul_log > 30 {
                     return Err(Error::InvalidData(format!(
                         "JXL MA tree: mul_log {mul_log} > 30"
                     )));
                 }
-                let mul_bits = decode_uint_in(&mut tree_hybrid, &mut tree_stream, br, 5)?;
+                let mul_bits = decode_uint_in(&mut tree_hybrid, &mut tree_stream, br, 5, 6, 0)?;
                 let mul_bits_max = (1u64 << (31 - mul_log)) - 2;
                 if mul_bits as u64 > mul_bits_max {
                     return Err(Error::InvalidData(format!(
@@ -437,7 +437,7 @@ impl MaTreeFdis {
                         "JXL MA tree: property {property} too large"
                     )));
                 }
-                let uvalue = decode_uint_in(&mut tree_hybrid, &mut tree_stream, br, 0)?;
+                let uvalue = decode_uint_in(&mut tree_hybrid, &mut tree_stream, br, 0, 6, 0)?;
                 let value = unpack_signed(uvalue);
                 let nodes_now = nodes.len() as u32;
                 let left_child = nodes_now + nodes_left;
@@ -478,12 +478,24 @@ impl MaTreeFdis {
 /// configured by `entropy` and the LZ77 / window state in `hybrid`. The
 /// `ctx` selects which cluster to use.
 ///
+/// `ctx_lz` is the distribution index used for the LZ77 distance code;
+/// per FDIS D.3 + Listing C.17 this is the per-channel-decode "extra"
+/// distribution at index `num_ctx` (immediately after the regular
+/// contexts). When LZ77 is disabled it is unused.
+///
+/// `dist_multiplier` per Listing C.17 is "the largest channel width
+/// amongst all channels that are to be decoded, excluding the
+/// meta-channels" — feeds the K_SPECIAL_DISTANCES table inside the
+/// LZ77 distance branch.
+///
 /// This is the spec's `DecodeHybridVarLenUint(ctx)` from Listing D.6.
 fn decode_uint_in(
     hybrid: &mut HybridUintState,
     entropy: &mut EntropyStream,
     br: &mut BitReader<'_>,
     ctx: u32,
+    ctx_lz: u32,
+    dist_multiplier: u32,
 ) -> Result<u32> {
     // Split the borrows: `cluster_map` + `configs` are immutably
     // captured by the `configs` closure; `entropies` + `ans_state` +
@@ -526,7 +538,7 @@ fn decode_uint_in(
             ClusterEntropy::Prefix { code } => code.decode(br_inner),
         }
     };
-    hybrid.decode(br, ctx, ctx, 0, read_token, cfg_for)
+    hybrid.decode(br, ctx, ctx_lz, dist_multiplier, read_token, cfg_for)
 }
 
 /// Description of a single channel to be decoded.
@@ -654,7 +666,8 @@ fn median3(a: i32, b: i32, c: i32) -> i32 {
 /// by property id (0..16 + 4 per applicable prior channel).
 ///
 /// Properties (FDIS Table D.2):
-/// * 0 = c (channel index)
+/// * 0 = c (channel index, **adjusted to be 0-based at the first
+///   non-meta channel**: c = i - nb_meta_channels)
 /// * 1 = stream index (= 0 for GlobalModular round-7 single-group)
 /// * 2 = y, 3 = x
 /// * 4 = abs(top), 5 = abs(left)
@@ -668,7 +681,20 @@ fn median3(a: i32, b: i32, c: i32) -> i32 {
 /// * 14 = left - leftleft
 /// * 15 = max_error (E.1; 0 when weighted predictor disabled)
 /// * 16+ = extra-channel properties (Listing D.8)
-fn compute_properties_fdis(img: &ModularImage, i: usize, x: i32, y: i32) -> Vec<i32> {
+///
+/// **Spec ambiguity**: FDIS Table D.2 says property 0 is "c (channel
+/// index)" without specifying meta-channel offset. Empirically (cjxl
+/// 8x8 grey lossless fixture) cjxl trains its MA tree against
+/// `c = (channel index) - nb_meta_channels`, so the first non-meta
+/// channel sees c=0. Meta-channels (preceding the data channels) get
+/// negative c values, which are still valid tree-walk inputs.
+fn compute_properties_fdis(
+    img: &ModularImage,
+    i: usize,
+    x: i32,
+    y: i32,
+    nb_meta: usize,
+) -> Vec<i32> {
     let desc = img.descs[i];
     let left = if x > 0 {
         img.get(i, x - 1, y)
@@ -710,7 +736,7 @@ fn compute_properties_fdis(img: &ModularImage, i: usize, x: i32, y: i32) -> Vec<
     let prop9 = left.wrapping_add(top).wrapping_sub(topleft); // gradient
 
     let mut props: Vec<i32> = Vec::with_capacity(16);
-    props.push(i as i32); // 0: c
+    props.push((i as i32) - (nb_meta as i32)); // 0: c (offset by nb_meta_channels)
     props.push(0); // 1: stream index (round-7: GlobalModular = 0)
     props.push(y); // 2
     props.push(x); // 3
@@ -814,6 +840,7 @@ pub fn decode_channels(
     br: &mut BitReader<'_>,
     descs: &[ChannelDesc],
     tree: &mut MaTreeFdis,
+    nb_meta: u32,
 ) -> Result<ModularImage> {
     if descs.is_empty() {
         return Ok(ModularImage {
@@ -834,19 +861,20 @@ pub fn decode_channels(
 
     // Pre-validate channel sizes.
     //
-    // The "1 bit per pixel" lower bound only holds for prefix-coded
-    // (Huffman) symbol streams: every prefix code symbol consumes ≥ 1
-    // bit. ANS-coded streams use range coding with fractional-bit cost
-    // per symbol, so a low-entropy stream (e.g. constant-grey image)
-    // can encode N pixels in well under N bits — the stream collapses
-    // to its 32-bit final ANS state plus a handful of preamble bits.
-    // Applying the prefix-mode bound there rejects valid bitstreams.
+    // We *intentionally* do NOT apply a "≥ 1 bit per pixel" lower
+    // bound here, even for prefix-coded streams. Per RFC 7932 §3.4
+    // and §3.5 (and our own `read_complex_prefix` implementation),
+    // a prefix code with a single non-zero symbol assigns that
+    // symbol a zero-length code, so 64 same-value pixels can be
+    // emitted in 0 bits. The ANS path likewise has fractional bit
+    // cost per symbol. Both modes therefore admit codestreams whose
+    // pixel count exceeds the byte-count by an unbounded margin
+    // for low-entropy regions.
     //
-    // For ANS we rely on the ANS decoder's own truncation detection
-    // (`AnsDecoder::renormalise` / `BitReader::read_bits` will surface
-    // "out of input" if the stream is genuinely short) rather than a
-    // pre-check that conflates symbol count with bit count.
-    let pixel_bit_check_applies = tree.entropy.use_prefix_code;
+    // We rely on the entropy decoders' own truncation detection
+    // (`BitReader::read_bits` surfaces "out of input" if the stream
+    // is genuinely short) plus the per-dimension cap below to bound
+    // allocation.
     for (i, d) in descs.iter().enumerate() {
         if d.width == 0 || d.height == 0 {
             return Err(Error::InvalidData(format!(
@@ -859,16 +887,6 @@ pub fn decode_channels(
                 "JXL Modular: channel {i} dim {}x{} exceeds cap {MAX_DIM}",
                 d.width, d.height
             )));
-        }
-        if pixel_bit_check_applies {
-            let pixels = (d.width as u64).saturating_mul(d.height as u64);
-            // Prefix-mode lower bound: ≥ 1 bit per pixel. Reject if the
-            // input could not even supply one bit per pixel.
-            if pixels > br.bits_remaining() as u64 {
-                return Err(Error::InvalidData(format!(
-                    "JXL Modular: channel {i} pixel count {pixels} exceeds remaining input bits"
-                )));
-            }
         }
     }
 
@@ -886,10 +904,25 @@ pub fn decode_channels(
     // mutably borrowing `tree.entropy` / `tree.hybrid`.
     let nodes = tree.nodes.clone();
 
+    // Per Listing C.17, `dist_multiplier` is "the largest channel width
+    // amongst all channels that are to be decoded, excluding the
+    // meta-channels". Meta-channels are identified by hshift == -1 (per
+    // C.9.1: dimensions not derived from original image dims).
+    let dist_multiplier: u32 = descs
+        .iter()
+        .filter(|d| d.hshift >= 0)
+        .map(|d| d.width)
+        .max()
+        .unwrap_or(0);
+
+    // The LZ77 distance distribution sits at index `num_ctx`
+    // (immediately after the regular per-leaf contexts).
+    let ctx_lz: u32 = tree.num_ctx as u32;
+
     for (i, desc) in descs.iter().enumerate() {
         for y in 0..desc.height {
             for x in 0..desc.width {
-                let props = compute_properties_fdis(&img, i, x as i32, y as i32);
+                let props = compute_properties_fdis(&img, i, x as i32, y as i32, nb_meta as usize);
                 let leaf = walk_tree(&nodes, &props)?;
                 if (leaf.ctx as usize) >= tree.num_ctx {
                     return Err(Error::InvalidData(format!(
@@ -897,7 +930,14 @@ pub fn decode_channels(
                         leaf.ctx, tree.num_ctx
                     )));
                 }
-                let token = decode_uint_in(&mut tree.hybrid, &mut tree.entropy, br, leaf.ctx)?;
+                let token = decode_uint_in(
+                    &mut tree.hybrid,
+                    &mut tree.entropy,
+                    br,
+                    leaf.ctx,
+                    ctx_lz,
+                    dist_multiplier,
+                )?;
                 let diff = unpack_signed(token);
                 let p = predict(&img, i, x as i32, y as i32, leaf.predictor)?;
                 let val = (diff as i64)
