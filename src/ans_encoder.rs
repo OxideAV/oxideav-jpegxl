@@ -65,7 +65,7 @@
 //!    `bitcount = code - 1` for all codes, giving lossless preamble
 //!    round-trip).
 
-use oxideav_core::{Error, Result};
+use crate::error::{JxlError as Error, Result};
 
 use crate::ans::alias::AliasTable;
 use crate::ans::distribution::K_LOG_COUNT_LUT;

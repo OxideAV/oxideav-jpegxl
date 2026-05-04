@@ -9,7 +9,7 @@
 //! This module exposes signature detection and a minimal demuxer that
 //! extracts the concatenated codestream payload from the wrapper.
 
-use oxideav_core::{Error, Result};
+use crate::error::{JxlError as Error, Result};
 
 /// Raw codestream magic: `FF 0A` (2 bytes, little-endian reading of `0x0AFF`).
 pub const RAW_CODESTREAM_SIGNATURE: [u8; 2] = [0xFF, 0x0A];

@@ -35,7 +35,7 @@
 //! | C.9.3.1      | [`decode_channel_pixels`] inner loop   |
 //! | D.7.2        | [`compute_properties`]                 |
 
-use oxideav_core::{Error, Result};
+use crate::error::{JxlError as Error, Result};
 
 use crate::abrac::Abrac;
 use crate::bitreader::BitReader;

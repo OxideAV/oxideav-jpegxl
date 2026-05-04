@@ -14,7 +14,7 @@
 //! ISO text is the only acceptable reference; `SPEC_BLOCKED.md` in this
 //! crate documents that the spec is not currently in `docs/image/jxl/`.
 
-use oxideav_core::{Error, Result};
+use crate::error::{JxlError as Error, Result};
 
 use crate::bitreader::{BitReader, U32Dist};
 use crate::container::{detect, extract_codestream, Signature, RAW_CODESTREAM_SIGNATURE};

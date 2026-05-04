@@ -16,7 +16,7 @@
 //! `MEMORY/project_jpegxl_fdis_typos.md` for the four typos round 1
 //! already documented.
 
-use oxideav_core::{Error, Result};
+use crate::error::{JxlError as Error, Result};
 
 use crate::bitreader::{BitReader, U32Dist};
 use crate::extensions::Extensions;

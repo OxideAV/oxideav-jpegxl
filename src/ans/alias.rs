@@ -16,7 +16,7 @@
 //! redirects its post-cutoff range to symbol `o` at offset
 //! `cutoffs[o]`.
 
-use oxideav_core::{Error, Result};
+use crate::error::{JxlError as Error, Result};
 
 /// Maximum supported `log_alphabet_size`. FDIS D.3.1 caps this at 15
 /// for the ANS path; we cap a bit lower than the bitreader's allocation

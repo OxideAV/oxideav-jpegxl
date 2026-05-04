@@ -20,7 +20,7 @@
 //! `GlobalModular` (a Modular sub-bitstream — see that module for its
 //! own bounds).
 
-use oxideav_core::{Error, Result};
+use crate::error::{JxlError as Error, Result};
 
 use crate::bitreader::BitReader;
 use crate::frame_header::{flags, Encoding, FrameHeader};

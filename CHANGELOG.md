@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Standalone (no-`registry`) build path.** Default-on `registry` Cargo
+  feature gates the `oxideav-core` dependency and the
+  `Decoder`/`Encoder`/`register` trait surface (now in a new
+  `registry` module). With `--no-default-features` the crate compiles
+  without `oxideav-core` and exposes:
+  - Crate-local `error::JxlError` / `error::Result` (mirrors the
+    `oxideav_core::Error` variants this crate produces:
+    `InvalidData` / `Unsupported` / `Eof` / `NeedMore` / `Other`).
+  - Crate-local `image::JxlImage` / `image::JxlPlane` /
+    `image::JxlPixelFormat` for decoded pixels (no
+    `oxideav_core::VideoFrame` dependence).
+  - Free-standing `decode_one_frame()` returning `JxlImage`, the
+    existing `encoder::encode_one_frame()` returning `Vec<u8>`, plus
+    the `probe()` / `probe_fdis()` header inspectors.
+  All pipeline modules (`bitreader` / `bitwriter` / `container` /
+  `metadata` / `metadata_fdis` / `frame_header` / `toc` /
+  `lf_global` / `global_modular` / `modular` / `modular_fdis` /
+  `transforms` / `predictors` / `matree` / `abrac` / `begabrac` /
+  `ans*` / `extensions` / `encoder` / `ans_encoder`) now use the
+  crate-local error type. The `From<JxlError> for oxideav_core::Error`
+  + `From<JxlImage> for oxideav_core::Frame` conversions live in the
+  registry-gated module so the framework-side `Decoder` / `Encoder`
+  traits keep working unchanged. Inline `ci-standalone` job in
+  `.github/workflows/ci.yml` builds + tests `--no-default-features`
+  on every push.
+
 ### Fixed
 
 - **prefix code: `read_complex_prefix` now matches libjxl's

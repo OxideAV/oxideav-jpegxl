@@ -14,7 +14,7 @@
 //! decoded, `state` equals `0x130000`. Use [`AnsDecoder::final_state`]
 //! to verify that condition at end-of-stream.
 
-use oxideav_core::{Error, Result};
+use crate::error::{JxlError as Error, Result};
 
 use crate::ans::alias::AliasTable;
 use crate::bitreader::BitReader;

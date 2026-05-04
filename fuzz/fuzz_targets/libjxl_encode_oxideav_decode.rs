@@ -20,7 +20,7 @@
 //! mode is supposed to roundtrip exactly).
 
 use libfuzzer_sys::fuzz_target;
-use oxideav_jpegxl::decode_one_frame;
+use oxideav_jpegxl::{decode_one_frame, JxlImage};
 use oxideav_jpegxl_fuzz::libjxl;
 
 const MAX_WIDTH: usize = 64;
@@ -80,12 +80,7 @@ fn image_from_fuzz_input(data: &[u8]) -> Option<(u32, u32, &[u8])> {
 /// any plane data covers the claimed area. Full byte-exact RGBA
 /// roundtrip won't be possible until the decoder grows colour
 /// support, at which point this assertion should be tightened.
-fn assert_pixel_equal(
-    expected_rgba: &[u8],
-    width: u32,
-    height: u32,
-    frame: &oxideav_core::frame::VideoFrame,
-) {
+fn assert_pixel_equal(expected_rgba: &[u8], width: u32, height: u32, frame: &JxlImage) {
     assert!(!frame.planes.is_empty(), "decoded frame has zero planes");
     let w = width as usize;
     let h = height as usize;

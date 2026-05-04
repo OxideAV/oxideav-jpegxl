@@ -4,7 +4,7 @@
 //! `kSpecialDistances` lookup table. The decoder maintains a 1 MiB
 //! sliding window for LZ77-style copy operations.
 
-use oxideav_core::{Error, Result};
+use crate::error::{JxlError as Error, Result};
 
 use super::hybrid_config::HybridUintConfig;
 use crate::bitreader::BitReader;

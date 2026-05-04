@@ -9,7 +9,6 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
-oxideav-core = "0.1"
 # libloading is the only libjxl interop: the cross-decode harness
 # `dlopen`s the system-installed libjxl at startup. No `*-sys` crate,
 # no libjxl source pulled into the dep tree (workspace policy bars

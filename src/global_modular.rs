@@ -21,7 +21,7 @@
 //! [`crate::modular_fdis`]. Per-channel pixel allocation is bounded by
 //! `width × height` against the bit reader's remaining input length.
 
-use oxideav_core::{Error, Result};
+use crate::error::{JxlError as Error, Result};
 
 use crate::bitreader::BitReader;
 use crate::frame_header::{Encoding, FrameHeader};

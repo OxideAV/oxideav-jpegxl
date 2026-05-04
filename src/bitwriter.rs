@@ -6,7 +6,7 @@
 //! the encoder modules pairs `BitWriter::write_bits(v, n)` against a
 //! subsequent `BitReader::read_bits(n)` and asserts equality.
 
-use oxideav_core::{Error, Result};
+use crate::error::{JxlError as Error, Result};
 
 /// LSB-first bit writer.
 ///

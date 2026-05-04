@@ -20,7 +20,7 @@
 //! billions of groups would already have been rejected by the
 //! `width × height` check in [`crate::frame_header::FrameHeader`].
 
-use oxideav_core::{Error, Result};
+use crate::error::{JxlError as Error, Result};
 
 use crate::ans::alias::AliasTable;
 use crate::ans::cluster::{num_clusters, read_clustering};

@@ -20,7 +20,7 @@
 //! they match a code"). Decode uses a flat lookup table sized by the
 //! longest code length, capped at 15 bits per RFC 7932 §3.1.
 
-use oxideav_core::{Error, Result};
+use crate::error::{JxlError as Error, Result};
 
 use crate::bitreader::BitReader;
 

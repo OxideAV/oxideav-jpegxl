@@ -18,7 +18,7 @@
 //! to drive [`HybridUintState::decode`] across `num_distributions`
 //! integer reads.
 
-use oxideav_core::{Error, Result};
+use crate::error::{JxlError as Error, Result};
 
 use crate::ans::alias::AliasTable;
 use crate::ans::distribution::read_distribution;

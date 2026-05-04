@@ -14,4 +14,20 @@ keywords = ["multimedia", "image", "jpegxl", "jxl", "codec"]
 categories = ["multimedia::encoding", "multimedia::images"]
 
 [dependencies]
-oxideav-core = "0.1"
+# `oxideav-core` is gated behind the default-on `registry` feature so
+# image-library consumers can depend on `oxideav-jpegxl` with
+# `default-features = false` and avoid the framework dependency tree
+# entirely. Without `registry` the crate exposes the standalone
+# `decode_one_frame` / `encode_one_frame` API plus crate-local
+# `JxlError` / `JxlImage` types and never references `oxideav-core`.
+oxideav-core = { version = "0.1", optional = true }
+
+[features]
+default = ["registry"]
+
+# Wires up the `register` entry point + `Decoder` / `Encoder` trait
+# implementations against `oxideav-core` so the crate can plug into the
+# `oxideav` framework registry. Default-on; turn off for image-library
+# use-cases that just want the standalone `decode_one_frame` /
+# `encode_one_frame` API.
+registry = ["dep:oxideav-core"]

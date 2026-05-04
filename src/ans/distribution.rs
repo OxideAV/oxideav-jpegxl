@@ -19,7 +19,7 @@
 //! Both fixes are minimal and required for the decoded distribution to
 //! satisfy the `sum to 4096` invariant the rest of D.3 relies on.
 
-use oxideav_core::{Error, Result};
+use crate::error::{JxlError as Error, Result};
 
 use crate::bitreader::BitReader;
 

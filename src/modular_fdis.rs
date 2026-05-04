@@ -37,7 +37,7 @@
 //! decoder-supplied `(width, height, num_channels)` from C.4.8 — none
 //! of which are read from the bitstream in this module.
 
-use oxideav_core::{Error, Result};
+use crate::error::{JxlError as Error, Result};
 
 use crate::ans::alias::AliasTable;
 use crate::ans::cluster::{num_clusters, read_clustering};

@@ -14,7 +14,7 @@
 //! whose payload bit-count we cap against the bit reader's remaining
 //! input length before any actual read.
 
-use oxideav_core::{Error, Result};
+use crate::error::{JxlError as Error, Result};
 
 use crate::bitreader::BitReader;
 

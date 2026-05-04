@@ -22,7 +22,7 @@
 //! average rule (`ac += (4096 - ac) >> 5` on a `1` bit, `ac -= ac >> 5`
 //! on a `0` bit).
 
-use oxideav_core::{Error, Result};
+use crate::error::{JxlError as Error, Result};
 
 /// Decoder state for the base ABRAC range coder (D.7).
 ///

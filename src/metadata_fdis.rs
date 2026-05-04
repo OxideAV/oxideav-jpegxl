@@ -16,7 +16,7 @@
 //! `U32` distribution it was decoded from (see `MAX_NUM_EXTRA_CHANNELS`
 //! and `MAX_NAME_LEN`).
 
-use oxideav_core::{Error, Result};
+use crate::error::{JxlError as Error, Result};
 
 use crate::bitreader::{unpack_signed, BitReader, U32Dist};
 use crate::extensions::Extensions;

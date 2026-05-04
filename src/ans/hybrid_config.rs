@@ -4,7 +4,7 @@
 //! `DecodeHybridVarLenUint` (D.3.6) can convert a token to an unsigned
 //! integer with a shared MSB / LSB / extra-bits split.
 
-use oxideav_core::{Error, Result};
+use crate::error::{JxlError as Error, Result};
 
 use crate::bitreader::BitReader;
 

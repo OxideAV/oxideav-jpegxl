@@ -27,7 +27,7 @@
 //! at `MAX_SQUEEZE_STEPS`, `nb_colours+nb_deltas` at `MAX_PALETTE_SIZE`.
 //! Channel count is bounded by [`crate::modular_fdis::MAX_CHANNELS`].
 
-use oxideav_core::{Error, Result};
+use crate::error::{JxlError as Error, Result};
 
 use crate::bitreader::{BitReader, U32Dist};
 use crate::modular_fdis::{ChannelDesc, ModularImage, MAX_CHANNELS, MAX_DIM};
