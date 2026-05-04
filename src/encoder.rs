@@ -974,16 +974,21 @@ mod tests {
         assert_eq!(frame.planes[0].data, pixels);
     }
 
-    // Note: a "constant grey" round-trip test was attempted but the
-    // decoder's coarse `pixels > bits_remaining` pre-validation in
-    // `modular_fdis.rs` rejects any frame whose ANS-coded symbol stream
-    // is smaller than 1 bit/pixel. ANS easily achieves <1 bit/pixel for
-    // single-symbol distributions (the entire 64-symbol stream collapses
-    // to the 32-bit final state). The decoder bound check is overly
-    // conservative; tightening it (or dropping it in favour of the
-    // existing MAX_DIM cap) is a separate decoder-side fix outside the
-    // round-4 ANS encoder scope.
-    //
-    // RGB round-trip is also pending: the round-3 decoder rejects
-    // colour_space=Rgb (Grey only). Same deferral.
+    /// Issue #382 regression: constant-grey ANS frames easily achieve
+    /// <1 bit/pixel — the entire 64-symbol stream collapses to a few
+    /// preamble bits + the 32-bit final ANS state. The previous
+    /// `pixels > bits_remaining` pre-check in `modular_fdis::decode_channels`
+    /// rejected this valid bitstream. The check now applies only to
+    /// prefix-coded streams, so this round-trip succeeds.
+    #[test]
+    fn ans_coded_constant_grey_8x8_round_trips_through_decoder() {
+        let pixels = vec![0x42u8; 64];
+        let bytes = encode_one_frame(8, 8, &pixels, InputFormat::Gray8).unwrap();
+        let frame = crate::decode_one_frame(&bytes, None).unwrap();
+        assert_eq!(frame.planes.len(), 1);
+        assert_eq!(frame.planes[0].data, pixels);
+    }
+
+    // Note: RGB round-trip is pending — the round-3 decoder rejects
+    // colour_space=Rgb (Grey only). Tracked separately from #382.
 }

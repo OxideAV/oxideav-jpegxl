@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **#382 — relax `pixels > bits_remaining` pre-validation for ANS-coded
+  streams.** The pre-check in `modular_fdis::decode_channels` rejected
+  any frame whose entropy-coded symbol stream was smaller than 1 bit
+  per pixel. That lower bound only holds for prefix (Huffman) codes,
+  where every symbol consumes ≥ 1 bit. ANS coding has variable
+  fractional-bit cost per symbol — a constant-grey 8×8 channel encodes
+  in well under 64 bits (preamble + 32-bit final state). The check now
+  runs only when `EntropyStream::use_prefix_code == true`; ANS-coded
+  paths rely on the ANS state / `BitReader` to detect truncation.
+  Regression test `ans_coded_constant_grey_8x8_round_trips_through_decoder`.
+
 ## [0.0.6](https://github.com/OxideAV/oxideav-jpegxl/compare/v0.0.5...v0.0.6) - 2026-05-04
 
 ### Fixed

@@ -833,6 +833,20 @@ pub fn decode_channels(
     }
 
     // Pre-validate channel sizes.
+    //
+    // The "1 bit per pixel" lower bound only holds for prefix-coded
+    // (Huffman) symbol streams: every prefix code symbol consumes ≥ 1
+    // bit. ANS-coded streams use range coding with fractional-bit cost
+    // per symbol, so a low-entropy stream (e.g. constant-grey image)
+    // can encode N pixels in well under N bits — the stream collapses
+    // to its 32-bit final ANS state plus a handful of preamble bits.
+    // Applying the prefix-mode bound there rejects valid bitstreams.
+    //
+    // For ANS we rely on the ANS decoder's own truncation detection
+    // (`AnsDecoder::renormalise` / `BitReader::read_bits` will surface
+    // "out of input" if the stream is genuinely short) rather than a
+    // pre-check that conflates symbol count with bit count.
+    let pixel_bit_check_applies = tree.entropy.use_prefix_code;
     for (i, d) in descs.iter().enumerate() {
         if d.width == 0 || d.height == 0 {
             return Err(Error::InvalidData(format!(
@@ -846,14 +860,15 @@ pub fn decode_channels(
                 d.width, d.height
             )));
         }
-        let pixels = (d.width as u64).saturating_mul(d.height as u64);
-        // Each pixel's smallest possible decode is one entropy-coded
-        // symbol = at minimum 1 bit. Reject if input could not even
-        // supply one bit per pixel.
-        if pixels > br.bits_remaining() as u64 {
-            return Err(Error::InvalidData(format!(
-                "JXL Modular: channel {i} pixel count {pixels} exceeds remaining input bits"
-            )));
+        if pixel_bit_check_applies {
+            let pixels = (d.width as u64).saturating_mul(d.height as u64);
+            // Prefix-mode lower bound: ≥ 1 bit per pixel. Reject if the
+            // input could not even supply one bit per pixel.
+            if pixels > br.bits_remaining() as u64 {
+                return Err(Error::InvalidData(format!(
+                    "JXL Modular: channel {i} pixel count {pixels} exceeds remaining input bits"
+                )));
+            }
         }
     }
 
