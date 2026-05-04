@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.6](https://github.com/OxideAV/oxideav-jpegxl/compare/v0.0.5...v0.0.6) - 2026-05-04
+
+### Fixed
+
+- fix clippy: drop unnecessary u32→u32 cast and 1*1*3 identity-op
+
+### Other
+
+- round 4 — re-integrate ANS-coded symbol stream
+- round 4 — fix alias-table bijection via aligned D[]
+- remove pre-existing buggy gradient_leaf_ma_tree test
+- revert round-3 ANS integration; keep ans_encoder module
+- fix alias-table inversion for offsets ≥ D[s]
+- cross-validate ANS-coded 16x16 skewed grey vs djxl
+- round 3 — switch symbol stream from prefix code to ANS
+- round-3 ANS entropy encoder + distribution preamble
+- drop unused write_prefix_code_count_one helper
+- add ISOBMFF wrap_codestream + encode_one_frame_isobmff
+- add djxl cross-validation roundtrip (round 2)
+- round 2 — switch from Predictor=Zero to Gradient (id 5)
+- round-1 lossless modular Gray/RGB/RGBA at 8 bpp
+- add cargo-fuzz harness with libjxl cross-decode oracle
+
 ## [0.0.5](https://github.com/OxideAV/oxideav-jpegxl/compare/v0.0.4...v0.0.5) - 2026-05-03
 
 ### Other
