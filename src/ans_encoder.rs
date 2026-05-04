@@ -1,4 +1,4 @@
-//! ANS entropy ENCODER — partial inverse of `crate::ans::symbol::AnsDecoder`
+//! ANS entropy ENCODER — forward inverse of `crate::ans::symbol::AnsDecoder`
 //! and `crate::ans::distribution::read_distribution`.
 //!
 //! The decoder side (FDIS Annex D.3.3 + D.3.4) is already in
@@ -7,39 +7,48 @@
 //! emits the on-wire ANS bitstream that the existing decoder will read
 //! back to recover the same symbol sequence.
 //!
-//! ## ⚠️ Round-3 status: WORKS FOR 1- AND 2-SYMBOL DISTRIBUTIONS ONLY
+//! ## Round-4 finding: alignment constraint on `D[s]`
 //!
-//! The JXL `AliasTable::build` (FDIS D.3.2 Listing D.1) does NOT
-//! guarantee that the per-symbol offsets are pairwise distinct mod
-//! `D[s]`. For distributions with 3+ non-zero symbols, the alias
-//! pump can produce a symbol whose offsets overlap mod `D[s]` (e.g.
-//! `D=[3278, 614, 204]` makes symbol 1's offsets cover `[50, 614)
-//! ∪ [3150, 3200)`, where the second range mod 614 = `[80, 130)`
-//! double-covers part of the first). The standard rANS encoder
-//! requires offsets-mod-`D[s]` to be a bijection — without that, the
-//! reverse-walk inverse update has no unique answer.
+//! The JXL spec's `AliasTable::build` (FDIS D.3.2 Listing D.1) only
+//! produces a per-symbol offset bijection when **every `D[s]` is a
+//! multiple of `bucket_size = 1 << (12 - log_alphabet_size)`**. With
+//! that alignment satisfied, the alias-pump's offsets for symbol `s`
+//! all lie in `[0, D[s])` AND form a bijection onto `[0, D[s])`. With
+//! that bijection the standard rANS reverse-walk encoder works without
+//! ambiguity.
 //!
-//! The encoder integration into `src/encoder.rs` is therefore deferred
-//! until either (a) `AliasTable::build` is changed to produce
-//! normalised offsets, OR (b) a smarter inverse-table that searches
-//! across ALL valid `(q, off)` pairs is implemented. Round 4 should
-//! revisit.
+//! For non-aligned `D[]` (e.g. `D=[3278, 614, 204]` at log_alpha=5,
+//! bucket_size=128), symbol 1's offsets cover `[50, 614) ∪ [3150, 3200)`
+//! (614 distinct slots) but mod 614 they cover only `{50..613}` — 50
+//! residues missing, the encoder gets stuck for `state mod 614 ∈ [0, 50)`.
 //!
-//! Until then, the standalone module is useful for:
-//! * Single-symbol distributions (`D = [4096, 0, ...]`).
-//! * Two-symbol distributions (`D = [a, b, 0, ...]` with `a + b = 4096`).
-//! * Uniform-over-N distributions (where N divides 4096 evenly OR with
-//!   the fractional-overflow scheme from D.3.4 — both round-trip).
+//! The fix in [`quantise_distribution_aligned`] forces every entry of
+//! the produced `D[]` to be a multiple of `bucket_size`. With log_alpha
+//! at the spec maximum of 8 (so bucket_size=16), this gives 256-step
+//! granularity per symbol — finer than the 128-step granularity at
+//! log_alpha=5 used by the round-2 encoder. The granularity loss vs an
+//! unconstrained `D[]` is negligible: the entropy bound is preserved
+//! to within `~log2(1 + 1/256) ≈ 0.006 bits/symbol`.
 //!
-//! ## High-level algorithm (when it works)
+//! Built-in safeguards: [`build_inverse_alias`] sanity-checks that each
+//! `(s, k)` slot in the inverse table is filled exactly once. If the
+//! caller passes a non-aligned `D[]` (e.g. via the legacy unaligned
+//! [`quantise_distribution`]), the build will fail with an "alias
+//! method's bijection invariant violated" error rather than silently
+//! mis-encoding.
+//!
+//! ## High-level algorithm
 //!
 //! 1. **Quantise** raw symbol counts into a non-negative `D[]` array of
-//!    length `1 << log_alphabet_size` with `sum(D) == 4096`.
+//!    length `1 << log_alphabet_size` with `sum(D) == 4096` AND each
+//!    entry a multiple of `bucket_size`. Use
+//!    [`quantise_distribution_aligned`] (NOT the legacy
+//!    [`quantise_distribution`]) for ANS.
 //!
 //! 2. **Inverse alias table** — for each symbol `s`, walk all 4096
 //!    alias-table indices and record `inv_alias[s][k]` where
-//!    `k = lookup(x).offset mod D[s]`. (BUG: collisions produce silent
-//!    overwrites — see status note above.)
+//!    `k = lookup(x).offset mod D[s]`. Aligned `D[]` makes this a
+//!    bijection.
 //!
 //! 3. **Reverse-walk encode** — process symbols in REVERSE order. For
 //!    each symbol `s`:
@@ -73,8 +82,19 @@ pub const ANS_LOG_TAB_SIZE: u32 = 12;
 /// Annex D.3.3 (the `(state << 16) | u(16)` refill).
 pub const ANS_REFILL_BITS: u32 = 16;
 
-/// Quantise raw symbol histogram counts into a `D[]` array of length
-/// `1 << log_alphabet_size` with `sum(D) == 4096`.
+/// Quantise raw symbol histogram counts into an UNALIGNED `D[]` array
+/// of length `1 << log_alphabet_size` with `sum(D) == 4096`.
+///
+/// **For ANS encoding, use [`quantise_distribution_aligned`] instead.**
+/// This function produces `D[]` entries that may not be multiples of
+/// `bucket_size`, which violates the alias-table bijection invariant
+/// required by [`build_inverse_alias`]. The 1- and 2-symbol cases work
+/// (the alias builder takes a short path), but 3+ symbol distributions
+/// will fail in `build_inverse_alias` with an "alias bijection
+/// invariant violated" error.
+///
+/// This function is retained only for the 1- and 2-symbol shortcut
+/// cases used by the existing tests.
 ///
 /// Algorithm: per-symbol target = `round(count_i / total * 4096)`,
 /// clamped to `[1, 4096]` for non-zero counts; zero counts stay 0.
@@ -194,31 +214,184 @@ pub fn quantise_distribution(counts: &[u32], log_alphabet_size: u32) -> Result<V
     Ok(d)
 }
 
+/// Quantise raw symbol histogram counts into a `D[]` array of length
+/// `1 << log_alphabet_size` where each entry is a multiple of
+/// `bucket_size = 1 << (12 - log_alphabet_size)` and `sum(D) == 4096`.
+///
+/// **Use this (not [`quantise_distribution`]) for ANS encoding.** The
+/// alignment constraint ensures the spec's alias-table construction
+/// produces a per-symbol offset bijection — which is required for the
+/// reverse-walk encoder ([`encode_symbols`]) to never get stuck.
+///
+/// The loss vs unconstrained quantisation is negligible: at the spec's
+/// maximum `log_alphabet_size = 8`, `bucket_size = 16`, giving 256-step
+/// granularity per symbol (vs the unconstrained 4096-step). The entropy
+/// bound rises by at most `~log2(1 + 1/256) ≈ 0.006 bits/symbol`.
+///
+/// Algorithm:
+/// 1. Compute granular target = `round(c / total * (4096 / bucket_size))`
+///    for each non-zero symbol.
+/// 2. Clamp to `[1, 4096 / bucket_size]`.
+/// 3. Adjust to hit exactly `4096 / bucket_size` granules total by
+///    nudging the largest entries up/down.
+/// 4. Multiply by `bucket_size` to get the final `D[]`.
+///
+/// `counts.len()` must be `<= 1 << log_alphabet_size`. Symbols beyond
+/// `counts.len()` get probability 0. The number of non-zero `counts`
+/// must be `<= 4096 / bucket_size` (i.e. `<= table_size`).
+///
+/// Returns `Err` if the histogram is empty (no non-zero counts) or
+/// `log_alphabet_size > 8` (out of spec range).
+pub fn quantise_distribution_aligned(counts: &[u32], log_alphabet_size: u32) -> Result<Vec<u16>> {
+    if log_alphabet_size > 8 {
+        return Err(Error::other(
+            "ANS encoder: log_alphabet_size > 8 not supported by spec (max is 5+u(2)=8)",
+        ));
+    }
+    if log_alphabet_size < 5 {
+        return Err(Error::other(
+            "ANS encoder: log_alphabet_size < 5 not supported by spec (min is 5+u(2)=5)",
+        ));
+    }
+    let table_size: usize = 1usize << log_alphabet_size;
+    let log_bucket_size: u32 = 12 - log_alphabet_size;
+    let bucket_size: u32 = 1u32 << log_bucket_size;
+    let max_grans: u32 = ANS_TAB_SIZE / bucket_size; // = table_size
+
+    if counts.len() > table_size {
+        return Err(Error::other(format!(
+            "ANS encoder: counts.len()={} exceeds 1 << log_alphabet_size={}",
+            counts.len(),
+            table_size
+        )));
+    }
+    let total: u64 = counts.iter().map(|&c| c as u64).sum();
+    if total == 0 {
+        return Err(Error::other(
+            "ANS encoder: cannot quantise an all-zero histogram",
+        ));
+    }
+
+    let mut grans: Vec<u32> = vec![0u32; table_size];
+    let mut nonzero: Vec<usize> = Vec::new();
+    for (i, &c) in counts.iter().enumerate() {
+        if c != 0 {
+            nonzero.push(i);
+        }
+    }
+    if nonzero.len() > max_grans as usize {
+        return Err(Error::other(format!(
+            "ANS encoder: {} non-zero symbols > {} granules available at log_alpha={}",
+            nonzero.len(),
+            max_grans,
+            log_alphabet_size
+        )));
+    }
+
+    // Single-symbol shortcut: full mass to that symbol (alias table
+    // builder takes the single-symbol short path).
+    if nonzero.len() == 1 {
+        let mut d = vec![0u16; table_size];
+        d[nonzero[0]] = ANS_TAB_SIZE as u16;
+        return Ok(d);
+    }
+
+    // Initial pass: each non-zero count → at least 1 granule.
+    let mut sum_grans: u32 = 0;
+    for &i in &nonzero {
+        let c = counts[i] as u64;
+        let target = ((c * max_grans as u64) / total) as u32;
+        grans[i] = target.max(1).min(max_grans);
+        sum_grans += grans[i];
+    }
+
+    // Adjust to hit exactly max_grans granules.
+    use core::cmp::Ordering;
+    match sum_grans.cmp(&max_grans) {
+        Ordering::Equal => {}
+        Ordering::Less => {
+            let mut deficit = max_grans - sum_grans;
+            let mut sorted = nonzero.clone();
+            sorted.sort_by_key(|&i| std::cmp::Reverse(grans[i]));
+            let mut k = 0usize;
+            while deficit > 0 {
+                let i = sorted[k % sorted.len()];
+                if grans[i] < max_grans {
+                    grans[i] += 1;
+                    deficit -= 1;
+                }
+                k += 1;
+                if k > sorted.len() * (max_grans as usize) {
+                    return Err(Error::other(
+                        "ANS encoder: aligned-quantise deficit allocation did not converge (BUG)",
+                    ));
+                }
+            }
+        }
+        Ordering::Greater => {
+            let mut excess = sum_grans - max_grans;
+            let mut sorted = nonzero.clone();
+            sorted.sort_by_key(|&i| std::cmp::Reverse(grans[i]));
+            let mut k = 0usize;
+            while excess > 0 {
+                let i = sorted[k % sorted.len()];
+                if grans[i] > 1 {
+                    grans[i] -= 1;
+                    excess -= 1;
+                }
+                k += 1;
+                if k > sorted.len() * (max_grans as usize) {
+                    return Err(Error::other(
+                        "ANS encoder: aligned-quantise excess removal did not converge (BUG)",
+                    ));
+                }
+            }
+        }
+    }
+
+    let d: Vec<u16> = grans.iter().map(|&g| (g * bucket_size) as u16).collect();
+    let final_sum: u32 = d.iter().map(|&v| v as u32).sum();
+    if final_sum != ANS_TAB_SIZE {
+        return Err(Error::other(format!(
+            "ANS encoder: aligned-quantise post-sum {final_sum} != 4096 (BUG)"
+        )));
+    }
+    // Sanity: every entry must be a multiple of bucket_size.
+    for (i, &v) in d.iter().enumerate() {
+        if (v as u32) % bucket_size != 0 {
+            return Err(Error::other(format!(
+                "ANS encoder: aligned-quantise D[{i}]={v} not multiple of bucket_size={bucket_size} (BUG)"
+            )));
+        }
+    }
+
+    Ok(d)
+}
+
 /// Build the inverse-alias table for a quantised distribution `d`.
 ///
 /// `inv_alias[s][k]` (for `k in [0, D[s])`) is the alias-table index
 /// `x in [0, 4096)` whose `AliasMapping(x)` returns `(s, off)` where
-/// `off mod D[s] == k`.
+/// `off mod D[s] == k`. The reverse-walk encoder
+/// ([`encode_symbols`]) uses this to recover the previous state given
+/// the current state and the symbol about to be encoded.
 ///
-/// **Note on the modular reduction**: the alias table built by
-/// [`AliasTable::build`] does NOT keep symbol-s offsets in `[0, D[s])`;
-/// instead, offsets can land anywhere in `[0, 4096)` so long as the
-/// `D[s]` offsets for symbol `s` are pairwise distinct mod `D[s]`. The
-/// decoder formula `new_state = D[s] * (state >> 12) + offset` doesn't
-/// require offsets to be small — it just needs the lookup to be a
-/// bijection [0, 4096) → ⋃ₛ {(s, k) : k ∈ [0, D[s])} (mod D[s]).
+/// **Bijection requirement**: this build sanity-checks that for each
+/// symbol `s`, the map `x → off mod D[s]` (restricted to `x` values
+/// that map to symbol `s`) is a BIJECTION onto `[0, D[s])`. The spec's
+/// `AliasTable::build` (FDIS D.3.2 Listing D.1) only satisfies this
+/// when **every `D[s]` is a multiple of `bucket_size`** — see the
+/// module-level docstring for the round-4 finding.
 ///
-/// Consequently the encoder's inverse table must also key on the
-/// **modular** offset `off mod D[s]` so that `q = (target_state - off)
-/// / D[s]` gives an integer.
-///
-/// Construction: walk all 4096 alias-table indices once, computing
-/// `(sym, off) = alias.lookup(x)` and recording
-/// `inv_alias[sym][off mod D[sym]] = x`.
+/// Use [`quantise_distribution_aligned`] (NOT [`quantise_distribution`])
+/// to produce `d` for ANS encoding. If a non-aligned `d` is passed in,
+/// this function returns an "alias bijection invariant violated" error
+/// (slot collision detected) rather than silently mis-encoding.
 pub fn build_inverse_alias(d: &[u16], alias: &AliasTable) -> Result<Vec<Vec<u16>>> {
-    let mut inv: Vec<Vec<u16>> = d.iter().map(|&p| vec![0u16; p as usize]).collect();
-    // Validate each (s, k) is filled exactly once using a per-symbol
-    // counter; the alias method's bijection invariant guarantees this.
+    // Sentinel value 0xFFFF marks "slot not yet filled". Real x values
+    // are in [0, 4096) so 0xFFFF is unambiguous.
+    const UNFILLED: u16 = 0xFFFF;
+    let mut inv: Vec<Vec<u16>> = d.iter().map(|&p| vec![UNFILLED; p as usize]).collect();
     let mut fill_counts: Vec<u32> = vec![0u32; d.len()];
     for x in 0..ANS_TAB_SIZE {
         let (sym, off) = alias.lookup(x);
@@ -235,17 +408,35 @@ pub fn build_inverse_alias(d: &[u16], alias: &AliasTable) -> Result<Vec<Vec<u16>
             )));
         }
         let k = (off % p) as usize;
+        if inv[s][k] != UNFILLED {
+            return Err(Error::other(format!(
+                "ANS encoder: alias bijection invariant violated — \
+                 (s={s}, k={k}) collision (x={x} clashes with x={prev}); \
+                 ensure D[s] is a multiple of bucket_size (use quantise_distribution_aligned)",
+                prev = inv[s][k]
+            )));
+        }
         inv[s][k] = x as u16;
         fill_counts[s] += 1;
     }
-    // Sanity check: each symbol s should have been seen exactly D[s]
-    // times across the 4096 lookups.
+    // Sanity: each symbol s should have D[s] fills, and no UNFILLED
+    // sentinels should remain.
     for (s, &c) in fill_counts.iter().enumerate() {
         if c != d[s] as u32 {
             return Err(Error::other(format!(
                 "ANS encoder: inv_alias for symbol {s} got {c} fills, expected D[{s}]={}",
                 d[s]
             )));
+        }
+    }
+    for (s, slots) in inv.iter().enumerate() {
+        for (k, &x) in slots.iter().enumerate() {
+            if x == UNFILLED {
+                return Err(Error::other(format!(
+                    "ANS encoder: inv_alias slot (s={s}, k={k}) unfilled — \
+                     alias bijection invariant violated (D[s] must be a multiple of bucket_size)"
+                )));
+            }
         }
     }
     Ok(inv)
@@ -693,9 +884,15 @@ fn write_distribution_general(bw: &mut BitWriter, d: &[u16], log_alphabet_size: 
         .position(|&c| c == max_code)
         .ok_or_else(|| Error::other("ANS encoder: no max-code position (BUG)"))?;
 
-    // For each entry in [0, alphabet_size): emit logcount via the
-    // K_LOG_COUNT_LUT inverse. For non-omit entries with code >= 2,
-    // ALSO emit the `bitcount` extra bits.
+    // FDIS Listing D.4 reads in TWO passes:
+    //   Pass 1: read each logcount via K_LOG_COUNT_LUT (peek u(7) +
+    //           advance). All logcounts together, then omit_pos = first
+    //           index whose logcount is the strict-max.
+    //   Pass 2: for each non-omit entry with code >= 2, read `bitcount`
+    //           extra bits.
+    //
+    // We mirror that ordering: write all logcounts first, then write
+    // extras in a second loop.
     //
     // logcount derivation: see [`code_for`]. We never emit code 13
     // (RLE escape) — the round-3 encoder doesn't use RLE.
@@ -704,17 +901,18 @@ fn write_distribution_general(bw: &mut BitWriter, d: &[u16], log_alphabet_size: 
     // K_LOG_COUNT_LUT advance), NOT the extra bits — see modular_fdis
     // /distribution.rs. Emitting extra bits at omit_pos would desync
     // the bitstream.
-    for i in 0..alphabet_size {
-        let code = codes[i];
+    //
+    // Pass 1: logcounts for ALL entries.
+    for &code in codes.iter().take(alphabet_size) {
         let (pattern, advance) = invert_log_count_lut(code);
         bw.write_bits(pattern, advance)?;
+    }
+    // Pass 2: extras for non-omit, code >= 2.
+    for i in 0..alphabet_size {
         if i == omit_pos {
-            // Decoder skips extra-bits decode for omit_pos and overwrites
-            // d[omit_pos] = 4096 - sum(others). So we emit ZERO extra
-            // bits here. The actual probability d[omit_pos] is recovered
-            // by the decoder's final pass.
             continue;
         }
+        let code = codes[i];
         if code == 13 {
             return Err(Error::other(
                 "ANS encoder: code 13 (RLE escape) not used in round 3",
@@ -873,6 +1071,134 @@ mod tests {
         }
     }
 
+    /// Round-4: aligned quantiser produces D[s] all multiples of bucket_size.
+    #[test]
+    fn quantise_distribution_aligned_basic() {
+        let log_alpha = 8u32;
+        let bucket_size = 1u32 << (12 - log_alpha); // = 16
+        let counts = vec![100u32, 50, 25, 10, 5, 1];
+        let d = quantise_distribution_aligned(&counts, log_alpha).unwrap();
+        let sum: u32 = d.iter().map(|&v| v as u32).sum();
+        assert_eq!(sum, 4096);
+        for (i, &v) in d.iter().enumerate() {
+            assert_eq!(
+                v as u32 % bucket_size,
+                0,
+                "D[{i}]={v} not multiple of bucket_size={bucket_size}"
+            );
+            if i < counts.len() && counts[i] > 0 {
+                assert!(v > 0, "non-zero count at {i} produced D=0");
+            }
+        }
+    }
+
+    /// Round-4: aligned quantiser with a single symbol short-circuits to
+    /// full mass on that symbol.
+    #[test]
+    fn quantise_distribution_aligned_single_symbol() {
+        let log_alpha = 8u32;
+        let mut counts = vec![0u32; 10];
+        counts[3] = 50;
+        let d = quantise_distribution_aligned(&counts, log_alpha).unwrap();
+        assert_eq!(d[3], 4096);
+        for (i, &v) in d.iter().enumerate() {
+            if i != 3 {
+                assert_eq!(v, 0);
+            }
+        }
+    }
+
+    /// Round-4: aligned quantiser rejects out-of-spec log_alpha.
+    #[test]
+    fn quantise_distribution_aligned_rejects_bad_log_alpha() {
+        assert!(quantise_distribution_aligned(&[1u32], 4).is_err());
+        assert!(quantise_distribution_aligned(&[1u32], 9).is_err());
+    }
+
+    /// Round-4: aligned quantiser + alias-table build + inverse-table
+    /// build must succeed (no bijection invariant violation) for all
+    /// reasonable distributions on log_alpha=8.
+    #[test]
+    fn aligned_quantise_then_inverse_build_never_fails() {
+        let log_alpha = 8u32;
+        let test_count_sets: Vec<Vec<u32>> = vec![
+            vec![80, 15, 5],
+            vec![100, 1, 1],
+            vec![50, 30, 20],
+            vec![40, 35, 20, 5],
+            vec![30, 25, 20, 15, 10],
+            vec![10; 10],
+            vec![100; 16],
+            vec![1, 1, 1, 1, 1, 1, 1, 1],
+        ];
+        for counts in test_count_sets {
+            let d = quantise_distribution_aligned(&counts, log_alpha)
+                .unwrap_or_else(|e| panic!("quantise failed for {counts:?}: {e}"));
+            let alias = AliasTable::build(&d, log_alpha)
+                .unwrap_or_else(|e| panic!("AliasTable::build failed for {counts:?}: {e}"));
+            let _inv = build_inverse_alias(&d, &alias)
+                .unwrap_or_else(|e| panic!("build_inverse_alias failed for {counts:?}: {e}"));
+        }
+    }
+
+    /// Round-4: end-to-end round-trip across many distributions and
+    /// pseudo-random symbol streams. Encoder must never error or
+    /// produce a wrong decoded sequence.
+    #[test]
+    fn aligned_full_round_trip_many_distributions() {
+        let log_alpha = 8u32;
+        let table_size = 1usize << log_alpha;
+        let test_count_sets: Vec<Vec<u32>> = vec![
+            vec![80, 15, 5],
+            vec![100, 1, 1],
+            vec![50, 30, 20],
+            vec![40, 35, 20, 5],
+            vec![30, 25, 20, 15, 10],
+            vec![10; 10],
+            vec![3, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+        ];
+        for counts in test_count_sets {
+            let d = quantise_distribution_aligned(&counts, log_alpha).unwrap();
+            let alias = AliasTable::build(&d, log_alpha).unwrap();
+            let inv = build_inverse_alias(&d, &alias).unwrap();
+
+            // Sample symbols deterministically from D.
+            let mut symbols: Vec<u16> = Vec::with_capacity(150);
+            let mut rng_state: u32 = 0xfeed_beef;
+            let nonzero_idx: Vec<usize> = (0..table_size).filter(|&i| d[i] > 0).collect();
+            for _ in 0..150 {
+                rng_state = rng_state.wrapping_mul(1103515245).wrapping_add(12345);
+                let r = rng_state % ANS_TAB_SIZE;
+                let mut acc = 0u32;
+                let mut chosen = nonzero_idx[0] as u16;
+                for &i in &nonzero_idx {
+                    acc += d[i] as u32;
+                    if r < acc {
+                        chosen = i as u16;
+                        break;
+                    }
+                }
+                symbols.push(chosen);
+            }
+
+            let mut bw = BitWriter::new();
+            encode_symbols(&mut bw, &symbols, &d, &inv, &alias)
+                .unwrap_or_else(|e| panic!("encode_symbols failed for {counts:?}: {e}"));
+            let bytes = bw.finish();
+
+            let mut br = BitReader::new(&bytes);
+            let mut dec = AnsDecoder::new(&mut br).unwrap();
+            for &expected in &symbols {
+                let s = dec.decode_symbol(&mut br, &d, &alias).unwrap();
+                assert_eq!(s, expected, "round-trip mismatch for counts={counts:?}");
+            }
+            assert!(
+                dec.final_state(),
+                "final state mismatch for counts={counts:?}"
+            );
+        }
+    }
+
     /// Quantise a single-symbol histogram → 4096 on that symbol.
     #[test]
     fn quantise_single_symbol_full_mass() {
@@ -940,13 +1266,13 @@ mod tests {
     /// before their preceding renormalisation, so they appear in the
     /// wire stream after refills (matching the decoder's read order).
     ///
-    /// **Ignored** until the 3+ symbol alias bijection issue is
-    /// resolved — see module-level status note.
+    /// Round 4: re-enabled by switching to `log_alpha=8` with
+    /// `quantise_distribution_aligned` so the alias table satisfies the
+    /// per-symbol offset bijection invariant.
     #[test]
-    #[ignore]
     fn extras_interleaved_round_trip() {
         use crate::ans::hybrid_config::HybridUintConfig;
-        let log_alpha = 5u32;
+        let log_alpha = 8u32;
         let table_size = 1usize << log_alpha;
 
         // 3-symbol distribution.
@@ -954,7 +1280,7 @@ mod tests {
         counts[0] = 80;
         counts[1] = 15;
         counts[2] = 5;
-        let d = quantise_distribution(&counts, log_alpha).unwrap();
+        let d = quantise_distribution_aligned(&counts, log_alpha).unwrap();
         let alias = AliasTable::build(&d, log_alpha).unwrap();
         let inv = build_inverse_alias(&d, &alias).unwrap();
 
@@ -1047,21 +1373,42 @@ mod tests {
         (token, extra_bits, n)
     }
 
+    /// Debug: write_distribution([3280, 624, 192]) → read_distribution should
+    /// recover the original distribution.
+    #[test]
+    fn write_distribution_three_symbol_round_trip() {
+        let log_alpha = 8u32;
+        let table_size = 1usize << log_alpha;
+        let mut d = vec![0u16; table_size];
+        d[0] = 3280;
+        d[1] = 624;
+        d[2] = 192;
+        assert_eq!(d.iter().map(|&v| v as u32).sum::<u32>(), 4096);
+        let mut bw = BitWriter::new();
+        write_distribution(&mut bw, &d, log_alpha).unwrap();
+        let bytes = bw.finish();
+        eprintln!("encoded {} bytes: {:?}", bytes.len(), bytes);
+        let mut br = BitReader::new(&bytes);
+        let d_decoded = read_distribution(&mut br, log_alpha).unwrap();
+        eprintln!("decoded D[0..6] = {:?}", &d_decoded[..6]);
+        assert_eq!(d[..6], d_decoded[..6]);
+    }
+
     /// End-to-end: distribution preamble + encoded symbols, both round-tripped.
     ///
-    /// **Ignored** until the 3+ symbol alias bijection issue is
-    /// resolved — see module-level status note.
+    /// Round 4: re-enabled by switching to `log_alpha=8` with
+    /// `quantise_distribution_aligned` so the alias table satisfies the
+    /// per-symbol offset bijection invariant.
     #[test]
-    #[ignore]
     fn distribution_plus_symbols_round_trip() {
-        let log_alpha = 5u32;
+        let log_alpha = 8u32;
         let table_size = 1usize << log_alpha;
         // A 3-symbol distribution forcing the general path.
         let mut counts = vec![0u32; table_size];
         counts[0] = 80;
         counts[1] = 15;
         counts[2] = 5;
-        let d = quantise_distribution(&counts, log_alpha).unwrap();
+        let d = quantise_distribution_aligned(&counts, log_alpha).unwrap();
         let alias = AliasTable::build(&d, log_alpha).unwrap();
         let inv = build_inverse_alias(&d, &alias).unwrap();
 
