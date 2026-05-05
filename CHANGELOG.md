@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.7](https://github.com/OxideAV/oxideav-jpegxl/compare/v0.0.6...v0.0.7) - 2026-05-05
+
+### Other
+
+- round 11 — Appendix B four-range index partition + Path 1/2 dispatch
+- gate oxideav-core behind default-on `registry` feature
+- round 10 — kRCT/kPalette/kSqueeze transform parsing + dispatch
+- round 8 — early-terminate symbol-code-lengths read on space==0
+- scope pixels>bits_remaining pre-check to prefix-coded streams
+
 ### Added
 
 - **Round 11 — inverse-palette four-range index partition + Path 1/2
