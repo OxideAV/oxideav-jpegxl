@@ -296,7 +296,7 @@ mod tests {
         let mut reg = CodecRegistry::new();
         register_codecs(&mut reg);
         let params = CodecParameters::video(CodecId::new(CODEC_ID_STR));
-        let dec = reg.make_decoder(&params).expect("expected live decoder");
+        let dec = reg.first_decoder(&params).expect("expected live decoder");
         assert_eq!(dec.codec_id().as_str(), CODEC_ID_STR);
     }
 
@@ -348,7 +348,7 @@ mod tests {
         let params = CodecParameters::video(CodecId::new(CODEC_ID_STR));
         let dec = ctx
             .codecs
-            .make_decoder(&params)
+            .first_decoder(&params)
             .expect("jxl decoder factory");
         assert_eq!(dec.codec_id().as_str(), CODEC_ID_STR);
         // The unified entry point also wires the .jxl extension hint
