@@ -21,6 +21,12 @@ categories = ["multimedia::encoding", "multimedia::images"]
 # `decode_one_frame` / `encode_one_frame` API plus crate-local
 # `JxlError` / `JxlImage` types and never references `oxideav-core`.
 oxideav-core = { version = "0.1", optional = true }
+# Distributed-slice auto-registration into `oxideav_core::REGISTRARS`
+# via the `oxideav_core::register!` macro. Tiny crate, no transitive
+# deps; works on every target including wasm. Optional + gated behind
+# the `registry` feature so standalone image-library callers don't pull
+# it in.
+linkme = { version = "0.3", optional = true }
 
 [features]
 default = ["registry"]
@@ -30,4 +36,4 @@ default = ["registry"]
 # `oxideav` framework registry. Default-on; turn off for image-library
 # use-cases that just want the standalone `decode_one_frame` /
 # `encode_one_frame` API.
-registry = ["dep:oxideav-core"]
+registry = ["dep:oxideav-core", "dep:linkme"]

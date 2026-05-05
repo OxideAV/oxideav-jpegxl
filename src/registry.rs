@@ -87,6 +87,8 @@ pub fn register(ctx: &mut RuntimeContext) {
     register_containers(&mut ctx.containers);
 }
 
+oxideav_core::register!("jpegxl", register);
+
 /// Register the `.jxl` file extension so the framework's container
 /// resolver can route JPEG XL files to this codec.
 ///
