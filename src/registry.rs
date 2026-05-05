@@ -11,7 +11,7 @@
 use oxideav_core::{
     CodecCapabilities, CodecId, CodecInfo, CodecParameters, CodecRegistry, ContainerRegistry,
     Decoder, Encoder, Error as CoreError, Frame, Packet, PixelFormat, Result as CoreResult,
-    TimeBase, VideoFrame, VideoPlane,
+    RuntimeContext, TimeBase, VideoFrame, VideoPlane,
 };
 
 use crate::encoder::{encode_one_frame as encoder_encode_one_frame, InputFormat};
@@ -63,7 +63,7 @@ impl From<JxlImage> for Frame {
 
 /// Register the JPEG XL codec — decoder + round-1 lossless modular
 /// encoder.
-pub fn register(reg: &mut CodecRegistry) {
+pub fn register_codecs(reg: &mut CodecRegistry) {
     let caps = CodecCapabilities::video("jpegxl_headers_only")
         .with_lossy(true)
         .with_intra_only(true);
@@ -73,6 +73,18 @@ pub fn register(reg: &mut CodecRegistry) {
             .decoder(make_decoder)
             .encoder(make_encoder),
     );
+}
+
+/// Unified registration entry point: install both the JPEG XL codec
+/// factories and the `.jxl` extension hint into a [`RuntimeContext`].
+///
+/// This is the preferred entry point for new code — it matches the
+/// convention every sibling crate now follows. Direct callers that
+/// only need one of the two sub-registries can keep using
+/// [`register_codecs`] / [`register_containers`].
+pub fn register(ctx: &mut RuntimeContext) {
+    register_codecs(&mut ctx.codecs);
+    register_containers(&mut ctx.containers);
 }
 
 /// Register the `.jxl` file extension so the framework's container
@@ -280,7 +292,7 @@ mod tests {
     #[test]
     fn decoder_factory_returns_live_decoder() {
         let mut reg = CodecRegistry::new();
-        register(&mut reg);
+        register_codecs(&mut reg);
         let params = CodecParameters::video(CodecId::new(CODEC_ID_STR));
         let dec = reg.make_decoder(&params).expect("expected live decoder");
         assert_eq!(dec.codec_id().as_str(), CODEC_ID_STR);
@@ -325,5 +337,24 @@ mod tests {
         assert_eq!(reg.container_for_extension("JXL"), Some(CODEC_ID_STR));
         assert_eq!(reg.container_for_extension("Jxl"), Some(CODEC_ID_STR));
         assert_eq!(reg.container_for_extension("png"), None);
+    }
+
+    #[test]
+    fn register_via_runtime_context_installs_codec_factory() {
+        let mut ctx = RuntimeContext::new();
+        register(&mut ctx);
+        let params = CodecParameters::video(CodecId::new(CODEC_ID_STR));
+        let dec = ctx
+            .codecs
+            .make_decoder(&params)
+            .expect("jxl decoder factory");
+        assert_eq!(dec.codec_id().as_str(), CODEC_ID_STR);
+        // The unified entry point also wires the .jxl extension hint
+        // through the same call, so the consumer doesn't need a
+        // separate `register_containers` invocation.
+        assert_eq!(
+            ctx.containers.container_for_extension("jxl"),
+            Some(CODEC_ID_STR)
+        );
     }
 }

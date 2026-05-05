@@ -112,7 +112,8 @@ pub const CODEC_ID_STR: &str = "jpegxl";
 // dragging in `oxideav-core`.
 #[cfg(feature = "registry")]
 pub use registry::{
-    make_decoder, make_encoder, register, register_containers, JxlDecoder, JxlEncoder,
+    make_decoder, make_encoder, register, register_codecs, register_containers, JxlDecoder,
+    JxlEncoder,
 };
 
 /// Decode the entire JXL packet (raw codestream OR ISOBMFF-wrapped) and
