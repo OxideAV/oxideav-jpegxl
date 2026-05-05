@@ -111,7 +111,9 @@ pub const CODEC_ID_STR: &str = "jpegxl";
 // feature so image-library callers can build the crate without
 // dragging in `oxideav-core`.
 #[cfg(feature = "registry")]
-pub use registry::{make_decoder, make_encoder, register, JxlDecoder, JxlEncoder};
+pub use registry::{
+    make_decoder, make_encoder, register, register_containers, JxlDecoder, JxlEncoder,
+};
 
 /// Decode the entire JXL packet (raw codestream OR ISOBMFF-wrapped) and
 /// return the first frame as a [`JxlImage`]. Round-3 envelope.

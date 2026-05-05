@@ -9,9 +9,9 @@
 //! none of which depend on `oxideav-core`.
 
 use oxideav_core::{
-    CodecCapabilities, CodecId, CodecInfo, CodecParameters, CodecRegistry, Decoder, Encoder,
-    Error as CoreError, Frame, Packet, PixelFormat, Result as CoreResult, TimeBase, VideoFrame,
-    VideoPlane,
+    CodecCapabilities, CodecId, CodecInfo, CodecParameters, CodecRegistry, ContainerRegistry,
+    Decoder, Encoder, Error as CoreError, Frame, Packet, PixelFormat, Result as CoreResult,
+    TimeBase, VideoFrame, VideoPlane,
 };
 
 use crate::encoder::{encode_one_frame as encoder_encode_one_frame, InputFormat};
@@ -73,6 +73,17 @@ pub fn register(reg: &mut CodecRegistry) {
             .decoder(make_decoder)
             .encoder(make_encoder),
     );
+}
+
+/// Register the `.jxl` file extension so the framework's container
+/// resolver can route JPEG XL files to this codec.
+///
+/// This crate does not yet ship a JXL demuxer (a `.jxl` file is a
+/// single codestream / ISOBMFF blob, decoded directly by
+/// [`decode_one_frame`](crate::decode_one_frame)), so only the
+/// extension hint is registered here.
+pub fn register_containers(reg: &mut ContainerRegistry) {
+    reg.register_extension("jxl", CODEC_ID_STR);
 }
 
 /// Decoder factory used by the registry. Returned as a boxed
@@ -304,5 +315,15 @@ mod tests {
             make_encoder(&params),
             Err(CoreError::Unsupported(_))
         ));
+    }
+
+    #[test]
+    fn register_containers_resolves_jxl_extension_case_insensitive() {
+        let mut reg = ContainerRegistry::new();
+        register_containers(&mut reg);
+        assert_eq!(reg.container_for_extension("jxl"), Some(CODEC_ID_STR));
+        assert_eq!(reg.container_for_extension("JXL"), Some(CODEC_ID_STR));
+        assert_eq!(reg.container_for_extension("Jxl"), Some(CODEC_ID_STR));
+        assert_eq!(reg.container_for_extension("png"), None);
     }
 }
