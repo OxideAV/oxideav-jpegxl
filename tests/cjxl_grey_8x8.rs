@@ -41,23 +41,29 @@ fn cjxl_grey_8x8_dump_first_bytes() {
 /// Soft test: this MAY return Unsupported / InvalidData while the
 /// FDIS decoder is still missing pieces. The test prints the decoder
 /// result so a reviewer can see exactly what the failure mode was, but
-/// does NOT fail the suite if it's an expected error. A pixel-perfect
-/// decode is the long-term goal but is gated on resolving the
-/// round-10 spec ambiguity below.
+/// does NOT fail the suite if it's an expected error.
 ///
-/// Round-10 status (this commit): the kRCT / kPalette / kSqueeze
-/// transform parsing + dispatch infrastructure landed
-/// (`crate::transforms` module). The cjxl 8x8 grey lossless fixture
-/// is a *kPalette* with `nb_colours=3 num_c=1 nb_deltas=0 d_pred=0`,
-/// and our decoder now drives the MA-tree pixel decode + per-spec
-/// inverse-palette without erroring — but the reconstructed pixel
-/// is `0` (per FDIS L.6 with index = -1) instead of cjxl's `128`.
-/// This is an unresolved spec gap (likely an L.6 typo: negative
-/// indices' kDeltaPalette path returns 0 for `[0,0,0]`, but cjxl
-/// expects 128 here). Documented in the agent's report as a docs
-/// follow-up — the inverse-palette branch needs a clean-room trace
-/// extension in `docs/image/jpegxl/`.
+/// Round-11 status (this commit): the inverse-palette transform now
+/// implements the four-range index partition + Path 1 / Path 2
+/// dispatch + Appendix B.6 bit-depth clamp from
+/// `docs/image/jpegxl/libjxl-trace-reverse-engineering.md` Appendix B
+/// (commit `679cf63`). For the cjxl 8x8 grey lossless fixture
+/// (`nb_colours=3 num_c=1 nb_deltas=0 d_pred=0`, idx=-1 throughout),
+/// both the FDIS Listing L.6 and Appendix B.4 Path 1 unambiguously
+/// give `output = kDeltaPalette[0][0] = 0` per the negative-index
+/// rule in §B.3.1 — yet `djxl` decodes the same fixture as all-128.
 ///
+/// This is an UNRESOLVED docs gap one layer deeper than what
+/// Appendix B documents: for the implementer-trivial case
+/// `(nb_deltas=0, predictor=Zero, idx=-1)`, the cjxl encoder appears
+/// to expect a different lookup than the spec text describes. Without
+/// libjxl source access (clean-room policy) we cannot reverse-engineer
+/// the algorithm beyond what's in Appendix B; round 12 needs an
+/// additional empirical correction to the appendix from a clean-room
+/// trace. Documented in the agent's report.
+///
+/// Round-10 status: kRCT / kPalette / kSqueeze transform parsing +
+/// dispatch infrastructure landed.
 /// Round-8 status: cl_code Kraft RESOLVED (Appendix A.6 — see
 /// `cjxl_grey_8x8_round9_progress_marker` for the regression guard).
 #[test]
@@ -67,31 +73,25 @@ fn cjxl_grey_8x8_decode_attempt() {
     match res {
         Ok(vf) => {
             // Decoder ran to completion. Pixel-perfect equality is
-            // gated on the round-10 spec gap (see doc-comment above);
-            // for now we just check shape — round 11 will add the
-            // pixel-equality assertion once L.6 is unblocked.
+            // gated on the docs gap (see doc-comment above); for now
+            // we just check shape.
             assert_eq!(vf.planes.len(), 1, "expected 1 plane (Gray8)");
             let plane = &vf.planes[0];
             assert_eq!(plane.stride, 8);
             assert_eq!(plane.data.len(), 64);
-            // Soft pixel check: print the decoded byte distribution so
-            // a reviewer can see whether L.6 is producing all-0,
-            // all-95, or actually all-128.
             let unique: std::collections::BTreeSet<u8> = plane.data.iter().copied().collect();
             eprintln!("decoded pixel set: {:?}", unique);
             if unique.len() == 1 && unique.contains(&128) {
-                eprintln!("ROUND-10 RESOLVED: pixels are all 128 (matches djxl)");
+                eprintln!("ROUND-12 RESOLVED: pixels are all 128 (matches djxl)");
             } else {
                 eprintln!(
-                    "ROUND-10 stop: pixels not yet 128 (got {:?}); see L.6 spec gap",
+                    "ROUND-11 stop: pixels not yet 128 (got {:?}); see Appendix B gap",
                     unique
                 );
             }
         }
         Err(e) => {
-            // Print and accept — earlier rounds had hard errors here.
-            // Once round-10 is resolved this branch will go away.
-            eprintln!("cjxl_grey_8x8 round-10 stop point: {e}");
+            eprintln!("cjxl_grey_8x8 round-11 stop point: {e}");
         }
     }
 }

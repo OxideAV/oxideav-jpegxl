@@ -316,8 +316,15 @@ fn apply_forward_one(
                     channels.len()
                 )));
             }
-            // Inserted meta channel: width=nb_colours, height=num_c,
-            // hshift=-1, vshift=-1.
+            // Per FDIS L.5: meta channel width = nb_colours, height =
+            // num_c, hshift = -1, vshift = -1.
+            //
+            // Note: trace-doc Appendix B.1 says `width = nb_colours +
+            // nb_deltas` but that contradicts the FDIS L.5 text. The
+            // FDIS is authoritative on bitstream size. The four-range
+            // partition in §B.3 + Appendix B.4 still applies on the
+            // index value space; only the meta-channel width follows
+            // the FDIS.
             let meta = ChannelDesc {
                 width: *nb_colours,
                 height: *num_c,
@@ -645,14 +652,32 @@ fn clamp_i32(v: i64) -> Result<i32> {
     }
 }
 
-/// Listing L.6 — inverse palette transform.
+/// Inverse palette transform — FDIS Listing L.6 + clean-room
+/// implementer-trace Appendix B (`docs/image/jpegxl/libjxl-trace-
+/// reverse-engineering.md`).
 ///
-/// `begin_c` is the position of the index channel after the palette
-/// transform was applied (the meta-channel sits at index 0 of the
-/// channel list; `begin_c` is the original `begin_c+1` shifted by the
-/// meta-channel insertion, i.e. `begin_c_in_decoded = begin_c + 1`).
-/// Per the spec we have `first = begin_c + 1` where `begin_c` is the
-/// original transform parameter, and the meta-channel is at index 0.
+/// `begin_c` is the original transform parameter; in the decoded
+/// channel list the meta-channel sits at index 0 (inserted by the
+/// forward step), so `first = begin_c + 1` is the position of the
+/// index channel.
+///
+/// Index resolution per Appendix B.3 partitions the integer line into
+/// four ranges (FDIS uses `nb_colours` as the upper bound of the
+/// explicit-lookup range, which is what the meta-channel actually
+/// stores; trace doc B.3 names the same boundary `palette_size`):
+///
+/// * `index < 0` — implicit delta-palette §B.3.1 (RGB only, `c >= 3` returns 0).
+/// * `0 <= index < nb_colours` — explicit palette lookup §B.3.2.
+/// * `nb_colours <= index < nb_colours + 64` — small 4×4×4 cube §B.3.3.
+/// * `nb_colours + 64 <= index` — large 5×5×5 cube §B.3.4.
+///
+/// Per Appendix B.4 the predictor add fires when EITHER `nb_deltas > 0`
+/// OR `predictor != Zero` (Path 2). When both are absent (`nb_deltas
+/// == 0 && predictor == Zero` = Path 1) the lookup result is the final
+/// pixel value.
+///
+/// Per Appendix B.6 the bit-depth used by §B.3.1 / §B.3.3 / §B.3.4 is
+/// `min(image.bitdepth, 24)`.
 fn inverse_palette(
     img: &mut ModularImage,
     begin_c: usize,
@@ -662,10 +687,6 @@ fn inverse_palette(
     d_pred: u32,
     bit_depth: u32,
 ) -> Result<()> {
-    // Per L.5: the meta-channel is at the very beginning of the channel
-    // list (channel[0]). The index channel is at `begin_c + 1` in the
-    // decoded list (because the meta-channel insertion shifted
-    // everything by one).
     let first = begin_c + 1;
     if first >= img.channels.len() {
         return Err(Error::InvalidData(format!(
@@ -676,6 +697,15 @@ fn inverse_palette(
     if num_c == 0 {
         return Err(Error::InvalidData("JXL inverse Palette: num_c == 0".into()));
     }
+
+    // §B.6: clamp bit_depth to 24 for implicit-palette scaling.
+    let bd_clamped = bit_depth.clamp(1, 24);
+
+    // FDIS L.5: meta-channel width = nb_colours (NOT palette_size; the
+    // trace doc B.1's `nb_colours + nb_deltas` is a misreading of how
+    // the meta channel is sized — `nb_deltas` indicates that the FIRST
+    // nb_deltas entries WITHIN nb_colours are delta-coded (residuals
+    // to add to the predictor) rather than extra columns).
     if img.descs[0].width as i64 != nb_colours || img.descs[0].height as i64 != num_c as i64 {
         return Err(Error::InvalidData(format!(
             "JXL inverse Palette: meta-channel dims {}x{} mismatch nb_colours={} num_c={}",
@@ -686,11 +716,11 @@ fn inverse_palette(
     let w = idx_desc.width;
     let h = idx_desc.height;
 
-    // Snapshot the meta-channel so we can mutate the data channels
+    // Snapshot meta + index channels so we can mutate the data channels
     // without overlapping borrows.
     let meta = img.channels[0].clone();
     let meta_w = img.descs[0].width as usize;
-    if meta.len() != meta_w * (num_c) {
+    if meta.len() != meta_w * num_c {
         return Err(Error::InvalidData(format!(
             "JXL inverse Palette: meta-channel size {} != nb_colours*num_c = {}",
             meta.len(),
@@ -699,21 +729,36 @@ fn inverse_palette(
     }
     let index_channel = img.channels[first].clone();
 
-    // Insert (num_c - 1) copies of the index channel right after `first`.
+    // §B.2 step 1: insert (num_c - 1) new EMPTY channels right after
+    // `first`. Per the trace appendix these are zero-initialised
+    // (the per-(x,y,c) loop overwrites them anyway, but transient
+    // reads during prediction must see zero, not a copy of the
+    // index channel, otherwise predictors leak index values into
+    // already-decoded neighbours).
+    let zero_data = vec![0i32; (w as usize) * (h as usize)];
     for _ in 1..num_c {
-        img.channels.insert(first + 1, index_channel.clone());
+        img.channels.insert(first + 1, zero_data.clone());
         img.descs.insert(first + 1, idx_desc);
     }
 
-    // Reconstruct each channel in [first .. first + num_c).
-    let predict_needed = nb_deltas > 0;
-    // clippy::needless_range_loop fires because we use `c` to index
-    // K_DELTA_PALETTE[row][c]; that's the spec's c-channel selector,
-    // not a sequential iterator over the palette table.
+    // §B.4 path selection: Path 2 fires when `nb_deltas > 0` OR
+    // `predictor != Zero`. In Path 1 the lookup result is the final
+    // value (no predictor add ever). In Path 2 the predictor adds when
+    // `index < nb_deltas` (negative indexes always satisfy this when
+    // `nb_deltas == 0` and predictor != Zero).
+    let path2 = nb_deltas > 0 || d_pred != 0;
+
+    // §B.4 point 4: the index is the SAME for all output channels at a
+    // given (x, y). Only the palette value differs by channel. The
+    // predictor is computed separately per channel.
+    //
+    // clippy::needless_range_loop fires because we use `c` as the
+    // K_DELTA_PALETTE column selector and the meta-channel row
+    // selector — both spec-mandated semantic indexes, not a
+    // sequential iterator.
     #[allow(clippy::needless_range_loop)]
     for c in 0..num_c {
         let target_idx = first + c;
-        // Snapshot dims (descs index unchanged for this channel).
         let dw = img.descs[target_idx].width;
         let dh = img.descs[target_idx].height;
         if dw != w || dh != h {
@@ -721,71 +766,98 @@ fn inverse_palette(
                 "JXL inverse Palette: per-channel dim mismatch after duplication".into(),
             ));
         }
-        // We must compute one channel at a time, with prediction looking
-        // at already-written samples in this same channel.
+        // Build this channel one pixel at a time, with prediction
+        // looking only at already-written samples in this same channel.
         let mut out = vec![0i32; (w as usize) * (h as usize)];
         for y in 0..h {
             for x in 0..w {
                 let pix = (y as usize) * (w as usize) + (x as usize);
                 let index = index_channel[pix] as i64;
-                let is_delta = index < nb_deltas;
-                let value: i64 = if (0..nb_colours).contains(&index) {
-                    // channel[0](index, c) — meta-channel sample at (index, c).
-                    let mi = (c) * meta_w + (index as usize);
-                    meta[mi] as i64
-                } else if index >= nb_colours {
-                    let mut k = index - nb_colours;
-                    if k < 64 {
-                        let bd = bit_depth.max(1);
-                        let max_val = (1i64 << bd) - 1;
-                        let term = ((k >> (2 * c)).rem_euclid(4)) * max_val / 4;
-                        let bias = 1i64 << bd.saturating_sub(3);
-                        term + bias
-                    } else {
-                        k -= 64;
-                        for _ in 0..c {
-                            k /= 5;
-                        }
-                        let bd = bit_depth.max(1);
-                        let max_val = (1i64 << bd) - 1;
-                        (k.rem_euclid(5)) * max_val / 4
-                    }
-                } else if c < 3 {
-                    // index < 0 branch
-                    let neg_index = (-index - 1).rem_euclid(143);
-                    let row = ((neg_index + 1) >> 1) as usize;
-                    let mut v = K_DELTA_PALETTE[row][c] as i64;
-                    if (neg_index & 1) == 0 {
-                        v = -v;
-                    }
-                    if bit_depth > 8 {
-                        v <<= bit_depth - 8;
-                    }
-                    v
-                } else {
-                    0
-                };
+                let value = get_palette_value(index, c, nb_colours, &meta, meta_w, bd_clamped)?;
                 let mut sample = value;
-                if is_delta && predict_needed {
-                    // Need prediction(x, y, d_pred) on the OUTPUT
-                    // channel under construction. We pass a temporary
-                    // ModularImage view containing only this channel
-                    // built so far.
+                if path2 && index < nb_deltas {
+                    // §B.4 Path 2 + index<nb_deltas: predictor's guess
+                    // at (x, y) on the already-decoded output of this
+                    // same channel.
                     let pred = predict_palette(&out, w, h, x as i32, y as i32, d_pred)?;
                     sample = sample.wrapping_add(pred);
                 }
-                let s32 = clamp_i32(sample)?;
-                out[pix] = s32;
+                out[pix] = clamp_i32(sample)?;
             }
         }
         img.channels[target_idx] = out;
     }
 
-    // Remove the meta-channel.
+    // §B.2 step 3: erase the meta-channel.
     img.channels.remove(0);
     img.descs.remove(0);
 
     Ok(())
+}
+
+/// `GetPaletteValue` per Appendix B.3 + FDIS L.6. Resolves the four-
+/// range index partition into a per-channel palette value; called
+/// once per (x, y, c) triple.
+///
+/// `nb_colours` is the upper bound of the explicit-lookup range
+/// (FDIS L.6 uses this directly). Trace doc B.3 names the same
+/// boundary `palette_size`; the FDIS does not store nb_deltas as
+/// extra meta-channel columns, so the two names refer to the same
+/// width.
+fn get_palette_value(
+    index: i64,
+    c: usize,
+    nb_colours: i64,
+    meta: &[i32],
+    meta_w: usize,
+    bit_depth: u32,
+) -> Result<i64> {
+    if index < 0 {
+        // §B.3.1 implicit delta-palette (RGB-only).
+        if c >= 3 {
+            return Ok(0);
+        }
+        // x = -(index + 1) Umod 143 — see B.3.1 (and FDIS L.6,
+        // which writes the sign-extraction inline).
+        let x = (-index - 1).rem_euclid(143);
+        let row = ((x + 1) >> 1) as usize;
+        let mut v = K_DELTA_PALETTE[row][c] as i64;
+        // sign: x odd → +, x even → −.
+        if (x & 1) == 0 {
+            v = -v;
+        }
+        if bit_depth > 8 {
+            v <<= bit_depth - 8;
+        }
+        Ok(v)
+    } else if index < nb_colours {
+        // §B.3.2 explicit palette lookup at meta[c, index] (column-major
+        // access via flat row-stride: row=c, col=index → c*meta_w+index).
+        let mi = c * meta_w + (index as usize);
+        Ok(meta[mi] as i64)
+    } else if index < nb_colours.saturating_add(64) {
+        // §B.3.3 small 4×4×4 cube. RGB-only.
+        if c >= 3 {
+            return Ok(0);
+        }
+        let k = index - nb_colours;
+        let max_val = (1i64 << bit_depth) - 1;
+        let term = ((k >> (2 * c)).rem_euclid(4)) * max_val / 4;
+        let bias = 1i64 << bit_depth.saturating_sub(3);
+        Ok(term + bias)
+    } else {
+        // §B.3.4 large 5×5×5 cube (no upper bound check; modulo wraps
+        // for arbitrarily large indexes per B.6). RGB-only.
+        if c >= 3 {
+            return Ok(0);
+        }
+        let mut k = index - nb_colours.saturating_add(64);
+        for _ in 0..c {
+            k /= 5;
+        }
+        let max_val = (1i64 << bit_depth) - 1;
+        Ok((k.rem_euclid(5)) * max_val / 4)
+    }
 }
 
 /// Listing C.16 prediction operating on a freshly-constructed channel
@@ -1307,6 +1379,200 @@ mod tests {
         assert_eq!(img.channels[0].len(), 64);
         for v in &img.channels[0] {
             assert_eq!(*v, 128);
+        }
+    }
+
+    #[test]
+    fn get_palette_value_explicit_lookup() {
+        // §B.3.2 — explicit palette: palette_size=4, c=0, index=2 →
+        // meta[c*meta_w + index] = meta[0*4+2] = meta[2].
+        let meta = vec![10i32, 20, 30, 40];
+        let v = get_palette_value(2, 0, 4, &meta, 4, 8).unwrap();
+        assert_eq!(v, 30);
+    }
+
+    #[test]
+    fn get_palette_value_negative_index_zero_for_alpha() {
+        // §B.3.1 — c >= 3 returns 0 for negative indexes.
+        let meta = vec![10i32, 20, 30, 40];
+        let v = get_palette_value(-1, 3, 4, &meta, 4, 8).unwrap();
+        assert_eq!(v, 0);
+    }
+
+    #[test]
+    fn get_palette_value_negative_index_first_entry() {
+        // §B.3.1 — orig_index=-1 → x=0 → row=0 → kDeltaPalette[0]=(0,0,0)
+        // → sign=- (x even) → value = -0 = 0 for c=0.
+        let meta = vec![0i32; 4];
+        let v = get_palette_value(-1, 0, 4, &meta, 4, 8).unwrap();
+        assert_eq!(v, 0);
+    }
+
+    #[test]
+    fn get_palette_value_negative_index_bit_depth_shift() {
+        // §B.3.1 — orig_index=-2 → x=1 → row=1 → kDeltaPalette[1]=(4,4,4)
+        // → sign=+ (x odd) → value = 4 for c=0.
+        // At 16-bit, value should be shifted by 8.
+        let meta = vec![0i32; 4];
+        let v8 = get_palette_value(-2, 0, 4, &meta, 4, 8).unwrap();
+        assert_eq!(v8, 4);
+        let v16 = get_palette_value(-2, 0, 4, &meta, 4, 16).unwrap();
+        assert_eq!(v16, 4 << 8);
+    }
+
+    #[test]
+    fn get_palette_value_negative_index_wraps_at_143() {
+        // §B.3.1 — `x = -(index+1) Umod 143`. orig=-144 wraps to x=0,
+        // same as orig=-1.
+        let meta = vec![0i32; 4];
+        let v_minus_1 = get_palette_value(-1, 0, 4, &meta, 4, 8).unwrap();
+        let v_minus_144 = get_palette_value(-144, 0, 4, &meta, 4, 8).unwrap();
+        assert_eq!(v_minus_1, v_minus_144);
+    }
+
+    #[test]
+    fn get_palette_value_small_cube_branch() {
+        // §B.3.3 — palette_size=4, index=4..67 hits the small 4×4×4 cube.
+        // For c=0, k=index-4=0 → ((0>>0) Umod 4)*255/4 + (1<<5) = 0+32 = 32.
+        let meta = vec![0i32; 4];
+        let v = get_palette_value(4, 0, 4, &meta, 4, 8).unwrap();
+        assert_eq!(v, 32);
+        // k=3 → (3 Umod 4)*255/4 + 32 = 191 + 32 = 223.
+        let v3 = get_palette_value(7, 0, 4, &meta, 4, 8).unwrap();
+        assert_eq!(v3, 191 + 32);
+    }
+
+    #[test]
+    fn get_palette_value_small_cube_alpha_zero() {
+        // §B.3.3 — c >= 3 returns 0 even in cube range.
+        let meta = vec![0i32; 16];
+        let v = get_palette_value(4, 3, 4, &meta, 4, 8).unwrap();
+        assert_eq!(v, 0);
+    }
+
+    #[test]
+    fn get_palette_value_large_cube_branch() {
+        // §B.3.4 — palette_size=4, index >= 4+64=68 hits the large 5×5×5
+        // cube. For c=0, k=0 → (0 Umod 5)*255/4 = 0.
+        let meta = vec![0i32; 4];
+        let v0 = get_palette_value(68, 0, 4, &meta, 4, 8).unwrap();
+        assert_eq!(v0, 0);
+        // k=4 → (4 Umod 5)*255/4 = 255.
+        let v4 = get_palette_value(72, 0, 4, &meta, 4, 8).unwrap();
+        assert_eq!(v4, 255);
+    }
+
+    #[test]
+    fn get_palette_value_large_cube_no_upper_bound() {
+        // §B.3.4 — no upper bound check; modulos wrap.
+        let meta = vec![0i32; 4];
+        // k=125 wraps via the per-c divides + the final %5.
+        let v = get_palette_value(4 + 64 + 125, 0, 4, &meta, 4, 8).unwrap();
+        // For c=0: k=125, 125 % 5 = 0, → 0.
+        assert_eq!(v, 0);
+    }
+
+    #[test]
+    fn inverse_palette_negative_index_alpha_returns_zero() {
+        // num_c=4 (RGBA-style), all-(-1) indices, palette[c, k] = 99 for
+        // every entry. Per §B.3.1 c=3 returns 0, so the alpha channel
+        // ends up all-zero regardless of the palette contents.
+        let palette_size = 1;
+        let num_c = 4;
+        let mut meta_data = vec![99i32; palette_size * num_c];
+        // Make c=0..2 entries reachable for sanity.
+        meta_data[0] = 0;
+        meta_data[1] = 0;
+        meta_data[2] = 0;
+        meta_data[3] = 99;
+        let mut img = ModularImage {
+            channels: vec![meta_data, vec![-1i32; 4]],
+            descs: vec![
+                ChannelDesc {
+                    width: palette_size as u32,
+                    height: num_c as u32,
+                    hshift: -1,
+                    vshift: -1,
+                },
+                ch(2, 2),
+            ],
+        };
+        inverse_palette(&mut img, 0, num_c, 1, 0, 0, 8).unwrap();
+        // After inverse: 4 output channels, each 2x2.
+        assert_eq!(img.channels.len(), 4);
+        for c in 0..3 {
+            // RGB: kDeltaPalette[0][c] = 0 for c<3, with sign flip (x=0
+            // even → negate) → 0. So RGB output is all-0.
+            for v in &img.channels[c] {
+                assert_eq!(*v, 0, "channel {c} expected 0");
+            }
+        }
+        // Alpha (c=3) per §B.3.1: returns 0.
+        for v in &img.channels[3] {
+            assert_eq!(*v, 0, "alpha expected 0 per B.3.1");
+        }
+    }
+
+    #[test]
+    fn inverse_palette_explicit_lookup_with_deltas() {
+        // 1-channel image with nb_colours = 3 and nb_deltas = 1
+        // (the FIRST entry is delta-coded — entries [1, 2] are
+        // absolute palette colours). Palette contents = [10, 20, 30].
+        // Index channel = [2,2,2,2]. d_pred = 0 (Zero predictor) →
+        // Path 2 (`nb_deltas > 0`). For idx=2, `2 < 1` is false → no
+        // predictor add → output = palette[2] = 30.
+        let nb_colours = 3;
+        let mut img = ModularImage {
+            channels: vec![vec![10i32, 20, 30], vec![2i32; 4]],
+            descs: vec![
+                ChannelDesc {
+                    width: nb_colours as u32,
+                    height: 1,
+                    hshift: -1,
+                    vshift: -1,
+                },
+                ch(2, 2),
+            ],
+        };
+        inverse_palette(&mut img, 0, 1, 3, 1, 0, 8).unwrap();
+        assert_eq!(img.channels.len(), 1);
+        for v in &img.channels[0] {
+            assert_eq!(*v, 30);
+        }
+    }
+
+    #[test]
+    fn inverse_palette_delta_branch_fires_for_negatives_when_path2() {
+        // 1-channel image with `nb_deltas = 0` and `d_pred = 1` (Left
+        // predictor). Per Appendix B.4 point 3, this is Path 2, and
+        // negative indexes (which always satisfy `index < nb_deltas =
+        // 0`) get the predictor add. Palette = [50], index = [-1; 4].
+        // Output (left-to-right, top-to-bottom):
+        //   (0,0): lookup=kDeltaPalette[0][0]=0 (sign-flipped to -0=0),
+        //          left=0 (no neighbour) → output=0+0=0.
+        //   (1,0): lookup=0, left=output[(0,0)]=0 → output=0+0=0.
+        //   (0,1): lookup=0, left=output[(0,0)]=0 (top-edge falls back
+        //          to left, but left has no x-1 either, so 0) → 0.
+        //   (1,1): lookup=0, left=output[(0,1)]=0 → 0.
+        // All zero. The point of the test is that the predictor add
+        // PATH IS taken (compile-time non-trivial), not that a specific
+        // non-zero value emerges.
+        let mut img = ModularImage {
+            channels: vec![vec![50i32], vec![-1i32; 4]],
+            descs: vec![
+                ChannelDesc {
+                    width: 1,
+                    height: 1,
+                    hshift: -1,
+                    vshift: -1,
+                },
+                ch(2, 2),
+            ],
+        };
+        inverse_palette(&mut img, 0, 1, 1, 0, 1, 8).unwrap();
+        assert_eq!(img.channels.len(), 1);
+        for v in &img.channels[0] {
+            assert_eq!(*v, 0);
         }
     }
 }

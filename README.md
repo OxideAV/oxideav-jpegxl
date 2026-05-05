@@ -114,6 +114,28 @@ assert!(reg.make_decoder(&params).is_err());
 - No demuxer is registered: this crate treats a JXL file as a single
   codestream buffer fed directly to `probe(...)`.
 
+### Modular pixel decode status
+
+The Modular sub-bitstream pipeline (FDIS Annex C.9 + D, plus the
+inverse transforms in Annex L.4 / L.5 / I.3) is wired end-to-end:
+container → SizeHeader → ImageMetadata → FrameHeader → TOC →
+LfGlobal → MA-tree → ANS / prefix entropy → per-channel pixel decode
+→ inverse transforms (RCT / Palette / Squeeze).
+
+Round 11 made the **inverse Palette** transform Appendix-B-faithful
+(see `docs/image/jpegxl/libjxl-trace-reverse-engineering.md`), with
+the four-range index partition (negative → kDeltaPalette,
+0..nb_colours → explicit lookup, nb_colours..+64 → 4×4×4 cube,
++64.. → 5×5×5 cube), Path 1 / Path 2 dispatch on `(nb_deltas,
+predictor)`, and the §B.6 bit-depth-24 clamp. The cjxl-encoded
+8×8 grey-lossless fixture (`nb_colours=3 nb_deltas=0 d_pred=0`,
+idx=-1 throughout) still decodes to all-zero rather than djxl's
+all-128: per FDIS L.6 *and* Appendix B.4 Path 1, this should be
+the kDeltaPalette[0][c]=0 lookup result, but the encoder side
+expects a different value. This points to an extra-deep gap in
+both the FDIS spec and Appendix B for the trivial-encoder case;
+needs another empirical correction round.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).

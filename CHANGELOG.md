@@ -9,6 +9,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Round 11 — inverse-palette four-range index partition + Path 1/2
+  dispatch.** `transforms::inverse_palette` now follows Appendix B of
+  `docs/image/jpegxl/libjxl-trace-reverse-engineering.md` (commit
+  `679cf63`) for the full negative-index/explicit/cube partition
+  rather than the spec's collapsed three-branch form. Concretely:
+  - **§B.3 four-range partition** factored into a new
+    `get_palette_value(index, c, nb_colours, meta, meta_w, bit_depth)`
+    helper covering: `index < 0` (implicit delta-palette via
+    `kDeltaPalette[72][3]`, RGB-only); `0 <= index < nb_colours`
+    (explicit palette lookup at `meta[c, index]`); `nb_colours <=
+    index < nb_colours + 64` (small 4×4×4 cube, RGB-only); and
+    `nb_colours + 64 <= index` (large 5×5×5 cube, RGB-only,
+    no upper bound — modulo wraps).
+  - **§B.4 Path 1 vs Path 2 dispatch** correctly fires the predictor
+    add when EITHER `nb_deltas > 0` OR `predictor != Zero` (previous
+    code only checked `nb_deltas > 0`, missing the
+    `nb_deltas==0 && predictor!=Zero` case where negative indexes
+    still satisfy `index < nb_deltas`).
+  - **§B.6 bit-depth clamp to 24** for implicit-palette scaling
+    (`bit_depth.min(24).max(1)`); previously the 24-bit cap was
+    not enforced.
+  - **§B.2 step 1 — empty-channel insertion** for `num_c > 1`
+    (zero-initialised, not copies of the index channel — predictors
+    must see a clean output state when reading already-decoded
+    neighbours, otherwise index values leak into RGB output).
+  - 11 new unit tests in `transforms::tests` exercising each
+    branch + alpha-channel zero-return + 143-modulus wraparound +
+    bit-depth shift in the negative branch.
 - **Standalone (no-`registry`) build path.** Default-on `registry` Cargo
   feature gates the `oxideav-core` dependency and the
   `Decoder`/`Encoder`/`register` trait surface (now in a new
