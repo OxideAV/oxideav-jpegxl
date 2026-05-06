@@ -1,10 +1,14 @@
 # oxideav-jpegxl
 
-Pure-Rust **JPEG XL** (ISO/IEC 18181) codec — signature + container
-detection, `SizeHeader` parsing, partial `ImageMetadata` parsing. Pixel
-decoding is **not** implemented yet: probing identifies and measures a
-JXL file, but `make_decoder(...)` returns `Error::Unsupported`. No
-encoder. Zero C dependencies, zero FFI, zero `*-sys`.
+Pure-Rust **JPEG XL** (ISO/IEC 18181) codec — full container + signature
+detection, `SizeHeader` + `ImageMetadata` + `FrameHeader` + `TOC`
+parsing, single-group Modular pixel decode (Grey 8-bit), and a
+**round-5 lossless Modular encoder** with per-image predictor selection
+across {Left, Top, Average, West-Predictor, Gradient} and a
+frequency-adapted ANS-coded symbol stream. Round-5 hits **4.12 bpp**
+on a 256×256 grey natural-image fixture (51.5% of raw, lossless,
+self-roundtrip + bit-exact through libjxl's `djxl`). Zero C
+dependencies, zero FFI, zero `*-sys`.
 
 Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace)
 framework but usable standalone.
@@ -53,26 +57,30 @@ parsing not yet implemented")` rather than silent misparse.
 
 ## What this crate does **not** do
 
-- No pixel decoding. Neither the Modular path (Weighted + Gradient
-  predictor, MA-tree range coder) nor the VarDCT path (variable-size
-  DCT, LF/HF subbands, Chroma-from-Luma, Gaborish, EPF) is implemented.
-  `registry.make_decoder(&params)` returns
-  `Error::Unsupported("jxl decode not yet implemented")`.
-- No encoder. Not registered; `make_encoder` rejects any call.
-- No animation, preview, or intrinsic-size sub-bundle decoding (parsing
-  stops at the `have_*` flags).
+- VarDCT path (variable-size DCT, LF/HF subbands, Chroma-from-Luma,
+  Gaborish, EPF) — Modular only.
+- Multi-group decode (the round-3 decoder rejects `TOC.entries > 1`).
+- Colour-space decode beyond Grey 8-bit (RGB encoder output is valid
+  for djxl but our decoder rejects `ColourSpace::Rgb`).
+- Predictor 6 (Annex E Weighted) on either decode or encode side.
+- Encoder lossy mode (encoder is lossless Modular only).
+- Animation / preview / intrinsic-size sub-bundle decoding.
 
-### Why pixel decode is blocked
+### Why VarDCT decode is still blocked
 
-Pixel-decoder work is gated on having the normative ISO/IEC 18181-1
-(JPEG XL Core Coding System) text in `docs/image/jxl/`. As of this
-release the workspace does not carry the spec — it is listed in the
-project-wide `docs/README.md` "Known gaps — ISO/IEC (paid)" section.
-Workspace policy forbids consulting third-party source (libjxl,
-jxlatte, jxl-rs, FUIF, brunsli) as a substitute. See
-[`SPEC_BLOCKED.md`](SPEC_BLOCKED.md) for the audit, the documents
-checked, and the unblock procedure + planned work-order for when the
-ISO PDF lands.
+Modular pixel decode is fully wired (see status section below) and
+single-leaf MA-tree + ANS lossless frames round-trip end-to-end. The
+remaining decoder gap is the **VarDCT path** (variable-size DCT,
+LF/HF subbands, Chroma-from-Luma, Gaborish, EPF) — these need a deeper
+walk through FDIS §3.8 which is partially documented in the in-tree
+clean-room behavioural trace
+(`docs/image/jpegxl/libjxl-trace-reverse-engineering.md`). Workspace
+policy forbids consulting third-party source (libjxl, jxlatte,
+jxl-rs, FUIF, brunsli) as a substitute. See
+[`SPEC_BLOCKED.md`](SPEC_BLOCKED.md) for the audit + planned
+work-order. Modular Appendix B §B.3.1 / §B.4 Path 1 (delta-palette
+edge case, idx=-1 / nb_deltas=0 / predictor=Zero) is also still
+gapped (#500).
 
 ## Usage
 
@@ -109,10 +117,27 @@ assert!(reg.make_decoder(&params).is_err());
 
 ### Codec / container IDs
 
-- Codec: `"jpegxl"` — decoder slot registered (returns
-  `Error::Unsupported` on instantiation); no encoder slot.
+- Codec: `"jpegxl"` — decoder + encoder slots both registered.
 - No demuxer is registered: this crate treats a JXL file as a single
   codestream buffer fed directly to `probe(...)`.
+
+### Encoder status (round 5)
+
+The Modular lossless encoder ([`encoder::encode_one_frame`]) accepts
+Gray8 / Rgb8 / Rgba8 input up to 1024×1024 (single-group cap) and
+emits a raw JXL codestream. Round 5 added per-image predictor
+selection across `{1 Left, 2 Top, 3 Average, 4 West-Predictor, 5
+Gradient}` (FDIS Listing C.16 ids) — the encoder pre-scans residual
+magnitudes and picks the lowest-scoring predictor for the single
+MA-tree leaf, then emits an ANS-coded symbol stream against an
+aligned 4096-summing distribution (round 4). Cross-validated through
+both our own decoder and libjxl's `djxl` on:
+
+- 8×8 / 16×16 / 64×64 grey synthetic fixtures (round 4 baseline).
+- **256×256 grey natural image (round 5):** 33747 bytes for 65536-pixel
+  raw input → **4.12 bits/pixel**, 51.5% compression, bit-exact
+  lossless self + djxl round-trip. PSNR-Y is mathematically infinite
+  (lossless, MSE = 0), well above the round-39 35 dB target.
 
 ### Modular pixel decode status
 

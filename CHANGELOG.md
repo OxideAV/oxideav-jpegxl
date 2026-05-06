@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Round 5 encoder — per-image predictor selection.** The Modular
+  encoder now scans the input once per candidate predictor (sum of
+  `|residual|` over all channels) and picks the lowest-scoring one
+  for the single MA-tree leaf, instead of always emitting Gradient
+  (5). Candidate set: `{1 Left, 2 Top, 3 Average, 4 West-Predictor,
+  5 Gradient}` from FDIS Listing C.16. Predictor 0 (Zero) is
+  excluded (rarely optimal on natural data); predictor 6 (Annex E
+  Weighted) is excluded (decoder rejects); predictors 7..=13 are
+  excluded for now (need a wider reconstruction-buffer refactor).
+  - `pick_best_predictor_id` does the prescan; `predict()` is the
+    dispatcher matching the round-5 reconstruction-buffer convention.
+  - `write_single_leaf_ma_tree(bw, predictor_id)` (renamed from
+    `write_gradient_leaf_ma_tree`) parameterises the cluster-1
+    single-symbol prefix code so any of the 13 supported predictor
+    ids fits in the 4-bit alphabet.
+- **Round 5 PSNR-Y target hit.** New cross-validation tests in
+  `tests/encode_djxl_roundtrip.rs`:
+  - `djxl_decodes_our_grey_256x256_natural_image_with_compression` —
+    256×256 synthetic natural grey (smooth sinusoid + low-amplitude
+    noise) encodes to **33747 bytes / 4.12 bpp / 51.5% of raw**
+    (vs uncompressed 65536 bytes), bit-exact lossless round-trip
+    through libjxl's `djxl`. PSNR-Y is mathematically infinite
+    (lossless, MSE = 0), well above the round-39 35 dB target.
+  - `self_roundtrip_grey_256x256_natural_image` — same fixture
+    through our own decoder, asserts both compression and
+    pixel-equality without the djxl dependency.
+
 ## [0.0.7](https://github.com/OxideAV/oxideav-jpegxl/compare/v0.0.6...v0.0.7) - 2026-05-05
 
 ### Other

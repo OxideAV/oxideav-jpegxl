@@ -264,3 +264,121 @@ fn djxl_decodes_our_grey_16x16_skewed_image() {
     assert_eq!(h, 16);
     assert_eq!(data, pixels, "djxl round-trip pixel mismatch");
 }
+
+/// Synthesise a 256×256 grey "natural" image with low-frequency 2-D
+/// sinusoidal structure plus a small amount of high-frequency noise.
+///
+/// Pixel (x, y) = clamp(0, 255, 128 + 64*sin(2π·x/64) + 40*cos(2π·y/48)
+///                                       + LCG_noise(±6))
+///
+/// Designed so:
+///   * smooth regions dominate (Gradient predictor strongly preferred),
+///   * residual histogram heavily skewed toward small values (test that
+///     the round-5 ANS distribution + per-image predictor picker
+///     compress to well below 8 bits/pixel).
+fn synth_natural_grey_256x256() -> Vec<u8> {
+    let w = 256usize;
+    let h = 256usize;
+    let mut pixels = Vec::with_capacity(w * h);
+    let mut state: u32 = 0xDEAD_BEEF;
+    for y in 0..h {
+        for x in 0..w {
+            // Cheap LUT-free sinusoid via Taylor; we only care about a
+            // smooth low-frequency surface, not exact precision.
+            let xt = (x as f64) * std::f64::consts::PI * 2.0 / 64.0;
+            let yt = (y as f64) * std::f64::consts::PI * 2.0 / 48.0;
+            let s = 128.0 + 64.0 * xt.sin() + 40.0 * yt.cos();
+            // 13-bit LCG noise → ±6 amplitude.
+            state = state.wrapping_mul(1103515245).wrapping_add(12345);
+            let noise = ((state >> 19) & 0xF) as i32 - 8; // [-8, 7]
+            let v = (s as i32 + noise / 2).clamp(0, 255);
+            pixels.push(v as u8);
+        }
+    }
+    pixels
+}
+
+/// **Round-5 PSNR-Y target.** Encode a 256×256 grey "natural" image
+/// (smooth sinusoid + low-amplitude noise), cross-decode through djxl,
+/// and assert:
+///   1. `djxl` decodes our codestream successfully,
+///   2. the decode is **bit-exact** (lossless modular round-trip → ∞ dB
+///      PSNR-Y, well above the 35 dB target),
+///   3. encoded size is below the raw input — i.e. compression is
+///      actually happening at this scale (round-4 sometimes produced
+///      output bigger than raw on small fixtures because of distribution
+///      preamble; at 256×256 the preamble amortises).
+#[test]
+fn djxl_decodes_our_grey_256x256_natural_image_with_compression() {
+    if !djxl_available() {
+        eprintln!("djxl not on PATH — skipping 256×256 cross-validation test");
+        return;
+    }
+    let pixels = synth_natural_grey_256x256();
+    assert_eq!(pixels.len(), 256 * 256);
+    let jxl = encode_one_frame(256, 256, &pixels, InputFormat::Gray8)
+        .expect("encode 256x256 grey natural");
+    let raw_bytes = pixels.len() as f64;
+    let bpp = (jxl.len() as f64 * 8.0) / (256.0 * 256.0);
+    eprintln!(
+        "encoded grey 256x256 natural → {} bytes ({:.3} bits/pixel; raw={:.0} B; ratio={:.3})",
+        jxl.len(),
+        bpp,
+        raw_bytes,
+        jxl.len() as f64 / raw_bytes,
+    );
+    assert!(
+        jxl.len() < pixels.len(),
+        "round-5 encoder should compress 256x256 natural image \
+         below raw bytes ({} encoded ≥ {} raw)",
+        jxl.len(),
+        pixels.len(),
+    );
+    let pgm = match djxl_decode_to_pgm(&jxl) {
+        Ok(p) => p,
+        Err(e) => panic!("djxl decode failed on 256x256 natural: {e}"),
+    };
+    let (w, h, data) = parse_pgm(&pgm).expect("parse djxl PGM output");
+    assert_eq!(w, 256);
+    assert_eq!(h, 256);
+    assert_eq!(data.len(), 256 * 256);
+    // Lossless → bit-exact match. PSNR-Y is mathematically infinite
+    // (MSE = 0), comfortably above the 35 dB round-39 target.
+    assert_eq!(
+        data, pixels,
+        "djxl round-trip pixel mismatch on 256x256 natural image"
+    );
+
+    // Symmetric self-roundtrip: our own decoder must also round-trip
+    // bit-exactly. (256x256 fits the single-group cap, exercises the
+    // multi-byte ANS distribution preamble + thousands of tokens.)
+    let frame =
+        oxideav_jpegxl::decode_one_frame(&jxl, None).expect("self-decode 256x256 grey natural");
+    assert_eq!(frame.planes.len(), 1);
+    assert_eq!(frame.planes[0].data.len(), 256 * 256);
+    assert_eq!(
+        frame.planes[0].data, pixels,
+        "self-decode pixel mismatch on 256x256 natural image"
+    );
+}
+
+/// Pure self-roundtrip (no djxl dependency) on the round-5 256×256
+/// natural-image fixture. Confirms the encoder + decoder agree end-to-end
+/// at the size where the round-5 wins land (predictor-id selection +
+/// histogram amortisation across thousands of tokens).
+#[test]
+fn self_roundtrip_grey_256x256_natural_image() {
+    let pixels = synth_natural_grey_256x256();
+    let jxl = encode_one_frame(256, 256, &pixels, InputFormat::Gray8)
+        .expect("encode 256x256 grey natural");
+    let bpp = (jxl.len() as f64 * 8.0) / (256.0 * 256.0);
+    eprintln!(
+        "self-roundtrip 256x256 grey natural: {} bytes ({:.3} bits/pixel)",
+        jxl.len(),
+        bpp
+    );
+    assert!(jxl.len() < pixels.len(), "compression failed");
+    let frame = oxideav_jpegxl::decode_one_frame(&jxl, None).expect("self-decode 256x256");
+    assert_eq!(frame.planes.len(), 1);
+    assert_eq!(frame.planes[0].data, pixels);
+}
