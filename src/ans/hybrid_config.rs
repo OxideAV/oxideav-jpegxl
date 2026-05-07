@@ -95,14 +95,15 @@ impl HybridUintConfig {
             .msb_in_token
             .checked_add(self.lsb_in_token)
             .ok_or_else(|| Error::InvalidData("JXL ReadUint: msb+lsb overflow".into()))?;
-        // n = split_exponent + ((token - split) >> total_in_token).
-        // We've already verified split_exponent <= 15 and
-        // msb+lsb <= split_exponent, so n stays bounded by ~31 for any
-        // practically-reachable token.
+        // 2024-spec C.3.3 Listing for ReadUint:
+        //   n = split_exponent - msb_in_token - lsb_in_token
+        //     + ((token - split) >> (msb_in_token + lsb_in_token));
+        // Round 3 omitted the `- msb - lsb` part, inflating n by
+        // (msb + lsb) extra bits per token and over-consuming bitstream.
         let above = token - self.split;
         let n_extra = above >> total_in_token;
-        let n = self
-            .split_exponent
+        let n_base = self.split_exponent.saturating_sub(total_in_token);
+        let n = n_base
             .checked_add(n_extra)
             .ok_or_else(|| Error::InvalidData("JXL ReadUint: n overflow".into()))?;
         if n >= 32 {
@@ -143,27 +144,33 @@ impl HybridUintConfig {
         }
         let total_in_token = self.msb_in_token + self.lsb_in_token;
 
-        // Find the smallest `n` (>= split_exponent) such that the
-        // decode formula
-        //   value = ((((1 << msb) | top_msb) << n) | extra_bits) << lsb | lsb_bits
-        // can represent `value`. This is `n = floor(log2(value >> lsb)) - msb`.
+        // Decoder formula:
+        //   n_base = split_exponent - msb - lsb
+        //   n      = n_base + n_extra
+        //   tok    = ((token - split) >> (msb + lsb)) yields n_extra
+        //   value  = ((tok_high << n) | extra) << lsb | lsb_bits
+        // where tok_high carries (1 << msb) plus msb_part bits.
+        // Top bit of value sits at position n + msb + lsb.
+        // So n = top_bit_pos(value) - msb - lsb.
         let lsb_bits = value & ((1u32 << self.lsb_in_token).wrapping_sub(1));
-        let v = value >> self.lsb_in_token;
-        // `v` has its top bit at position `top_bit_pos`.
-        let top_bit_pos = 31 - v.leading_zeros();
-        // Decoder reconstructs `tok = (1 << msb) | top_msb_part`, then
-        // `(tok << n)` carries the leading 1 to bit `(msb + n)`. So
-        // `n = top_bit_pos - msb`.
-        let n = top_bit_pos - self.msb_in_token;
-        debug_assert!(n >= self.split_exponent);
-        let n_above = n - self.split_exponent;
-        // Bits below the leading 1 in v break into `msb_in_token` MSB
-        // bits (go into the token) and `n` extra-payload bits.
-        let below_leading_1 = v ^ (1u32 << top_bit_pos);
-        let extra_bits = below_leading_1 & ((1u32 << n).wrapping_sub(1));
-        let msb_part = below_leading_1 >> n;
+        // Top bit of value (it's >= split which has top bit at split_exp).
+        let top_bit_pos = 31 - value.leading_zeros();
+        let n = top_bit_pos
+            .saturating_sub(self.msb_in_token)
+            .saturating_sub(self.lsb_in_token);
+        let n_base = self.split_exponent - total_in_token;
+        debug_assert!(n >= n_base);
+        let n_extra = n - n_base;
+        // Bits between the leading 1 (at top_bit_pos) and the lsb-region
+        // (lowest lsb_in_token bits) break into:
+        //   - msb_in_token bits at the top (go into the token), then
+        //   - n bits below those (extra payload).
+        let body = (value >> self.lsb_in_token) ^ (1u32 << (top_bit_pos - self.lsb_in_token));
+        // body has bits in [0, n + msb).
+        let extra_bits = body & ((1u32 << n).wrapping_sub(1));
+        let msb_part = body >> n;
         let token =
-            self.split + ((n_above << total_in_token) | (msb_part << self.lsb_in_token) | lsb_bits);
+            self.split + ((n_extra << total_in_token) | (msb_part << self.lsb_in_token) | lsb_bits);
         (token, extra_bits, n)
     }
 }

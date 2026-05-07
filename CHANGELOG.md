@@ -9,6 +9,63 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Round 4 (2024-spec)** — three independent decoder bugs fixed; all
+  three previously-blocked single-group docs fixtures
+  (`gradient-64x64-lossless.jxl`, `palette-32x32.jxl`, plus the round-3
+  baseline `gray-64x64.jxl`) now decode pixel-correct against their
+  committed `expected.png` references via a new full-image PNG-decoder
+  comparison harness (`tests/round4_pixel_correctness.rs`).
+  - **2024-spec C.3.3 `ReadUint` formula fix** — round 3 computed the
+    extra-bits count as `n = split_exponent + ((token - split) >>
+    (msb + lsb))` but spec C.3.3 says
+    `n = (split_exponent - msb_in_token - lsb_in_token) +
+    ((token - split) >> (msb + lsb))`. The missing `- msb - lsb`
+    inflated `n` by `(msb + lsb)` extra bits per above-split token,
+    which is the root cause of "12× bits/token" over-consumption that
+    blocked `gradient-64x64` and `palette-32x32` in round 3.
+    `HybridUintConfig::read_uint` now uses the spec formula; the
+    in-tree `encode_uint` round-trip helper was likewise updated to
+    keep the existing round-trip unit tests passing.
+  - **2024-spec H.5.2 Self-correcting predictor — three sign / formula
+    fixes**:
+    1. `subpred[3]` had `n8.wrapping_add(...)` in round 3; spec listing
+       reads `subpred[3] = N3 - (...)`. Sign flipped to
+       `wrapping_sub`.
+    2. `error2weight` was missing the trailing `>> shift`. Spec:
+       `4 + ((maxweight * ((1<<24) Idiv ((err_sum >> shift) + 1))) >> shift)`.
+       The missing outer shift inflated weights non-uniformly across
+       sub-predictors when their shifts differ, producing wrong
+       sub-predictor mixing.
+    3. `s = (sum_weights >> 1) - 1` per spec; round 3 omitted the
+       `- 1`.
+  - **2024-spec H.5.1 `err[i]` formula fix** — round 3 stored
+    `abs(((subpred[i] + 3) >> 3) - true_value)`; spec is
+    `(abs(subpred[i] - (true_value << 3)) + 3) >> 3`. These differ in
+    rounding, producing wrong sub_err values that propagate to
+    downstream WP weights.
+  - **2024-spec H.5.2 sub_err edge cases** — when N or NW does not
+    exist for the `err_sum[i]` neighbour gathering, spec says use 0
+    (for N, W, WW) or N's value (for NW, NE). Round 3 used 0 for all
+    out-of-range neighbours; corrected to use N's err for NW at
+    column 0.
+  - **2024-spec H.5.2 rightmost-column carry** — spec adds
+    `err[i]_W` to `err_sum[i]` when `x == width - 1`. Round 3
+    omitted this. Now applied via an explicit branch.
+  - **2024-spec H.5 / H.4 max_error semantics** — round 3 used the
+    PREVIOUS sample's max_error for property 15 of the CURRENT
+    sample. Spec calls `wp_predict` first to get max_error for the
+    current sample, then uses that as `property[15]` for the MA-tree
+    decision. Restructured `decode_channels` to call WP up-front,
+    use the result for both property 15 and (if the leaf picks
+    predictor 6) the prediction value.
+  - **`tests/round4_pixel_correctness.rs`** — full-image PNG-backed
+    pixel-correctness harness (4 fixtures: `pixel-1x1`,
+    `gray-64x64`, `gradient-64x64-lossless`, `palette-32x32`) plus
+    a manual `palette_invasive_pixel_decode` diagnostic that walks
+    decode_channels token-by-token printing bit positions, kept for
+    round-5 work.
+  - **`png` dev-dependency** (`png = "0.18"`) — pulled only by the
+    test harness; no codec-semantics overlap with JPEG XL itself.
 - **Round 3 (2024-spec)** — bit-alignment fix at the GlobalModular →
   inner-Modular boundary + ANS alias-mapping conditional-offset fix.
   After this round, `gray-64x64.jxl` decodes pixel-correct against

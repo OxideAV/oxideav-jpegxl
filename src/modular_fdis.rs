@@ -953,7 +953,9 @@ fn wp_predict(
         n8.wrapping_sub((((te_w as i64 + te_n as i64 + te_ne as i64) * wp.p1 as i64) >> 5) as i32);
     let p2 =
         w8.wrapping_sub((((te_w as i64 + te_n as i64 + te_nw as i64) * wp.p2 as i64) >> 5) as i32);
-    let p3 = n8.wrapping_add(
+    // 2024-spec Listing H.5.2 subpred[3] — sign is `N3 - (...)`, not `N3 + (...)`.
+    // Round 3 had `wrapping_add`; corrected to `wrapping_sub` here.
+    let p3 = n8.wrapping_sub(
         ((te_nw as i64 * wp.p3a as i64
             + te_n as i64 * wp.p3b as i64
             + te_ne as i64 * wp.p3c as i64
@@ -969,23 +971,52 @@ fn wp_predict(
         let mut weights = [0u64; 4];
         let weights_cfg = [wp.w0, wp.w1, wp.w2, wp.w3];
         for k in 0..4 {
-            let sum = state.sub_err_at(k, x - 1, y) // W
-                + state.sub_err_at(k, x, y - 1) // N
-                + state.sub_err_at(k, x - 1, y - 1) // NW
-                + state.sub_err_at(k, x - 2, y) // WW
-                + if (x + 1) < state.width as i32 && y > 0 {
-                    state.sub_err_at(k, x + 1, y - 1) // NE
-                } else {
-                    state.sub_err_at(k, x, y - 1) // fallback to N's sub_err
-                };
+            // Edge cases per H.5.2:
+            //  - if W, N or WW does not exist, the value 0 is used instead;
+            //  - if NW or NE does not exist, the value of N is used instead.
+            let n_se = if y > 0 {
+                state.sub_err_at(k, x, y - 1)
+            } else {
+                0
+            };
+            let w_se = if x > 0 {
+                state.sub_err_at(k, x - 1, y)
+            } else {
+                0
+            };
+            let nw_se = if x > 0 && y > 0 {
+                state.sub_err_at(k, x - 1, y - 1)
+            } else {
+                n_se
+            };
+            let ww_se = if x > 1 {
+                state.sub_err_at(k, x - 2, y)
+            } else {
+                0
+            };
+            let ne_se = if (x + 1) < state.width as i32 && y > 0 {
+                state.sub_err_at(k, x + 1, y - 1)
+            } else {
+                n_se
+            };
+            // err_sum is `Umod (1 << 32)` per spec; we hold non-negative
+            // u32 since each err[i] is `(abs(...) + 3) >> 3 >= 0`.
+            let mut err_sum =
+                (n_se as i64 + w_se as i64 + nw_se as i64 + ww_se as i64 + ne_se as i64) as u64
+                    & 0xFFFF_FFFF;
+            // Special case: if x == width - 1, err_sum[i] += err[i]_W.
+            if x == (state.width as i32 - 1) {
+                err_sum = (err_sum + w_se as u64) & 0xFFFF_FFFF;
+            }
             // error2weight(err_sum, maxweight):
-            //   shift = max(0, floor(log2(err_sum + 1)) - 5)
-            //   return 4 + (maxweight * ((1 << 24) Idiv ((err_sum >> shift) + 1)))
-            let err_sum = sum.max(0) as u32;
-            let bits = 32u32 - (err_sum + 1).leading_zeros();
+            //   shift = floor(log2(err_sum + 1)) - 5; if shift < 0 shift = 0;
+            //   return 4 + ((maxweight * ((1 << 24) Idiv ((err_sum >> shift) + 1))) >> shift);
+            let err_sum32 = err_sum as u32;
+            let bits = 32u32 - (err_sum32 + 1).leading_zeros();
             let shift = (bits.saturating_sub(1)).saturating_sub(5);
-            let denom = ((err_sum >> shift) as u64) + 1;
-            let weight = 4u64 + (weights_cfg[k] as u64 * (1u64 << 24) / denom);
+            let denom = ((err_sum32 >> shift) as u64) + 1;
+            let inner = (weights_cfg[k] as u64 * (1u64 << 24) / denom) >> shift;
+            let weight = 4u64 + inner;
             weights[k] = weight;
         }
         weights
@@ -1013,7 +1044,9 @@ fn wp_predict(
         let g = w8.wrapping_add(n8).wrapping_sub(nw8);
         return (g, preds, 0);
     }
-    let s_init: i64 = (sum_weights >> 1) as i64;
+    // 2024-spec Listing H.5.2 — `s = (sum_weights >> 1) - 1`. Round 3
+    // missed the `- 1`.
+    let s_init: i64 = (sum_weights >> 1) as i64 - 1;
     let s = (0..4).fold(s_init, |acc, k| acc + preds[k] as i64 * shifted[k] as i64);
     let mut prediction = ((s * (1i64 << 24).div_euclid(sum_weights as i64)) >> 24) as i32;
 
@@ -1365,8 +1398,20 @@ pub fn decode_channels(
     for (i, desc) in descs.iter().enumerate() {
         for y in 0..desc.height {
             for x in 0..desc.width {
-                let max_err = wp_states[i].as_ref().map(|s| s.last_max_error).unwrap_or(0);
-                let props = get_properties(&img, i, x as i32, y as i32, stream_index, max_err);
+                // 2024-spec H.5.1: WP is invoked "for each sample (including
+                // samples that use a different predictor)". So compute the
+                // weighted-predictor result first when WP state exists; the
+                // resulting `max_error` is property[15] for the MA-tree
+                // decision that picks this sample's leaf.
+                let (wp_pred8, wp_subpreds, wp_max_error) =
+                    if let Some(state) = wp_states[i].as_ref() {
+                        let nb = Neighbours::at(&img, i, x as i32, y as i32);
+                        wp_predict(state, &nb, x as i32, y as i32, wp)
+                    } else {
+                        (0, [0; 4], 0)
+                    };
+
+                let props = get_properties(&img, i, x as i32, y as i32, stream_index, wp_max_error);
                 let leaf = *evaluate_tree(&tree.nodes, &props)?;
                 if (leaf.ctx as usize) >= tree.num_ctx {
                     return Err(Error::InvalidData(format!(
@@ -1382,15 +1427,29 @@ pub fn decode_channels(
                     dist_multiplier,
                 )?;
                 let diff = unpack_signed(token);
-                let (p, sub_preds, max_err_now) = predict(
-                    &img,
-                    i,
-                    x as i32,
-                    y as i32,
-                    leaf.predictor,
-                    wp,
-                    wp_states[i].as_ref(),
-                )?;
+
+                // Compute prediction value for `leaf.predictor`. Predictor 6
+                // reuses the wp_predict result we already have (rounded).
+                let p = if leaf.predictor == 6 {
+                    if wp_states[i].is_none() {
+                        return Err(Error::InvalidData(
+                            "JXL Modular: leaf predictor 6 but no WP state".into(),
+                        ));
+                    }
+                    (wp_pred8.wrapping_add(3)) >> 3
+                } else {
+                    let (v, _, _) = predict(
+                        &img,
+                        i,
+                        x as i32,
+                        y as i32,
+                        leaf.predictor,
+                        wp,
+                        wp_states[i].as_ref(),
+                    )?;
+                    v
+                };
+
                 let val = (diff as i64)
                     .saturating_mul(leaf.multiplier as i64)
                     .saturating_add(leaf.offset as i64)
@@ -1403,41 +1462,24 @@ pub fn decode_channels(
                 let v = val as i32;
                 img.set(i, x, y, v);
 
-                // Update the WP state for this channel. Even when the
-                // current leaf used a non-6 predictor, the spec calls
-                // for true_err / sub_err to be tracked unconditionally
-                // (Annex H.5 / E.1) so that future predictor-6 calls
-                // see correct history. We compute sub-predictors from
-                // the unweighted call above when predictor was 6, and
-                // re-do them otherwise to keep state consistent.
+                // 2024-spec H.5.1: AFTER decoding the sample, compute and
+                // store true_err + err[i] for the current sample so that
+                // future samples (which see this position as a neighbour)
+                // get the correct history. We use the ALREADY-COMPUTED
+                // wp_pred8 / wp_subpreds from the BEFORE-decode call —
+                // they were computed against neighbour state and are the
+                // same prediction values the spec stores against.
                 if let Some(state) = wp_states[i].as_mut() {
-                    // Re-derive 8x prediction + sub-predictions if the
-                    // leaf wasn't predictor 6 (we need them for state).
-                    let (pred8, preds, max_err_actual) = if leaf.predictor == 6 {
-                        // We already have preds from `predict`, but
-                        // pred8 would be the 8x prediction (recompute
-                        // from p which is already (pred8 + 3) >> 3).
-                        // Cheaper: re-call wp_predict directly.
-                        let nb = Neighbours::at(&img, i, x as i32, y as i32);
-                        // Note: `img` already has the new sample written.
-                        // wp_predict uses neighbours of (x,y), not (x,y)
-                        // itself, so this is safe.
-                        let _ = sub_preds;
-                        let _ = max_err_now;
-                        wp_predict(state, &nb, x as i32, y as i32, wp)
-                    } else {
-                        let nb = Neighbours::at(&img, i, x as i32, y as i32);
-                        wp_predict(state, &nb, x as i32, y as i32, wp)
-                    };
-                    state.last_max_error = max_err_actual;
-                    // true_err = prediction - (true_value << 3)
-                    let te = pred8.wrapping_sub(v.wrapping_shl(3));
+                    state.last_max_error = wp_max_error;
+                    // true_err = NarrowToI32(prediction - (true_value << 3))
+                    let te = wp_pred8.wrapping_sub(v.wrapping_shl(3));
                     state.set_true_err(x, y, te);
-                    // sub_err_i = abs((preds_i + 3) >> 3 - true_value)
-                    for (k, p_i) in preds.iter().enumerate() {
-                        let pv = (p_i.wrapping_add(3)) >> 3;
-                        let se = pv.wrapping_sub(v).unsigned_abs() as i32;
-                        state.set_sub_err(k, x, y, se);
+                    // err[i] = (abs(subpred[i] - (true_value << 3)) + 3) >> 3
+                    let tv8 = v.wrapping_shl(3);
+                    for (k, p_i) in wp_subpreds.iter().enumerate() {
+                        let diff_i = p_i.wrapping_sub(tv8);
+                        let se = (diff_i.unsigned_abs().wrapping_add(3)) >> 3;
+                        state.set_sub_err(k, x, y, se as i32);
                     }
                 }
             }
@@ -1445,6 +1487,20 @@ pub fn decode_channels(
     }
 
     Ok(img)
+}
+
+/// Public diagnostic re-export of `decode_uint_in_with_dist` for use by
+/// integration-test bisects. Identical to the internal function used in
+/// `decode_channels`; round-4 bisects need it to step through pixel
+/// decode token-by-token while printing bit positions.
+pub fn decode_uint_in_with_dist_pub(
+    hybrid: &mut HybridUintState,
+    entropy: &mut EntropyStream,
+    br: &mut BitReader<'_>,
+    ctx: u32,
+    dist_multiplier: u32,
+) -> Result<u32> {
+    decode_uint_in_with_dist(hybrid, entropy, br, ctx, dist_multiplier)
 }
 
 /// Variant of `decode_uint_in` that propagates a non-zero

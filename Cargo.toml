@@ -15,3 +15,10 @@ categories = ["multimedia::encoding", "multimedia::images"]
 
 [dependencies]
 oxideav-core = "0.1"
+
+[dev-dependencies]
+# Used only by integration tests to decode the committed `expected.png`
+# fixtures and compare them byte-for-byte against our decoder's output.
+# `png` is a single-purpose pure-Rust PNG decoder; no codec semantics
+# overlap with JPEG XL.
+png = "0.18"
