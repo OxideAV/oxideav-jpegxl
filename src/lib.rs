@@ -68,27 +68,37 @@
 //!   [`ans::cluster::read_general_clustering`] — D.3.5 general path.
 //! * Round 3 (planned): GlobalModular wiring + cjxl fixture decode.
 //!
-//! ## Round-3 status (this commit)
+//! ## Round-1 (2024-spec) status (this commit)
 //!
-//! `make_decoder` now returns a live FDIS decoder ([`JxlDecoder`]) that
-//! handles the *narrow envelope* needed by the simplest cjxl Modular
-//! lossless output:
+//! `make_decoder` returns a live decoder ([`JxlDecoder`]) that handles
+//! the simplest end-to-end Modular bitstreams:
 //!
-//! * Raw codestream OR ISOBMFF wrapping;
-//! * Single-channel Grey 8 bpp;
+//! * Raw codestream OR ISOBMFF wrapping.
+//! * Grey (1 plane) OR RGB (3 planes), 8 bits per sample (integer).
 //! * Single-group, single-pass frame (`num_groups == 1 &&
-//!   num_passes == 1`);
-//! * `nb_transforms == 0` (no Squeeze / Palette / RCT);
-//! * Single-leaf MA tree (no decision-node evaluation);
-//! * No Patches / Splines / NoiseParameters;
-//! * `use_global_tree == false`;
-//! * No ICC profile (Annex B);
-//! * No weighted predictor (Annex E predictor `6`).
+//!   num_passes == 1`).
+//! * `nb_transforms` arbitrary at the *parse* level (TransformInfo
+//!   bundles per H.7 are decoded for any nb_transforms > 0); inverse
+//!   application of Palette / Squeeze defers to round 2 with a clean
+//!   `Error::Unsupported` exit point. RCT (no channel-list change)
+//!   passes through the layout step.
+//! * Multi-leaf MA tree evaluated end-to-end (decision-node
+//!   `property[k] > value` traversal per H.4.1).
+//! * `use_global_tree` is honoured.
+//! * No Patches / Splines / NoiseParameters — those are LfGlobal
+//!   features round 2 will land alongside the VarDCT path.
+//! * No ICC profile (Annex E.4).
+//! * Predictor 6 (Annex H.5 Self-correcting) only resolved at the
+//!   (0, 0) origin; full WP defers to round 2.
+//!
+//! The acceptance fixture for round 1 is `pixel-1x1.jxl` (1×1 RGB
+//! lossless, 22 B): decodes to R=255 G=0 B=0 matching its
+//! `expected.png`.
 //!
 //! Anything outside this envelope returns
 //! [`Error::Unsupported`](oxideav_core::Error::Unsupported) at the
-//! relevant gate point. Wider coverage (RGB, VarDCT, Squeeze, ICC,
-//! weighted predictor, multi-leaf trees) lands in round 4.
+//! relevant gate point. Wider coverage (VarDCT, Squeeze inverse,
+//! Palette inverse, ICC, full WP predictor 6) lands in round 2+.
 
 pub mod abrac;
 pub mod ans;
@@ -157,19 +167,19 @@ fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
     }))
 }
 
-/// Round-3 JXL decoder. Drives `decode_one_frame` per packet.
+/// Round-1 (2024-spec) JXL decoder. Drives `decode_one_frame` per packet.
 ///
-/// Limitations (round 3):
-/// * Only Modular-encoded frames with a single Grey channel.
-/// * Only single-group frames (`num_groups == 1 && num_passes == 1`).
-/// * No transforms (kPalette / kRCT / kSqueeze).
-/// * No global tree (`use_global_tree == false`).
-/// * MA tree must be a single leaf (no decision nodes evaluated).
-/// * No Patches / Splines / Noise.
+/// Limitations (round 1):
+/// * Only Modular-encoded frames (kModular, not kVarDCT).
+/// * Grey (1ch) OR RGB (3ch) only — XYB / YCbCr defer.
+/// * Single-group, single-pass frames.
+/// * Inverse Palette / Squeeze transforms defer (parsing + RCT
+///   layout pass-through is wired).
+/// * Predictor 6 (Self-correcting) only at (0, 0) origin.
+/// * No Patches / Splines / Noise / ICC profile.
 ///
 /// Anything outside this envelope returns `Error::Unsupported` from a
-/// well-defined point in the bitstream rather than panicking. Round 4
-/// will widen the envelope to RGB / VarDCT / Squeeze.
+/// well-defined point in the bitstream rather than panicking.
 struct JxlDecoder {
     codec_id: CodecId,
     pending: Option<Packet>,
@@ -285,47 +295,61 @@ fn decode_codestream(codestream: &[u8], pts: Option<i64>) -> Result<VideoFrame> 
     //    nothing else (no LfGroup / HfGlobal / PassGroup follow).
     let lf_global = LfGlobal::read(&mut br, &fh, &metadata)?;
 
-    // 9. Map the decoded modular image to a VideoFrame. Only Grey
-    //    8-bit-per-sample is wired in round 3.
-    if metadata.colour_encoding.colour_space != ColourSpace::Grey {
-        return Err(Error::Unsupported(format!(
-            "jxl decoder (round 3): colour_space {:?} not supported (Grey only)",
-            metadata.colour_encoding.colour_space
-        )));
-    }
+    // 9. Map the decoded modular image to a VideoFrame.
+    //
+    // Round-1 (2024-spec) supports:
+    //   - Grey colour_space (single channel, 1 plane)
+    //   - RGB colour_space (3 channels → 3 planes in R/G/B order)
+    //   - 8-bit integer bit depth
+    //
+    // Other colour spaces (XYB, YCbCr) and float bit depths fall in
+    // later rounds.
     if metadata.bit_depth.float_sample {
         return Err(Error::Unsupported(
-            "jxl decoder (round 3): float bit depth not supported".into(),
+            "jxl decoder (round 1): float bit depth not supported".into(),
         ));
     }
     if metadata.bit_depth.bits_per_sample != 8 {
         return Err(Error::Unsupported(format!(
-            "jxl decoder (round 3): bits_per_sample {} not supported (8 only)",
+            "jxl decoder (round 1): bits_per_sample {} not supported (8 only)",
             metadata.bit_depth.bits_per_sample
         )));
     }
     let img = lf_global.global_modular.image;
-    if img.channels.len() != 1 {
+    let n_chans = img.channels.len();
+    let expected_chans = match metadata.colour_encoding.colour_space {
+        ColourSpace::Grey => 1,
+        ColourSpace::Rgb => 3,
+        _ => {
+            return Err(Error::Unsupported(format!(
+                "jxl decoder (round 1): colour_space {:?} not supported (Grey/RGB only)",
+                metadata.colour_encoding.colour_space
+            )));
+        }
+    };
+    if n_chans != expected_chans {
         return Err(Error::Unsupported(format!(
-            "jxl decoder (round 3): {} channels not supported (1 only)",
-            img.channels.len()
+            "jxl decoder (round 1): {} channels but colour_space wants {}",
+            n_chans, expected_chans
         )));
     }
-    let desc = img.descs[0];
-    let w = desc.width as usize;
-    let h = desc.height as usize;
-    let mut bytes = Vec::with_capacity(w * h);
-    for &v in img.channels[0].iter() {
-        bytes.push(v.clamp(0, 255) as u8);
+    let mut planes: Vec<VideoPlane> = Vec::with_capacity(n_chans);
+    for (i, ch_data) in img.channels.iter().enumerate() {
+        let desc = img.descs[i];
+        let w = desc.width as usize;
+        let h = desc.height as usize;
+        let mut bytes = Vec::with_capacity(w * h);
+        for &v in ch_data.iter() {
+            bytes.push(v.clamp(0, 255) as u8);
+        }
+        planes.push(VideoPlane {
+            stride: w,
+            data: bytes,
+        });
+        // Sanity check height while we're here.
+        debug_assert_eq!(planes[i].data.len(), w * h);
     }
-    let plane = VideoPlane {
-        stride: w,
-        data: bytes,
-    };
-    Ok(VideoFrame {
-        pts,
-        planes: vec![plane],
-    })
+    Ok(VideoFrame { pts, planes })
 }
 
 /// FDIS-side `Headers` returned by [`probe_fdis`]. Mirrors the

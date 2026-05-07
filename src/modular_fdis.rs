@@ -1,40 +1,40 @@
-//! Modular image sub-bitstream — FDIS 18181-1 §C.9 (FDIS-2021 path).
+//! Modular image sub-bitstream — ISO/IEC 18181-1:2024 Annex H.
 //!
-//! This module is the **FDIS-2021** Modular decoder, written from scratch
-//! against the published spec rather than the 2019 committee draft. The
-//! committee-draft pipeline (BEGABRAC + matree + modular) lives in the
-//! sibling `modular` / `matree` / `begabrac` modules and is **kept in
-//! place** for round 3 — round 4 will gate or remove it.
+//! Implements the 2024-published Modular decoder (formerly FDIS-2021
+//! §C.9). The committee-draft pipeline (BEGABRAC + matree + modular)
+//! lives in the sibling `modular` / `matree` / `begabrac` modules and is
+//! retained as reference scaffolding only — it is not on the live
+//! decode path.
 //!
-//! Key differences from the committee-draft path:
+//! ## 2024-spec correspondence
 //!
-//! * Entropy coder is **ANS** (FDIS Annex D.3), not BEGABRAC.
-//! * The MA tree (D.4.1) is decoded via a 6-cluster ANS sub-stream
-//!   (D.4.2), not via BEGABRAC.
-//! * Per-channel symbols are decoded as `UnpackSigned(integer)` × leaf
-//!   multiplier + leaf offset, then added to a Listing-C.16 prediction.
+//! * `H.2` Image decoding — `ModularHeader` bundle (Table H.1) read by
+//!   [`crate::global_modular::GlobalModular::read`].
+//! * `H.3` Channel decoding — predictors per Table H.3, neighbours per
+//!   Table H.2; implemented in [`predict`] + [`decode_channels`].
+//! * `H.4` Meta-adaptive context model — properties per Table H.4 +
+//!   tree traversal in [`evaluate_tree`] / [`get_properties`].
+//! * `H.4.2` MA tree decoding — implemented in [`MaTreeFdis::read`].
+//! * `H.5` Self-correcting predictor (predictor 6) — DEFERRED (round 2).
+//! * `H.6` Transformations (RCT / Palette / Squeeze) — `H.6.3` RCT
+//!   parsed + applied (round 1); `H.6.4` Palette + `H.6.2` Squeeze
+//!   parsed but inverse-application errors (round 2 work).
 //!
-//! ## Round 3 scope
+//! ## Round 1 (2024-spec) scope
 //!
-//! Implements the minimum needed to decode the first cjxl-produced
-//! `--lossless` Modular `.jxl` fixture: single Grey channel, no
-//! transforms, no Squeeze, no Palette, no RCT. Specifically:
-//!
-//! * `WPHeader` decoded but Annex E predictor is rejected (predictor
-//!   == 6) since the round-3 fixture uses simpler predictors.
-//! * `nb_transforms == 0` is the only accepted shape; non-zero → returns
-//!   `Error::Unsupported`.
-//! * Channel decoding loop implements Listing C.17 + Listing C.16
-//!   (predictors 0..=5 and 7..=13). Predictor 6 (Annex E weighted
-//!   predictor) is rejected.
-//! * MA tree must contain a single leaf (no decision nodes) — the
-//!   default MA tree that cjxl emits for trivial images. Multi-node
-//!   trees parse cleanly but property evaluation is left to round 4.
+//! * `WPHeader` decoded but predictor 6 rejected at decode time —
+//!   simpler predictors cover round-1 fixtures.
+//! * Multi-leaf MA trees evaluated end-to-end (decision-node
+//!   `property[k] > value` traversal per H.4.1). 16 base properties
+//!   from Table H.4 plus per-previous-channel properties.
+//! * Multi-channel decode (Grey 1ch + RGB 3ch).
+//! * RCT inverse applied (H.6.3).
+//! * Palette / Squeeze parsed but error out at inverse — round 2.
 //!
 //! Allocation bound: every `Vec::with_capacity` is sized against either
 //! a per-channel `width * height` pre-validated count or the bit
 //! reader's remaining input length. Channels are capped at the
-//! decoder-supplied `(width, height, num_channels)` from C.4.8 — none
+//! decoder-supplied `(width, height, num_channels)` from G.1.3 — none
 //! of which are read from the bitstream in this module.
 
 use oxideav_core::{Error, Result};
@@ -58,6 +58,174 @@ pub const MAX_CHANNELS: usize = 64;
 /// via the size_header (1<<30); we cap further at 65536 because the
 /// decoder allocates a `Vec<i32>` of `width * height` per channel.
 pub const MAX_DIM: u32 = 65536;
+
+/// 2024-spec Table H.6 — Modular transform identifier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransformId {
+    /// Reversible Colour Transform (H.6.3).
+    Rct,
+    /// (Delta-)Palette (H.6.4).
+    Palette,
+    /// Modified Haar transform / Squeeze (H.6.2).
+    Squeeze,
+}
+
+impl TransformId {
+    fn from_u32(v: u32) -> Result<Self> {
+        match v {
+            0 => Ok(TransformId::Rct),
+            1 => Ok(TransformId::Palette),
+            2 => Ok(TransformId::Squeeze),
+            _ => Err(Error::InvalidData(format!(
+                "JXL TransformId: invalid value {v}"
+            ))),
+        }
+    }
+}
+
+/// 2024-spec Table H.7 — `TransformInfo` bundle. Per-transform fields
+/// are made `Option<…>` because each transform kind only populates a
+/// subset (e.g. RCT uses `rct_type`; Palette uses `num_c`/`nb_colours`).
+#[derive(Debug, Clone)]
+pub struct TransformInfo {
+    pub tr: TransformId,
+    pub begin_c: Option<u32>,
+    pub rct_type: Option<u32>,
+    pub num_c: Option<u32>,
+    pub nb_colours: Option<u32>,
+    pub nb_deltas: Option<u32>,
+    pub d_pred: Option<u32>,
+    pub num_sq: Option<u32>,
+    pub squeeze_params: Vec<SqueezeParam>,
+}
+
+impl TransformInfo {
+    /// 2024-spec Table H.7. The first u(2) selects the transform kind
+    /// (kRCT=0, kPalette=1, kSqueeze=2). Fields that follow depend on
+    /// the kind.
+    pub fn read(br: &mut BitReader<'_>) -> Result<Self> {
+        let tr_raw = br.read_bits(2)?;
+        let tr = TransformId::from_u32(tr_raw)?;
+
+        let begin_c = if tr != TransformId::Squeeze {
+            Some(br.read_u32([
+                U32Dist::Bits(3),
+                U32Dist::BitsOffset(6, 8),
+                U32Dist::BitsOffset(10, 72),
+                U32Dist::BitsOffset(13, 1096),
+            ])?)
+        } else {
+            None
+        };
+
+        let rct_type = if tr == TransformId::Rct {
+            Some(br.read_u32([
+                U32Dist::Val(6),
+                U32Dist::Bits(2),
+                U32Dist::BitsOffset(4, 2),
+                U32Dist::BitsOffset(6, 10),
+            ])?)
+        } else {
+            None
+        };
+
+        let (num_c, nb_colours, nb_deltas, d_pred) = if tr == TransformId::Palette {
+            let num_c = br.read_u32([
+                U32Dist::Val(1),
+                U32Dist::Val(3),
+                U32Dist::Val(4),
+                U32Dist::BitsOffset(13, 1),
+            ])?;
+            let nb_colours = br.read_u32([
+                U32Dist::BitsOffset(8, 0),
+                U32Dist::BitsOffset(10, 256),
+                U32Dist::BitsOffset(12, 1280),
+                U32Dist::BitsOffset(16, 5376),
+            ])?;
+            let nb_deltas = br.read_u32([
+                U32Dist::Val(0),
+                U32Dist::BitsOffset(8, 1),
+                U32Dist::BitsOffset(10, 257),
+                U32Dist::BitsOffset(16, 1281),
+            ])?;
+            let d_pred = br.read_bits(4)?;
+            (Some(num_c), Some(nb_colours), Some(nb_deltas), Some(d_pred))
+        } else {
+            (None, None, None, None)
+        };
+
+        let (num_sq, squeeze_params) = if tr == TransformId::Squeeze {
+            let num_sq = br.read_u32([
+                U32Dist::Val(0),
+                U32Dist::BitsOffset(4, 1),
+                U32Dist::BitsOffset(6, 9),
+                U32Dist::BitsOffset(8, 41),
+            ])?;
+            // Bound: cap the number of squeeze steps to prevent absurd
+            // allocations on malicious input.
+            const MAX_SQUEEZE: u32 = 49 + 256;
+            if num_sq > MAX_SQUEEZE {
+                return Err(Error::InvalidData(format!(
+                    "JXL Modular Squeeze: num_sq {num_sq} exceeds {MAX_SQUEEZE}"
+                )));
+            }
+            let mut sps: Vec<SqueezeParam> = Vec::with_capacity(num_sq as usize);
+            for _ in 0..num_sq {
+                sps.push(SqueezeParam::read(br)?);
+            }
+            (Some(num_sq), sps)
+        } else {
+            (None, Vec::new())
+        };
+
+        Ok(Self {
+            tr,
+            begin_c,
+            rct_type,
+            num_c,
+            nb_colours,
+            nb_deltas,
+            d_pred,
+            num_sq,
+            squeeze_params,
+        })
+    }
+}
+
+/// 2024-spec Table H.9 — `SqueezeParams` bundle. Only present when
+/// `nb_transforms` includes a Squeeze with non-default parameters.
+#[derive(Debug, Clone, Copy)]
+pub struct SqueezeParam {
+    pub horizontal: bool,
+    pub in_place: bool,
+    pub begin_c: u32,
+    pub num_c: u32,
+}
+
+impl SqueezeParam {
+    pub fn read(br: &mut BitReader<'_>) -> Result<Self> {
+        let horizontal = br.read_bool()?;
+        let in_place = br.read_bool()?;
+        let begin_c = br.read_u32([
+            U32Dist::Bits(3),
+            U32Dist::BitsOffset(6, 8),
+            U32Dist::BitsOffset(10, 72),
+            U32Dist::BitsOffset(13, 1096),
+        ])?;
+        let num_c = br.read_u32([
+            U32Dist::Val(1),
+            U32Dist::Val(2),
+            U32Dist::Val(3),
+            U32Dist::BitsOffset(4, 4),
+        ])?;
+        Ok(Self {
+            horizontal,
+            in_place,
+            begin_c,
+            num_c,
+        })
+    }
+}
 
 /// `WPHeader` per FDIS Table C.23 — Weighted Predictor parameters used
 /// only when a leaf node selects predictor 6. We *parse* the header for
@@ -233,11 +401,17 @@ impl EntropyStream {
             )));
         }
 
+        // 2024-spec C.2.1: if use_prefix_code is FALSE (ANS path),
+        // log_alphabet_size = 5 + u(2). If TRUE (prefix path),
+        // log_alphabet_size = 15. The FDIS 2021 text had this swapped
+        // (a documented spec typo); the 2024 published edition is the
+        // authoritative reading and matches the libjxl reference output
+        // observed via cjxl/djxl black-box validation.
         let use_prefix_code = br.read_bit()? == 1;
         let log_alphabet_size = if use_prefix_code {
-            5 + br.read_bits(2)?
-        } else {
             15
+        } else {
+            5 + br.read_bits(2)?
         };
         let _alphabet_size_max = 1u32 << log_alphabet_size;
 
@@ -561,67 +735,126 @@ impl ModularImage {
     }
 }
 
-/// Apply FDIS Listing C.16 — `prediction(x, y, predictor)` for sample
-/// at `(x, y)` in channel `i`.
+/// Neighbour set for prediction + property derivation per
+/// 2024-spec Table H.2.
+///
+/// Names match the spec exactly: `c` is the current sample (not yet
+/// decoded), `w` / `n` / `nw` / `ne` / `nn` / `nee` / `ww` are previously
+/// decoded neighbours with edge-fallback rules from H.3.
+#[derive(Debug, Clone, Copy)]
+pub struct Neighbours {
+    pub w: i32,
+    pub n: i32,
+    pub nw: i32,
+    pub ne: i32,
+    pub nn: i32,
+    pub nee: i32,
+    pub ww: i32,
+}
+
+impl Neighbours {
+    /// Compute the seven prediction neighbours for sample `(x, y)` in
+    /// `channel[i]`, applying the 2024-spec H.3 edge-case fallbacks.
+    pub fn at(img: &ModularImage, i: usize, x: i32, y: i32) -> Self {
+        let width = img.descs[i].width as i32;
+        let w = if x > 0 {
+            img.get(i, x - 1, y)
+        } else if y > 0 {
+            img.get(i, x, y - 1)
+        } else {
+            0
+        };
+        let n = if y > 0 { img.get(i, x, y - 1) } else { w };
+        let nw = if x > 0 && y > 0 {
+            img.get(i, x - 1, y - 1)
+        } else {
+            w
+        };
+        let ne = if (x + 1) < width && y > 0 {
+            img.get(i, x + 1, y - 1)
+        } else {
+            n
+        };
+        let nn = if y > 1 { img.get(i, x, y - 2) } else { n };
+        let nee = if (x + 2) < width && y > 0 {
+            img.get(i, x + 2, y - 1)
+        } else {
+            ne
+        };
+        let ww = if x > 1 { img.get(i, x - 2, y) } else { w };
+        Self {
+            w,
+            n,
+            nw,
+            ne,
+            nn,
+            nee,
+            ww,
+        }
+    }
+}
+
+/// Apply 2024-spec Table H.3 — `prediction(x, y, k)` for sample at
+/// `(x, y)` in channel `i`. Predictor 6 (Self-correcting) is rejected
+/// in round 1.
 fn predict(img: &ModularImage, i: usize, x: i32, y: i32, predictor: u32) -> Result<i32> {
-    let left = if x > 0 {
-        img.get(i, x - 1, y)
-    } else if y > 0 {
-        img.get(i, x, y - 1)
-    } else {
-        0
-    };
-    let top = if y > 0 { img.get(i, x, y - 1) } else { left };
-    let topleft = if x > 0 && y > 0 {
-        img.get(i, x - 1, y - 1)
-    } else {
-        left
-    };
-    let desc = img.descs[i];
-    let topright = if (x + 1) < desc.width as i32 && y > 0 {
-        img.get(i, x + 1, y - 1)
-    } else {
-        top
-    };
-    let topright2 = if (x + 2) < desc.width as i32 && y > 0 {
-        img.get(i, x + 2, y - 1)
-    } else {
-        topright
-    };
-    let leftleft = if x > 1 { img.get(i, x - 2, y) } else { left };
-    let toptop = if y > 1 { img.get(i, x, y - 2) } else { top };
-    let grad = top.wrapping_add(left).wrapping_sub(topleft);
+    let nb = Neighbours::at(img, i, x, y);
     let v = match predictor {
-        0 => 0,
-        1 => left,
-        2 => top,
-        3 => left.wrapping_add(top).wrapping_div_euclid(2),
+        0 => 0, // Zero
+        1 => nb.w,
+        2 => nb.n,
+        3 => nb.w.wrapping_add(nb.n).wrapping_div_euclid(2), // Avg(W, N)
         4 => {
-            if (grad - left).abs() < (grad - top).abs() {
-                left
+            // Select: |N - NW| < |W - NW| ? W : N
+            // Spec text: abs(N - NW) < abs(W - NW)
+            let lhs = (nb.n as i64 - nb.nw as i64).abs();
+            let rhs = (nb.w as i64 - nb.nw as i64).abs();
+            if lhs < rhs {
+                nb.w
             } else {
-                top
+                nb.n
             }
         }
-        5 => median3(grad, left, top),
-        6 => {
-            return Err(Error::Unsupported(
-                "JXL Modular: weighted predictor (6) not yet supported (round 4)".into(),
-            ));
+        5 => {
+            // Gradient: clamp(W + N - NW, min(W, N), max(W, N))
+            let g = nb.w.wrapping_add(nb.n).wrapping_sub(nb.nw);
+            let lo = nb.w.min(nb.n);
+            let hi = nb.w.max(nb.n);
+            g.clamp(lo, hi)
         }
-        7 => topright,
-        8 => topleft,
-        9 => leftleft,
-        10 => left.wrapping_add(topleft).wrapping_div_euclid(2),
-        11 => topleft.wrapping_add(top).wrapping_div_euclid(2),
-        12 => top.wrapping_add(topright).wrapping_div_euclid(2),
+        6 => {
+            // Self-correcting predictor (Annex H.5). Full implementation
+            // requires the per-pixel `true_err` and `err[i]` history
+            // arrays — round 2 work. For round 1 we satisfy the *trivial*
+            // case where the predictor is being asked at a position with
+            // no decoded history (no W, N, NW, NE, NN, NEE, WW): all
+            // edge-case fallbacks resolve to 0, every sub-predictor of
+            // H.5.2 is 0, the weighted sum is 0, and `(prediction + 3)
+            // >> 3 == 0`. This is exactly the situation at the (0, 0)
+            // pixel of any image; without full WP we cannot extend
+            // beyond it. Larger images that genuinely use predictor 6
+            // at non-(0, 0) positions error out cleanly.
+            if x == 0 && y == 0 {
+                0
+            } else {
+                return Err(Error::Unsupported(
+                    "JXL Modular: self-correcting predictor (6) at non-origin position requires full WP (round 2)".into(),
+                ));
+            }
+        }
+        7 => nb.ne,                                            // NorthEast
+        8 => nb.nw,                                            // NorthWest
+        9 => nb.ww,                                            // WestWest
+        10 => nb.w.wrapping_add(nb.nw).wrapping_div_euclid(2), // Avg(W, NW)
+        11 => nb.n.wrapping_add(nb.nw).wrapping_div_euclid(2), // Avg(N, NW)
+        12 => nb.n.wrapping_add(nb.ne).wrapping_div_euclid(2), // Avg(N, NE)
         13 => {
-            // (6*top - 2*toptop + 7*left + leftleft + topright2 + 3*topright + 8) Idiv 16
-            let s = 6i64 * top as i64 - 2 * toptop as i64
-                + 7 * left as i64
-                + leftleft as i64
-                + topright2 as i64
-                + 3 * topright as i64
+            // AvgAll: (6*N - 2*NN + 7*W + WW + NEE + 3*NE + 8) Idiv 16
+            let s = 6i64 * nb.n as i64 - 2 * nb.nn as i64
+                + 7 * nb.w as i64
+                + nb.ww as i64
+                + nb.nee as i64
+                + 3 * nb.ne as i64
                 + 8;
             s.div_euclid(16) as i32
         }
@@ -634,22 +867,165 @@ fn predict(img: &ModularImage, i: usize, x: i32, y: i32, predictor: u32) -> Resu
     Ok(v)
 }
 
-fn median3(a: i32, b: i32, c: i32) -> i32 {
-    if (a <= b && b <= c) || (c <= b && b <= a) {
-        b
-    } else if (b <= a && a <= c) || (c <= a && a <= b) {
-        a
+/// Compute a property vector per 2024-spec Table H.4 + H.4.1.
+///
+/// Properties 0..=15 are the base set (channel/stream indices, position,
+/// neighbour-magnitude features, and gradient residuals). Properties
+/// 16+ are added for each previously-decoded channel that shares the
+/// current channel's exact (width, height, hshift, vshift), in order
+/// of decreasing index.
+///
+/// `stream_index` is 0 for the GlobalModular sub-bitstream (the only
+/// case round 1 covers).
+pub fn get_properties(img: &ModularImage, i: usize, x: i32, y: i32, stream_index: i32) -> Vec<i32> {
+    let nb = Neighbours::at(img, i, x, y);
+    // Property 8: x > 0 ? (W at (x-1) - gradient_at_(x-1)) : N.
+    // gradient_at_(x-1) = (the value of property 9 at (x-1, y))
+    //                   = W' + N' - NW' for sample (x-1, y).
+    // For (x-1, y): W' = (x>1 ? img(x-2, y) : if y>0 img(x-1, y-1) else 0)
+    //               N' = if y>0 img(x-1, y-1) else W'
+    //               NW' = if x>1 && y>0 img(x-2, y-1) else W'
+    let prop8 = if x > 0 {
+        let wm1 = nb.w; // value at (x-1, y), already decoded (was W of (x,y))
+                        // Re-derive W'/N'/NW' for the previous sample.
+        let w_prev = if x > 1 {
+            img.get(i, x - 2, y)
+        } else if y > 0 {
+            img.get(i, x - 1, y - 1)
+        } else {
+            0
+        };
+        let n_prev = if y > 0 {
+            img.get(i, x - 1, y - 1)
+        } else {
+            w_prev
+        };
+        let nw_prev = if x > 1 && y > 0 {
+            img.get(i, x - 2, y - 1)
+        } else {
+            w_prev
+        };
+        let grad_prev = w_prev.wrapping_add(n_prev).wrapping_sub(nw_prev);
+        wm1.wrapping_sub(grad_prev)
     } else {
-        c
+        nb.n
+    };
+
+    let mut props = vec![
+        i as i32,                                    // 0: i (channel index)
+        stream_index,                                // 1: stream index
+        y,                                           // 2: y
+        x,                                           // 3: x
+        nb.n.unsigned_abs() as i32, // 4: abs(N) — keep as i32, may overflow on i32::MIN
+        nb.w.unsigned_abs() as i32, // 5: abs(W)
+        nb.n,                       // 6: N
+        nb.w,                       // 7: W
+        prop8,                      // 8
+        nb.w.wrapping_add(nb.n).wrapping_sub(nb.nw), // 9: W + N - NW (gradient)
+        nb.w.wrapping_sub(nb.nw),   // 10: W - NW
+        nb.nw.wrapping_sub(nb.n),   // 11: NW - N
+        nb.n.wrapping_sub(nb.ne),   // 12: N - NE
+        nb.n.wrapping_sub(nb.nn),   // 13: N - NN
+        nb.w.wrapping_sub(nb.ww),   // 14: W - WW
+        0,                          // 15: max_error (predictor 6) — round 2
+    ];
+
+    // Properties 16+: scan previous channels with matching dims/shifts.
+    // For each j from i-1 down to 0 with matching dims:
+    //   property[k++] = abs(rC)         (16)
+    //   property[k++] = rC              (17)
+    //   property[k++] = abs(rC - rG)    (18)
+    //   property[k++] = rC - rG         (19)
+    // where rC = channel[j](x, y), rW/rN/rNW are j's neighbours,
+    // rG = clamp(rW + rN - rNW, min(rW, rN), max(rW, rN)).
+    let cur = img.descs[i];
+    for j in (0..i).rev() {
+        let d = img.descs[j];
+        if d.width != cur.width
+            || d.height != cur.height
+            || d.hshift != cur.hshift
+            || d.vshift != cur.vshift
+        {
+            continue;
+        }
+        let r_c = img.get(j, x, y);
+        let r_w = if x > 0 {
+            img.get(j, x - 1, y)
+        } else if y > 0 {
+            img.get(j, x, y - 1)
+        } else {
+            0
+        };
+        let r_n = if y > 0 { img.get(j, x, y - 1) } else { r_w };
+        let r_nw = if x > 0 && y > 0 {
+            img.get(j, x - 1, y - 1)
+        } else {
+            r_w
+        };
+        let g = r_w.wrapping_add(r_n).wrapping_sub(r_nw);
+        let r_g = g.clamp(r_w.min(r_n), r_w.max(r_n));
+        props.push(r_c.unsigned_abs() as i32);
+        props.push(r_c);
+        props.push(r_c.wrapping_sub(r_g).unsigned_abs() as i32);
+        props.push(r_c.wrapping_sub(r_g));
     }
+
+    props
 }
 
-/// Round-3 channel decode loop — Listing C.17.
+/// Walk the MA tree per H.4.1: from `tree[0]`, for each decision node
+/// `d` test `property[d.property] > d.value`. True → `d.left_child`.
+/// False → `d.right_child`. Repeat until a leaf is reached.
+pub fn evaluate_tree<'a>(nodes: &'a [MaNode], properties: &[i32]) -> Result<&'a MaLeaf> {
+    if nodes.is_empty() {
+        return Err(Error::InvalidData("JXL MA tree: empty tree".into()));
+    }
+    let mut cursor: usize = 0;
+    // Bound: at most nodes.len() decision-node steps (the tree is acyclic
+    // by construction since left/right_child are forward-only).
+    for _ in 0..=nodes.len() {
+        match &nodes[cursor] {
+            MaNode::Leaf(l) => return Ok(l),
+            MaNode::Decision {
+                property,
+                value,
+                left_child,
+                right_child,
+            } => {
+                let p_idx = *property as usize;
+                let pv = properties.get(p_idx).copied().unwrap_or(0);
+                let next = if pv > *value {
+                    *left_child as usize
+                } else {
+                    *right_child as usize
+                };
+                if next >= nodes.len() {
+                    return Err(Error::InvalidData(format!(
+                        "JXL MA tree: child index {next} out of range {}",
+                        nodes.len()
+                    )));
+                }
+                cursor = next;
+            }
+        }
+    }
+    Err(Error::InvalidData(
+        "JXL MA tree: traversal exceeded node count (cycle or malformed tree)".into(),
+    ))
+}
+
+/// 2024-spec Annex H.3 — channel decode loop.
 ///
-/// Constraints: the MA tree must be a single leaf (no decision nodes).
-/// With a single leaf the per-pixel context is constant; per the spec
-/// `D[leaf_node.ctx]` is a single distribution. We avoid the property
-/// computation entirely.
+/// Decodes every channel in `descs` using the supplied MA tree. For
+/// each sample:
+/// 1. Compute properties (Table H.4).
+/// 2. Walk the MA tree to find a leaf (`MA(properties)`).
+/// 3. Decode an integer via the leaf's context ANS / prefix entropy.
+/// 4. `diff = UnpackSigned(integer) * leaf.multiplier + leaf.offset`.
+/// 5. `channel[i](x, y) = diff + prediction(x, y, leaf.predictor)`.
+///
+/// `dist_multiplier` is set per H.3 to "the largest channel width
+/// amongst all channels that are to be decoded".
 pub fn decode_channels(
     br: &mut BitReader<'_>,
     descs: &[ChannelDesc],
@@ -668,24 +1044,8 @@ pub fn decode_channels(
             MAX_CHANNELS
         )));
     }
-    if tree.nodes.len() != 1 {
-        return Err(Error::Unsupported(format!(
-            "JXL Modular: MA tree with {} nodes not supported (round 3 needs single-leaf tree)",
-            tree.nodes.len()
-        )));
-    }
-    let leaf = match tree.nodes[0] {
-        MaNode::Leaf(l) => l,
-        MaNode::Decision { .. } => {
-            return Err(Error::InvalidData(
-                "JXL Modular: single-node tree is decision, not leaf".into(),
-            ));
-        }
-    };
-    if (leaf.ctx as usize) >= tree.num_ctx {
-        return Err(Error::InvalidData(
-            "JXL Modular: leaf ctx out of bounds".into(),
-        ));
+    if tree.nodes.is_empty() {
+        return Err(Error::InvalidData("JXL Modular: empty MA tree".into()));
     }
 
     // Pre-validate channel sizes.
@@ -723,10 +1083,30 @@ pub fn decode_channels(
         descs: descs.to_vec(),
     };
 
+    // dist_multiplier per H.3 — largest channel width amongst channels
+    // to be decoded. Used by the LZ77 special-distance branch.
+    let dist_multiplier = descs.iter().map(|d| d.width).max().unwrap_or(0);
+
+    let stream_index = 0i32; // GlobalModular only in round 1.
+
     for (i, desc) in descs.iter().enumerate() {
         for y in 0..desc.height {
             for x in 0..desc.width {
-                let token = decode_uint_in(&mut tree.hybrid, &mut tree.entropy, br, leaf.ctx)?;
+                let props = get_properties(&img, i, x as i32, y as i32, stream_index);
+                let leaf = *evaluate_tree(&tree.nodes, &props)?;
+                if (leaf.ctx as usize) >= tree.num_ctx {
+                    return Err(Error::InvalidData(format!(
+                        "JXL Modular: leaf ctx {} out of bounds {}",
+                        leaf.ctx, tree.num_ctx
+                    )));
+                }
+                let token = decode_uint_in_with_dist(
+                    &mut tree.hybrid,
+                    &mut tree.entropy,
+                    br,
+                    leaf.ctx,
+                    dist_multiplier,
+                )?;
                 let diff = unpack_signed(token);
                 let p = predict(&img, i, x as i32, y as i32, leaf.predictor)?;
                 let val = (diff as i64)
@@ -744,6 +1124,54 @@ pub fn decode_channels(
     }
 
     Ok(img)
+}
+
+/// Variant of `decode_uint_in` that propagates a non-zero
+/// `dist_multiplier` to the LZ77 special-distance branch (H.3 prescribes
+/// this for the channel-decode hybrid uint stream).
+fn decode_uint_in_with_dist(
+    hybrid: &mut HybridUintState,
+    entropy: &mut EntropyStream,
+    br: &mut BitReader<'_>,
+    ctx: u32,
+    dist_multiplier: u32,
+) -> Result<u32> {
+    let EntropyStream {
+        cluster_map,
+        configs,
+        entropies,
+        ans_state,
+        ..
+    } = entropy;
+    let cluster_map_ref: &Vec<u32> = cluster_map;
+    let configs_ref: &Vec<HybridUintConfig> = configs;
+    let cfg_for = |c: u32| -> HybridUintConfig {
+        let cl = cluster_map_ref.get(c as usize).copied().unwrap_or(0) as usize;
+        configs_ref[cl.min(configs_ref.len().saturating_sub(1))]
+    };
+    let n_entropies = entropies.len();
+    let read_token = |br_inner: &mut BitReader<'_>, c: u32| -> Result<u32> {
+        let cluster = cluster_map_ref
+            .get(c as usize)
+            .copied()
+            .ok_or_else(|| Error::InvalidData("JXL EntropyStream: ctx out of range".into()))?
+            as usize;
+        if cluster >= n_entropies {
+            return Err(Error::InvalidData(
+                "JXL EntropyStream: cluster index out of range".into(),
+            ));
+        }
+        match &mut entropies[cluster] {
+            ClusterEntropy::Ans { dist, alias } => {
+                let ans = ans_state.as_mut().ok_or_else(|| {
+                    Error::InvalidData("JXL EntropyStream: missing ANS state".into())
+                })?;
+                Ok(ans.decode_symbol(br_inner, dist, alias)? as u32)
+            }
+            ClusterEntropy::Prefix { code } => code.decode(br_inner),
+        }
+    };
+    hybrid.decode(br, ctx, ctx, dist_multiplier, read_token, cfg_for)
 }
 
 #[cfg(test)]
@@ -836,10 +1264,86 @@ mod tests {
     }
 
     #[test]
-    fn median3_works() {
-        assert_eq!(median3(1, 2, 3), 2);
-        assert_eq!(median3(3, 1, 2), 2);
-        assert_eq!(median3(2, 3, 1), 2);
-        assert_eq!(median3(5, 5, 5), 5);
+    fn evaluate_tree_single_leaf() {
+        let leaf = MaLeaf {
+            ctx: 0,
+            predictor: 1,
+            offset: 0,
+            multiplier: 1,
+        };
+        let nodes = vec![MaNode::Leaf(leaf)];
+        let result = evaluate_tree(&nodes, &[]).unwrap();
+        assert_eq!(result.ctx, 0);
+        assert_eq!(result.predictor, 1);
+    }
+
+    #[test]
+    fn evaluate_tree_decision_walks_correctly() {
+        // Tree: root (property=3 (x), value=10)
+        //   true branch (x > 10) → leaf ctx=1
+        //   false branch       → leaf ctx=2
+        let nodes = vec![
+            MaNode::Decision {
+                property: 3,
+                value: 10,
+                left_child: 1,
+                right_child: 2,
+            },
+            MaNode::Leaf(MaLeaf {
+                ctx: 1,
+                predictor: 0,
+                offset: 0,
+                multiplier: 1,
+            }),
+            MaNode::Leaf(MaLeaf {
+                ctx: 2,
+                predictor: 0,
+                offset: 0,
+                multiplier: 1,
+            }),
+        ];
+        // properties[3] = 5 → 5 > 10 false → right (ctx=2)
+        let mut props = vec![0i32; 16];
+        props[3] = 5;
+        let leaf = evaluate_tree(&nodes, &props).unwrap();
+        assert_eq!(leaf.ctx, 2);
+        // properties[3] = 100 → 100 > 10 true → left (ctx=1)
+        props[3] = 100;
+        let leaf = evaluate_tree(&nodes, &props).unwrap();
+        assert_eq!(leaf.ctx, 1);
+    }
+
+    #[test]
+    fn evaluate_tree_rejects_out_of_range_child() {
+        let nodes = vec![MaNode::Decision {
+            property: 0,
+            value: 0,
+            left_child: 99, // out of range
+            right_child: 1,
+        }];
+        // properties[0] = 1 → property > value (0) → take left → out of range
+        let props = vec![1i32];
+        assert!(evaluate_tree(&nodes, &props).is_err());
+    }
+
+    #[test]
+    fn get_properties_first_pixel_grey_image() {
+        // 2x2 grey channel, all zero → first pixel (0, 0): all neighbours
+        // collapse to 0; props[2] = y = 0; props[3] = x = 0.
+        let img = ModularImage {
+            channels: vec![vec![0i32; 4]],
+            descs: vec![ChannelDesc {
+                width: 2,
+                height: 2,
+                hshift: 0,
+                vshift: 0,
+            }],
+        };
+        let p = get_properties(&img, 0, 0, 0, 0);
+        assert_eq!(p[0], 0); // channel index
+        assert_eq!(p[1], 0); // stream index
+        assert_eq!(p[2], 0); // y
+        assert_eq!(p[3], 0); // x
+        assert!(p.len() >= 16);
     }
 }

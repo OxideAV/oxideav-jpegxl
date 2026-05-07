@@ -38,28 +38,18 @@ fn cjxl_grey_8x8_dump_first_bytes() {
     eprintln!("total bytes: {}", FIXTURE.len());
 }
 
-/// Soft test: this MAY return Unsupported / InvalidData while the
-/// round-3 decoder is still missing pieces (multi-leaf MA tree
-/// evaluation, large-token property-node interpretation, etc.). The
-/// test prints the decoder result so a reviewer can see exactly what
-/// the failure mode was, but does NOT fail the suite if it's an
-/// expected error. A successful decode asserts pixel-perfect equality
-/// with the source PGM (all 128s).
-///
-/// Round-3 status (commit landing this test): the decoder gets through
-/// SizeHeader, ImageMetadata (Grey/8bpp), FrameHeader (Modular,
-/// is_last, no crop), TOC (single 167-byte entry), LfChannelDequantization
-/// (all_default), GlobalModular preamble (`use_global_tree=true`,
-/// `wp_header.default_wp=true`, `nb_transforms=0`), and the MA tree
-/// EntropyStream prelude (1 cluster, simple-prefix code over a
-/// 115-symbol alphabet emitting symbols {8, 14, 113}). The first
-/// prefix-decoded symbol from the tree sub-stream is 8 → property=7
-/// → decision node, but a subsequent decode returns 113 which the
-/// HybridUintConfig (split=16, msb=1, lsb=2) expands to ~552964 — a
-/// value far too large to be a property index. Since the FDIS spec is
-/// open to multiple readings here and the workspace policy bars
-/// consulting third-party JXL implementations, round 3 stops here and
-/// flags the gap for round 4.
+/// Soft test for the grey-8x8 fixture. Updated 2026-05-08 (round 1
+/// against the 2024-published core spec): the entropy-stack
+/// `use_prefix_code` ↔ `log_alphabet_size` swap (FDIS-2021 typo #5)
+/// has been corrected, multi-leaf MA tree evaluation is implemented,
+/// and per-pixel property computation is wired. This particular
+/// fixture was encoded by cjxl 0.11.1 (effort=1) into a 180-byte
+/// stream with a non-trivial complex prefix-code histogram; it tickles
+/// a separate code path in the prefix decoder that round 1 doesn't
+/// fully reproduce yet — see the SPECGAP entry in the round-1 report.
+/// The pixel-correct acceptance fixture for round 1 is `pixel-1x1.jxl`
+/// (see the sibling `cjxl_gray_64x64.rs` integration test); this
+/// test stays soft so a future round can complete it without churn.
 #[test]
 fn cjxl_grey_8x8_decode_attempt() {
     use oxideav_jpegxl::decode_one_frame;
@@ -75,10 +65,7 @@ fn cjxl_grey_8x8_decode_attempt() {
             }
         }
         Err(e) => {
-            // Print and accept — round 3 stops here. Round 4 picks up
-            // multi-leaf MA tree evaluation + token-> property
-            // interpretation rules.
-            eprintln!("cjxl_grey_8x8 round-3 stop point: {e}");
+            eprintln!("cjxl_grey_8x8 round-1 (2024-spec) stop point: {e}");
         }
     }
 }

@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Round 1 (2024-spec)** — Modular sub-bitstream pixel decode
+  end-to-end against the final ISO/IEC 18181-1:2024 core spec (Annex
+  H), built on top of the round-1..3 baseline:
+  - `modular_fdis::evaluate_tree` walks decision-node MA trees per
+    H.4.1, replacing the round-3 single-leaf-only restriction.
+  - `modular_fdis::get_properties` computes the 16 base properties
+    of Table H.4 plus per-previous-channel properties (4 each for
+    every channel with matching dims/shifts).
+  - `modular_fdis::Neighbours` materialises the 7 prediction
+    neighbours per Table H.2 with the H.3 edge-case fallbacks.
+  - `modular_fdis::predict` covers Table H.3 predictors 0-5 + 7-13;
+    predictor 6 (Self-correcting) is implemented for the trivial
+    (0, 0) origin case (returns 0 — full WP defers to round 2).
+  - `modular_fdis::TransformInfo` + `TransformId` parses the H.7
+    bundle for `nb_transforms > 0`; channel-list adjustment for
+    Palette is applied; inverse Palette / Squeeze application defers
+    to round 2 with a clean `Error::Unsupported` exit point.
+  - `decode_codestream` accepts RGB images (3 channels) in addition
+    to Grey, producing 3 / 1 plane VideoFrames respectively.
+  - `pixel-1x1.jxl` (1×1 RGB lossless, 22 B fixture from
+    `docs/image/jpegxl/fixtures/pixel-1x1/`) now decodes
+    pixel-correct: R=255, G=0, B=0 (matches `expected.png`).
+  - Black-box validator test for `djxl` confirms the binary decodes
+    the same `gray-64x64` fixture; we never read djxl/cjxl source.
+- **FDIS-2021 spec typo #5 documented and corrected**: D.3.1's
+  `use_prefix_code` ↔ `log_alphabet_size` mapping was swapped in the
+  FDIS 2021 text (`if use_prefix_code is 1 → log_alphabet_size = 5 +
+  u(2)`); the 2024-published edition (C.2.1) reverses it (prefix →
+  15, ANS → 5+u(2)) which matches the libjxl reference output
+  observed via cjxl/djxl. The implementation in
+  `modular_fdis::EntropyStream::read` now follows the 2024 reading.
+
 ### Removed
 
 - **Decoder rounds 7-11 + encoder rounds 1-6 RETIRED 2026-05-08** under

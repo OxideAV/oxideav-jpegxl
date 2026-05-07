@@ -1,14 +1,31 @@
 # oxideav-jpegxl
 
-Pure-Rust **JPEG XL** (ISO/IEC 18181) codec — currently
-**RETIRED 2026-05-08 pending strict-isolation cleanroom workspace**.
-The crate ships round-1..3 wiring only: signature + container
-detection, `SizeHeader` + partial `ImageMetadata` parsing, the FDIS
-Annex D ANS entropy module, and the LfGlobal + GlobalModular
-tree-prelude. Pixel decoding past the tree-prelude returns
-`Error::Unsupported`; there is no encoder.
+Pure-Rust **JPEG XL** (ISO/IEC 18181-1:2024) decoder. Resumed
+2026-05-08 against the final published 2024 core spec after the
+trace-doc-driven rounds 7-11 + encoder rounds 1-6 were retired
+(see "Why retired (history)" below). This crate currently ships:
 
-## Why retired
+- Round-1..3 baseline (pre-retire): signature + container detection,
+  `SizeHeader` + full `ImageMetadata` (FDIS A.6 form), FrameHeader +
+  TOC, the Annex C entropy stack (ANS + prefix codes + hybrid uint +
+  LZ77 + clustering), LfGlobal + GlobalModular tree-prelude.
+- **Round 1 (2024-spec, this commit)**: end-to-end Modular pixel
+  decode. Multi-leaf MA tree evaluation per Annex H.4.1, the 16
+  base properties of Table H.4 plus per-previous-channel properties,
+  Table H.3 predictors 0-5 and 7-13 (predictor 6 Self-correcting is
+  trivially handled at the (0, 0) origin only — full WP defers),
+  multi-channel Grey + RGB output, TransformInfo (H.7) parsing.
+  Inverse application of Palette / Squeeze defers to round 2 with a
+  clean `Error::Unsupported`.
+
+The acceptance fixture `pixel-1x1.jxl` (from
+`docs/image/jpegxl/fixtures/pixel-1x1/`, a 1×1 RGB lossless 22-byte
+bitstream) decodes pixel-correct to R=255 G=0 B=0, matching the
+committed `expected.png`. Black-box validation against `cjxl` /
+`djxl` is run as a separate test (the binaries are treated as opaque
+processes — we never read libjxl source).
+
+## Why retired (history)
 
 `OxideAV/docs` retired `image/jpegxl/libjxl-trace-reverse-engineering.md`
 (the 792-line behavioural-trace writeup that previously drove rounds
