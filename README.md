@@ -9,21 +9,42 @@ trace-doc-driven rounds 7-11 + encoder rounds 1-6 were retired
   `SizeHeader` + full `ImageMetadata` (FDIS A.6 form), FrameHeader +
   TOC, the Annex C entropy stack (ANS + prefix codes + hybrid uint +
   LZ77 + clustering), LfGlobal + GlobalModular tree-prelude.
-- **Round 1 (2024-spec, this commit)**: end-to-end Modular pixel
-  decode. Multi-leaf MA tree evaluation per Annex H.4.1, the 16
-  base properties of Table H.4 plus per-previous-channel properties,
-  Table H.3 predictors 0-5 and 7-13 (predictor 6 Self-correcting is
-  trivially handled at the (0, 0) origin only — full WP defers),
-  multi-channel Grey + RGB output, TransformInfo (H.7) parsing.
-  Inverse application of Palette / Squeeze defers to round 2 with a
-  clean `Error::Unsupported`.
+- **Rounds 1..5 (2024-spec)**: end-to-end Modular pixel decode for
+  single-group, single-pass frames. Multi-leaf MA tree per Annex
+  H.4.1 (16 base properties of Table H.4 + per-previous-channel
+  properties), Table H.3 predictors 0..13, full H.5 self-correcting
+  WP predictor, RCT / Palette / Squeeze inverse transforms (H.6),
+  Grey + RGB output at 8 bpp. Five committed fixtures decode
+  pixel-correct vs `expected.png` (PNG-decoder-backed byte-for-byte
+  comparison): `pixel-1x1`, `gray-64x64`, `gradient-64x64-lossless`,
+  `palette-32x32`, `grey_8x8_lossless`.
+- **Round 6 (2024-spec)**: Annex E.4 ICC profile decode +
+  LfGroup / PassGroup type scaffolding.
+  * `src/icc.rs` — full Annex E.4 ICC decoder. Reads `enc_size =
+    U64()`, decodes 41 pre-clustered distributions + `enc_size`
+    bytes via `DecodeHybridVarLenUint` and the
+    `IccContext(i, prev_byte, prev_prev_byte)` 41-context function;
+    walks the resulting encoded stream through E.4.3 (header with
+    predicted-byte ladder) + E.4.4 (tag list) + E.4.5 (main content
+    + Nth-order predictor at orders 0/1/2). When `want_icc=true` is
+    set in `ColourEncoding` the decoder no longer fails outright —
+    the bit reader is correctly advanced past the ICC stream and a
+    minimal "acsp" magic check at offset 36 validates the result.
+    The decoded ICC bytes are not yet propagated to `VideoFrame`
+    (`oxideav_core::VideoFrame` has no ICC slot in 0.1.x).
+  * `src/lf_group.rs` (G.2) and `src/pass_group.rs` (G.4) — typed
+    bundles + per-group-rectangle geometry + per-pass `(minshift,
+    maxshift)` recurrence. Per-LfGroup / per-PassGroup decode
+    itself is round-7 work, gated on a coordinated four-piece
+    refactor (GlobalModular `nb_meta_channels`-aware partial
+    decode + `stream_index` threading + TOC permutation awareness
+    + post-PassGroup inverse-transform application). Multi-LfGroup
+    / multi-group / multi-pass / VarDCT frames now fail with
+    precise round-7-targeting error messages.
 
-The acceptance fixture `pixel-1x1.jxl` (from
-`docs/image/jpegxl/fixtures/pixel-1x1/`, a 1×1 RGB lossless 22-byte
-bitstream) decodes pixel-correct to R=255 G=0 B=0, matching the
-committed `expected.png`. Black-box validation against `cjxl` /
-`djxl` is run as a separate test (the binaries are treated as opaque
-processes — we never read libjxl source).
+Black-box validation against `cjxl` / `djxl` is available as
+opaque-binary tests (the binaries are treated as opaque processes
+— we never read libjxl source).
 
 ## Why retired (history)
 
@@ -39,14 +60,29 @@ pre-retirement history is preserved on the `old` branch.
 
 ## Forward path
 
-A strict-isolation `docs/image/jpegxl-cleanroom/` workspace with the
-four-role layout (Specifier / Extractor / Implementer / Auditor) —
-Specifier wall: ISO/IEC 18181-1 FDIS + 18181-3 conformance corpus only,
-no libjxl source ever — modelled after `docs/video/msmpeg4/`,
-`docs/video/magicyuv/`, `docs/audio/tta-cleanroom/`. Until that
-workspace exists, no further decoder rounds will land. Encoder rounds
-will be re-authored on top of the cleanroom workspace once decoder
-forward progress resumes.
+Decoder rounds resumed 2026-05-08 against the published 2024 core
+spec PDF + the 18181-3 conformance corpus + the small lossless
+fixtures already committed under `docs/image/jpegxl/fixtures/`. The
+contaminated trace docs (`libjxl-trace-reverse-engineering.md`,
+`jpegxl-fixtures-and-traces.md`, `round9_python_redecoder.py`) and
+the `old` branch are universally off-limits per
+`feedback_no_external_libs.md` workspace policy.
+
+Round 7+ candidates (in priority order):
+
+1. **LfGroup / PassGroup decode wiring** — multi-group /
+   multi-pass support against a synthetic multi-group lossless
+   fixture (cjxl 0.12.0 against a 256×256+ lossless PNG).
+2. **VarDCT decode** (Annex I) — start with `vardct-256x256-d1`
+   then move to `vardct-256x256-d3` and `large-1024x768-d2`.
+3. **XYB inverse colour transform** (§K) — needed for VarDCT
+   downstream, plus some Modular images that use XYB.
+4. **ICC bytes propagation** — coordinate with `oxideav-core` to
+   add `VideoFrame::icc_profile`.
+
+Encoder rounds will be re-authored on top of those decoder
+milestones; encoder is still retired pending decoder forward
+progress.
 
 Zero C dependencies, zero FFI, zero `*-sys` (carried over from the
 round-1..3 design).

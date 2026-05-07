@@ -99,6 +99,28 @@
 //! [`Error::Unsupported`](oxideav_core::Error::Unsupported) at the
 //! relevant gate point. Wider coverage (VarDCT, Squeeze inverse,
 //! Palette inverse, ICC, full WP predictor 6) lands in round 2+.
+//!
+//! ## Round-6 (2024-spec) additions
+//!
+//! * **Annex E.4 ICC profile decode** ([`icc`]): the 7-state-equivalent
+//!   entropy-coded ICC byte stream (41 pre-clustered distributions +
+//!   `IccContext(i, b1, b2)` 41-context function) is decoded into the
+//!   final ICC profile bytes per E.4.3 (header), E.4.4 (tag list) and
+//!   E.4.5 (main content). When `metadata.colour_encoding.want_icc ==
+//!   true` the bit-position is now correctly advanced past the ICC
+//!   stream rather than failing with `Error::Unsupported` outright;
+//!   the decoded bytes are validated for the "acsp" magic at offset 36
+//!   but are not yet propagated to `oxideav_core::VideoFrame` (which
+//!   has no ICC slot in 0.1.x).
+//! * **G.2 LfGroup / G.4 PassGroup type scaffolding** ([`lf_group`],
+//!   [`pass_group`]): typed bundles + per-group rectangle geometry +
+//!   `(minshift, maxshift)` computation per pass. Per-LfGroup and
+//!   per-PassGroup decode itself is not yet wired (round-7 follow-up
+//!   gated on the GlobalModular `nb_meta_channels`-aware refactor —
+//!   see `lf_group` crate-level docs).
+//! * Multi-LfGroup / multi-group / multi-pass / VarDCT frames fail
+//!   with precise round-7-targeting error messages instead of the
+//!   round-3 generic "TOC with N entries" rejection.
 
 pub mod abrac;
 pub mod ans;
@@ -108,12 +130,15 @@ pub mod container;
 pub mod extensions;
 pub mod frame_header;
 pub mod global_modular;
+pub mod icc;
 pub mod lf_global;
+pub mod lf_group;
 pub mod matree;
 pub mod metadata;
 pub mod metadata_fdis;
 pub mod modular;
 pub mod modular_fdis;
+pub mod pass_group;
 pub mod predictors;
 pub mod toc;
 
@@ -219,6 +244,28 @@ impl Decoder for JxlDecoder {
     }
 }
 
+/// Decode the ICC stream (Annex E.4) at the current bit position and
+/// return the resulting ICC profile bytes.
+///
+/// The caller has already verified that
+/// `metadata.colour_encoding.want_icc == true`. Round 6 wires the
+/// decode end-to-end; the returned bytes are valid per E.4.3..E.4.5 if
+/// `Ok`. The function also performs a minimal ICC.1 sanity check —
+/// for outputs >= 40 bytes the magic "acsp" must be at offset 36 —
+/// because the predicted-header rule in E.4.3 forces those bytes when
+/// the encoded delta is zero, but a malformed delta could shift them.
+fn decode_icc_stream_at(br: &mut BitReader<'_>) -> Result<Vec<u8>> {
+    let encoded = icc::decode_encoded_icc_stream(br)?;
+    let profile = icc::reconstruct_icc_profile(&encoded)?;
+    if profile.len() >= 40 && &profile[36..40] != b"acsp" {
+        return Err(Error::InvalidData(format!(
+            "JXL ICC: decoded profile lacks 'acsp' magic at offset 36 (got {:02X?})",
+            &profile[36..40]
+        )));
+    }
+    Ok(profile)
+}
+
 /// Decode the entire JXL packet (raw codestream OR ISOBMFF-wrapped) and
 /// return the first frame as a [`VideoFrame`]. Round-3 envelope.
 pub fn decode_one_frame(input: &[u8], pts: Option<i64>) -> Result<VideoFrame> {
@@ -242,13 +289,17 @@ fn decode_codestream(codestream: &[u8], pts: Option<i64>) -> Result<VideoFrame> 
     // 2. ImageMetadata (FDIS A.6).
     let metadata = ImageMetadataFdis::read(&mut br)?;
 
-    // 3. ICC profile is gated on `metadata.colour_encoding.want_icc`. We
-    //    reject any frame that wants an ICC profile in round 3 — the
-    //    Annex B decoder is not wired.
+    // 3. ICC profile (Annex E.4) — round-6 lands the decoder. The
+    //    decoded ICC bytes are validated (must contain "acsp" magic at
+    //    offset 36 if length >= 40) but not currently propagated to
+    //    `VideoFrame` because `oxideav_core::VideoFrame` has no ICC
+    //    slot. The decode is still run because (a) it advances the
+    //    bit reader past the ICC stream so subsequent FrameHeader /
+    //    TOC parsing finds the right bit offset, and (b) it gives a
+    //    direct `Error::InvalidData` if the codestream's ICC stream
+    //    is malformed.
     if metadata.colour_encoding.want_icc {
-        return Err(Error::Unsupported(
-            "jxl decoder (round 3): want_icc=true (Annex B ICC stream) not yet wired".into(),
-        ));
+        let _icc_bytes = decode_icc_stream_at(&mut br)?;
     }
 
     // 4. Byte-align before frame data per FDIS 6.3.
@@ -272,17 +323,33 @@ fn decode_codestream(codestream: &[u8], pts: Option<i64>) -> Result<VideoFrame> 
     let toc = Toc::read(&mut br, &fh)?;
 
     // 7. Single-group frames have a single TOC entry containing all
-    //    frame data. Round 3 only handles that case.
+    //    frame data. Round 6 still only handles that case but reports
+    //    the precise reason (multi-group vs multi-pass vs VarDCT) so
+    //    round-7 can target each gate individually.
+    let num_groups = fh.num_groups();
+    let num_lf_groups = fh.num_lf_groups();
+    if num_lf_groups > 1 {
+        return Err(crate::lf_group::unsupported_multi_lf_group_error(
+            num_lf_groups,
+            fh.encoding,
+        ));
+    }
+    if num_groups > 1 || fh.passes.num_passes > 1 {
+        return Err(crate::pass_group::unsupported_multi_group_error(
+            num_groups,
+            fh.passes.num_passes,
+        ));
+    }
     if toc.entries.len() != 1 {
         return Err(Error::Unsupported(format!(
-            "jxl decoder (round 3): TOC with {} entries; only single-group frames supported",
+            "jxl decoder (round 6): TOC with {} entries unexpected for single-group/single-pass frame",
             toc.entries.len()
         )));
     }
     // Diagnostic on unhandled features.
     if fh.encoding != crate::frame_header::Encoding::Modular {
         return Err(Error::Unsupported(format!(
-            "jxl decoder (round 3): encoding {:?} not supported (Modular only)",
+            "jxl decoder (round 6): encoding {:?} not supported (Modular only — VarDCT round-8+ work)",
             fh.encoding
         )));
     }

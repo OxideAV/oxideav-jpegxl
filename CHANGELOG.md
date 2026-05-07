@@ -9,6 +9,91 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Round 6 (2024-spec)** — Annex E.4 ICC profile decode + LfGroup /
+  PassGroup type scaffolding.
+  - **`src/icc.rs`** — full ICC profile decoder per Annex E.4. Reads
+    `enc_size = U64()`, then 41 pre-clustered distributions (the
+    existing `EntropyStream::read(br, 41)` infrastructure built for
+    Modular), then `enc_size` bytes via `DecodeHybridVarLenUint`
+    driven by the `IccContext(i, prev_byte, prev_prev_byte)`
+    41-context function from E.4.1. The encoded byte stream is split
+    into `output_size` (Varint) + `commands_size` (Varint) prefix +
+    command stream + data stream, then walked through E.4.3 (header
+    with predicted-byte ladder), E.4.4 (tag list with 21-tagcode
+    switch + previous_tagstart / previous_tagsize accumulation), and
+    E.4.5 (main content with command set 1 / 2 / 3 / 4 / 10 / 16-23
+    + Nth-order predictor at orders 0/1/2). 14 unit tests
+    (round-trip helpers + spec-listing edge cases incl. the example
+    "shuffle of (1,2,3,4,5,6,7) at width 2 → (1,5,2,6,3,7,4)").
+  - **`src/lf_group.rs`** — Annex G.2 type scaffolding. `LfGroup`
+    bundle (Table G.3) + `LfCoefficients` (G.2.2 — VarDCT only) +
+    `ModularLfGroup` (G.2.3 — always present) + `HfMetadata` (G.2.4).
+    Per-LfGroup decode itself is round-7 work; the parser stub
+    returns `Error::Unsupported` with a precise round-7 follow-up
+    message. `ModularLfGroup::rect_for_index` does compute the
+    per-LfGroup pixel rectangle in frame coordinates.
+  - **`src/pass_group.rs`** — Annex G.4 type scaffolding. `PassGroup`
+    bundle (Table G.5) + `ModularGroupData` (G.4.2). Per-PassGroup
+    decode is round-7 work; `ModularGroupData::rect_for_index`
+    computes per-group pixel rectangles. Plus
+    `compute_pass_shift_range(pass_index, downsample, last_pass)`
+    implementing the `(minshift, maxshift)` recurrence from the
+    G.4.2 first paragraph: pass 0 starts at maxshift=3, subsequent
+    passes inherit maxshift = previous pass's minshift; minshift
+    comes from the smallest `log2(downsample[n])` over `n` with
+    `last_pass[n] == p`, falling back to maxshift if no match.
+  - **`lib::decode_codestream`** — when
+    `metadata.colour_encoding.want_icc == true` the bit reader is
+    now correctly advanced past the ICC stream via
+    `icc::decode_encoded_icc_stream` + `icc::reconstruct_icc_profile`,
+    instead of erroring with "Annex B ICC stream not yet wired". A
+    minimal ICC.1 sanity check verifies the "acsp" magic at offset
+    36; the decoded bytes are not propagated to `VideoFrame`
+    (`oxideav_core::VideoFrame` has no ICC slot in 0.1.x).
+    Multi-LfGroup / multi-group / multi-pass / VarDCT frames now
+    fail with precise round-7-targeting error messages instead of
+    the generic "TOC with N entries" rejection.
+
+### Round-6 acceptance
+
+- All 5 currently-pixel-correct fixtures still decode pixel-correct
+  vs `expected.png`: pixel-1x1, gray-64x64, gradient-64x64-lossless,
+  palette-32x32, grey_8x8_lossless. (No regression of the
+  five-round single-group decode path.)
+- 32 new unit tests (14 ICC + 8 LfGroup + 10 PassGroup); total test
+  count goes from 211 to 243.
+- `cargo clippy --all-targets -- -D warnings` clean.
+- `cargo fmt --check` clean.
+
+### Round-6 deferred (round-7 candidates)
+
+- LfGroup / PassGroup actual decode wiring: blocked on four
+  coordinated changes — GlobalModular `nb_meta_channels`-aware
+  partial decode (G.1.3 last paragraph), `stream_index` threading
+  through `decode_channels` (Table H.4 property 1), TOC permutation
+  awareness, and inverse-transform application timing (post-PassGroup
+  per G.4.2 last sentence). These four are too coupled to ship
+  individually without regressing the five pixel-correct fixtures.
+- Multi-group lossless modular fixture: docs corpus has no fixture
+  in this category (the smallest multi-group fixture
+  `large-1024x768-d2` is VarDCT). Round 7 should produce one via
+  `cjxl input.png output.jxl -d 0 -e 7` against a 256×256+ lossless
+  PNG and commit it to `tests/fixtures/`.
+- ICC bytes propagation to `oxideav_core::VideoFrame`: the parsed
+  ICC profile is currently discarded after sanity-check because
+  there's no `VideoFrame::icc_profile` slot in `oxideav-core 0.1`.
+  Round 8+ work should be coordinated with an `oxideav-core` minor
+  release that adds the slot.
+- XYB inverse transform (§C.5 / §K): deferred — no XYB fixture in
+  current pixel-correct corpus. Synthetic XYB fixture would require
+  encoder support which doesn't exist in this crate.
+
+### SPECGAP entries (round 6)
+
+None new. The Annex E.4 ICC pseudocode in the 2024 published edition
+is complete and unambiguous; no round-7 SPECGAP pivot is required
+for it.
+
 - **Round 5 (2024-spec)** — RFC 7932 §3.5 prefix-code histogram Kraft
   early-stop fix; `grey_8x8_lossless.jxl` (cjxl 0.11.1, 180-byte
   emit) now decodes pixel-correct (all 64 bytes equal 128 as
