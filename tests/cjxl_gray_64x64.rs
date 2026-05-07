@@ -121,12 +121,14 @@ fn cjxl_gray_64x64_decode_attempt() {
     }
 }
 
-const GRADIENT_64X64: &[u8] =
-    include_bytes!("../../../docs/image/jpegxl/fixtures/gradient-64x64-lossless/input.jxl");
-const PALETTE_32X32: &[u8] =
-    include_bytes!("../../../docs/image/jpegxl/fixtures/palette-32x32/input.jxl");
-const GRAY_64X64_DOCS: &[u8] =
-    include_bytes!("../../../docs/image/jpegxl/fixtures/gray-64x64/input.jxl");
+// Round-2 docs-fixture mirrors. The original fixtures live at
+// `docs/image/jpegxl/fixtures/{gradient-64x64-lossless,palette-32x32,
+// gray-64x64}/input.jxl` in the OxideAV/docs repository; the crate's
+// CI checks out only this crate's repo, so we copy the binaries into
+// `tests/fixtures/` to keep the tests self-contained.
+const GRADIENT_64X64: &[u8] = include_bytes!("fixtures/gradient_64x64_lossless.jxl");
+const PALETTE_32X32: &[u8] = include_bytes!("fixtures/palette_32x32.jxl");
+const GRAY_64X64_DOCS: &[u8] = include_bytes!("fixtures/gray_64x64_docs.jxl");
 
 /// Round-2 soft test: decode the gradient-64x64-lossless docs fixture.
 /// Currently expected to fail at GlobalModular (entropy stream prelude
