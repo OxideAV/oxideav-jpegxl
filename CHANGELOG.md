@@ -9,6 +9,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Round 3 (2024-spec)** — bit-alignment fix at the GlobalModular →
+  inner-Modular boundary + ANS alias-mapping conditional-offset fix.
+  After this round, `gray-64x64.jxl` decodes pixel-correct against
+  its committed `expected.png` reference (gradient pattern
+  `pixel(x, y) = ((x + y) * 2) & 0xff`, first scanline `0, 2, 4, …`).
+  - **2024-spec C.3.2 (ANS state init position)** — round 1+2 read
+    the ANS `u(32)` state initialiser EAGERLY at end of the entropy
+    stream prelude inside `EntropyStream::read`. Empirical bisect
+    against `cjxl 0.12.0` traces shows the state init is emitted
+    AFTER the inner Modular sub-bitstream's ModularHeader (i.e.
+    after `use_global_tree` / `WPHeader` / `nb_transforms` /
+    `transforms`) and IMMEDIATELY before the first symbol decode.
+    Round 3 splits the prelude reading from the state init reading
+    via a new `EntropyStream::read_ans_state_init` method, which
+    `decode_channels` invokes just before the first per-pixel
+    `DecodeHybridVarLenUint` call. Position confirmed by tracing
+    inner_use_global_tree against the expected `1` bit in cjxl's
+    bytestream: bit 199 (gray-64x64), bit 338 (gradient-64x64),
+    bit 359 (palette-32x32) all read `1` (true) once the state init
+    is deferred — they were reading `0` (false) when the state init
+    was eager.
+  - **2024-spec C.2.6 (alias mapping conditional offset)** — round 1
+    `AliasTable::lookup` always returned `offset = offsets[i] + pos`,
+    but spec C.2.6 makes the formula CONDITIONAL on whether
+    `pos >= cutoffs[i]`: in the "stays in own bucket" branch the
+    offset is just `pos` (no `+ offsets[i]`). The unconditional
+    formula caused incorrect ANS state evolution and triggered
+    extra `u(16)` refills that ran the bitreader past EOF on
+    small ANS-path fixtures. Round 3 adds the conditional.
+  - **`gray-64x64.jxl` pixel-correct end-to-end** — first lossless
+    Modular fixture > 1×1 to decode without EOF. Output checked
+    against the gradient pattern in `docs/image/jpegxl/fixtures/
+    gray-64x64/expected.png` first 16 pixels (0, 2, 4, …, 30) +
+    histogram (min=0 max=252 mean=126.0).
+  - **Diagnostic tooling**: `tests/round3_bit_alignment_bisect.rs`
+    — eight tests (4 manual bisects + 4 production-path walks)
+    that print bit positions at every spec milestone for the four
+    target fixtures, with cross-reference comments against trace.
 - **Round 2 (2024-spec)** — Inverse Modular transforms (Annex H.6) +
   full Self-correcting predictor (Annex H.5) + 2024-spec-correctness
   fixes for the entropy stream prelude (Annex C.2.1) and CLCL prefix

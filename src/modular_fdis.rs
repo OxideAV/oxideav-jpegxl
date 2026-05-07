@@ -367,8 +367,22 @@ pub struct EntropyStream {
 }
 
 impl EntropyStream {
-    /// Read the FDIS D.3 prelude for `num_dist` distributions, then —
-    /// for the ANS branch — read the `u(32)` state initialiser.
+    /// Read the FDIS D.3 prelude for `num_dist` distributions.
+    ///
+    /// **2024-spec correction (round 3)**: the `u(32)` ANS state
+    /// initialiser specified by C.3.2 ("Upon initialization of a new
+    /// ANS stream") is **NOT** read here. cjxl 0.12.0 traces show that
+    /// the state initialiser is emitted between the entropy stream's
+    /// prelude and the FIRST `DecodeHybridVarLenUint` call against the
+    /// stream — typically AFTER the consumer's intervening bundle reads
+    /// (ModularHeader.use_global_tree / WPHeader / nb_transforms /
+    /// transforms in the GlobalModular path). Round 1+2 read the
+    /// state init eagerly inside this routine, which off-aligned every
+    /// downstream field by 32 bits and ultimately mis-decoded the
+    /// inner Modular ModularHeader's `use_global_tree` flag.
+    ///
+    /// Callers must invoke [`Self::read_ans_state_init`] just before
+    /// the first symbol decode against an ANS stream.
     pub fn read(br: &mut BitReader<'_>, num_dist: usize) -> Result<Self> {
         let lz77_enabled = br.read_bit()? == 1;
         let lz77 = if lz77_enabled {
@@ -501,8 +515,9 @@ impl EntropyStream {
                 let alias = AliasTable::build(&dist, log_alphabet_size)?;
                 entropies.push(ClusterEntropy::Ans { dist, alias });
             }
-            // ANS state init.
-            let ans_state = AnsDecoder::new(br)?;
+            // 2024-spec round-3 fix: ANS state init `u(32)` is read by
+            // the consumer just before the first symbol decode, NOT
+            // here. See `read_ans_state_init`.
             Ok(Self {
                 use_prefix_code: false,
                 log_alphabet_size,
@@ -511,9 +526,25 @@ impl EntropyStream {
                 lz77,
                 lz_len_conf,
                 cluster_map,
-                ans_state: Some(ans_state),
+                ans_state: None,
             })
         }
+    }
+
+    /// Read the ANS state initialiser (`u(32)` per spec C.3.2) for an
+    /// ANS-path entropy stream. This is a no-op if the stream uses a
+    /// prefix code or has already been initialised. Must be called
+    /// after the prelude (`Self::read`) and BEFORE the first symbol
+    /// decode for that stream.
+    pub fn read_ans_state_init(&mut self, br: &mut BitReader<'_>) -> Result<()> {
+        if self.use_prefix_code {
+            return Ok(());
+        }
+        if self.ans_state.is_some() {
+            return Ok(());
+        }
+        self.ans_state = Some(AnsDecoder::new(br)?);
+        Ok(())
     }
 
     /// Decode a symbol from the underlying entropy stream against the
@@ -574,6 +605,11 @@ impl MaTreeFdis {
     pub fn read(br: &mut BitReader<'_>) -> Result<Self> {
         // The tree sub-stream uses 6 distributions (T[0..=5]).
         let mut tree_stream = EntropyStream::read(br, 6)?;
+        // For an ANS-path tree-stream, the state initialiser is read
+        // before the first MA-tree decode call. Tree-streams observed
+        // in cjxl 0.12.0 fixtures uniformly use prefix codes, but the
+        // spec permits ANS for the tree as well.
+        tree_stream.read_ans_state_init(br)?;
 
         // Listing D.9 — decode the tree.
         let mut nodes: Vec<MaNode> = Vec::new();
@@ -662,7 +698,9 @@ impl MaTreeFdis {
             )));
         }
 
-        // Symbol stream — independent D.3 prelude.
+        // Symbol stream — independent D.3 prelude. The ANS state init
+        // (if any) is deferred to just before the first symbol decode
+        // — see comments on `EntropyStream::read`.
         let entropy = EntropyStream::read(br, num_ctx)?;
         let hybrid = HybridUintState::new(entropy.lz77, entropy.lz_len_conf);
 
@@ -1281,6 +1319,14 @@ pub fn decode_channels(
         }
     }
 
+    // 2024-spec C.3.2 round-3 fix: read the ANS state initialiser for
+    // the symbol stream (if any) RIGHT HERE, just before the first
+    // symbol decode. cjxl 0.12.0 traces show the `u(32)` is emitted
+    // AFTER the inner ModularHeader (use_global_tree / WPHeader /
+    // nb_transforms / transforms) and IMMEDIATELY before the first
+    // pixel-decode call against the stream.
+    tree.entropy.read_ans_state_init(br)?;
+
     let mut channels: Vec<Vec<i32>> = Vec::with_capacity(descs.len());
     for d in descs.iter() {
         let n = (d.width as usize).saturating_mul(d.height as usize);
@@ -1291,14 +1337,12 @@ pub fn decode_channels(
         descs: descs.to_vec(),
     };
 
-    // dist_multiplier per H.3 — largest channel width amongst non-meta
-    // channels. Meta channels carry hshift = -1.
-    let dist_multiplier = descs
-        .iter()
-        .filter(|d| d.hshift >= 0)
-        .map(|d| d.width)
-        .max()
-        .unwrap_or_else(|| descs.iter().map(|d| d.width).max().unwrap_or(0));
+    // dist_multiplier per H.3 — largest channel width amongst all
+    // channels that are to be decoded (incl. meta-channels). The
+    // ROUND-2 reading "excluding meta-channels" was wrong — re-read
+    // 2024 H.3 paragraph 3 ("...largest channel width amongst all
+    // channels that are to be decoded.") which makes no exclusion.
+    let dist_multiplier = descs.iter().map(|d| d.width).max().unwrap_or(0);
 
     let stream_index = 0i32; // GlobalModular only in round 1.
 

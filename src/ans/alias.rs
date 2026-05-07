@@ -205,12 +205,23 @@ impl AliasTable {
         if i >= self.symbols.len() {
             return (0, 0);
         }
-        let symbol = if pos >= self.cutoffs[i] as u32 {
+        let in_redirect = pos >= self.cutoffs[i] as u32;
+        let symbol = if in_redirect {
             self.symbols[i]
         } else {
             i as u16
         };
-        let offset = self.offsets[i] as u32 + pos;
+        // 2024-spec C.2.6 round-3 fix: the offset formula is
+        // *conditional* on whether `pos >= cutoffs[i]`. Round 1 missed
+        // the conditional and always returned `offsets[i] + pos`,
+        // which caused incorrect ANS state evolution and triggered
+        // extra refills that ran the bitreader past EOF on small
+        // ANS-path fixtures.
+        let offset = if in_redirect {
+            self.offsets[i] as u32 + pos
+        } else {
+            pos
+        };
         (symbol, offset)
     }
 }
