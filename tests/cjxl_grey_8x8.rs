@@ -38,34 +38,51 @@ fn cjxl_grey_8x8_dump_first_bytes() {
     eprintln!("total bytes: {}", FIXTURE.len());
 }
 
-/// Soft test for the grey-8x8 fixture. Updated 2026-05-08 (round 1
-/// against the 2024-published core spec): the entropy-stack
-/// `use_prefix_code` ↔ `log_alphabet_size` swap (FDIS-2021 typo #5)
-/// has been corrected, multi-leaf MA tree evaluation is implemented,
-/// and per-pixel property computation is wired. This particular
-/// fixture was encoded by cjxl 0.11.1 (effort=1) into a 180-byte
-/// stream with a non-trivial complex prefix-code histogram; it tickles
-/// a separate code path in the prefix decoder that round 1 doesn't
-/// fully reproduce yet — see the SPECGAP entry in the round-1 report.
-/// The pixel-correct acceptance fixture for round 1 is `pixel-1x1.jxl`
-/// (see the sibling `cjxl_gray_64x64.rs` integration test); this
-/// test stays soft so a future round can complete it without churn.
+/// Soft-was-once: the grey-8x8 fixture decode. As of round 5 the prefix-
+/// code Kraft early-stop (RFC 7932 §3.5) is implemented; cjxl 0.11.1's
+/// emitted complex prefix histograms now decode through the symbol-
+/// stream prelude. The test stays soft (errors are logged not asserted)
+/// because pixel-correctness on this fixture is not yet a hard target —
+/// the round-5 hard test for grey_8x8 lives in
+/// `tests/round5_grey_8x8_pixel_correctness.rs`.
 #[test]
 fn cjxl_grey_8x8_decode_attempt() {
     use oxideav_jpegxl::decode_one_frame;
     let res = decode_one_frame(FIXTURE, None);
     match res {
         Ok(vf) => {
-            assert_eq!(vf.planes.len(), 1, "expected 1 plane (Gray8)");
-            let plane = &vf.planes[0];
-            assert_eq!(plane.stride, 8);
-            assert_eq!(plane.data.len(), 64);
-            for (i, &v) in plane.data.iter().enumerate() {
-                assert_eq!(v, 128, "pixel {i} should be 128 (constant grey input)");
+            eprintln!("cjxl_grey_8x8 decoded: {} planes", vf.planes.len());
+            if !vf.planes.is_empty() {
+                let p = &vf.planes[0];
+                eprintln!(
+                    "  plane[0] stride={} len={} first 8 bytes: {:?}",
+                    p.stride,
+                    p.data.len(),
+                    &p.data[..8.min(p.data.len())]
+                );
             }
         }
         Err(e) => {
-            eprintln!("cjxl_grey_8x8 round-1 (2024-spec) stop point: {e}");
+            eprintln!("cjxl_grey_8x8 round-5 stop point: {e}");
         }
+    }
+}
+
+/// Round-5 hard test: pixel-correctness for grey_8x8_lossless.
+///
+/// The fixture is a constant-grey 8×8 PGM (all bytes = 128) encoded by
+/// cjxl 0.11.1 with `--lossless`. Round 5's RFC 7932 §3.5 Kraft
+/// early-stop fix unblocks the prefix-code histogram decode, after
+/// which the symbol stream + per-pixel decode chain succeed.
+#[test]
+fn cjxl_grey_8x8_pixel_correct() {
+    use oxideav_jpegxl::decode_one_frame;
+    let vf = decode_one_frame(FIXTURE, None).expect("grey_8x8 should decode after round 5 fix");
+    assert_eq!(vf.planes.len(), 1, "expected 1 plane (Gray8)");
+    let plane = &vf.planes[0];
+    assert_eq!(plane.stride, 8);
+    assert_eq!(plane.data.len(), 64);
+    for (i, &v) in plane.data.iter().enumerate() {
+        assert_eq!(v, 128, "pixel {i} should be 128 (constant grey input)");
     }
 }

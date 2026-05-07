@@ -9,6 +9,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Round 5 (2024-spec)** — RFC 7932 §3.5 prefix-code histogram Kraft
+  early-stop fix; `grey_8x8_lossless.jxl` (cjxl 0.11.1, 180-byte
+  emit) now decodes pixel-correct (all 64 bytes equal 128 as
+  expected for a constant-grey PGM input).
+  - **Root cause** — `read_complex_prefix` decoded all `count`
+    code-lengths regardless of whether the running Kraft sum had
+    already reached `1 << 15`. cjxl 0.11.1 emits histograms whose
+    Kraft saturates mid-stream (specifically the cluster[1] histogram
+    at bit 299..549 of the grey_8x8 fixture: 251 lengths reach
+    Kraft = 32768 exactly; the remaining 6 lengths must be treated
+    as implicit zeros per RFC 7932 §3.5).
+  - **Fix** — track a running Kraft sum inside the lengths loop;
+    once it reaches `1 << 15`, break early and rely on the initial
+    `vec![0u32; alphabet_size]` to leave the trailing entries as
+    implicit zeros. Repeat-16 (re-emit previous non-zero length) is
+    also instrumented to short-circuit when its replication crosses
+    the Kraft boundary.
+  - **Bisect** — `tests/round5_grey_8x8_cluster_bisect.rs` walks the
+    symbol-stream prelude bit-by-bit, decoding each cluster's prefix
+    histogram and printing the clcl array, the Kraft sum, and the
+    per-symbol code-length array. Cluster 1 was the failing one;
+    the round-4 trace stopped at bit 563 with Kraft=32832 (64 over
+    budget). `src/ans/prefix.rs` exposes a public `diagnose_complex_prefix`
+    entry point that captures partial state even on failure.
+  - **New API surface** — `read_prefix_code_traced` /
+    `read_complex_prefix_traced` / `diagnose_complex_prefix` /
+    `ClclTrace` are public so future bisect tests can reproduce the
+    same per-cluster step-by-step trace without copy-paste.
+
 - **Round 4 (2024-spec)** — three independent decoder bugs fixed; all
   three previously-blocked single-group docs fixtures
   (`gradient-64x64-lossless.jxl`, `palette-32x32.jxl`, plus the round-3

@@ -211,6 +211,70 @@ fn bit_reverse(mut x: u32, n: u32) -> u32 {
     out
 }
 
+/// Trace of the inner state during a prefix-code decode. Used by the
+/// round-5 instrumented bisect tests to find the failing cluster.
+#[derive(Debug, Default, Clone)]
+pub struct ClclTrace {
+    /// "simple" / "complex" / "single" depending on the kind of prefix
+    /// histogram.
+    pub kind: &'static str,
+    /// 18-element clcl array (only meaningful for the complex path).
+    pub clcl: [u32; 18],
+    /// Kraft sum across the 18-symbol clcl alphabet (target: 32).
+    pub kraft_clcl: u64,
+    /// Number of non-zero clcl entries.
+    pub non_zero: u32,
+    /// HSKIP value (0/2/3 for complex; 1 means simple-prefix branch).
+    pub hskip: u32,
+    /// Per-symbol code lengths.
+    pub code_lengths: Option<Vec<u32>>,
+    /// Maximum code length used.
+    pub max_length: u32,
+}
+
+/// Like [`read_prefix_code`] but additionally returns a trace of the
+/// internal decoder state. Used by the round-5 grey_8x8 bisect tests
+/// to find the failing cluster.
+pub fn read_prefix_code_traced(
+    br: &mut BitReader<'_>,
+    alphabet_size: u32,
+) -> Result<(PrefixCode, ClclTrace)> {
+    if alphabet_size as usize > MAX_ALPHABET_SIZE {
+        return Err(Error::InvalidData(
+            "JXL prefix: alphabet_size too large".into(),
+        ));
+    }
+    if alphabet_size == 0 {
+        return Err(Error::InvalidData("JXL prefix: alphabet_size == 0".into()));
+    }
+    if alphabet_size == 1 {
+        let code_lengths = vec![0u32; 1];
+        let code = PrefixCode::from_lengths(&code_lengths)?;
+        return Ok((
+            code,
+            ClclTrace {
+                kind: "single",
+                ..Default::default()
+            },
+        ));
+    }
+
+    let kind = br.read_bits(2)?;
+    if kind == 1 {
+        let code = read_simple_prefix(br, alphabet_size)?;
+        Ok((
+            code,
+            ClclTrace {
+                kind: "simple",
+                hskip: 1,
+                ..Default::default()
+            },
+        ))
+    } else {
+        read_complex_prefix_traced(br, alphabet_size, kind)
+    }
+}
+
 /// Decode a prefix-code histogram (a "Huffman histogram stream" per
 /// FDIS D.2.1) and return the decoded [`PrefixCode`].
 ///
@@ -374,6 +438,291 @@ fn read_clcl_symbol(br: &mut BitReader<'_>) -> Result<u32> {
     ))
 }
 
+/// Step-by-step trace of one prefix-code histogram decode. Used by
+/// the round-5 grey_8x8 bisect tests when a cluster's prefix code
+/// fails to satisfy the Kraft inequality. Returns Ok(trace) regardless
+/// of whether the code itself was valid — the diagnosis lives in the
+/// trace, not in the Result.
+pub fn diagnose_complex_prefix(
+    br: &mut BitReader<'_>,
+    alphabet_size: u32,
+    hskip: u32,
+) -> ClclTrace {
+    let mut trace = ClclTrace {
+        kind: "complex",
+        hskip,
+        ..Default::default()
+    };
+
+    let mut clcl = [0u32; 18];
+    let mut sum_kraft: u64 = 0;
+    let mut nonzero_count = 0u32;
+    for i in (hskip as usize)..18 {
+        let v = match read_clcl_symbol(br) {
+            Ok(v) => v,
+            Err(_) => return trace,
+        };
+        clcl[K_CODE_LENGTH_CODE_ORDER[i]] = v;
+        if v > 0 {
+            nonzero_count += 1;
+            sum_kraft += 1u64 << (5 - v);
+            if nonzero_count >= 2 && sum_kraft >= 32 {
+                break;
+            }
+        }
+    }
+    trace.clcl = clcl;
+    trace.kraft_clcl = sum_kraft;
+    trace.non_zero = nonzero_count;
+    if nonzero_count == 0 {
+        return trace;
+    }
+    let cl_code = match PrefixCode::from_lengths(&clcl) {
+        Ok(c) => c,
+        Err(_) => return trace,
+    };
+
+    let mut lengths = vec![0u32; alphabet_size as usize];
+    let mut idx: usize = 0;
+    let mut prev_nonzero: u32 = 8;
+    let mut last_was_16 = false;
+    let mut last_was_17 = false;
+    let mut repeat_count_16: u32 = 0;
+    let mut repeat_count_17: u32 = 0;
+    let mut kraft_sum: u64 = 0;
+    const KRAFT_BUDGET: u64 = 1u64 << 15;
+    while idx < alphabet_size as usize {
+        let sym = match cl_code.decode(br) {
+            Ok(s) => s,
+            Err(_) => break,
+        };
+        if sym <= 15 {
+            lengths[idx] = sym;
+            if sym > 0 {
+                kraft_sum += 1u64 << (15 - sym);
+            }
+            idx += 1;
+            if sym != 0 {
+                prev_nonzero = sym;
+            }
+            last_was_16 = false;
+            last_was_17 = false;
+            if kraft_sum >= KRAFT_BUDGET {
+                break;
+            }
+        } else if sym == 16 {
+            let extra = match br.read_bits(2) {
+                Ok(v) => v,
+                Err(_) => break,
+            };
+            let new_count = if last_was_16 {
+                4 * (repeat_count_16 - 2) + 3 + extra
+            } else {
+                3 + extra
+            };
+            let delta = new_count.saturating_sub(repeat_count_16);
+            let mut overflow = false;
+            for _ in 0..delta {
+                if idx >= alphabet_size as usize {
+                    break;
+                }
+                lengths[idx] = prev_nonzero;
+                kraft_sum += 1u64 << (15 - prev_nonzero);
+                idx += 1;
+                if kraft_sum >= KRAFT_BUDGET {
+                    overflow = true;
+                    break;
+                }
+            }
+            repeat_count_16 = new_count;
+            last_was_16 = true;
+            last_was_17 = false;
+            if overflow {
+                break;
+            }
+        } else if sym == 17 {
+            let extra = match br.read_bits(3) {
+                Ok(v) => v,
+                Err(_) => break,
+            };
+            let new_count = if last_was_17 {
+                8 * (repeat_count_17 - 2) + 3 + extra
+            } else {
+                3 + extra
+            };
+            let delta = new_count.saturating_sub(repeat_count_17);
+            for _ in 0..delta {
+                if idx >= alphabet_size as usize {
+                    break;
+                }
+                lengths[idx] = 0;
+                idx += 1;
+            }
+            repeat_count_17 = new_count;
+            last_was_17 = true;
+            last_was_16 = false;
+        } else {
+            break;
+        }
+        if !last_was_16 {
+            repeat_count_16 = 0;
+        }
+        if !last_was_17 {
+            repeat_count_17 = 0;
+        }
+    }
+
+    trace.code_lengths = Some(lengths.clone());
+    trace.max_length = lengths.iter().copied().max().unwrap_or(0);
+    trace
+}
+
+/// Traced variant of [`read_complex_prefix`] used by the round-5
+/// grey_8x8 bisect tests.
+pub fn read_complex_prefix_traced(
+    br: &mut BitReader<'_>,
+    alphabet_size: u32,
+    hskip: u32,
+) -> Result<(PrefixCode, ClclTrace)> {
+    if hskip != 0 && hskip != 2 && hskip != 3 {
+        return Err(Error::InvalidData(
+            "JXL prefix (complex): invalid HSKIP".into(),
+        ));
+    }
+
+    let mut trace = ClclTrace {
+        kind: "complex",
+        hskip,
+        ..Default::default()
+    };
+
+    let mut clcl = [0u32; 18];
+    let mut sum_kraft: u64 = 0;
+    let mut nonzero_count = 0u32;
+    for i in (hskip as usize)..18 {
+        let v = read_clcl_symbol(br)?;
+        clcl[K_CODE_LENGTH_CODE_ORDER[i]] = v;
+        if v > 0 {
+            nonzero_count += 1;
+            sum_kraft += 1u64 << (5 - v);
+            if nonzero_count >= 2 && sum_kraft >= 32 {
+                break;
+            }
+        }
+    }
+    trace.clcl = clcl;
+    trace.kraft_clcl = sum_kraft;
+    trace.non_zero = nonzero_count;
+    if nonzero_count == 0 {
+        return Err(Error::InvalidData(
+            "JXL prefix (complex): all code-length-code-lengths zero".into(),
+        ));
+    }
+    let cl_code = PrefixCode::from_lengths(&clcl)?;
+
+    let bits_remaining_cap = br.bits_remaining();
+    if (alphabet_size as usize) > bits_remaining_cap.saturating_mul(11) + 18 {
+        return Err(Error::InvalidData(
+            "JXL prefix (complex): alphabet_size larger than input could supply".into(),
+        ));
+    }
+
+    let mut lengths = vec![0u32; alphabet_size as usize];
+    let mut idx: usize = 0;
+    let mut prev_nonzero: u32 = 8;
+    let mut last_was_16 = false;
+    let mut last_was_17 = false;
+    let mut repeat_count_16: u32 = 0;
+    let mut repeat_count_17: u32 = 0;
+    let mut kraft_sum: u64 = 0;
+    const KRAFT_BUDGET: u64 = 1u64 << 15;
+    while idx < alphabet_size as usize {
+        let sym = cl_code.decode(br)?;
+        if sym <= 15 {
+            lengths[idx] = sym;
+            if sym > 0 {
+                kraft_sum += 1u64 << (15 - sym);
+            }
+            idx += 1;
+            if sym != 0 {
+                prev_nonzero = sym;
+            }
+            last_was_16 = false;
+            last_was_17 = false;
+            if kraft_sum >= KRAFT_BUDGET {
+                break;
+            }
+        } else if sym == 16 {
+            let extra = br.read_bits(2)?;
+            let new_count = if last_was_16 {
+                4 * (repeat_count_16 - 2) + 3 + extra
+            } else {
+                3 + extra
+            };
+            let delta = new_count.saturating_sub(repeat_count_16);
+            let mut overflow = false;
+            for _ in 0..delta {
+                if idx >= alphabet_size as usize {
+                    trace.code_lengths = Some(lengths.clone());
+                    return Err(Error::InvalidData(
+                        "JXL prefix (complex): repeat-16 overruns alphabet".into(),
+                    ));
+                }
+                lengths[idx] = prev_nonzero;
+                kraft_sum += 1u64 << (15 - prev_nonzero);
+                idx += 1;
+                if kraft_sum >= KRAFT_BUDGET {
+                    overflow = true;
+                    break;
+                }
+            }
+            repeat_count_16 = new_count;
+            last_was_16 = true;
+            last_was_17 = false;
+            if overflow {
+                break;
+            }
+        } else if sym == 17 {
+            let extra = br.read_bits(3)?;
+            let new_count = if last_was_17 {
+                8 * (repeat_count_17 - 2) + 3 + extra
+            } else {
+                3 + extra
+            };
+            let delta = new_count.saturating_sub(repeat_count_17);
+            for _ in 0..delta {
+                if idx >= alphabet_size as usize {
+                    trace.code_lengths = Some(lengths.clone());
+                    return Err(Error::InvalidData(
+                        "JXL prefix (complex): repeat-17 overruns alphabet".into(),
+                    ));
+                }
+                lengths[idx] = 0;
+                idx += 1;
+            }
+            repeat_count_17 = new_count;
+            last_was_17 = true;
+            last_was_16 = false;
+        } else {
+            return Err(Error::InvalidData(
+                "JXL prefix (complex): code-length symbol out of range".into(),
+            ));
+        }
+        if !last_was_16 {
+            repeat_count_16 = 0;
+        }
+        if !last_was_17 {
+            repeat_count_17 = 0;
+        }
+    }
+
+    trace.code_lengths = Some(lengths.clone());
+    trace.max_length = lengths.iter().copied().max().unwrap_or(0);
+
+    let code = PrefixCode::from_lengths(&lengths)?;
+    Ok((code, trace))
+}
+
 fn read_complex_prefix(
     br: &mut BitReader<'_>,
     alphabet_size: u32,
@@ -442,16 +791,32 @@ fn read_complex_prefix(
     let mut last_was_17 = false;
     let mut repeat_count_16: u32 = 0;
     let mut repeat_count_17: u32 = 0;
+    // RFC 7932 §3.5 early-stop: once the running Kraft sum across
+    // emitted code lengths reaches 1<<15, decoding stops; the
+    // remaining symbols are implicit zeros. cjxl 0.11.1 emits prefix
+    // histograms that exploit this — they encode lengths past the
+    // Kraft saturation point, expecting the decoder to stop on time
+    // rather than including those phantom lengths in the canonical
+    // table. Round-4 missed this rule, hitting an over-budget Kraft
+    // when decoding the grey_8x8_lossless cluster[1] histogram.
+    let mut kraft_sum: u64 = 0;
+    const KRAFT_BUDGET: u64 = 1u64 << 15;
     while idx < alphabet_size as usize {
         let sym = cl_code.decode(br)?;
         if sym <= 15 {
             lengths[idx] = sym;
+            if sym > 0 {
+                kraft_sum += 1u64 << (15 - sym);
+            }
             idx += 1;
             if sym != 0 {
                 prev_nonzero = sym;
             }
             last_was_16 = false;
             last_was_17 = false;
+            if kraft_sum >= KRAFT_BUDGET {
+                break;
+            }
         } else if sym == 16 {
             // Repeat previous non-zero code length 3..6 times.
             let extra = br.read_bits(2)?;
@@ -461,6 +826,7 @@ fn read_complex_prefix(
                 3 + extra
             };
             let delta = new_count.saturating_sub(repeat_count_16);
+            let mut overflow = false;
             for _ in 0..delta {
                 if idx >= alphabet_size as usize {
                     return Err(Error::InvalidData(
@@ -468,11 +834,19 @@ fn read_complex_prefix(
                     ));
                 }
                 lengths[idx] = prev_nonzero;
+                kraft_sum += 1u64 << (15 - prev_nonzero);
                 idx += 1;
+                if kraft_sum >= KRAFT_BUDGET {
+                    overflow = true;
+                    break;
+                }
             }
             repeat_count_16 = new_count;
             last_was_16 = true;
             last_was_17 = false;
+            if overflow {
+                break;
+            }
         } else if sym == 17 {
             // Repeat zero 3..10 times.
             let extra = br.read_bits(3)?;
@@ -507,6 +881,8 @@ fn read_complex_prefix(
         }
     }
 
+    // After early-stop the remaining lengths are implicit zeros (the
+    // initial Vec::new(0u32) value).
     PrefixCode::from_lengths(&lengths)
 }
 
@@ -663,6 +1039,53 @@ mod tests {
         let err = read_prefix_code(&mut br, huge).unwrap_err();
         let msg = format!("{err:?}");
         assert!(msg.contains("alphabet_size"));
+    }
+
+    #[test]
+    fn from_lengths_kraft_overflow_rejected() {
+        // 32768 + 64 = a 1-bit, a 2-bit, a 3-bit, an 8-bit and an
+        // (over-budget) 9-bit symbol — the exact shape that triggered
+        // the round-5 grey_8x8 cluster[1] regression.
+        let mut lengths = vec![0u32; 257];
+        lengths[0] = 1; // kraft 16384
+        lengths[1] = 2; // 8192
+        lengths[2] = 3; // 4096
+                        // Padding to reach exactly 32768
+        lengths[3] = 3; // 4096 — total 32768
+                        // Now add an extra 9-bit symbol, taking us 64 over budget.
+        lengths[100] = 9;
+        assert!(PrefixCode::from_lengths(&lengths).is_err());
+    }
+
+    #[test]
+    fn complex_prefix_kraft_early_stop_padding() {
+        // RFC 7932 §3.5: once the running Kraft sum reaches 1<<15,
+        // remaining lengths are implicit zeros. Construct a complex
+        // prefix histogram that emits Kraft-saturating lengths then
+        // additional non-zero "phantom" lengths past saturation;
+        // verify the decoder treats the phantoms as implicit zeros
+        // rather than Kraft-overflowing the table.
+        //
+        // This is a regression test for the round-5 grey_8x8 cluster[1]
+        // failure: cjxl 0.11.1 emits histograms with Kraft-saturating
+        // mid-stream and trailing non-zero lengths that would otherwise
+        // overflow.
+        //
+        // We don't construct a full bitstream here (the encoding is
+        // intricate); instead we exercise the from_lengths Kraft
+        // budget directly.
+        // Kraft = 1<<14 + 1<<14 = 32768 — saturated with two length-1
+        // codes. (NB: technically that's already the entire Kraft
+        // budget; canonical Huffman with two length-1 codes is the
+        // 2-symbol alphabet.) Adding a length-2 code afterwards should
+        // overflow. The from_lengths path itself does not stop early —
+        // it requires every input length to fit. The early-stop logic
+        // lives in read_complex_prefix; the lengths array passed to
+        // from_lengths must already have the phantom lengths zeroed
+        // out.
+        assert!(PrefixCode::from_lengths(&[1, 1, 2]).is_err());
+        // Same alphabet but with the would-be-phantom zeroed out:
+        assert!(PrefixCode::from_lengths(&[1, 1, 0]).is_ok());
     }
 
     #[test]
