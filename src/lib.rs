@@ -112,7 +112,8 @@ pub use metadata::{parse_headers, BitDepth, Headers, ImageMetadata, SizeHeader};
 
 use oxideav_core::{CodecCapabilities, CodecId, CodecParameters, Error, Result};
 use oxideav_core::{
-    CodecInfo, CodecRegistry, Decoder, Encoder, Frame, Packet, VideoFrame, VideoPlane,
+    CodecInfo, CodecRegistry, Decoder, Encoder, Frame, Packet, RuntimeContext, VideoFrame,
+    VideoPlane,
 };
 
 use crate::bitreader::BitReader;
@@ -124,9 +125,11 @@ use crate::toc::Toc;
 /// Public codec id string. Matches the aggregator feature name `jpegxl`.
 pub const CODEC_ID_STR: &str = "jpegxl";
 
-/// Register the JPEG XL decoder stub. The encoder slot is intentionally
-/// left unregistered: the crate is decoder-side only.
-pub fn register(reg: &mut CodecRegistry) {
+/// Register the JPEG XL decoder stub into the supplied
+/// [`CodecRegistry`]. The encoder slot is intentionally left
+/// unregistered: the crate is decoder-side only and currently
+/// retired-pending-cleanroom (see crate-level docs).
+pub fn register_codecs(reg: &mut CodecRegistry) {
     let caps = CodecCapabilities::video("jpegxl_headers_only")
         .with_lossy(true)
         .with_intra_only(true);
@@ -136,6 +139,14 @@ pub fn register(reg: &mut CodecRegistry) {
             .decoder(make_decoder),
     );
 }
+
+/// Unified entry point: install the JPEG XL codec into a
+/// [`RuntimeContext`].
+pub fn register(ctx: &mut RuntimeContext) {
+    register_codecs(&mut ctx.codecs);
+}
+
+oxideav_core::register!("jpegxl", register);
 
 fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
     let codec_id = params.codec_id.clone();
@@ -380,10 +391,13 @@ mod tests {
 
     #[test]
     fn decoder_factory_returns_live_decoder() {
-        let mut reg = CodecRegistry::new();
-        register(&mut reg);
+        let mut ctx = RuntimeContext::new();
+        register(&mut ctx);
         let params = CodecParameters::video(CodecId::new(CODEC_ID_STR));
-        let dec = reg.make_decoder(&params).expect("expected live decoder");
+        let dec = ctx
+            .codecs
+            .first_decoder(&params)
+            .expect("expected live decoder");
         assert_eq!(dec.codec_id().as_str(), CODEC_ID_STR);
     }
 

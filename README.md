@@ -1,10 +1,38 @@
 # oxideav-jpegxl
 
-Pure-Rust **JPEG XL** (ISO/IEC 18181) codec — signature + container
-detection, `SizeHeader` parsing, partial `ImageMetadata` parsing. Pixel
-decoding is **not** implemented yet: probing identifies and measures a
-JXL file, but `make_decoder(...)` returns `Error::Unsupported`. No
-encoder. Zero C dependencies, zero FFI, zero `*-sys`.
+Pure-Rust **JPEG XL** (ISO/IEC 18181) codec — currently
+**RETIRED 2026-05-08 pending strict-isolation cleanroom workspace**.
+The crate ships round-1..3 wiring only: signature + container
+detection, `SizeHeader` + partial `ImageMetadata` parsing, the FDIS
+Annex D ANS entropy module, and the LfGlobal + GlobalModular
+tree-prelude. Pixel decoding past the tree-prelude returns
+`Error::Unsupported`; there is no encoder.
+
+## Why retired
+
+`OxideAV/docs` retired `image/jpegxl/libjxl-trace-reverse-engineering.md`
+(the 792-line behavioural-trace writeup that previously drove rounds
+7-11) on 2026-05-06 (commit `d732002`) under fruits-of-poisonous-tree:
+even when no libjxl source is literally quoted, an agent that read
+libjxl source while authoring the writeup carries structural narrative
+across. Decoder rounds 7-11 + encoder rounds 1-6 were authored within
+that session window and have been reset off master with the trace doc.
+See `CHANGELOG.md [Unreleased]` for the full retired-commits list. The
+pre-retirement history is preserved on the `old` branch.
+
+## Forward path
+
+A strict-isolation `docs/image/jpegxl-cleanroom/` workspace with the
+four-role layout (Specifier / Extractor / Implementer / Auditor) —
+Specifier wall: ISO/IEC 18181-1 FDIS + 18181-3 conformance corpus only,
+no libjxl source ever — modelled after `docs/video/msmpeg4/`,
+`docs/video/magicyuv/`, `docs/audio/tta-cleanroom/`. Until that
+workspace exists, no further decoder rounds will land. Encoder rounds
+will be re-authored on top of the cleanroom workspace once decoder
+forward progress resumes.
+
+Zero C dependencies, zero FFI, zero `*-sys` (carried over from the
+round-1..3 design).
 
 Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace)
 framework but usable standalone.

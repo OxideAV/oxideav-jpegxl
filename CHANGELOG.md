@@ -7,6 +7,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Removed
+
+- **Decoder rounds 7-11 + encoder rounds 1-6 RETIRED 2026-05-08** under
+  fruits-of-poisonous-tree. The `OxideAV/docs` repository retired
+  `image/jpegxl/libjxl-trace-reverse-engineering.md` (the 792-line
+  behavioural-trace writeup) on 2026-05-06 (commit `d732002`); the
+  retire reasoning applies to any code authored by an agent that read
+  that doc, even when no source was literally quoted. This crate's
+  master was reset to `9d79695` (round-3 LfGlobal + GlobalModular +
+  Modular sub-bitstream wiring, 2026-05-01) — the last commit before
+  the retired trace doc landed in `OxideAV/docs` (`8931c26`,
+  2026-05-02 22:55). The pre-retirement history is preserved on the
+  `old` branch for forensics.
+  - **Retired decoder commits**: `403f256` (round 7 — typo #6/#7 +
+    MA-tree decodes), `06b4d00` (modular pre-check scope),
+    `d49e583` (round 8 — prefix early-terminate),
+    `ba225c2` / `1217a08` / `1540102` / `7827d96` / `52b1cfb` /
+    `8258cdc` / `a2419a6` (round 9 — typo #8 + instrumentation),
+    `ab5f94a` (round 10 — kRCT/kPalette/kSqueeze parsing + dispatch),
+    `2e41c1d` (round 11 — Appendix B four-range index partition).
+  - **Retired encoder commits**: `a53e041` / `198f9e4` / `5f35de8` /
+    `f83a6d8` / `0c9b9d8` / `88f05ee` / `6215efc` / `39b2e73` /
+    `dd8be6e` / `65195e5` / `1925527` / `fedb620` / `9804c79` (encoder
+    rounds 1-6 — independent codec surface but authored within the
+    same trace-doc-contaminated session window).
+  - **Retired infrastructure commits**: `4f1b6bd` (CI workflow
+    centralisation), `9a8b33d` (standalone-friendly registry feature),
+    `2cb9943` (register_containers extension lookup), `dd68816`
+    (register entry-point unification), `cde6f6a` (auto-register
+    macro), `e4ea5b7` (`make_decoder` → `first_decoder` rename),
+    `852ac81` (re-export `__oxideav_entry`), `9d3e999` (drop linkme
+    dep). Re-applicable in non-narrative plumbing rounds later.
+  - **Retired crates.io versions** (yank pending): v0.0.5 (published
+    2026-05-04), v0.0.6 (2026-05-04), v0.0.7 (2026-05-05). Tags
+    v0.0.5 / v0.0.6 / v0.0.7 deleted from `origin`. Version bumped
+    0.0.4 → 0.0.8 in this commit to skip the yanked range.
+  - **Forward path**: a strict-isolation `docs/image/jpegxl-cleanroom/`
+    workspace with the four-role layout (Specifier / Extractor /
+    Implementer / Auditor) — Specifier wall: ISO/IEC 18181-1 FDIS +
+    18181-3 conformance corpus only, no libjxl source ever. Modelled
+    after `docs/video/msmpeg4/`, `docs/video/magicyuv/`,
+    `docs/audio/tta-cleanroom/`. Until that workspace exists, this
+    crate ships only the round-1..3 ANS + headers + LfGlobal +
+    GlobalModular wiring; no further decoder rounds will land.
+
+### Changed
+
+- API shim for the post-retire workspace: `register(ctx: &mut RuntimeContext)`
+  + `register_codecs(reg: &mut CodecRegistry)` + `oxideav_core::register!`
+  macro call (current registration pattern); the round-1..3 test that
+  used `reg.make_decoder` now uses `ctx.codecs.first_decoder` to match
+  the post-rename `oxideav-core` API.
+
 ### Added
 
 - New `ans` module implementing the FDIS 18181-1:2021 Annex D entropy
