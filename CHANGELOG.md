@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.5](https://github.com/OxideAV/oxideav-jpegxl/compare/v0.0.4...v0.0.5) - 2026-05-07
+
+### Other
+
+- update Cargo.toml dependencies
+
 ### Added
 
 - New `ans` module implementing the FDIS 18181-1:2021 Annex D entropy
