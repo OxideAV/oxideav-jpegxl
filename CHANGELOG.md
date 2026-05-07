@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.8](https://github.com/OxideAV/oxideav-jpegxl/compare/v0.0.7...v0.0.8) - 2026-05-07
+
+### Other
+
+- round 6 — predictor candidate set widened to FDIS C.16 ids 1..=5 + 7..=12
+- drop dead `linkme` dep
+- re-export __oxideav_entry from registry sub-module
+- round 5 — per-image predictor selection + 256x256 PSNR target
+- registry calls: rename make_decoder/make_encoder → first_decoder/first_encoder
+- auto-register via oxideav_core::register! macro (linkme distributed slice)
+- unify entry point on register(&mut RuntimeContext) ([#502](https://github.com/OxideAV/oxideav-jpegxl/pull/502))
+- add register_containers for .jxl extension lookup
+
 ### Added
 
 - **Round 6 encoder — predictor candidate set widened to FDIS C.16
