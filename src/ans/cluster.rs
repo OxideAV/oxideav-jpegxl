@@ -150,11 +150,16 @@ pub fn read_general_clustering(
 
     // num_dist == 1 → D.3.5 is skipped for the sub-stream. Proceed
     // straight to use_prefix_code + HybridUintConfig + distribution.
+    //
+    // 2024-spec C.2.1: use_prefix_code=1 → log_alpha=15, =0 → 5+u(2).
+    // The FDIS-2021 listing (D.3.1) had the two branches swapped (typo
+    // #5); the 2024 published edition's authoritative reading matches
+    // libjxl + the trace bit counts seen against `cjxl` fixtures.
     let use_prefix_code = br.read_bit()? == 1;
     let log_alphabet_size = if use_prefix_code {
-        5 + br.read_bits(2)?
-    } else {
         15
+    } else {
+        5 + br.read_bits(2)?
     };
 
     let cfg = HybridUintConfig::read(br, log_alphabet_size)?;

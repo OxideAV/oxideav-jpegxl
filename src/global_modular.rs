@@ -27,8 +27,8 @@ use crate::bitreader::{BitReader, U32Dist};
 use crate::frame_header::{Encoding, FrameHeader};
 use crate::metadata_fdis::{ColourSpace, ImageMetadataFdis};
 use crate::modular_fdis::{
-    decode_channels, ChannelDesc, MaTreeFdis, ModularImage, TransformId, TransformInfo, WpHeader,
-    MAX_CHANNELS,
+    decode_channels, horiz_isqueeze, inverse_palette, inverse_rct, vert_isqueeze, ChannelDesc,
+    MaTreeFdis, ModularImage, SqueezeParam, TransformId, TransformInfo, WpHeader, MAX_CHANNELS,
 };
 
 /// Decoded `GlobalModular` — the channel descriptions and the actual
@@ -71,7 +71,9 @@ impl GlobalModular {
         //    the tree in whichever bundle reaches it first.
         let global_use_tree = br.read_bool()?;
         let global_tree = if global_use_tree {
-            Some(MaTreeFdis::read(br)?)
+            Some(MaTreeFdis::read(br).map_err(|e| {
+                Error::InvalidData(format!("JXL GlobalModular: global tree read failed: {e}"))
+            })?)
         } else {
             None
         };
@@ -135,25 +137,42 @@ impl GlobalModular {
             )));
         }
 
-        // 4b. Adjust channel descriptions per H.6 (transforms can add
-        //     meta-channels at the start of the channel list, e.g.
-        //     Palette adds 1 meta-channel for the colour table). In
-        //     round 1 we only handle this for Palette; Squeeze + RCT
-        //     are deferred since they require post-decode inverse work.
+        // 4b. Adjust channel descriptions per H.6: transforms add
+        //     meta-channels at the start of the channel list (Palette)
+        //     or split channels into pairs (Squeeze).  RCT does not
+        //     change the layout. The list returned is the layout AT
+        //     THE TIME OF DECODE — i.e. with transform bookkeeping
+        //     applied so the decoder reads the correct number of
+        //     channels at the correct dimensions.
         let descs = apply_transforms_to_channel_layout(descs, &transforms)?;
 
         // 5. Pixel decode (per Annex H.3).
-        let image = decode_channels(br, &descs, &mut tree)?;
+        let mut image = decode_channels(br, &descs, &mut tree, &wp_header)?;
 
-        // 6. Inverse transforms — round 1 errors out cleanly when any
-        //    non-trivial transform was signalled. Pixel-correct decode
-        //    of fixtures using transforms is round-2 work.
-        if !transforms.is_empty() {
-            return Err(Error::Unsupported(format!(
-                "JXL GlobalModular: inverse transforms (have {} of types {:?}) not yet applied (round 2)",
-                transforms.len(),
-                transforms.iter().map(|t| t.tr).collect::<Vec<_>>()
-            )));
+        // 6. Inverse transforms — apply in REVERSE bitstream order
+        //    (Annex H.6 §inverse-transform-application order).
+        let bit_depth = metadata.bit_depth.bits_per_sample.max(1);
+        for t in transforms.iter().rev() {
+            match t.tr {
+                TransformId::Rct => {
+                    let begin = t.begin_c.unwrap_or(0) as usize;
+                    let rct_type = t.rct_type.unwrap_or(0);
+                    inverse_rct(&mut image, begin, rct_type)?;
+                }
+                TransformId::Palette => {
+                    let begin = t.begin_c.unwrap_or(0) as usize;
+                    let num_c = t.num_c.unwrap_or(1);
+                    let nb_colours = t.nb_colours.unwrap_or(0);
+                    let nb_deltas = t.nb_deltas.unwrap_or(0);
+                    let d_pred = t.d_pred.unwrap_or(0);
+                    inverse_palette(
+                        &mut image, begin, num_c, nb_colours, nb_deltas, d_pred, bit_depth,
+                    )?;
+                }
+                TransformId::Squeeze => {
+                    apply_inverse_squeeze(&mut image, &t.squeeze_params)?;
+                }
+            }
         }
 
         Ok(Self {
@@ -167,14 +186,114 @@ impl GlobalModular {
     }
 }
 
+/// Apply the Inverse Squeeze transform's per-step pair-merge for every
+/// step in `squeeze_params`, in reverse order. This implements Listing
+/// I.18 from FDIS / Annex H.6.2 from the 2024 edition.
+///
+/// Empty `squeeze_params` is the "default parameters" path; round 2
+/// only handles the explicit-params case (the small fixtures don't
+/// trigger default-param Squeeze; if they did the encoder would not
+/// have emitted an explicit kSqueeze transform).
+fn apply_inverse_squeeze(image: &mut ModularImage, squeeze_params: &[SqueezeParam]) -> Result<()> {
+    if squeeze_params.is_empty() {
+        return Err(Error::Unsupported(
+            "JXL Modular Squeeze: default-params (empty) sequence not yet supported (round 2)"
+                .into(),
+        ));
+    }
+    // Inverse application: reverse-iterate the params.
+    for sp in squeeze_params.iter().rev() {
+        let begin = sp.begin_c as usize;
+        let num_c = sp.num_c as usize;
+        let end = begin + num_c - 1;
+        let r = if sp.in_place {
+            end + 1
+        } else {
+            // For "not in place" the residuals were appended at the very
+            // end of the channel list; their count is num_c so they sit
+            // at indices [channel_count - num_c .. channel_count).
+            // Per spec: `r = channel.size() + begin - end - 1` (which is
+            // `channel.size() - num_c`).
+            image
+                .channels
+                .len()
+                .saturating_sub(num_c)
+                .saturating_add(begin)
+                .saturating_sub(begin)
+        };
+        for c in begin..=end {
+            // We pair channel[c] with channel[r + (c - begin)] (since
+            // each iteration removes channel r, the residual stays at
+            // the same index r as we step through c).
+            let r_index = if sp.in_place { r + (c - begin) } else { r };
+            if r_index >= image.channels.len() {
+                return Err(Error::InvalidData(format!(
+                    "JXL Modular Squeeze: residual channel index {r_index} out of range {}",
+                    image.channels.len()
+                )));
+            }
+            if c >= image.channels.len() || c == r_index {
+                return Err(Error::InvalidData(format!(
+                    "JXL Modular Squeeze: invalid channel pair c={c} r={r_index}"
+                )));
+            }
+            // Compute output dims.
+            let cd = image.descs[c];
+            let rd = image.descs[r_index];
+            let (merged, new_w, new_h) = if sp.horizontal {
+                if cd.height != rd.height {
+                    return Err(Error::InvalidData(
+                        "JXL Modular Squeeze (horiz): channel pair height mismatch".into(),
+                    ));
+                }
+                let (out, ow) = horiz_isqueeze(
+                    &image.channels[c],
+                    cd.width,
+                    &image.channels[r_index],
+                    rd.width,
+                    cd.height,
+                )?;
+                (out, ow, cd.height)
+            } else {
+                if cd.width != rd.width {
+                    return Err(Error::InvalidData(
+                        "JXL Modular Squeeze (vert): channel pair width mismatch".into(),
+                    ));
+                }
+                let (out, oh) = vert_isqueeze(
+                    &image.channels[c],
+                    cd.height,
+                    &image.channels[r_index],
+                    rd.height,
+                    cd.width,
+                )?;
+                (out, cd.width, oh)
+            };
+            // Write back to channel[c] with new dims.
+            image.channels[c] = merged;
+            image.descs[c] = ChannelDesc {
+                width: new_w,
+                height: new_h,
+                hshift: cd.hshift - if sp.horizontal { 1 } else { 0 },
+                vshift: cd.vshift - if sp.horizontal { 0 } else { 1 },
+            };
+            // Remove the residual channel.
+            image.channels.remove(r_index);
+            image.descs.remove(r_index);
+        }
+    }
+    Ok(())
+}
+
 /// Apply transform metadata to the channel layout so the decoded
 /// channel data has the correct shape per H.6:
 /// * `kPalette` — adds one meta-channel of dims `nb_colours × num_c`
-///   at the front; the original `num_c` channels are removed (kept as
-///   palette indices in a single channel).
+///   at the front; the original `num_c` channels are reduced to a
+///   single index channel.
 /// * `kRCT` — no channel-list change.
-/// * `kSqueeze` — transforms channel dims; round 1 declines to model
-///   it (the inverse pass is deferred).
+/// * `kSqueeze` — for each step, halves one dim of `num_c` source
+///   channels (round-up) and inserts a residu channel of the same
+///   width × half-height (or half-width × height) for each.
 fn apply_transforms_to_channel_layout(
     mut descs: Vec<ChannelDesc>,
     transforms: &[TransformInfo],
@@ -221,11 +340,55 @@ fn apply_transforms_to_channel_layout(
                 // RCT does not change the channel list per H.6.3.
             }
             TransformId::Squeeze => {
-                // Squeeze reshapes the channel list significantly; round 1
-                // declines to model it. The inverse pass is round-2 work.
-                return Err(Error::Unsupported(
-                    "JXL Modular: kSqueeze transform not yet supported (round 2)".into(),
-                ));
+                // Per Listing I.17 (FDIS) / Annex H.6.2 (2024). For each
+                // step, halve one dim (round-up) of channels [begin..end]
+                // and insert a residu channel for each at position
+                // `r + c - begin` where `r = in_place ? end+1 : len`.
+                let params = &t.squeeze_params;
+                if params.is_empty() {
+                    return Err(Error::Unsupported(
+                        "JXL Modular Squeeze: default-params (empty) sequence not yet supported"
+                            .into(),
+                    ));
+                }
+                for sp in params {
+                    let begin = sp.begin_c as usize;
+                    let num_c = sp.num_c as usize;
+                    let end = begin + num_c - 1;
+                    if end >= descs.len() {
+                        return Err(Error::InvalidData(format!(
+                            "JXL Modular Squeeze: end {end} >= channel count {}",
+                            descs.len()
+                        )));
+                    }
+                    let r_base = if sp.in_place { end + 1 } else { descs.len() };
+                    for (k, c) in (begin..=end).enumerate() {
+                        let cd = descs[c];
+                        let (new_w, new_h, residu_w, residu_h, dh, dv) = if sp.horizontal {
+                            let nw = cd.width.div_ceil(2);
+                            let rw = cd.width / 2;
+                            (nw, cd.height, rw, cd.height, 1, 0)
+                        } else {
+                            let nh = cd.height.div_ceil(2);
+                            let rh = cd.height / 2;
+                            (cd.width, nh, cd.width, rh, 0, 1)
+                        };
+                        descs[c] = ChannelDesc {
+                            width: new_w,
+                            height: new_h,
+                            hshift: cd.hshift + dh,
+                            vshift: cd.vshift + dv,
+                        };
+                        let residu = ChannelDesc {
+                            width: residu_w,
+                            height: residu_h,
+                            hshift: cd.hshift + dh,
+                            vshift: cd.vshift + dv,
+                        };
+                        let insert_at = if sp.in_place { r_base + k } else { descs.len() };
+                        descs.insert(insert_at, residu);
+                    }
+                }
             }
         }
     }

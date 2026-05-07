@@ -331,34 +331,40 @@ fn read_simple_prefix(br: &mut BitReader<'_>, alphabet_size: u32) -> Result<Pref
 
 /// RFC 7932 §3.5 variable-length code for the 18 code-length-code
 /// lengths. Each entry is `(symbol, code, code_length_in_bits)`.
+///
+/// Per RFC 7932 §3.5: "the bit lengths of the prefix code over the
+/// code length alphabet are compressed with the following
+/// variable-length code (as it appears in the compressed data, where
+/// the bits are parsed from right to left)". The "bits parsed right
+/// to left" wording means the rightmost character of each codeword is
+/// the FIRST bit read from the stream — equivalent to LSB-first packing
+/// where the bit pattern, read directly via `peek_bits(N)`, matches
+/// the codeword's numeric value (no bit-reversal needed).
 const CLCL_VL_TABLE: &[(u32, u32, u32)] = &[
-    // The 2-4 bit code from RFC 7932 §3.5:
-    //   0 → 00     (2 bits)
-    //   1 → 0111   (4 bits)
-    //   2 → 011    (3 bits)
-    //   3 → 10     (2 bits)
-    //   4 → 01     (2 bits)
-    //   5 → 1111   (4 bits)
-    // Bit order: MSB-first in the RFC. JXL packs LSB-first, so we
-    // bit-reverse below at lookup time.
+    //   0 → 00     (2 bits) — peek 2 bits, raw = 0b00
+    //   1 → 0111   (4 bits) — peek 4 bits, raw = 0b0111 = 7
+    //   2 → 011    (3 bits) — peek 3 bits, raw = 0b011 = 3
+    //   3 → 10     (2 bits) — peek 2 bits, raw = 0b10 = 2
+    //   4 → 01     (2 bits) — peek 2 bits, raw = 0b01 = 1
+    //   5 → 1111   (4 bits) — peek 4 bits, raw = 0b1111 = 15
     (0, 0b00, 2),
-    (1, 0b0111, 4),
-    (2, 0b011, 3),
     (3, 0b10, 2),
     (4, 0b01, 2),
+    (2, 0b011, 3),
+    (1, 0b0111, 4),
     (5, 0b1111, 4),
 ];
 
 fn read_clcl_symbol(br: &mut BitReader<'_>) -> Result<u32> {
     // Build a tiny lookup table by hand each call. The table is small
     // enough that the overhead is irrelevant compared to bit reading.
-    // We try lengths in ascending order.
-    // Peek 4 bits, match against the table.
+    // Try shorter codes first (sym 0/3/4 are 2-bit; sym 2 is 3-bit;
+    // sym 1/5 are 4-bit) so a successful 2-bit match doesn't get
+    // shadowed by a partial 4-bit prefix coincidence.
     let raw = br.peek_bits(4)?;
     for &(sym, code, len) in CLCL_VL_TABLE {
-        let lsb_first = bit_reverse(code, len);
         let mask = (1u32 << len) - 1;
-        if (raw & mask) == lsb_first {
+        if (raw & mask) == code {
             br.advance_bits(len)?;
             return Ok(sym);
         }

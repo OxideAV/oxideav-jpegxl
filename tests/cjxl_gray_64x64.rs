@@ -121,6 +121,127 @@ fn cjxl_gray_64x64_decode_attempt() {
     }
 }
 
+const GRADIENT_64X64: &[u8] =
+    include_bytes!("../../../docs/image/jpegxl/fixtures/gradient-64x64-lossless/input.jxl");
+const PALETTE_32X32: &[u8] =
+    include_bytes!("../../../docs/image/jpegxl/fixtures/palette-32x32/input.jxl");
+const GRAY_64X64_DOCS: &[u8] =
+    include_bytes!("../../../docs/image/jpegxl/fixtures/gray-64x64/input.jxl");
+
+/// Round-2 soft test: decode the gradient-64x64-lossless docs fixture.
+/// Currently expected to fail at GlobalModular (entropy stream prelude
+/// alignment in complex-prefix path); the test prints the stop point
+/// without asserting success so a future round can advance it.
+#[test]
+fn r2_gradient_decode_attempt() {
+    use oxideav_jpegxl::decode_one_frame;
+    eprintln!("gradient-64x64-lossless len={}", GRADIENT_64X64.len());
+    match decode_one_frame(GRADIENT_64X64, None) {
+        Ok(vf) => eprintln!(
+            "  OK: planes={} sample={:?}",
+            vf.planes.len(),
+            vf.planes.first().map(|p| (p.stride, p.data.len()))
+        ),
+        Err(e) => eprintln!("  FAIL: {e}"),
+    }
+}
+#[test]
+fn r2_palette_decode_attempt() {
+    use oxideav_jpegxl::decode_one_frame;
+    eprintln!("palette-32x32 len={}", PALETTE_32X32.len());
+    match decode_one_frame(PALETTE_32X32, None) {
+        Ok(vf) => eprintln!(
+            "  OK: planes={} sample={:?}",
+            vf.planes.len(),
+            vf.planes.first().map(|p| (p.stride, p.data.len()))
+        ),
+        Err(e) => eprintln!("  FAIL: {e}"),
+    }
+}
+#[test]
+fn r2_gray_docs_decode_attempt() {
+    use oxideav_jpegxl::decode_one_frame;
+    eprintln!("gray-64x64 (docs) len={}", GRAY_64X64_DOCS.len());
+    match decode_one_frame(GRAY_64X64_DOCS, None) {
+        Ok(vf) => eprintln!(
+            "  OK: planes={} sample={:?}",
+            vf.planes.len(),
+            vf.planes.first().map(|p| (p.stride, p.data.len()))
+        ),
+        Err(e) => eprintln!("  FAIL: {e}"),
+    }
+}
+
+/// Step-by-step diagnostic for round-2 work: walk through the same
+/// pipeline `decode_one_frame` does and print where it stops.
+#[test]
+fn cjxl_gray_64x64_pipeline_walkthrough() {
+    use oxideav_jpegxl::bitreader::BitReader;
+    use oxideav_jpegxl::container;
+    use oxideav_jpegxl::frame_header::{FrameDecodeParams, FrameHeader};
+    use oxideav_jpegxl::lf_global::LfGlobal;
+    use oxideav_jpegxl::metadata_fdis::{ImageMetadataFdis, SizeHeaderFdis};
+    use oxideav_jpegxl::toc::Toc;
+
+    let sig = container::detect(FIXTURE).unwrap();
+    let codestream: Vec<u8> = match sig {
+        container::Signature::RawCodestream => FIXTURE[2..].to_vec(),
+        container::Signature::Isobmff => container::extract_codestream(FIXTURE).unwrap().to_vec(),
+    };
+    eprintln!("codestream {} bytes", codestream.len());
+    let mut br = BitReader::new(&codestream);
+    let size = SizeHeaderFdis::read(&mut br).expect("size");
+    eprintln!("size {:?} (bits={})", size, br.bits_read());
+    let metadata = ImageMetadataFdis::read(&mut br).expect("metadata");
+    eprintln!(
+        "metadata cs={:?} bd={} (bits={})",
+        metadata.colour_encoding.colour_space,
+        metadata.bit_depth.bits_per_sample,
+        br.bits_read()
+    );
+    br.pu0().expect("align");
+    eprintln!("after align, bits_read={}", br.bits_read());
+    let fh_params = FrameDecodeParams {
+        xyb_encoded: metadata.xyb_encoded,
+        num_extra_channels: metadata.num_extra_channels,
+        have_animation: metadata.have_animation,
+        have_animation_timecodes: metadata
+            .animation
+            .map(|a| a.have_timecodes)
+            .unwrap_or(false),
+        image_width: size.width,
+        image_height: size.height,
+    };
+    let fh = FrameHeader::read(&mut br, &fh_params).expect("frame_header");
+    eprintln!(
+        "fh enc={:?} {}x{} (bits={})",
+        fh.encoding,
+        fh.width,
+        fh.height,
+        br.bits_read()
+    );
+    let toc = Toc::read(&mut br, &fh).expect("toc");
+    eprintln!(
+        "toc entries={} total_bytes={} (bits={})",
+        toc.entries.len(),
+        toc.entries.iter().map(|e| *e as usize).sum::<usize>(),
+        br.bits_read()
+    );
+    match LfGlobal::read(&mut br, &fh, &metadata) {
+        Ok(lfg) => {
+            eprintln!(
+                "LfGlobal OK: nb_transforms={} channels={} (bits={})",
+                lfg.global_modular.nb_transforms,
+                lfg.global_modular.image.channels.len(),
+                br.bits_read()
+            );
+        }
+        Err(e) => {
+            eprintln!("LfGlobal FAIL at bits_read={}: {e}", br.bits_read());
+        }
+    }
+}
+
 /// Black-box validator: when `djxl` is on `$PATH`, run it on the same
 /// fixture and confirm a successful decode + correct dimensions in the
 /// emitted PNG. We never read djxl's source — only its output bytes.

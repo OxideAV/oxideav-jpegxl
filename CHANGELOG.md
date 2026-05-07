@@ -9,6 +9,71 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Round 2 (2024-spec)** — Inverse Modular transforms (Annex H.6) +
+  full Self-correcting predictor (Annex H.5) + 2024-spec-correctness
+  fixes for the entropy stream prelude (Annex C.2.1) and CLCL prefix
+  decode (RFC 7932 §3.5), built additively on round 1's pixel-1x1
+  pixel-correct decode.
+  - **`modular_fdis::inverse_palette` (Annex H.6.4)** — full inverse
+    palette transform incl. delta-palette via the verbatim
+    `K_DELTA_PALETTE[72][3]` table (transcribed from FDIS Listing
+    L.6), implicit colour extrapolation via the bitdepth-scaled
+    formulas, and per-channel re-expansion from a single index
+    channel + meta-channel palette to `num_c` colour channels.
+  - **`modular_fdis::inverse_rct` (Annex H.6.3)** — all 6 RCT type
+    modes (`type ∈ [0, 6]`) × 6 permutations = 42 `rct_type` codes,
+    incl. the YCgCo branch (type==6) that uses the 4-step inverse.
+    Channel triple `(A, B, C)` re-mapped to `(V[0], V[1], V[2])` via
+    spec-formula permutations.
+  - **`modular_fdis::horiz_isqueeze` / `vert_isqueeze` (Annex H.6.2)**
+    — pair-merge inverse Squeeze step with the spec's `tendency()`
+    function. Default-params (empty `squeeze_params`) defers to a
+    later round.
+  - **`global_modular::apply_transforms_to_channel_layout`** now
+    handles Squeeze layout (channel dim halving + residu-channel
+    insertion at `r + c - begin`).
+  - **`global_modular`** applies inverse transforms in REVERSE order
+    after `decode_channels` per H.6's "from last to first" rule,
+    instead of erroring out as in round 1.
+  - **`modular_fdis::WpState` + `wp_predict` (Annex H.5)** — full
+    Self-correcting predictor with `true_err`, `sub_err[0..4]`
+    per-channel arrays, 4 sub-predictor weights, and the H.5.2
+    `error2weight` clamping. State updates after every sample
+    decode regardless of whether predictor 6 was selected (so future
+    predictor-6 calls see correct history).
+  - **`modular_fdis::get_properties`** now wires `property[15]` to
+    the WP `max_error` value (round 1 left it at 0).
+  - **2024-spec C.2.1 fix in `ans::cluster::read_general_clustering`**:
+    `use_prefix_code` ↔ `log_alphabet_size` mapping was reversed
+    (round 1 fixed `EntropyStream::read` but missed the same swap
+    in the cluster sub-stream).
+  - **RFC 7932 §3.5 CLCL prefix-decode fix**: the 6-symbol
+    code-length-code lookup interprets codewords as "bits parsed
+    right to left" — the rightmost char of each codeword is the
+    FIRST bit read. This is equivalent to LSB-first packing with
+    no bit-reversal (round 1 incorrectly bit-reversed, breaking
+    every fixture using complex-prefix codes).
+  - **`bitreader::pu0` is now lenient** — does not enforce zero
+    padding bits before byte boundaries. cjxl 0.12.0 emits non-zero
+    padding on small fixtures (gradient-64x64, palette-32x32) at
+    the metadata→frame_header alignment; the 2024 spec's text says
+    the zero-padding is "for validity" only, not a decode-time
+    requirement, and `djxl` accepts the same streams.
+  - **`metadata_fdis::ImageMetadataFdis::read` tail dropped** — the
+    FDIS-2021 `default_transform` Bool + `cw_mask` u(3) +
+    per-mask F16 weight arrays were over-reading by 4-5 bits
+    relative to libjxl's actual stream consumption. Round 2 leaves
+    these at their defaults (`default_transform=true, cw_mask=0`)
+    and SPECGAPs the exact gating condition.
+  - **3 new soft fixture tests** (`r2_gradient_decode_attempt`,
+    `r2_palette_decode_attempt`, `r2_gray_docs_decode_attempt`)
+    against the docs/image/jpegxl/fixtures/ corpus. These currently
+    fail at GlobalModular entropy stream prelude alignment in the
+    complex-prefix path but the inverse-transform infrastructure
+    they would feed is verified by unit tests.
+  - **`pixel-1x1.jxl` regression-free** — the 1×1 RGB lossless
+    acceptance fixture from round 1 still decodes to R=255 G=0 B=0.
+
 - **Round 1 (2024-spec)** — Modular sub-bitstream pixel decode
   end-to-end against the final ISO/IEC 18181-1:2024 core spec (Annex
   H), built on top of the round-1..3 baseline:

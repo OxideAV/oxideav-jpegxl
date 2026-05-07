@@ -70,6 +70,28 @@ pub enum TransformId {
     Squeeze,
 }
 
+/// 2024-spec Annex H.6.4 (FDIS L.5) — `kDeltaPalette` table for
+/// implicit delta-palette entries (used when `index < 0`). 72 RGB
+/// triples covering common signed-delta neighbourhoods.
+#[rustfmt::skip]
+pub const K_DELTA_PALETTE: [[i32; 3]; 72] = [
+    [0, 0, 0], [4, 4, 4], [11, 0, 0], [0, 0, -13], [0, -12, 0], [-10, -10, -10],
+    [-18, -18, -18], [-27, -27, -27], [-18, -18, 0], [0, 0, -32], [-32, 0, 0],
+    [-37, -37, -37], [0, -32, -32], [24, 24, 45], [50, 50, 50], [-45, -24, -24],
+    [-24, -45, -45], [0, -24, -24], [-34, -34, 0], [-24, 0, -24], [-45, -45, -24],
+    [64, 64, 64], [-32, 0, -32], [0, -32, 0], [-32, 0, 32], [-24, -45, -24],
+    [45, 24, 45], [24, -24, -45], [-45, -24, 24], [80, 80, 80], [64, 0, 0],
+    [0, 0, -64], [0, -64, -64], [-24, -24, 45], [96, 96, 96], [64, 64, 0],
+    [45, -24, -24], [34, -34, 0], [112, 112, 112], [24, -45, -45], [45, 45, -24],
+    [0, -32, 32], [24, -24, 45], [0, 96, 96], [45, -24, 24], [24, -45, -24],
+    [-24, -45, 24], [0, -64, 0], [96, 0, 0], [128, 128, 128], [64, 0, 64],
+    [144, 144, 144], [96, 96, 0], [-36, -36, 36], [45, -24, -45], [45, -45, -24],
+    [0, 0, -96], [0, 128, 128], [0, 96, 0], [45, 24, -45], [-128, 0, 0],
+    [24, -45, 24], [-45, 24, -45], [64, 0, -64], [64, -64, -64], [96, 0, 96],
+    [45, -45, 24], [24, 45, -45], [64, 64, -64], [128, 128, 0], [0, 0, -128],
+    [-24, 45, -45],
+];
+
 impl TransformId {
     fn from_u32(v: u32) -> Result<Self> {
         match v {
@@ -405,8 +427,12 @@ impl EntropyStream {
         // log_alphabet_size = 5 + u(2). If TRUE (prefix path),
         // log_alphabet_size = 15. The FDIS 2021 text had this swapped
         // (a documented spec typo); the 2024 published edition is the
-        // authoritative reading and matches the libjxl reference output
-        // observed via cjxl/djxl black-box validation.
+        // authoritative reading.
+        //
+        // Round 2 also moves the read of `use_prefix_code` BEFORE the
+        // clustering map (D.3.5). Round 1 had clustering before, but
+        // black-box validation against cjxl 0.12.0 small-fixture traces
+        // shows clustering follows use_prefix_code+log_alphabet_size.
         let use_prefix_code = br.read_bit()? == 1;
         let log_alphabet_size = if use_prefix_code {
             15
@@ -608,6 +634,12 @@ impl MaTreeFdis {
                 }
                 let uvalue = decode_uint_in(&mut tree_hybrid, &mut tree_stream, br, 0)?;
                 let value = unpack_signed(uvalue);
+                // FDIS Listing D.9: left = tree.size + nodes_left + 1
+                // right = tree.size + nodes_left + 2. The listing's
+                // `nodes_left` reflects the count AFTER decrementing
+                // for the current iteration; equivalent to our
+                // (nodes_left - 1) at the time of the formula. We
+                // expand the formula directly for clarity.
                 let nodes_now = nodes.len() as u32;
                 let left_child = nodes_now + nodes_left;
                 let right_child = nodes_now + nodes_left + 1;
@@ -794,10 +826,194 @@ impl Neighbours {
     }
 }
 
+/// Per-channel state for the Self-correcting Weighted Predictor
+/// (Annex H.5). Holds `true_err` and `sub_err[0..4]` for every
+/// previously-decoded sample of one channel.
+#[derive(Debug, Clone)]
+pub struct WpState {
+    pub width: u32,
+    pub height: u32,
+    /// `true_err[y * width + x]`. Stored in 8x scale (sample << 3).
+    pub true_err: Vec<i32>,
+    /// `sub_err[i][y * width + x]`. 1x scale.
+    pub sub_err: [Vec<i32>; 4],
+    /// `max_error` for the most recently predicted sample.
+    pub last_max_error: i32,
+}
+
+impl WpState {
+    pub fn new(width: u32, height: u32) -> Self {
+        let n = (width as usize).saturating_mul(height as usize);
+        Self {
+            width,
+            height,
+            true_err: vec![0i32; n],
+            sub_err: [vec![0i32; n], vec![0i32; n], vec![0i32; n], vec![0i32; n]],
+            last_max_error: 0,
+        }
+    }
+
+    fn at(&self, buf: &[i32], x: i32, y: i32) -> i32 {
+        if x < 0 || y < 0 || (x as u32) >= self.width || (y as u32) >= self.height {
+            return 0;
+        }
+        buf[(y as u32 * self.width + x as u32) as usize]
+    }
+
+    fn true_err_at(&self, x: i32, y: i32) -> i32 {
+        self.at(&self.true_err, x, y)
+    }
+
+    fn sub_err_at(&self, i: usize, x: i32, y: i32) -> i32 {
+        self.at(&self.sub_err[i], x, y)
+    }
+
+    fn set_true_err(&mut self, x: u32, y: u32, v: i32) {
+        self.true_err[(y * self.width + x) as usize] = v;
+    }
+
+    fn set_sub_err(&mut self, i: usize, x: u32, y: u32, v: i32) {
+        self.sub_err[i][(y * self.width + x) as usize] = v;
+    }
+}
+
+/// Annex H.5.2 sub-predictor + final-prediction computation.
+///
+/// Returns `(prediction_in_8x_scale, [predictioni_in_8x_scale; 4],
+/// max_error)`.  All inputs (N, W, NW, NE, NN, WW) are pre-shifted by 3.
+/// The caller is responsible for the `(prediction + 3) >> 3` rounding
+/// before using the value as the predictor 6 result.
+fn wp_predict(
+    state: &WpState,
+    nb: &Neighbours,
+    x: i32,
+    y: i32,
+    wp: &WpHeader,
+) -> (i32, [i32; 4], i32) {
+    // Inputs in 8x scale.
+    let n8 = nb.n.wrapping_shl(3);
+    let w8 = nb.w.wrapping_shl(3);
+    let nw8 = nb.nw.wrapping_shl(3);
+    let ne8 = nb.ne.wrapping_shl(3);
+    let nn8 = nb.nn.wrapping_shl(3);
+    let _ww8 = nb.ww.wrapping_shl(3);
+
+    // true_err neighbours (already in 8x scale, stored that way).
+    let te_w = state.true_err_at(x - 1, y);
+    let te_n = state.true_err_at(x, y - 1);
+    let te_nw = state.true_err_at(x - 1, y - 1);
+    let te_ne_raw = if (x + 1) < state.width as i32 && y > 0 {
+        state.true_err_at(x + 1, y - 1)
+    } else {
+        te_n
+    };
+    let te_ne = te_ne_raw;
+
+    // Sub-predictions per Listing E.1, in 8x scale.
+    let p0 = w8.wrapping_add(ne8).wrapping_sub(n8);
+    let p1 =
+        n8.wrapping_sub((((te_w as i64 + te_n as i64 + te_ne as i64) * wp.p1 as i64) >> 5) as i32);
+    let p2 =
+        w8.wrapping_sub((((te_w as i64 + te_n as i64 + te_nw as i64) * wp.p2 as i64) >> 5) as i32);
+    let p3 = n8.wrapping_add(
+        ((te_nw as i64 * wp.p3a as i64
+            + te_n as i64 * wp.p3b as i64
+            + te_ne as i64 * wp.p3c as i64
+            + (nn8 as i64 - n8 as i64) * wp.p3d as i64
+            + (nw8 as i64 - w8 as i64) * wp.p3e as i64)
+            >> 5) as i32,
+    );
+    let preds = [p0, p1, p2, p3];
+
+    // Sum sub_err over the 5 neighbours: N, W, NW, WW, NE.
+    let weights = {
+        // err_sum_i = sum of sub_err[i] over (N, W, NW, WW, NE).
+        let mut weights = [0u64; 4];
+        let weights_cfg = [wp.w0, wp.w1, wp.w2, wp.w3];
+        for k in 0..4 {
+            let sum = state.sub_err_at(k, x - 1, y) // W
+                + state.sub_err_at(k, x, y - 1) // N
+                + state.sub_err_at(k, x - 1, y - 1) // NW
+                + state.sub_err_at(k, x - 2, y) // WW
+                + if (x + 1) < state.width as i32 && y > 0 {
+                    state.sub_err_at(k, x + 1, y - 1) // NE
+                } else {
+                    state.sub_err_at(k, x, y - 1) // fallback to N's sub_err
+                };
+            // error2weight(err_sum, maxweight):
+            //   shift = max(0, floor(log2(err_sum + 1)) - 5)
+            //   return 4 + (maxweight * ((1 << 24) Idiv ((err_sum >> shift) + 1)))
+            let err_sum = sum.max(0) as u32;
+            let bits = 32u32 - (err_sum + 1).leading_zeros();
+            let shift = (bits.saturating_sub(1)).saturating_sub(5);
+            let denom = ((err_sum >> shift) as u64) + 1;
+            let weight = 4u64 + (weights_cfg[k] as u64 * (1u64 << 24) / denom);
+            weights[k] = weight;
+        }
+        weights
+    };
+
+    // Listing E.3 — final prediction.
+    let sum_weights_pre = weights[0] + weights[1] + weights[2] + weights[3];
+    // log_weight = floor(log2(sum_weights)) + 1
+    let log_weight = if sum_weights_pre == 0 {
+        1
+    } else {
+        // floor(log2(x))+1 == bit-position of MSB in 1-indexed terms.
+        64u32 - (sum_weights_pre).leading_zeros()
+    };
+    // shift = log_weight - 5 (saturating).
+    let mut shifted = [0u64; 4];
+    let sh = log_weight.saturating_sub(5);
+    for (k, w) in weights.iter().enumerate() {
+        shifted[k] = w >> sh;
+    }
+    let sum_weights = shifted[0] + shifted[1] + shifted[2] + shifted[3];
+    if sum_weights == 0 {
+        // Degenerate; should never happen in well-formed bitstreams.
+        // Fall back to the NW gradient.
+        let g = w8.wrapping_add(n8).wrapping_sub(nw8);
+        return (g, preds, 0);
+    }
+    let s_init: i64 = (sum_weights >> 1) as i64;
+    let s = (0..4).fold(s_init, |acc, k| acc + preds[k] as i64 * shifted[k] as i64);
+    let mut prediction = ((s * (1i64 << 24).div_euclid(sum_weights as i64)) >> 24) as i32;
+
+    // If true_errN, true_errW, true_errNW have the same sign,
+    // clamp to [min(W, N, NE), max(W, N, NE)] (in 8x scale).
+    if (te_n ^ te_w) | (te_n ^ te_nw) <= 0 {
+        let lo = w8.min(n8).min(ne8);
+        let hi = w8.max(n8).max(ne8);
+        prediction = prediction.clamp(lo, hi);
+    }
+
+    // Listing E.4 — max_error.
+    let mut max_error = te_w;
+    if te_n.unsigned_abs() > max_error.unsigned_abs() {
+        max_error = te_n;
+    }
+    if te_nw.unsigned_abs() > max_error.unsigned_abs() {
+        max_error = te_nw;
+    }
+    if te_ne.unsigned_abs() > max_error.unsigned_abs() {
+        max_error = te_ne;
+    }
+
+    (prediction, preds, max_error)
+}
+
 /// Apply 2024-spec Table H.3 — `prediction(x, y, k)` for sample at
-/// `(x, y)` in channel `i`. Predictor 6 (Self-correcting) is rejected
-/// in round 1.
-fn predict(img: &ModularImage, i: usize, x: i32, y: i32, predictor: u32) -> Result<i32> {
+/// `(x, y)` in channel `i`. Predictor 6 (Self-correcting) requires the
+/// caller to pass the per-channel `WpState` and `WpHeader`.
+fn predict(
+    img: &ModularImage,
+    i: usize,
+    x: i32,
+    y: i32,
+    predictor: u32,
+    wp: &WpHeader,
+    wp_state: Option<&WpState>,
+) -> Result<(i32, [i32; 4], i32)> {
     let nb = Neighbours::at(img, i, x, y);
     let v = match predictor {
         0 => 0, // Zero
@@ -823,24 +1039,16 @@ fn predict(img: &ModularImage, i: usize, x: i32, y: i32, predictor: u32) -> Resu
             g.clamp(lo, hi)
         }
         6 => {
-            // Self-correcting predictor (Annex H.5). Full implementation
-            // requires the per-pixel `true_err` and `err[i]` history
-            // arrays — round 2 work. For round 1 we satisfy the *trivial*
-            // case where the predictor is being asked at a position with
-            // no decoded history (no W, N, NW, NE, NN, NEE, WW): all
-            // edge-case fallbacks resolve to 0, every sub-predictor of
-            // H.5.2 is 0, the weighted sum is 0, and `(prediction + 3)
-            // >> 3 == 0`. This is exactly the situation at the (0, 0)
-            // pixel of any image; without full WP we cannot extend
-            // beyond it. Larger images that genuinely use predictor 6
-            // at non-(0, 0) positions error out cleanly.
-            if x == 0 && y == 0 {
-                0
-            } else {
-                return Err(Error::Unsupported(
-                    "JXL Modular: self-correcting predictor (6) at non-origin position requires full WP (round 2)".into(),
-                ));
-            }
+            // Self-correcting predictor (Annex H.5).
+            let state = wp_state.ok_or_else(|| {
+                Error::InvalidData("JXL Modular: predictor 6 used but WP state missing".into())
+            })?;
+            let (pred8, preds, max_err) = wp_predict(state, &nb, x, y, wp);
+            // Round (prediction + 3) >> 3 → arithmetic shift, but the
+            // spec uses unsigned-style >> for non-negative values; for
+            // signed we use (pred8 + 3) >> 3 with arith shift.
+            let v = (pred8.wrapping_add(3)) >> 3;
+            return Ok((v, preds, max_err));
         }
         7 => nb.ne,                                            // NorthEast
         8 => nb.nw,                                            // NorthWest
@@ -864,7 +1072,7 @@ fn predict(img: &ModularImage, i: usize, x: i32, y: i32, predictor: u32) -> Resu
             )));
         }
     };
-    Ok(v)
+    Ok((v, [0; 4], 0))
 }
 
 /// Compute a property vector per 2024-spec Table H.4 + H.4.1.
@@ -876,8 +1084,16 @@ fn predict(img: &ModularImage, i: usize, x: i32, y: i32, predictor: u32) -> Resu
 /// of decreasing index.
 ///
 /// `stream_index` is 0 for the GlobalModular sub-bitstream (the only
-/// case round 1 covers).
-pub fn get_properties(img: &ModularImage, i: usize, x: i32, y: i32, stream_index: i32) -> Vec<i32> {
+/// case round 1 covers). `max_error` is property[15] from the
+/// self-correcting predictor's last call (Listing H.5/E.4).
+pub fn get_properties(
+    img: &ModularImage,
+    i: usize,
+    x: i32,
+    y: i32,
+    stream_index: i32,
+    max_error: i32,
+) -> Vec<i32> {
     let nb = Neighbours::at(img, i, x, y);
     // Property 8: x > 0 ? (W at (x-1) - gradient_at_(x-1)) : N.
     // gradient_at_(x-1) = (the value of property 9 at (x-1, y))
@@ -927,7 +1143,7 @@ pub fn get_properties(img: &ModularImage, i: usize, x: i32, y: i32, stream_index
         nb.n.wrapping_sub(nb.ne),   // 12: N - NE
         nb.n.wrapping_sub(nb.nn),   // 13: N - NN
         nb.w.wrapping_sub(nb.ww),   // 14: W - WW
-        0,                          // 15: max_error (predictor 6) — round 2
+        max_error,                  // 15: max_error (predictor 6, Annex H.5)
     ];
 
     // Properties 16+: scan previous channels with matching dims/shifts.
@@ -1025,11 +1241,12 @@ pub fn evaluate_tree<'a>(nodes: &'a [MaNode], properties: &[i32]) -> Result<&'a 
 /// 5. `channel[i](x, y) = diff + prediction(x, y, leaf.predictor)`.
 ///
 /// `dist_multiplier` is set per H.3 to "the largest channel width
-/// amongst all channels that are to be decoded".
+/// amongst all channels that are to be decoded, excluding meta-channels".
 pub fn decode_channels(
     br: &mut BitReader<'_>,
     descs: &[ChannelDesc],
     tree: &mut MaTreeFdis,
+    wp: &WpHeader,
 ) -> Result<ModularImage> {
     if descs.is_empty() {
         return Ok(ModularImage {
@@ -1062,15 +1279,6 @@ pub fn decode_channels(
                 d.width, d.height
             )));
         }
-        let pixels = (d.width as u64).saturating_mul(d.height as u64);
-        // Each pixel's smallest possible decode is one entropy-coded
-        // symbol = at minimum 1 bit. Reject if input could not even
-        // supply one bit per pixel.
-        if pixels > br.bits_remaining() as u64 {
-            return Err(Error::InvalidData(format!(
-                "JXL Modular: channel {i} pixel count {pixels} exceeds remaining input bits"
-            )));
-        }
     }
 
     let mut channels: Vec<Vec<i32>> = Vec::with_capacity(descs.len());
@@ -1083,16 +1291,38 @@ pub fn decode_channels(
         descs: descs.to_vec(),
     };
 
-    // dist_multiplier per H.3 — largest channel width amongst channels
-    // to be decoded. Used by the LZ77 special-distance branch.
-    let dist_multiplier = descs.iter().map(|d| d.width).max().unwrap_or(0);
+    // dist_multiplier per H.3 — largest channel width amongst non-meta
+    // channels. Meta channels carry hshift = -1.
+    let dist_multiplier = descs
+        .iter()
+        .filter(|d| d.hshift >= 0)
+        .map(|d| d.width)
+        .max()
+        .unwrap_or_else(|| descs.iter().map(|d| d.width).max().unwrap_or(0));
 
     let stream_index = 0i32; // GlobalModular only in round 1.
+
+    // Per-channel WP state. Allocate only when the MA tree has any
+    // leaf with predictor 6 (or property[15] reads — the Self-correcting
+    // max_error). Otherwise the state is irrelevant.
+    let needs_wp_state = tree.nodes.iter().any(|n| match n {
+        MaNode::Leaf(l) => l.predictor == 6,
+        MaNode::Decision { property, .. } => *property == 15,
+    });
+    let mut wp_states: Vec<Option<WpState>> = if needs_wp_state {
+        descs
+            .iter()
+            .map(|d| Some(WpState::new(d.width, d.height)))
+            .collect()
+    } else {
+        descs.iter().map(|_| None).collect()
+    };
 
     for (i, desc) in descs.iter().enumerate() {
         for y in 0..desc.height {
             for x in 0..desc.width {
-                let props = get_properties(&img, i, x as i32, y as i32, stream_index);
+                let max_err = wp_states[i].as_ref().map(|s| s.last_max_error).unwrap_or(0);
+                let props = get_properties(&img, i, x as i32, y as i32, stream_index, max_err);
                 let leaf = *evaluate_tree(&tree.nodes, &props)?;
                 if (leaf.ctx as usize) >= tree.num_ctx {
                     return Err(Error::InvalidData(format!(
@@ -1108,7 +1338,15 @@ pub fn decode_channels(
                     dist_multiplier,
                 )?;
                 let diff = unpack_signed(token);
-                let p = predict(&img, i, x as i32, y as i32, leaf.predictor)?;
+                let (p, sub_preds, max_err_now) = predict(
+                    &img,
+                    i,
+                    x as i32,
+                    y as i32,
+                    leaf.predictor,
+                    wp,
+                    wp_states[i].as_ref(),
+                )?;
                 let val = (diff as i64)
                     .saturating_mul(leaf.multiplier as i64)
                     .saturating_add(leaf.offset as i64)
@@ -1118,7 +1356,46 @@ pub fn decode_channels(
                         "JXL Modular: decoded sample value {val} out of i32 range"
                     )));
                 }
-                img.set(i, x, y, val as i32);
+                let v = val as i32;
+                img.set(i, x, y, v);
+
+                // Update the WP state for this channel. Even when the
+                // current leaf used a non-6 predictor, the spec calls
+                // for true_err / sub_err to be tracked unconditionally
+                // (Annex H.5 / E.1) so that future predictor-6 calls
+                // see correct history. We compute sub-predictors from
+                // the unweighted call above when predictor was 6, and
+                // re-do them otherwise to keep state consistent.
+                if let Some(state) = wp_states[i].as_mut() {
+                    // Re-derive 8x prediction + sub-predictions if the
+                    // leaf wasn't predictor 6 (we need them for state).
+                    let (pred8, preds, max_err_actual) = if leaf.predictor == 6 {
+                        // We already have preds from `predict`, but
+                        // pred8 would be the 8x prediction (recompute
+                        // from p which is already (pred8 + 3) >> 3).
+                        // Cheaper: re-call wp_predict directly.
+                        let nb = Neighbours::at(&img, i, x as i32, y as i32);
+                        // Note: `img` already has the new sample written.
+                        // wp_predict uses neighbours of (x,y), not (x,y)
+                        // itself, so this is safe.
+                        let _ = sub_preds;
+                        let _ = max_err_now;
+                        wp_predict(state, &nb, x as i32, y as i32, wp)
+                    } else {
+                        let nb = Neighbours::at(&img, i, x as i32, y as i32);
+                        wp_predict(state, &nb, x as i32, y as i32, wp)
+                    };
+                    state.last_max_error = max_err_actual;
+                    // true_err = prediction - (true_value << 3)
+                    let te = pred8.wrapping_sub(v.wrapping_shl(3));
+                    state.set_true_err(x, y, te);
+                    // sub_err_i = abs((preds_i + 3) >> 3 - true_value)
+                    for (k, p_i) in preds.iter().enumerate() {
+                        let pv = (p_i.wrapping_add(3)) >> 3;
+                        let se = pv.wrapping_sub(v).unsigned_abs() as i32;
+                        state.set_sub_err(k, x, y, se);
+                    }
+                }
             }
         }
     }
@@ -1174,6 +1451,414 @@ fn decode_uint_in_with_dist(
     hybrid.decode(br, ctx, ctx, dist_multiplier, read_token, cfg_for)
 }
 
+// ----------------------------------------------------------------------
+// Inverse transforms — Annex H.6
+// ----------------------------------------------------------------------
+
+/// 2024-spec Annex H.6.3 — Inverse RCT (Reversible Colour Transform).
+///
+/// Operates on three channels starting at `begin_c`. For every pixel
+/// `(x, y)` in those channels, the values `(A, B, C)` are replaced by
+/// `(V[0], V[1], V[2])`. `rct_type` ∈ [0, 41] selects one of 42
+/// permutation × type combinations; `permutation = rct_type / 7` and
+/// `type = rct_type % 7`.
+pub fn inverse_rct(img: &mut ModularImage, begin_c: usize, rct_type: u32) -> Result<()> {
+    if begin_c + 3 > img.channels.len() {
+        return Err(Error::InvalidData(format!(
+            "JXL Modular RCT: begin_c {} + 3 exceeds channel count {}",
+            begin_c,
+            img.channels.len()
+        )));
+    }
+    let permutation = (rct_type / 7) as usize;
+    let typ = rct_type % 7;
+    if permutation > 5 {
+        return Err(Error::InvalidData(format!(
+            "JXL Modular RCT: invalid rct_type {rct_type} (permutation {permutation} > 5)"
+        )));
+    }
+
+    let d0 = img.descs[begin_c];
+    let d1 = img.descs[begin_c + 1];
+    let d2 = img.descs[begin_c + 2];
+    if d0.width != d1.width
+        || d0.width != d2.width
+        || d0.height != d1.height
+        || d0.height != d2.height
+    {
+        return Err(Error::InvalidData(
+            "JXL Modular RCT: three channels must share dimensions".into(),
+        ));
+    }
+    let w = d0.width as usize;
+    let h = d0.height as usize;
+    let n = w * h;
+
+    // Take the channels out for in-place mutation.
+    // We need three independent &mut slices.
+    let (a_buf, b_buf, c_buf) = {
+        // Split-borrow the three channels.
+        let chans = &mut img.channels;
+        let (head, tail) = chans.split_at_mut(begin_c + 1);
+        let a = &mut head[begin_c]; // index begin_c
+        let (b, rest) = tail.split_first_mut().expect("begin_c+1 exists");
+        let c = &mut rest[0]; // index begin_c+2
+        (a, b, c)
+    };
+    if a_buf.len() < n || b_buf.len() < n || c_buf.len() < n {
+        return Err(Error::InvalidData(
+            "JXL Modular RCT: channel buffer length mismatch".into(),
+        ));
+    }
+
+    for idx in 0..n {
+        let a = a_buf[idx];
+        let mut b = b_buf[idx];
+        let mut c = c_buf[idx];
+        let (d, e, f);
+        if typ == 6 {
+            // YCgCo
+            let tmp = a.wrapping_sub(c >> 1);
+            e = c.wrapping_add(tmp);
+            f = tmp.wrapping_sub(b >> 1);
+            d = f.wrapping_add(b);
+        } else {
+            if typ & 1 != 0 {
+                c = c.wrapping_add(a);
+            }
+            if (typ >> 1) == 1 {
+                b = b.wrapping_add(a);
+            }
+            if (typ >> 1) == 2 {
+                b = b.wrapping_add((a.wrapping_add(c)) >> 1);
+            }
+            d = a;
+            e = b;
+            f = c;
+        }
+        // V[permutation Umod 3] = D
+        // V[(permutation + 1 + permutation/3) Umod 3] = E
+        // V[(permutation + 2 - permutation/3) Umod 3] = F
+        let mut v = [0i32; 3];
+        v[permutation % 3] = d;
+        v[(permutation + 1 + permutation / 3) % 3] = e;
+        v[(permutation + 2 - permutation / 3) % 3] = f;
+        a_buf[idx] = v[0];
+        b_buf[idx] = v[1];
+        c_buf[idx] = v[2];
+    }
+    Ok(())
+}
+
+/// Helper for the Palette inverse transform: prediction(x, y, d_pred)
+/// against the *current state* of the indices channel. Uses the same
+/// `predict` code path as the main decode loop. Predictor 6 (WP) is
+/// rejected here — palette delta-prediction with WP is not exercised
+/// by the round-2 small fixtures.
+fn palette_predict_for_inverse(
+    img: &ModularImage,
+    chan_idx: usize,
+    x: i32,
+    y: i32,
+    d_pred: u32,
+) -> Result<i32> {
+    if d_pred == 6 {
+        return Err(Error::Unsupported(
+            "JXL Modular Palette: d_pred=6 (WP) for delta-palette not yet supported".into(),
+        ));
+    }
+    let wp = WpHeader::default();
+    let (v, _, _) = predict(img, chan_idx, x, y, d_pred, &wp, None)?;
+    Ok(v)
+}
+
+/// 2024-spec Annex H.6.4 — Inverse Palette transform.
+///
+/// `begin_c` is the channel index (in the channel list **at time of
+/// inverse**, i.e. AFTER all prior transforms have been applied) at
+/// which the palette indices live. `num_c` original channels are to be
+/// reconstructed; `nb_colours` is the explicit palette size. The meta-
+/// channel containing the palette table is at index 0 and has
+/// dimensions `nb_colours × num_c`.
+pub fn inverse_palette(
+    img: &mut ModularImage,
+    begin_c: usize,
+    num_c: u32,
+    nb_colours: u32,
+    nb_deltas: u32,
+    d_pred: u32,
+    bit_depth: u32,
+) -> Result<()> {
+    let num_c = num_c as usize;
+    let _nb_colours_signed = nb_colours as i32;
+    if num_c == 0 {
+        return Err(Error::InvalidData("JXL Palette: num_c must be >= 1".into()));
+    }
+    if img.channels.is_empty() {
+        return Err(Error::InvalidData(
+            "JXL Palette: no meta-channel for palette".into(),
+        ));
+    }
+    // After channel-list adjustment, indices live at index `begin_c + 1`
+    // (the `+1` is because the meta-channel is at position 0). But the
+    // caller passes `begin_c` referring to the BITSTREAM begin_c, so
+    // the meta channel is at 0 and indices at `begin_c + 1`.
+    let first = begin_c + 1;
+    let last = first + num_c - 1;
+    if last >= img.channels.len() + (num_c - 1) {
+        // We will be inserting copies; check that first is in range.
+        if first >= img.channels.len() {
+            return Err(Error::InvalidData(format!(
+                "JXL Palette: indices channel {first} out of range {}",
+                img.channels.len()
+            )));
+        }
+    }
+    if img.channels.is_empty() {
+        return Err(Error::InvalidData(
+            "JXL Palette: missing meta-channel at index 0".into(),
+        ));
+    }
+
+    let idx_desc = img.descs[first];
+    let w = idx_desc.width;
+    let h = idx_desc.height;
+    let _ = idx_desc;
+
+    // Insert num_c-1 copies of channel[first] at positions [first+1..=last].
+    for i in (first + 1)..=last {
+        let copy = img.channels[first].clone();
+        let desc = img.descs[first];
+        if i <= img.channels.len() {
+            img.channels.insert(i, copy);
+            img.descs.insert(i, desc);
+        } else {
+            img.channels.push(copy);
+            img.descs.push(desc);
+        }
+    }
+
+    // Reconstruct each channel independently. We need the meta-channel
+    // table at index 0 to remain intact during reconstruction (read
+    // only) and we mutate channels [first..=last].
+    let bitdepth = bit_depth.max(1);
+    let one_shifted = if bitdepth >= 32 {
+        i32::MAX
+    } else {
+        ((1i64 << bitdepth) - 1) as i32
+    };
+    let saturate_div_4 = one_shifted / 4;
+    let small_offset = if bitdepth > 3 {
+        1i32 << (bitdepth - 3)
+    } else {
+        1
+    };
+
+    // Take a snapshot of the meta-channel for read-only use.
+    let palette_table = img.channels[0].clone();
+    let palette_w = img.descs[0].width as i32;
+
+    #[allow(clippy::needless_range_loop)]
+    // c indexes spec equations; iterator form would obscure them.
+    for c in 0..num_c {
+        let chan_index = first + c;
+        // For non-delta entries we read indices directly from the
+        // partially-reconstructed channel BEFORE this iteration's
+        // sample is written; for delta entries we add a prediction
+        // that uses already-decoded NEIGHBOURS (never (x,y) itself).
+        for y in 0..h {
+            for x in 0..w {
+                // Read the index from channel[chan_index] BEFORE we
+                // overwrite it.
+                let pos = (y * w + x) as usize;
+                let index = img.channels[chan_index][pos];
+                let is_delta = index < nb_deltas as i32;
+
+                let mut value;
+                if index >= 0 && index < nb_colours as i32 {
+                    // value = channel[0](index, c)
+                    let pidx = index;
+                    let pv = palette_table
+                        .get((c as i32 * palette_w + pidx) as usize)
+                        .copied()
+                        .ok_or_else(|| {
+                            Error::InvalidData(format!(
+                                "JXL Palette: index {pidx} out of palette {palette_w}"
+                            ))
+                        })?;
+                    value = pv;
+                } else if index >= nb_colours as i32 {
+                    // implicit colour from numeric index extrapolation
+                    let mut idx = index - nb_colours as i32;
+                    if idx < 64 {
+                        // value = ((idx >> (2*c)) % 4) * ((1 << bd) - 1) / 4
+                        //       + (1 << max(0, bd - 3))
+                        let v_part = (idx >> (2 * c as i32)).rem_euclid(4);
+                        value = v_part
+                            .wrapping_mul(saturate_div_4)
+                            .wrapping_add(small_offset);
+                    } else {
+                        idx -= 64;
+                        for _ in 0..c {
+                            idx /= 5;
+                        }
+                        let v_part = idx.rem_euclid(5);
+                        value = v_part.wrapping_mul(saturate_div_4);
+                    }
+                } else if c < 3 {
+                    // delta-palette via kDeltaPalette table
+                    let neg_idx = (-index - 1).rem_euclid(143);
+                    let row = ((neg_idx + 1) >> 1) as usize;
+                    let row = row.min(K_DELTA_PALETTE.len().saturating_sub(1));
+                    let mut v = K_DELTA_PALETTE[row][c];
+                    if (neg_idx & 1) == 0 {
+                        v = -v;
+                    }
+                    if bitdepth > 8 {
+                        v <<= bitdepth - 8;
+                    }
+                    value = v;
+                } else {
+                    value = 0;
+                }
+                // Per H.6.4: assign value, then if delta-palette, add
+                // `prediction(x, y, d_pred)` against the already-decoded
+                // neighbours of (x, y) in this channel. Neighbour lookup
+                // never reads (x, y) itself, so the pre-write step is
+                // safe even though `predict` borrows `img` immutably.
+                if is_delta {
+                    let p =
+                        palette_predict_for_inverse(img, chan_index, x as i32, y as i32, d_pred)?;
+                    value = value.wrapping_add(p);
+                }
+                img.channels[chan_index][pos] = value;
+            }
+        }
+    }
+
+    // Remove the meta-channel.
+    img.channels.remove(0);
+    img.descs.remove(0);
+
+    Ok(())
+}
+
+/// 2024-spec Annex H.6.2 — Tendency function.
+fn squeeze_tendency(a: i32, b: i32, c: i32) -> i32 {
+    let mut x = (4i64 * a as i64 - 3 * c as i64 - b as i64 + 6).div_euclid(12) as i32;
+    if a >= b && b >= c {
+        if x.wrapping_sub(x & 1) > 2i32.wrapping_mul(a.wrapping_sub(b)) {
+            x = 2i32.wrapping_mul(a.wrapping_sub(b)).wrapping_add(1);
+        }
+        if x.wrapping_add(x & 1) > 2i32.wrapping_mul(b.wrapping_sub(c)) {
+            x = 2i32.wrapping_mul(b.wrapping_sub(c));
+        }
+        x
+    } else if a <= b && b <= c {
+        if x.wrapping_add(x & 1) < 2i32.wrapping_mul(a.wrapping_sub(b)) {
+            x = 2i32.wrapping_mul(a.wrapping_sub(b)).wrapping_sub(1);
+        }
+        if x.wrapping_sub(x & 1) < 2i32.wrapping_mul(b.wrapping_sub(c)) {
+            x = 2i32.wrapping_mul(b.wrapping_sub(c));
+        }
+        x
+    } else {
+        0
+    }
+}
+
+/// 2024-spec Annex H.6.2 — Horizontal inverse squeeze step. Combines
+/// `input_1` (W1 × H, "averages") and `input_2` (W2 × H, "residuals")
+/// into one output channel of dimensions `(W1 + W2) × H`. Either
+/// W1 == W2 or W1 == W2 + 1.
+pub fn horiz_isqueeze(
+    input_1: &[i32],
+    w1: u32,
+    input_2: &[i32],
+    w2: u32,
+    h: u32,
+) -> Result<(Vec<i32>, u32)> {
+    if !(w1 == w2 || w1 == w2 + 1) {
+        return Err(Error::InvalidData(format!(
+            "JXL Squeeze (horiz): w1={w1} w2={w2} not pair-compatible"
+        )));
+    }
+    let out_w = w1 + w2;
+    let mut out = vec![0i32; (out_w as usize) * (h as usize)];
+    for y in 0..h {
+        for x in 0..w2 {
+            let avg = input_1[(y * w1 + x) as usize];
+            let residu = input_2[(y * w2 + x) as usize];
+            let next_avg = if x + 1 < w1 {
+                input_1[(y * w1 + x + 1) as usize]
+            } else {
+                avg
+            };
+            let left = if x > 0 {
+                out[(y * out_w + (x << 1) - 1) as usize]
+            } else {
+                avg
+            };
+            let diff = residu.wrapping_add(squeeze_tendency(left, avg, next_avg));
+            // first = (2*avg + diff - sign(diff) * (diff & 1)) >> 1
+            let sgn = diff.signum();
+            let first = (2i64 * avg as i64 + diff as i64 - sgn as i64 * (diff & 1) as i64) >> 1;
+            let first = first as i32;
+            out[(y * out_w + 2 * x) as usize] = first;
+            out[(y * out_w + 2 * x + 1) as usize] = first.wrapping_sub(diff);
+        }
+        if w1 > w2 {
+            out[(y * out_w + 2 * w2) as usize] = input_1[(y * w1 + w2) as usize];
+        }
+    }
+    Ok((out, out_w))
+}
+
+/// 2024-spec Annex H.6.2 — Vertical inverse squeeze step.
+pub fn vert_isqueeze(
+    input_1: &[i32],
+    h1: u32,
+    input_2: &[i32],
+    h2: u32,
+    w: u32,
+) -> Result<(Vec<i32>, u32)> {
+    if !(h1 == h2 || h1 == h2 + 1) {
+        return Err(Error::InvalidData(format!(
+            "JXL Squeeze (vert): h1={h1} h2={h2} not pair-compatible"
+        )));
+    }
+    let out_h = h1 + h2;
+    let mut out = vec![0i32; (w as usize) * (out_h as usize)];
+    for y in 0..h2 {
+        for x in 0..w {
+            let avg = input_1[(y * w + x) as usize];
+            let residu = input_2[(y * w + x) as usize];
+            let next_avg = if y + 1 < h1 {
+                input_1[((y + 1) * w + x) as usize]
+            } else {
+                avg
+            };
+            let top = if y > 0 {
+                out[(((y << 1) - 1) * w + x) as usize]
+            } else {
+                avg
+            };
+            let diff = residu.wrapping_add(squeeze_tendency(top, avg, next_avg));
+            let sgn = diff.signum();
+            let first = (2i64 * avg as i64 + diff as i64 - sgn as i64 * (diff & 1) as i64) >> 1;
+            let first = first as i32;
+            out[(2 * y * w + x) as usize] = first;
+            out[((2 * y + 1) * w + x) as usize] = first.wrapping_sub(diff);
+        }
+    }
+    if h1 > h2 {
+        for x in 0..w {
+            out[((2 * h2) * w + x) as usize] = input_1[(h2 * w + x) as usize];
+        }
+    }
+    Ok((out, out_h))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1199,8 +1884,9 @@ mod tests {
                 vshift: 0,
             }],
         };
-        assert_eq!(predict(&img, 0, 0, 0, 0).unwrap(), 0);
-        assert_eq!(predict(&img, 0, 1, 1, 0).unwrap(), 0);
+        let wp = WpHeader::default();
+        assert_eq!(predict(&img, 0, 0, 0, 0, &wp, None).unwrap().0, 0);
+        assert_eq!(predict(&img, 0, 1, 1, 0, &wp, None).unwrap().0, 0);
     }
 
     #[test]
@@ -1214,8 +1900,9 @@ mod tests {
                 vshift: 0,
             }],
         };
+        let wp = WpHeader::default();
         // (1, 0) → left = sample at (0, 0) = 5
-        assert_eq!(predict(&img, 0, 1, 0, 1).unwrap(), 5);
+        assert_eq!(predict(&img, 0, 1, 0, 1, &wp, None).unwrap().0, 5);
     }
 
     #[test]
@@ -1229,8 +1916,9 @@ mod tests {
                 vshift: 0,
             }],
         };
+        let wp = WpHeader::default();
         // (0, 1) → top = sample at (0, 0) = 5
-        assert_eq!(predict(&img, 0, 0, 1, 2).unwrap(), 5);
+        assert_eq!(predict(&img, 0, 0, 1, 2, &wp, None).unwrap().0, 5);
     }
 
     #[test]
@@ -1244,13 +1932,16 @@ mod tests {
                 vshift: 0,
             }],
         };
+        let wp = WpHeader::default();
         // sample at (1, 1): left = 30 (sample at (0,1)), top = 0 (sample at (1,0))
         // (30 + 0) / 2 = 15
-        assert_eq!(predict(&img, 0, 1, 1, 3).unwrap(), 15);
+        assert_eq!(predict(&img, 0, 1, 1, 3, &wp, None).unwrap().0, 15);
     }
 
     #[test]
-    fn predict_predictor_6_rejected() {
+    fn predict_predictor_6_at_origin_returns_zero() {
+        // At (0, 0) all neighbours collapse to 0; sub-predictors are 0;
+        // (prediction + 3) >> 3 == 0.
         let img = ModularImage {
             channels: vec![vec![0; 4]],
             descs: vec![ChannelDesc {
@@ -1260,7 +1951,10 @@ mod tests {
                 vshift: 0,
             }],
         };
-        assert!(predict(&img, 0, 1, 1, 6).is_err());
+        let wp = WpHeader::default();
+        let state = WpState::new(2, 2);
+        let (v, _, _) = predict(&img, 0, 0, 0, 6, &wp, Some(&state)).unwrap();
+        assert_eq!(v, 0);
     }
 
     #[test]
@@ -1326,6 +2020,105 @@ mod tests {
         assert!(evaluate_tree(&nodes, &props).is_err());
     }
 
+    /// Round-2 inverse-transform unit tests — Annex H.6.
+    #[test]
+    fn inverse_rct_type_0_identity_after_no_op() {
+        // type==0 means no add-back operations; D = A, E = B, F = C.
+        // permutation=0 → V[0]=D=A, V[1]=E=B, V[2]=F=C — exact identity.
+        let mut img = ModularImage {
+            channels: vec![vec![10i32], vec![20i32], vec![30i32]],
+            descs: vec![
+                ChannelDesc {
+                    width: 1,
+                    height: 1,
+                    hshift: 0,
+                    vshift: 0,
+                };
+                3
+            ],
+        };
+        inverse_rct(&mut img, 0, 0).unwrap();
+        assert_eq!(img.channels[0][0], 10);
+        assert_eq!(img.channels[1][0], 20);
+        assert_eq!(img.channels[2][0], 30);
+    }
+
+    #[test]
+    fn inverse_rct_type_6_ycgco_round_trip() {
+        // YCgCo (type 6, permutation 0) maps (Y, Co, Cg) → (G, R, B) per
+        // FDIS L.4. With Y=128, Co=0, Cg=0: tmp = 128 - 0 = 128; E = 0 + 128 = 128;
+        // F = 128 - 0 = 128; D = 128 + 0 = 128. So all three V are 128.
+        let mut img = ModularImage {
+            channels: vec![vec![128i32], vec![0i32], vec![0i32]],
+            descs: vec![
+                ChannelDesc {
+                    width: 1,
+                    height: 1,
+                    hshift: 0,
+                    vshift: 0,
+                };
+                3
+            ],
+        };
+        inverse_rct(&mut img, 0, 6).unwrap();
+        assert_eq!(img.channels[0][0], 128);
+        assert_eq!(img.channels[1][0], 128);
+        assert_eq!(img.channels[2][0], 128);
+    }
+
+    #[test]
+    fn inverse_palette_explicit_colour_lookup() {
+        // 2x2 indices channel + 4-colour palette meta channel.
+        // Layout: meta @ idx 0 (4×1), indices @ idx 1 (2×2).
+        // num_c=1, nb_colours=4, nb_deltas=0, d_pred=0.
+        // Palette: [10, 20, 30, 40].
+        // Indices: [0, 1; 2, 3] → expected output [10, 20; 30, 40].
+        let mut img = ModularImage {
+            channels: vec![vec![10, 20, 30, 40], vec![0, 1, 2, 3]],
+            descs: vec![
+                ChannelDesc {
+                    width: 4,
+                    height: 1,
+                    hshift: -1,
+                    vshift: -1,
+                },
+                ChannelDesc {
+                    width: 2,
+                    height: 2,
+                    hshift: 0,
+                    vshift: 0,
+                },
+            ],
+        };
+        inverse_palette(&mut img, 0, 1, 4, 0, 0, 8).unwrap();
+        // After inverse: meta is removed, channel 0 holds the colours.
+        assert_eq!(img.channels.len(), 1);
+        assert_eq!(img.channels[0], vec![10, 20, 30, 40]);
+    }
+
+    #[test]
+    fn squeeze_tendency_zero_when_neighbours_disagree() {
+        // tendency returns 0 when neither A>=B>=C nor A<=B<=C.
+        assert_eq!(squeeze_tendency(10, 5, 8), 0);
+        // Strictly monotone: A>=B>=C: A=20, B=10, C=5.
+        // x = (4*20 - 3*5 - 10 + 6) / 12 = (80-15-10+6)/12 = 61/12 = 5
+        // first guard: x - (x&1) = 4 vs 2*(20-10)=20. 4 > 20? no.
+        // second guard: x + (x&1) = 6 vs 2*(10-5)=10. 6 > 10? no.
+        // So x = 5.
+        assert_eq!(squeeze_tendency(20, 10, 5), 5);
+    }
+
+    #[test]
+    fn horiz_isqueeze_simple_pair() {
+        // input_1 = [10] (averages, 1×1), input_2 = [0] (residuals, 1×1),
+        // output dims = 2×1. With residu=0 and tendency=0 (degenerate
+        // single-element case), diff=0; first = (2*10 + 0 - 0) >> 1 = 10;
+        // out = [10, 10].
+        let (out, w) = horiz_isqueeze(&[10], 1, &[0], 1, 1).unwrap();
+        assert_eq!(w, 2);
+        assert_eq!(out, vec![10, 10]);
+    }
+
     #[test]
     fn get_properties_first_pixel_grey_image() {
         // 2x2 grey channel, all zero → first pixel (0, 0): all neighbours
@@ -1339,7 +2132,7 @@ mod tests {
                 vshift: 0,
             }],
         };
-        let p = get_properties(&img, 0, 0, 0, 0);
+        let p = get_properties(&img, 0, 0, 0, 0, 0);
         assert_eq!(p[0], 0); // channel index
         assert_eq!(p[1], 0); // stream index
         assert_eq!(p[2], 0); // y
