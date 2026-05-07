@@ -3,12 +3,15 @@
 Pure-Rust **JPEG XL** (ISO/IEC 18181) codec — full container + signature
 detection, `SizeHeader` + `ImageMetadata` + `FrameHeader` + `TOC`
 parsing, single-group Modular pixel decode (Grey 8-bit), and a
-**round-5 lossless Modular encoder** with per-image predictor selection
-across {Left, Top, Average, West-Predictor, Gradient} and a
-frequency-adapted ANS-coded symbol stream. Round-5 hits **4.12 bpp**
-on a 256×256 grey natural-image fixture (51.5% of raw, lossless,
-self-roundtrip + bit-exact through libjxl's `djxl`). Zero C
-dependencies, zero FFI, zero `*-sys`.
+**round-6 lossless Modular encoder** with per-image predictor selection
+across the FDIS Listing C.16 set `{1 Left, 2 Top, 3 Average,
+4 West-Predictor, 5 Gradient, 7 TopRight, 8 TopLeft, 9 LeftLeft,
+10 Avg(L,TL), 11 Avg(TL,T), 12 Avg(T,TR)}` and a frequency-adapted
+ANS-coded symbol stream. Round-6 hits **4.12 bpp** on a 256×256 grey
+natural-image fixture (51.5% of raw, lossless, self-roundtrip +
+bit-exact through libjxl's `djxl`); the wider candidate set is the
+foundation for round-7+ per-channel / multi-leaf MA-tree splits.
+Zero C dependencies, zero FFI, zero `*-sys`.
 
 Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace)
 framework but usable standalone.
@@ -121,23 +124,43 @@ assert!(reg.make_decoder(&params).is_err());
 - No demuxer is registered: this crate treats a JXL file as a single
   codestream buffer fed directly to `probe(...)`.
 
-### Encoder status (round 5)
+### Encoder status (round 6)
 
 The Modular lossless encoder ([`encoder::encode_one_frame`]) accepts
 Gray8 / Rgb8 / Rgba8 input up to 1024×1024 (single-group cap) and
-emits a raw JXL codestream. Round 5 added per-image predictor
-selection across `{1 Left, 2 Top, 3 Average, 4 West-Predictor, 5
-Gradient}` (FDIS Listing C.16 ids) — the encoder pre-scans residual
-magnitudes and picks the lowest-scoring predictor for the single
-MA-tree leaf, then emits an ANS-coded symbol stream against an
-aligned 4096-summing distribution (round 4). Cross-validated through
-both our own decoder and libjxl's `djxl` on:
+emits a raw JXL codestream. Round 6 widens the per-image predictor
+candidate set from round-5's `{1, 2, 3, 4, 5}` to `{1, 2, 3, 4, 5,
+7, 8, 9, 10, 11, 12}` — adding TopRight (7), TopLeft (8), LeftLeft
+(9), and the three two-neighbour averages (10, 11, 12) — by tracking
+a wider reconstruction-buffer footprint that mirrors what
+`modular_fdis::predict` reads on the decoder side. The encoder
+pre-scans residual magnitudes for each candidate and picks the
+lowest-scoring predictor for the single MA-tree leaf, then emits an
+ANS-coded symbol stream against an aligned 4096-summing distribution
+(round 4).
+
+Predictor 6 (Annex E Weighted) and predictor 13 (Six-Tap) are still
+excluded:
+- Weighted is a state-machine predictor the round-3 decoder rejects.
+- Six-Tap self-roundtrips through our own decoder bit-exactly but
+  diverges from libjxl's `djxl` on random natural data — likely yet
+  another FDIS / libjxl spec divergence — and workspace policy bars
+  consulting libjxl source. Re-add to the candidate list once
+  `docs/image/jpegxl/libjxl-trace-reverse-engineering.md` documents
+  the empirical correction. See `src/encoder.rs::pick_best_predictor_id`
+  for the audit trail.
+
+Cross-validated through both our own decoder and libjxl's `djxl` on:
 
 - 8×8 / 16×16 / 64×64 grey synthetic fixtures (round 4 baseline).
-- **256×256 grey natural image (round 5):** 33747 bytes for 65536-pixel
+- **256×256 grey natural image (round 6):** 33747 bytes for 65536-pixel
   raw input → **4.12 bits/pixel**, 51.5% compression, bit-exact
   lossless self + djxl round-trip. PSNR-Y is mathematically infinite
   (lossless, MSE = 0), well above the round-39 35 dB target.
+  (Round-6 entropy is unchanged from round 5 because both Average (3)
+  and Gradient (5) produce the same residual sum on smooth fixtures;
+  the wider candidate set is a foundation for round-7+ per-channel /
+  multi-leaf MA-tree splits.)
 
 ### Modular pixel decode status
 

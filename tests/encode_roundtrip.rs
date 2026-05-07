@@ -177,3 +177,27 @@ fn rgba_probe_recovers_alpha_extra_channel() {
         ExtraChannelType::Alpha
     );
 }
+
+/// Round-6 regression: random 64x64 grey self-roundtrip. The encoder
+/// can pick any of the 11 candidate predictors (1..=5, 7..=12);
+/// whichever it chooses must be evaluated identically by
+/// `modular_fdis::predict` for self-decode bit-exactness. Predictor 13
+/// is intentionally absent from the encoder candidate set — see the
+/// `pick_best_predictor_id` doc comment in `src/encoder.rs`.
+#[test]
+fn round6_64x64_random_self_roundtrip() {
+    let mut pixels = Vec::with_capacity(64 * 64);
+    let mut state: u32 = 0x1234_5678;
+    for _ in 0..(64 * 64) {
+        state = state.wrapping_mul(1103515245).wrapping_add(12345);
+        pixels.push((state >> 16) as u8);
+    }
+    let jxl = encode_one_frame(64, 64, &pixels, InputFormat::Gray8).expect("encode");
+    let frame = decode_one_frame(&jxl, None).expect("self-decode");
+    let data = &frame.planes[0].data;
+    assert_eq!(
+        data, &pixels,
+        "self-decode 64x64 random must be bit-exact (whichever \
+         round-6 predictor was picked must agree with modular_fdis::predict)"
+    );
+}

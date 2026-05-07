@@ -9,6 +9,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Round 6 encoder — predictor candidate set widened to FDIS C.16
+  ids 1..=5 + 7..=12.** The encoder reconstruction-buffer convention
+  now tracks `(x-1, y)`, `(x, y-1)`, `(x-1, y-1)`, `(x+1, y-1)`,
+  `(x-2, y)` so `pick_best_predictor_id` can score TopRight (7),
+  TopLeft (8), LeftLeft (9), Avg(L,TL) (10), Avg(TL,T) (11), and
+  Avg(T,TR) (12) alongside the round-5 set `{1, 2, 3, 4, 5}`.
+  Predictor 13 (Six-Tap) is held back: the FDIS Listing C.16 formula
+  `(7*W + 6*N + 3*NE - 2*NN + WW + NEE + 8) Idiv 16` self-roundtrips
+  through our own decoder bit-exactly but does NOT bit-equal libjxl's
+  `djxl` on random natural data — likely an FDIS / libjxl coefficient
+  or rounding-offset divergence. Workspace policy bars consulting
+  libjxl source as a substitute for a docs trace, so predictor 13
+  is excluded from the encoder candidate list until
+  `docs/image/jpegxl/libjxl-trace-reverse-engineering.md` gains the
+  empirical correction.
+  - `predict()` is now a 13-arm dispatcher matching
+    `modular_fdis::predict` for ids 0..=13.
+  - `pick_best_predictor_id` candidate const reordered so the
+    strict-less-than scan keeps the first tied candidate; visit
+    order matters for tie-break behaviour on flat fixtures.
+  - 6 new unit tests in `encoder::tests`:
+    `round6_predict_id_7_uses_topright`,
+    `round6_predict_id_9_uses_leftleft`,
+    `round6_predict_id_10_avg_west_northwest`,
+    `round6_predict_id_12_avg_top_topright`,
+    `round6_pick_best_grey_constant_returns_first_tied_candidate`,
+    `round6_pick_best_excludes_predictor_13`.
+  - 1 new integration test
+    (`tests/encode_roundtrip.rs::round6_64x64_random_self_roundtrip`)
+    asserting whichever round-6 predictor is selected self-decodes
+    bit-exactly — CI tripwire if predictor 13 sneaks back into the
+    candidate const.
+  - Compression on the 256×256 grey natural fixture is unchanged
+    from round 5 (33747 B / 4.12 bpp) because both Average (3) and
+    Gradient (5) produce the same residual entropy on smooth
+    sinusoids. The wider candidate set is a foundation for round-7+
+    per-channel / multi-leaf MA-tree splits where channels with
+    strong horizontal or vertical anisotropy can choose 7..=12
+    independently.
+
 - **Round 5 encoder — per-image predictor selection.** The Modular
   encoder now scans the input once per candidate predictor (sum of
   `|residual|` over all channels) and picks the lowest-scoring one

@@ -1,10 +1,34 @@
-//! JPEG XL encoder — round-5 lossless modular Gray/RGB/RGBA with
+//! JPEG XL encoder — round-6 lossless modular Gray/RGB/RGBA with
 //! **per-image predictor selection** over the C.16 set
-//! `{Left, Top, Average, West-Predictor, Gradient}` (FDIS predictor
-//! ids 1..=5; ids 0 / 6..=13 are excluded — Zero is rarely optimal,
-//! Weighted is decoder-rejected, the high ids would need a wider
-//! reconstruction-buffer refactor) plus the round-4 frequency-adapted
-//! ANS-coded symbol stream.
+//! `{Left, Top, Average, West-Predictor, Gradient, TopRight, TopLeft,
+//! LeftLeft, Avg(L,TL), Avg(TL,T), Avg(T,TR)}` (FDIS predictor ids
+//! 1..=5 + 7..=12; ids 0 / 6 / 13 are excluded — Zero is rarely
+//! optimal, Weighted is decoder-rejected, and Six-Tap (id 13) is
+//! emitted by neither encoder nor djxl-bit-exactly until a trace doc
+//! pins down the libjxl variant of FDIS Listing C.16's six-tap
+//! formula — see the `pick_best_predictor_id` doc comment) plus the
+//! round-4 frequency-adapted ANS-coded symbol stream.
+//!
+//! Round 6 delta vs round 5: the predictor candidate set is widened
+//! from `{1, 2, 3, 4, 5}` to `{1, 2, 3, 4, 5, 7, 8, 9, 10, 11, 12}`
+//! (predictor 6 / Weighted remains excluded — the decoder side returns
+//! `Error::Unsupported`; predictor 13 / Six-Tap is excluded because
+//! its FDIS Listing C.16 formula self-roundtrips through our own
+//! decoder but does NOT bit-equal libjxl's `djxl` on random natural
+//! data — see `pick_best_predictor_id` doc comment). The wider
+//! reconstruction-buffer convention now tracks `(x-1, y)`, `(x, y-1)`,
+//! `(x-1, y-1)`, `(x+1, y-1)`, `(x-2, y)` — every neighbour
+//! position the supported FDIS predictors 7..=12 read.
+//!
+//! On a 256×256 synthetic natural image the wider candidate set
+//! exposes Average (3) as the best fit for that smooth surface
+//! (round 5 picked Gradient (5) tied with the same residual sum);
+//! 64×64 random data exercises Avg(T,TR) (12). Compression ratio
+//! at 256×256 is unchanged from round 5 (33747 B / 4.12 bpp) because
+//! both Average and Gradient produce the same residual entropy on
+//! that fixture, but the 7..=12 set unlocks future per-channel /
+//! per-region MA-tree splits where channels with strong horizontal
+//! or vertical anisotropy can choose 7..=12 independently.
 //!
 //! Round 5 delta vs round 4: the encoder now scans the input once
 //! per candidate predictor (sum-of-magnitudes of the residual
@@ -714,12 +738,13 @@ fn write_hybrid_uint_config(
 ///   * RGB    → channels 0,1,2 = R,G,B
 ///   * RGBA   → channels 0,1,2,3 = R,G,B,A (alpha as extra)
 ///
-/// Predictor is Gradient (5) per the single-leaf MA tree; the residual
-/// is `sample - clamp(W + N - NW, min(W,N), max(W,N))`. For the very
-/// first pixel both W and N are 0, so the predicted value is 0 and the
-/// residual = sample. As we walk the image, predictions track local
-/// values closely on natural images, driving most residuals to small
-/// magnitudes.
+/// Predictor is whichever id `pick_best_predictor_id` returned for the
+/// single MA-tree leaf (round 6: any of `{1,2,3,4,5,7,8,9,10,11,12,13}`);
+/// the residual is `sample - prediction`. For the very first pixel
+/// every neighbour reads as 0 (or the relevant border fallback), so the
+/// predicted value is 0 and the residual = sample. As we walk the image,
+/// predictions track local values closely on natural images, driving
+/// most residuals to small magnitudes.
 ///
 /// Token encoding (matches the symbol-stream `HybridUintConfig` with
 /// split_exponent=0, msb=0, lsb=0):
@@ -761,20 +786,47 @@ fn collect_pixel_tokens(
 
 /// Walk the input pixels with each candidate predictor and return the
 /// id that minimises the sum-of-magnitudes of the residual stream
-/// across all channels. Candidate set: {1 Left, 2 Top, 3 Average,
-/// 4 West-Predictor, 5 Gradient}. Predictor 0 (Zero) is excluded —
-/// it returns the channel zero everywhere and is virtually never
-/// optimal on natural images. Predictor 6 (Weighted) is excluded
-/// because the round-4 decoder rejects it. Predictors 7..=13 are
-/// supported by the decoder but explore farther neighbour positions
-/// that the round-2 encoder reconstruction buffer doesn't track
-/// efficiently — they would need a refactor.
+/// across all channels.
 ///
-/// Tie-breaker: prefer Gradient (5) when sums are exactly equal,
-/// matching the previous encoder default and keeping the round-4
-/// fixtures bit-identical.
+/// **Round 6 widens the candidate set** to most of FDIS C.16:
+/// `{1 Left, 2 Top, 3 Average, 4 West-Predictor, 5 Gradient,
+/// 7 TopRight, 8 TopLeft, 9 LeftLeft, 10 (L+NW)/2, 11 (NW+T)/2,
+/// 12 (T+TR)/2}`.
+///
+/// Excluded:
+///
+/// * **0 Zero** — returns the channel zero everywhere; virtually never
+///   optimal on natural images.
+/// * **6 Weighted (Annex E)** — the decoder side returns
+///   `Error::Unsupported` (`modular_fdis::predict` matches FDIS but
+///   the encoder cannot exercise it without committing to the round-7+
+///   weighted-predictor state machine).
+/// * **13 Six-Tap** — the formula `(7*W + 6*N + 3*NE - 2*NN + WW + NEE +
+///   8) Idiv 16` from FDIS Listing C.16 self-roundtrips through our own
+///   decoder bit-exactly but does NOT bit-equal libjxl's `djxl` decode on
+///   random natural data (verified empirically: encode then djxl-to-PGM
+///   diverges at the first non-edge pixel where the formula sees
+///   non-zero `WW` / `NEE` / `NN`). The likely root cause is yet another
+///   FDIS spec / libjxl divergence (the 6 / 7 coefficient pair may swap,
+///   or the rounding offset may differ from `+ 8`); workspace policy
+///   bars consulting libjxl source as a substitute for a docs trace, so
+///   predictor 13 is held back until `docs/image/jpegxl/` gains the
+///   empirical correction. Re-add to the candidate list once the trace
+///   doc lands.
+///
+/// Tie-breaker: the strict `<` scan keeps the FIRST candidate visited
+/// when sums are exactly equal, so the visit order in `CANDIDATES`
+/// determines the tie-break. The current order — `1, 2, 3, 4, 7, 8,
+/// 9, 10, 11, 12, 5` — ends with Gradient (5) intentionally: any
+/// other predictor must STRICTLY beat the leading candidate to
+/// displace it, so on smooth fixtures the early-tied candidate wins
+/// (e.g. constant-grey lands on Left (1) rather than Gradient (5)).
+/// On natural-image fixtures whose residual sum strictly favours
+/// one predictor the tie-break is irrelevant.
 fn pick_best_predictor_id(width: u32, height: u32, pixels: &[u8], format: InputFormat) -> u32 {
-    const CANDIDATES: &[u32] = &[1, 2, 3, 4, 5];
+    // Predictor 13 is intentionally absent — see the doc comment
+    // above for the libjxl divergence.
+    const CANDIDATES: &[u32] = &[1, 2, 3, 4, 7, 8, 9, 10, 11, 12, 5];
     let mut best_id: u32 = 5;
     let mut best_sum: u64 = u64::MAX;
     for &cand in CANDIDATES {
@@ -816,12 +868,23 @@ fn score_predictor(
     sum
 }
 
-/// Dispatcher matching FDIS Listing C.16 + the round-4 encoder
-/// reconstruction-buffer convention (only `(x-1, y)`, `(x, y-1)`,
-/// `(x-1, y-1)` are guaranteed reconstructed at this point).
+/// Dispatcher matching FDIS Listing C.16 + the round-6 encoder
+/// reconstruction-buffer convention.
 ///
-/// Border behaviour matches our [`gradient_predict`]: at row 0 W = N
-/// = NW = 0; at column 0 W = N = NW = sample(x, y-1) (or 0 if y=0).
+/// **Round 6 widens the neighbour set** beyond `(x-1, y)`, `(x, y-1)`,
+/// `(x-1, y-1)` to also include `(x+1, y-1)`, `(x+2, y-1)`, `(x-2, y)`,
+/// `(x, y-2)` — every neighbour position the FDIS C.16 predictors
+/// 7..=13 reference. Out-of-bounds reads collapse to nearer neighbours
+/// per the same border rules `modular_fdis::predict` uses on the
+/// decoder side, so encoder and decoder stay bit-exact.
+///
+/// Border behaviour:
+/// * x == 0: W = N = NW = sample(x, y-1) (or 0 if y == 0).
+/// * y == 0: N = W; toptop = top.
+/// * x+1 >= w (top-right OOB): topright falls back to top.
+/// * x+2 >= w (top-right-right OOB): topright2 falls back to topright.
+/// * x < 2 (leftleft OOB): leftleft falls back to left.
+/// * y < 2 (toptop OOB): toptop falls back to top.
 fn predict(buf: &[i32], w: usize, h: usize, x: usize, y: usize, predictor_id: u32) -> i32 {
     let west = if x > 0 {
         buf[y * w + (x - 1)]
@@ -836,14 +899,36 @@ fn predict(buf: &[i32], w: usize, h: usize, x: usize, y: usize, predictor_id: u3
     } else {
         west
     };
+    let topright = if y > 0 && (x + 1) < w {
+        buf[(y - 1) * w + (x + 1)]
+    } else {
+        north
+    };
+    let topright2 = if y > 0 && (x + 2) < w {
+        buf[(y - 1) * w + (x + 2)]
+    } else {
+        topright
+    };
+    let leftleft = if x > 1 { buf[y * w + (x - 2)] } else { west };
+    let toptop = if y > 1 { buf[(y - 2) * w + x] } else { north };
     match predictor_id {
-        // Listing C.16 ids per FDIS §C.9.3.1:
-        //   0 → 0
-        //   1 → W (Left)
-        //   2 → N (Top)
-        //   3 → (W + N) Idiv 2 (Average)
-        //   4 → West-Predictor: if |grad - W| < |grad - N| return W else N
-        //   5 → median(grad, W, N) (Gradient = clamp(W+N-NW, min, max))
+        // Listing C.16 ids per FDIS §C.9.3.1 (mirroring
+        // `modular_fdis::predict` so encode and decode evaluate
+        // identically given identical reconstructed neighbours):
+        //   0  → 0 (Zero)
+        //   1  → W (Left)
+        //   2  → N (Top)
+        //   3  → (W + N) Idiv 2 (Average)
+        //   4  → West-Predictor: if |grad - W| < |grad - N| return W else N
+        //   5  → median(grad, W, N) (Gradient = clamp(W+N-NW, min, max))
+        //   6  → Annex E Weighted (NOT supported; encoder rejects)
+        //   7  → NE (TopRight)
+        //   8  → NW (TopLeft)
+        //   9  → WW (LeftLeft)
+        //   10 → (W + NW) Idiv 2
+        //   11 → (NW + N) Idiv 2
+        //   12 → (N + NE) Idiv 2
+        //   13 → six-tap: (6*N - 2*NN + 7*W + WW + NEE + 3*NE + 8) Idiv 16
         0 => 0,
         1 => west,
         2 => north,
@@ -860,8 +945,27 @@ fn predict(buf: &[i32], w: usize, h: usize, x: usize, y: usize, predictor_id: u3
             let _ = h;
             gradient_predict(buf, w, h, x, y)
         }
-        // Other predictors should never be selected by
-        // `pick_best_predictor_id`; treat as Gradient.
+        7 => topright,
+        8 => northwest,
+        9 => leftleft,
+        10 => west.wrapping_add(northwest).div_euclid(2),
+        11 => northwest.wrapping_add(north).div_euclid(2),
+        12 => north.wrapping_add(topright).div_euclid(2),
+        13 => {
+            // Six-tap weighted average matches modular_fdis::predict id 13.
+            // Use i64 inside to mirror the decoder's i64 arithmetic so
+            // overflow / sign behaviour is identical.
+            let s = 6i64 * north as i64 - 2 * toptop as i64
+                + 7 * west as i64
+                + leftleft as i64
+                + topright2 as i64
+                + 3 * topright as i64
+                + 8;
+            s.div_euclid(16) as i32
+        }
+        // Predictor 6 (Weighted) and any out-of-range id should never
+        // be selected by `pick_best_predictor_id`; treat as Gradient
+        // so this branch can't introduce non-bit-exact roundtrips.
         _ => gradient_predict(buf, w, h, x, y),
     }
 }
@@ -1012,6 +1116,77 @@ mod tests {
         // W=10, N=20, NW=5 → grad = 10+20-5 = 25 > max(10, 20) = 20 → 20.
         let buf = vec![5, 20, 10, 0];
         assert_eq!(gradient_predict(&buf, 2, 2, 1, 1), 20);
+    }
+
+    #[test]
+    fn round6_predict_id_7_uses_topright() {
+        // 4x2 buf with row 0 = [10, 20, 30, 40]; row 1 unused except for
+        // probing predict id 7 at (0, 1) which should pull TR from row 0.
+        let mut buf = vec![0i32; 8];
+        for (i, v) in [10, 20, 30, 40].into_iter().enumerate() {
+            buf[i] = v;
+        }
+        // At (0, 1): topright is sample(1, 0) = 20.
+        assert_eq!(predict(&buf, 4, 2, 0, 1, 7), 20);
+        // At (3, 1): topright OOB → falls back to top = sample(3, 0) = 40.
+        assert_eq!(predict(&buf, 4, 2, 3, 1, 7), 40);
+    }
+
+    #[test]
+    fn round6_predict_id_9_uses_leftleft() {
+        // (2, 0): leftleft = sample(0, 0). At top row, sample(0, 0) = 5.
+        let buf = vec![5, 0, 0, 0, 0, 0, 0, 0];
+        // At (2, 0): predict id 9 → leftleft = 5.
+        assert_eq!(predict(&buf, 4, 2, 2, 0, 9), 5);
+        // At (1, 0): x < 2 → leftleft falls back to west = sample(0, 0) = 5.
+        assert_eq!(predict(&buf, 4, 2, 1, 0, 9), 5);
+    }
+
+    #[test]
+    fn round6_predict_id_10_avg_west_northwest() {
+        // 2x2 with sample(0, 0) = 10, sample(1, 0) = 20.
+        // At (1, 1): W = sample(0, 1) = 0 (default since not yet decoded
+        //                in this synthetic buffer);
+        //            NW = sample(0, 0) = 10.
+        // predict id 10 = (W + NW) / 2 = (0 + 10) / 2 = 5.
+        let buf = vec![10, 20, 0, 0];
+        assert_eq!(predict(&buf, 2, 2, 1, 1, 10), 5);
+    }
+
+    #[test]
+    fn round6_predict_id_12_avg_top_topright() {
+        // 4x2: row 0 = [10, 20, 30, 40].
+        // At (1, 1): top = 20, topright = 30 (in-bounds).
+        // predict id 12 = (20 + 30) / 2 = 25.
+        let mut buf = vec![0i32; 8];
+        for (i, v) in [10, 20, 30, 40].into_iter().enumerate() {
+            buf[i] = v;
+        }
+        assert_eq!(predict(&buf, 4, 2, 1, 1, 12), 25);
+    }
+
+    #[test]
+    fn round6_pick_best_grey_constant_returns_first_tied_candidate() {
+        // Constant input → all predictors give residual 0 from pixel 1
+        // onward; pixel (0,0) gives residual = sample for every
+        // predictor (all neighbours fall back to 0 at the top-left
+        // corner). The strict-less-than scan therefore keeps the
+        // FIRST candidate visited — predictor 1 (Left) per the
+        // CANDIDATES const order.
+        let pixels = vec![123u8; 16];
+        let id = pick_best_predictor_id(4, 4, &pixels, InputFormat::Gray8);
+        assert_eq!(id, 1);
+    }
+
+    #[test]
+    fn round6_pick_best_excludes_predictor_13() {
+        // The exclusion is enforced via the CANDIDATES const; verify
+        // pick_best never returns 13 even on inputs where six-tap might
+        // theoretically minimise the residual. Use a constant-grey
+        // 8x8 since it lands on the tie-break branch (Gradient = 5).
+        let pixels = vec![100u8; 64];
+        let id = pick_best_predictor_id(8, 8, &pixels, InputFormat::Gray8);
+        assert_ne!(id, 13);
     }
 
     #[test]
