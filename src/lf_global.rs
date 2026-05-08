@@ -22,7 +22,8 @@
 
 use oxideav_core::{Error, Result};
 
-use crate::bitreader::{BitReader, U32Dist};
+use crate::ans::cluster::{num_clusters, read_clustering};
+use crate::bitreader::{unpack_signed, BitReader, U32Dist};
 use crate::frame_header::{flags, Encoding, FrameHeader};
 use crate::global_modular::GlobalModular;
 use crate::metadata_fdis::ImageMetadataFdis;
@@ -172,28 +173,86 @@ impl LfChannelCorrelation {
     }
 }
 
-/// `HfBlockContext` bundle — FDIS Listing C.15 (§C.8.4). Describes the
-/// HF block-context model. Round-11 only handles the `u(1) == 1`
-/// default-table fast path — that consumes a single bit and selects the
-/// 39-element default `block_ctx_map`. The non-default branch (per-LF
-/// thresholds + qf thresholds + clustering map) returns
-/// `Error::Unsupported` until full HF decode lands.
+/// `HfBlockContext` bundle — ISO/IEC 18181-1:2024 §I.2.2 (was FDIS
+/// Listing C.15). Describes the HF block-context model.
+///
+/// Two encodings:
+///
+/// 1. **Default**: `u(1) == 1` selects the 39-element fixed table from
+///    the spec.
+/// 2. **Custom**: `u(1) == 0` reads:
+///    * `nb_lf_thr[i] = u(4)` for `i in 0..3`, then `nb_lf_thr[i]` thresholds
+///      decoded as `UnpackSigned(ReadThreshold())` per channel.
+///    * `nb_qf_thr = u(4)`, then `nb_qf_thr` qf thresholds, each
+///      `1 + U32(u(2), 4+u(3), 12+u(5), 44+u(8))`.
+///    * `bsize = 39 * (nb_qf_thr+1) * (nb_lf_thr[0]+1) * (nb_lf_thr[1]+1) * (nb_lf_thr[2]+1)`.
+///    * `block_ctx_map = ReadBlockCtxMap()` which is the standard C.2.2
+///      clustering with `num_dist = bsize` (skipping when `bsize == 1`
+///      → `block_ctx_map = [0]`).
+///    * Spec invariants: `bsize ≤ 39 * 64` and resulting
+///      `num_clusters ≤ 16`.
 #[derive(Debug, Clone)]
 pub struct HfBlockContext {
     /// True when the default 39-element `block_ctx_map` was selected.
     pub used_default: bool,
-    /// The 39-element block context map per Listing C.15.
+    /// The block context map per §I.2.2. For the default branch this is
+    /// the 39-element fixed table; for the custom branch it has `bsize`
+    /// elements.
     pub block_ctx_map: Vec<u8>,
-    /// `nb_block_ctx = max(block_ctx_map) + 1` per §C.8.3.
+    /// `nb_block_ctx = max(block_ctx_map) + 1` per §C.8.3 / I.2.2.
     pub nb_block_ctx: u32,
+    /// Per-channel LF thresholds `lf_thresholds[c]`. Empty for the
+    /// default branch.
+    pub lf_thresholds: [Vec<i32>; 3],
+    /// QF thresholds. Empty for the default branch.
+    pub qf_thresholds: Vec<u32>,
+}
+
+/// Read a `Threshold` per §I.2.2:
+/// `U32(u(4), 16 + u(8), 272 + u(16), 65808 + u(32))`.
+///
+/// The 32-bit branch is read via `read_u32` only handles up to `u(32)`
+/// returning a `u32`, but the spec's 4th selector reaches `65808 + u(32)`
+/// which can overflow `u32`. We model the field as `u32` and saturate on
+/// overflow with `Error::InvalidData` since a threshold value > u32::MAX
+/// cannot match any real decoded HF value.
+fn read_threshold(br: &mut BitReader<'_>) -> Result<u32> {
+    let sel = br.read_bits(2)?;
+    let v: u64 = match sel {
+        0 => br.read_bits(4)? as u64,
+        1 => 16u64 + br.read_bits(8)? as u64,
+        2 => 272u64 + br.read_bits(16)? as u64,
+        _ => {
+            // Reading u(32) into a 64-bit accumulator. read_bits returns
+            // u32; reading 32 bits in two halves keeps us inside the
+            // BitReader API.
+            let lo = br.read_bits(16)? as u64;
+            let hi = br.read_bits(16)? as u64;
+            65808u64 + ((hi << 16) | lo)
+        }
+    };
+    if v > u32::MAX as u64 {
+        return Err(Error::InvalidData(format!(
+            "JXL HfBlockContext: ReadThreshold = {v} exceeds u32::MAX"
+        )));
+    }
+    Ok(v as u32)
 }
 
 impl HfBlockContext {
-    /// Default 39-element table per Listing C.15 first branch.
+    /// Default 39-element table per §I.2.2 first branch.
     pub const DEFAULT_BLOCK_CTX_MAP: [u8; 39] = [
         0, 1, 2, 2, 3, 3, 4, 5, 6, 6, 6, 6, 6, 7, 8, 9, 9, 10, 11, 12, 13, 14, 14, 14, 14, 14, 7,
         8, 9, 9, 10, 11, 12, 13, 14, 14, 14, 14, 14,
     ];
+
+    /// Spec invariant: `nb_lf_thr[i]` is read as `u(4)`, max 15. The
+    /// custom-branch `bsize` cap from the spec ("num_dist ≤ 39 * 64")
+    /// constrains the product `(nb_qf_thr+1) * Π (nb_lf_thr[i]+1)` to
+    /// at most 64 — the largest legal product.
+    const MAX_BSIZE: u32 = 39 * 64;
+    /// Spec invariant: "the resulting num_clusters ≤ 16".
+    const MAX_NUM_CLUSTERS: u32 = 16;
 
     pub fn read(br: &mut BitReader<'_>) -> Result<Self> {
         let used_default = br.read_bool()?;
@@ -204,13 +263,77 @@ impl HfBlockContext {
                 used_default: true,
                 block_ctx_map: map,
                 nb_block_ctx: nb,
+                lf_thresholds: [Vec::new(), Vec::new(), Vec::new()],
+                qf_thresholds: Vec::new(),
             });
         }
-        Err(Error::Unsupported(
-            "JXL LfGlobal: HfBlockContext non-default-table branch (per-LF thresholds + qf \
-             thresholds + clustering map) not yet supported (round 12+)"
-                .into(),
-        ))
+
+        // Custom branch — §I.2.2 second arm.
+        let mut lf_thresholds: [Vec<i32>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+        let mut nb_lf_thr = [0u32; 3];
+        for i in 0..3 {
+            let n = br.read_bits(4)?;
+            nb_lf_thr[i] = n;
+            let mut v = Vec::with_capacity(n as usize);
+            for _ in 0..n {
+                let raw = read_threshold(br)?;
+                v.push(unpack_signed(raw));
+            }
+            lf_thresholds[i] = v;
+        }
+        let nb_qf_thr = br.read_bits(4)?;
+        let mut qf_thresholds: Vec<u32> = Vec::with_capacity(nb_qf_thr as usize);
+        for _ in 0..nb_qf_thr {
+            let raw = br.read_u32([
+                U32Dist::Bits(2),
+                U32Dist::BitsOffset(3, 4),
+                U32Dist::BitsOffset(5, 12),
+                U32Dist::BitsOffset(8, 44),
+            ])?;
+            qf_thresholds.push(raw.checked_add(1).ok_or_else(|| {
+                Error::InvalidData("JXL HfBlockContext: qf_threshold overflow".into())
+            })?);
+        }
+
+        // bsize = 39 * (nb_qf_thr+1) * Π (nb_lf_thr[i]+1).
+        let bsize_u64 = 39u64
+            * (nb_qf_thr as u64 + 1)
+            * (nb_lf_thr[0] as u64 + 1)
+            * (nb_lf_thr[1] as u64 + 1)
+            * (nb_lf_thr[2] as u64 + 1);
+        if bsize_u64 > Self::MAX_BSIZE as u64 {
+            return Err(Error::InvalidData(format!(
+                "JXL HfBlockContext: bsize {bsize_u64} > 39*64={} (spec invariant)",
+                Self::MAX_BSIZE
+            )));
+        }
+        let bsize = bsize_u64 as u32;
+
+        // ReadBlockCtxMap: standard C.2.2 clustering with num_dist = bsize.
+        // When bsize == 1, the spec skips the procedure and returns
+        // clusters = [0].
+        let block_ctx_map_u32: Vec<u32> = if bsize <= 1 {
+            vec![0u32; bsize as usize]
+        } else {
+            read_clustering(br, bsize as usize)?
+        };
+        let nb = num_clusters(&block_ctx_map_u32);
+        if nb > Self::MAX_NUM_CLUSTERS {
+            return Err(Error::InvalidData(format!(
+                "JXL HfBlockContext: num_clusters {nb} > {} (spec invariant)",
+                Self::MAX_NUM_CLUSTERS
+            )));
+        }
+        // Cluster indices fit in u8 (max 16 < 256).
+        let block_ctx_map: Vec<u8> = block_ctx_map_u32.iter().map(|&v| v as u8).collect();
+
+        Ok(Self {
+            used_default: false,
+            block_ctx_map,
+            nb_block_ctx: nb,
+            lf_thresholds,
+            qf_thresholds,
+        })
     }
 }
 
@@ -369,12 +492,155 @@ mod tests {
     }
 
     #[test]
-    fn hf_block_context_non_default_rejected_round_11() {
-        // u(1) = 0 → non-default branch returns Unsupported.
-        let bytes = pack_lsb(&[(0, 1)]);
+    fn hf_block_context_custom_minimum_zero_thresholds() {
+        // u(1) = 0 → custom branch.
+        // nb_lf_thr[0] = 0 (4 bits), nb_lf_thr[1] = 0, nb_lf_thr[2] = 0,
+        // nb_qf_thr = 0 (4 bits). bsize = 39 * 1 * 1 * 1 * 1 = 39.
+        // ReadBlockCtxMap with num_dist = 39:
+        //   is_simple = 1 (1 bit), nbits = 0 (2 bits) → 39 × u(0) = all 0
+        //   → block_ctx_map = [0; 39], num_clusters = 1.
+        let bytes = pack_lsb(&[
+            (0, 1), // u(1) = 0 → custom
+            (0, 4), // nb_lf_thr[0] = 0
+            (0, 4), // nb_lf_thr[1] = 0
+            (0, 4), // nb_lf_thr[2] = 0
+            (0, 4), // nb_qf_thr = 0
+            (1, 1), // is_simple = 1
+            (0, 2), // nbits = 0 → all cluster indices read as u(0) = 0
+        ]);
         let mut br = BitReader::new(&bytes);
+        let hbc = HfBlockContext::read(&mut br).unwrap();
+        assert!(!hbc.used_default);
+        assert_eq!(hbc.block_ctx_map.len(), 39);
+        assert_eq!(hbc.nb_block_ctx, 1);
+        for &v in &hbc.block_ctx_map {
+            assert_eq!(v, 0);
+        }
+        for ch in &hbc.lf_thresholds {
+            assert!(ch.is_empty());
+        }
+        assert!(hbc.qf_thresholds.is_empty());
+    }
+
+    #[test]
+    fn hf_block_context_custom_with_qf_threshold() {
+        // u(1) = 0 → custom.
+        // nb_lf_thr[0..3] = 0, nb_qf_thr = 1.
+        // qf_threshold #0: U32 selector 0 → u(2) value 3 → +1 = 4.
+        // bsize = 39 * 2 * 1 * 1 * 1 = 78. Clustering with num_dist=78:
+        //   is_simple = 1, nbits = 0 → all 0. num_clusters = 1.
+        let bytes = pack_lsb(&[
+            (0, 1), // u(1) = 0
+            (0, 4),
+            (0, 4),
+            (0, 4),
+            (1, 4), // nb_qf_thr = 1
+            (0, 2), // U32 sel = 0 (u(2))
+            (3, 2), // u(2) = 3 → qf_threshold = 4
+            (1, 1), // is_simple
+            (0, 2), // nbits = 0
+        ]);
+        let mut br = BitReader::new(&bytes);
+        let hbc = HfBlockContext::read(&mut br).unwrap();
+        assert_eq!(hbc.qf_thresholds, vec![4]);
+        assert_eq!(hbc.block_ctx_map.len(), 78);
+        assert_eq!(hbc.nb_block_ctx, 1);
+    }
+
+    #[test]
+    fn hf_block_context_custom_simple_clustering_bit_exact() {
+        // Round-trip: build a 1+12+0+...+39*nbits bit-exact custom
+        // HfBlockContext bitstream, decode it, then verify exactly the
+        // expected number of bits were consumed and `block_ctx_map`
+        // matches the encoder input.
+        //
+        // Format:
+        // - u(1) = 0 (custom)
+        // - nb_lf_thr[0..3] = 0 (4 bits each, 12 bits total)
+        // - nb_qf_thr = 0 (4 bits)
+        // - is_simple = 1 (1 bit)
+        // - nbits = 2 (2 bits)
+        // - 39 × u(2): the cluster indices.
+        // Total: 1 + 12 + 4 + 1 + 2 + 39*2 = 98 bits.
+        let map: [u32; 39] = [
+            0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
+            2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
+        ];
+        let mut bits: Vec<(u32, u32)> = vec![
+            (0, 1), // u(1) = 0 → custom
+            (0, 4),
+            (0, 4),
+            (0, 4),
+            (0, 4), // nb_qf_thr = 0
+            (1, 1), // is_simple
+            (2, 2), // nbits = 2
+        ];
+        for &v in &map {
+            bits.push((v, 2));
+        }
+        let bytes = pack_lsb(&bits);
+        let mut br = BitReader::new(&bytes);
+        let bits_before = br.bits_read();
+        let hbc = HfBlockContext::read(&mut br).unwrap();
+        let bits_after = br.bits_read();
+        let consumed = bits_after - bits_before;
+        assert_eq!(consumed, 1 + 12 + 4 + 1 + 2 + 39 * 2);
+        for (i, &v) in map.iter().enumerate() {
+            assert_eq!(hbc.block_ctx_map[i] as u32, v, "cell {i}");
+        }
+        assert_eq!(hbc.nb_block_ctx, 3);
+    }
+
+    #[test]
+    fn hf_block_context_custom_oversized_bsize_rejected() {
+        // nb_lf_thr[0]=15, nb_lf_thr[1]=15, nb_lf_thr[2]=15, nb_qf_thr=15
+        // → bsize = 39 * 16 * 16 * 16 * 16 = 39 * 65536 ≫ 39*64.
+        // Must error before clustering is attempted.
+        let bytes = pack_lsb(&[
+            (0, 1),
+            (15, 4),
+            (15, 4),
+            // Need 15 thresholds for channel 0 — give a bunch of zeros.
+            (0, 2),
+            (0, 4),
+            (0, 2),
+            (0, 4),
+            (0, 2),
+            (0, 4),
+            (0, 2),
+            (0, 4),
+            (0, 2),
+            (0, 4),
+            (0, 2),
+            (0, 4),
+            (0, 2),
+            (0, 4),
+            (0, 2),
+            (0, 4),
+            (0, 2),
+            (0, 4),
+            (0, 2),
+            (0, 4),
+            (0, 2),
+            (0, 4),
+            (0, 2),
+            (0, 4),
+            (0, 2),
+            (0, 4),
+            (0, 2),
+            (0, 4),
+            (15, 4), // nb_lf_thr[1]=15
+        ]);
+        // Provide enough trailing zeros to satisfy further reads
+        // (channel 1 needs 15 thresholds + channel 2 nb_lf_thr + thresholds
+        // + nb_qf_thr + qf thresholds before bsize check, but with all
+        // zeros early the bsize-product test rejects regardless of how
+        // far the parser actually got — what matters is no panic).
+        let mut padded = bytes.clone();
+        padded.extend_from_slice(&[0u8; 256]);
+        let mut br = BitReader::new(&padded);
         let r = HfBlockContext::read(&mut br);
-        assert!(matches!(r, Err(Error::Unsupported(_))));
+        assert!(matches!(r, Err(Error::InvalidData(_))));
     }
 
     #[test]

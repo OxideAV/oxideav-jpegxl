@@ -9,6 +9,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Round 14 (2024-spec)** — HfBlockContext non-default-table branch
+  (§I.2.2 custom encoding) + HfGlobal §I.2.4 dequant-matrix
+  `encoding_mode` parse (Listing C.10 / Table I.5).
+
+  Two pre-flight pieces for round-15+ HF coefficient decode:
+
+  1. **HfBlockContext non-default branch** (`lf_global` module) —
+     `u(1) == 0` now drives:
+     - per-channel `nb_lf_thr[i] = u(4)` followed by
+       `nb_lf_thr[i]` thresholds via
+       `t = UnpackSigned(ReadThreshold())` where
+       `ReadThreshold = U32(u(4), 16+u(8), 272+u(16), 65808+u(32))`,
+     - `nb_qf_thr = u(4)` followed by `qf_thresholds[i] = 1 + U32(u(2), 4+u(3), 12+u(5), 44+u(8))`,
+     - `bsize = 39 * (nb_qf_thr+1) * Π (nb_lf_thr[i]+1)` with the
+       spec invariant `bsize ≤ 39 * 64`,
+     - `block_ctx_map = ReadBlockCtxMap()` — re-uses the existing
+       C.2.2 clustering decoder with `num_dist = bsize`; `bsize == 1`
+       short-circuits to `[0]` (no bits read) per C.2.2's `num_dist == 1`
+       skip rule. `num_clusters ≤ 16` invariant enforced.
+     The `vardct_256x256_d1.jxl` fixture progresses past LfGlobal as
+     a result.
+
+  2. **HfGlobal C.6.2 dequant-matrix non-default-encoding parse**
+     (`hf_global` module) — `u(1) == 0` now drives 17 sets of:
+     `encoding_mode = u(3)` validated against Table I.5's per-slot
+     valid-index list, then per-mode parameters per Listing C.10:
+     - **Library (0)** — no params.
+     - **Hornuss (1)** — 3×3 F16 matrix, all elements ×64.
+     - **DCT2 (2)** — 3×6 F16 matrix, all elements ×64.
+     - **DCT4 (3)** — 3×2 F16 matrix (col 0 ×64) + `ReadDctParams()`.
+     - **DCT4x8 (4)** — 3×1 F16 matrix + `ReadDctParams()`.
+     - **AFV (5)** — 3×9 F16 matrix (cols 0..5 ×64) + 2× `ReadDctParams()`
+       (the second is the `dct4x4_params`).
+     - **DCT (6)** — `ReadDctParams()` only.
+     - **RAW (7)** — defers to round 15+ (modular sub-bitstream of
+       quant-matrix shape requires the IDCT consumer to define the
+       Table H.4 stream_index).
+     `ReadDctParams()` reads `num_params = u(4) + 1`, then a 3×num_params
+     F16 matrix with col-0 ×64.
+
+  Acceptance: 5 new unit tests for HfBlockContext + 6 new for HfGlobal,
+  plus `tests/round14_hf_global_dequant.rs` with 3 integration tests
+  asserting the d1 fixture is past the HfBlockContext blocker. Round 11
+  + 12 + 13 sentinels remain green; 5 small lossless fixtures still
+  decode.
+
 - **Round 13 (2024-spec)** — DctSelect / HfMul derivation from
   BlockInfo (FDIS C.5.4 prose + Table C.16) + HfGlobal default-fast-
   path (C.6) + VarDCT pipeline wiring of round-12's F.1 LF dequant +
