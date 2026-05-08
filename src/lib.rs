@@ -258,6 +258,44 @@
 //! padded tail OR per-group WP bookkeeping). All five small
 //! lossless fixtures still pixel-correct vs round 4's
 //! `expected.png`.
+//!
+//! ## Round-10 (2024-spec) additions
+//!
+//! Two themes:
+//!
+//! 1. **C.1 + C.3.3 `lz_dist_ctx` spec-conformance fix** —
+//!    [`modular_fdis::decode_uint_in`] and `decode_uint_in_with_dist`
+//!    previously passed the per-symbol leaf context for both the
+//!    literal token AND the LZ77 distance token, which contradicts
+//!    the spec's "the LZ77 distance token is read using
+//!    `D[clusters[lz_dist_ctx]]`" with `lz_dist_ctx = num_dist`
+//!    (the dedicated extra context the codestream reserves whenever
+//!    `lz77.enabled`). When LZ77 fires, that bug would distort
+//!    every copy. Fixed: derive `lz_dist_ctx = cluster_map.len() -
+//!    1` from the post-prelude state of the `EntropyStream` and
+//!    thread it to `HybridUintState::decode`'s `ctx_lz` argument.
+//!    No-op for fixtures whose symbol stream has `lz77.enabled =
+//!    false` (synth_320 included).
+//!
+//! 2. **synth_320 edge-group drift bisect** — instrumented per-
+//!    decode tracing pinpoints the first mismatch at PG[0][0]
+//!    decode #3087 (frame coords y=24, x=14). State 0x9CA780
+//!    alias-maps to symbol 30 (cluster 0's low-prob `D[30] = 1`
+//!    entry), forcing an ANS refill plus extra bits that
+//!    over-consume 21 bits beyond the 9-byte slot. Bisect ruled
+//!    out: per-PassGroup transform layout (PG[0][0] carries no
+//!    transforms; only edge groups do); LZ77 path (off in the
+//!    symbol stream); per-channel WP state reset (PG[0][0] is the
+//!    first group); cluster_map / `dist_multiplier` derivation
+//!    (matches H.3). Round-11+ work will need a finer state-by-
+//!    state diff against djxl `--debug` (deferred to an Auditor
+//!    round) since the implementer wall bars djxl source / the
+//!    libjxl-trace doc.
+//!
+//! **Round-10 status** — synth_320 still decodes ~21k of 102400
+//! pixels matching the gradient (first 24 rows of PG[0][0] and
+//! PG[0][1] are pixel-correct; drift begins at y=24, x=14). All
+//! five small lossless fixtures still pixel-correct.
 
 pub mod abrac;
 pub mod ans;

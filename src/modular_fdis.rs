@@ -759,6 +759,16 @@ fn decode_uint_in(
     br: &mut BitReader<'_>,
     ctx: u32,
 ) -> Result<u32> {
+    // Round-10: same `lz_dist_ctx` derivation as
+    // `decode_uint_in_with_dist`. Even though this no-dist-multiplier
+    // path takes the literal-distance branch (offset+1 not Special),
+    // the distance TOKEN is still decoded against `lz_dist_ctx` per
+    // C.3.3, which determines its hybrid uint config.
+    let lz_dist_ctx = if entropy.lz77.enabled {
+        entropy.cluster_map.len().saturating_sub(1) as u32
+    } else {
+        ctx
+    };
     // Split the borrows: `cluster_map` + `configs` are immutably
     // captured by the `configs` closure; `entropies` + `ans_state` +
     // `cluster_map` are mutably captured by `read_token`. Rust's
@@ -800,7 +810,7 @@ fn decode_uint_in(
             ClusterEntropy::Prefix { code } => code.decode(br_inner),
         }
     };
-    hybrid.decode(br, ctx, ctx, 0, read_token, cfg_for)
+    hybrid.decode(br, ctx, lz_dist_ctx, 0, read_token, cfg_for)
 }
 
 /// Description of a single channel to be decoded.
@@ -1568,6 +1578,21 @@ pub fn decode_uint_in_with_dist_pub(
 /// Variant of `decode_uint_in` that propagates a non-zero
 /// `dist_multiplier` to the LZ77 special-distance branch (H.3 prescribes
 /// this for the channel-decode hybrid uint stream).
+///
+/// **Round-10 fix (2024-spec C.1 + C.3.3):** when `lz77.enabled`, the
+/// codestream sets `lz_dist_ctx = num_dist++` BEFORE clustering, then
+/// the LZ77 distance token in C.3.3's hybrid integer decoder is read
+/// "using D[clusters[lz_dist_ctx]]" — i.e. the dedicated last context,
+/// NOT the regular per-symbol leaf context. Round 9 incorrectly passed
+/// `ctx` for both, which would distort every LZ77 copy as soon as an
+/// encoder emits one. `lz_dist_ctx` is `cluster_map.len() - 1` whenever
+/// LZ77 is enabled (the entropy stream prelude reserves one extra
+/// context for it; see `EntropyStream::read`'s `effective_num_dist =
+/// num_dist + 1` branch). Without LZ77, `lz_dist_ctx` is unused so we
+/// keep the previous value. Note: the synth_320 fixture has
+/// `lz77.enabled = false` in its symbol stream, so this fix does not
+/// affect synth_320 directly — its remaining drift at y=24, x=14 is a
+/// separate state-evolution issue tracked in round-11.
 fn decode_uint_in_with_dist(
     hybrid: &mut HybridUintState,
     entropy: &mut EntropyStream,
@@ -1575,6 +1600,11 @@ fn decode_uint_in_with_dist(
     ctx: u32,
     dist_multiplier: u32,
 ) -> Result<u32> {
+    let lz_dist_ctx = if entropy.lz77.enabled {
+        entropy.cluster_map.len().saturating_sub(1) as u32
+    } else {
+        ctx
+    };
     let EntropyStream {
         cluster_map,
         configs,
@@ -1610,7 +1640,7 @@ fn decode_uint_in_with_dist(
             ClusterEntropy::Prefix { code } => code.decode(br_inner),
         }
     };
-    hybrid.decode(br, ctx, ctx, dist_multiplier, read_token, cfg_for)
+    hybrid.decode(br, ctx, lz_dist_ctx, dist_multiplier, read_token, cfg_for)
 }
 
 // ----------------------------------------------------------------------

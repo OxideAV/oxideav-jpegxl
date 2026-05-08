@@ -9,6 +9,64 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Round 10 (2024-spec)** — synth_320 edge-group drift bisection
+  + LZ77 distance-context spec-conformance fix.
+
+  **First-mismatch bisect** — instrumented per-decode tracing of the
+  `synth_320` PG[0][0] sub-bitstream pinpoints the divergence at
+  decode #3087 (frame coords y=24, x=14). State 0x9CA780 alias-maps
+  to symbol 30 (a low-prob entry: `D[30] = 1` of the cluster-0 ANS
+  distribution). The decode forces a state refill plus extra bits,
+  consuming 21 more bits than were available in the 9-byte
+  `PassGroup[0][0]` slot — falling into §F.3 zero-padded territory
+  and producing a garbage token (192) instead of the encoded
+  literal. djxl's bit-correct decode of the same fixture stays
+  within the 9-byte slot, so our state evolution must diverge from
+  djxl's somewhere between decodes #1 and #3087. Per-group decode
+  log + per-group transform layout + ANS state init are all
+  verified spec-correct. Diagnostic data captured: cluster-0 dist
+  has nz=`[(0, 4092), (2, 1), (27, 1), (30, 1), (32, 1)]`,
+  cluster-1 dist has nz=`[(2, 4090), (14, 2), (17, 4)]`,
+  `log_alphabet_size=6` (table_size 64), tree node[0] decides on
+  `property[15] > -3`. None of the obvious round-10 root-cause
+  candidates match the symptom: LZ77 is not enabled in the symbol
+  stream (so `lz_dist_ctx` cannot be the culprit; `dist_multiplier`
+  for PG[0][0] is `128` per H.3 and unused without LZ77); WP per-
+  channel state is reset per group (since PG[0][0] is the first
+  group, this is moot for the immediate symptom); per-group
+  transform layout is empty for PG[0][0] (only edge groups carry
+  transforms); channel index threading is identical between
+  GlobalModular and per-PassGroup paths. Round-11 will need a
+  finer-grained bisect — most likely a state-by-state diff against
+  djxl's `--debug` mode (gated on building djxl from source, which
+  is forbidden in the implementer round; deferring to an Auditor
+  round) or an alternative reference like the JPEG XL conformance
+  test suite's lossless-grey traces.
+
+  **C.1 + C.3.3 `lz_dist_ctx` correction** — per the spec, when
+  `lz77.enabled` the codestream sets `lz_dist_ctx = num_dist++`
+  (one extra context reserved AT THE END of the cluster mapping)
+  and the LZ77 distance token in `DecodeHybridVarLenUint`'s LZ77
+  branch is read against `D[clusters[lz_dist_ctx]]` — i.e. the
+  dedicated last context, not the same per-symbol leaf context as
+  the literal token. Round 9's `decode_uint_in` and
+  `decode_uint_in_with_dist` passed the leaf context for both the
+  literal token and the LZ77 distance token, which is a
+  spec-conformance bug that would distort every LZ77 copy
+  whenever an encoder emits one. Fixed by deriving
+  `lz_dist_ctx = cluster_map.len() - 1` when `lz77.enabled` and
+  threading it to `HybridUintState::decode`'s `ctx_lz` parameter.
+  No fixture change for synth_320 (its symbol stream uses
+  `lz77.enabled=false`); the fix is forward-looking for fixtures
+  that DO trigger LZ77.
+
+  **Status** — synth_320 still decodes to ~21k of 102400 pixels
+  matching the expected `(y + x) & 0xFF` gradient (the first 24
+  rows of PG[0][0] and PG[0][1] are pixel-correct, then drift
+  starts at exactly y=24, x=14 where state 0x9CA780 hits low-
+  prob symbol 30). All five small lossless fixtures still pixel-
+  correct (255 tests pass).
+
 - **Round 9 (2024-spec)** — synth_320 0-byte PassGroup blocker
   resolved via two underlying fixes plus per-group transforms support.
 
