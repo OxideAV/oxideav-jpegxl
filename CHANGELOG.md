@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.9](https://github.com/OxideAV/oxideav-jpegxl/compare/v0.0.8...v0.0.9) - 2026-05-08
+
+### Other
+
+- round-9 against ISO/IEC 18181-1:2024 — synth_320 0-byte PassGroup blocker resolved via three concurrent fixes
+- round-8 against ISO/IEC 18181-1:2024 — C.2.5 SPECGAP partial resolution + VarDCT scaffold
+- round-7 against ISO/IEC 18181-1:2024 — four-piece refactor wiring multi-group decode infrastructure (Annex G.1.3 + G.4.2)
+- round-6 against ISO/IEC 18181-1:2024 — Annex E.4 ICC profile decode + LfGroup/PassGroup type scaffolding
+- round-5 against ISO/IEC 18181-1:2024 — RFC 7932 §3.5 Kraft early-stop fix; grey_8x8_lossless pixel-correct
+- round-4 against ISO/IEC 18181-1:2024 — three independent decoder bugs fixed; gradient + palette + gray pixel-correct vs expected.png
+- round-3 against ISO/IEC 18181-1:2024 — bit-alignment + alias-mapping fixes
+- copy docs fixtures into tests/fixtures/ for CI self-containment
+- round-2 against ISO/IEC 18181-1:2024 — inverse transforms + WP predictor
+- round-1 against ISO/IEC 18181-1:2024 — Modular pixel decode end-to-end
+- clippy 1.95: unusual_byte_groupings + vec_init_then_push fixes
+
 ### Added
 
 - **Round 9 (2024-spec)** — synth_320 0-byte PassGroup blocker
