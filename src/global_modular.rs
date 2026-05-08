@@ -112,36 +112,54 @@ impl GlobalModular {
         //    - TransformInfo[nb_transforms],
         //    - if !use_global_tree: MA tree + clustered distributions,
         //    - ANS state + per-channel decode.
-        let inner_use_global_tree = br.read_bool()?;
-        let wp_header = WpHeader::read(br)?;
-
-        let nb_transforms = br.read_u32([
-            U32Dist::Val(0),
-            U32Dist::Val(1),
-            U32Dist::BitsOffset(4, 2),
-            U32Dist::BitsOffset(8, 18),
-        ])?;
-        // Bound: a malicious bitstream could supply an absurd value here.
-        // The U32 distribution caps `nb_transforms` at 18 + 2^8 = 274,
-        // which is well above any realistic image. We accept the cap
-        // implied by the U32 distribution.
-        const MAX_TRANSFORMS: u32 = 274;
-        if nb_transforms > MAX_TRANSFORMS {
-            return Err(Error::InvalidData(format!(
-                "JXL GlobalModular: nb_transforms {nb_transforms} exceeds {MAX_TRANSFORMS}"
-            )));
-        }
-        let mut transforms: Vec<TransformInfo> = Vec::with_capacity(nb_transforms as usize);
-        for _ in 0..nb_transforms {
-            transforms.push(TransformInfo::read(br)?);
-        }
+        // Round 15: per FDIS §C.9.1 last sentence — "In the trivial case
+        // where N is zero, the decoder takes no action." We must
+        // determine the channel count BEFORE reading the inner
+        // ModularHeader so we can skip the header entirely on the
+        // VarDCT-zero-extras case (where derive_channel_descs yields []).
+        // Empirically: bit-position trace of the d1 fixture confirms the
+        // libjxl reference decoder ends LfGlobal at the bit where our
+        // code starts reading `inner_use_global_tree` — so the entire
+        // ModularHeader (use_global_tree + WPHeader + nb_transforms +
+        // TransformInfo[]) is gated by N>0.
+        let prelim_descs = derive_channel_descs(fh, metadata)?;
+        let (inner_use_global_tree, wp_header, nb_transforms, transforms) =
+            if prelim_descs.is_empty() {
+                (
+                    false,
+                    WpHeader::default(),
+                    0u32,
+                    Vec::<TransformInfo>::new(),
+                )
+            } else {
+                let iugt = br.read_bool()?;
+                let wph = WpHeader::read(br)?;
+                let nbx = br.read_u32([
+                    U32Dist::Val(0),
+                    U32Dist::Val(1),
+                    U32Dist::BitsOffset(4, 2),
+                    U32Dist::BitsOffset(8, 18),
+                ])?;
+                const MAX_TRANSFORMS: u32 = 274;
+                if nbx > MAX_TRANSFORMS {
+                    return Err(Error::InvalidData(format!(
+                        "JXL GlobalModular: nb_transforms {nbx} exceeds {MAX_TRANSFORMS}"
+                    )));
+                }
+                let mut xforms: Vec<TransformInfo> = Vec::with_capacity(nbx as usize);
+                for _ in 0..nbx {
+                    xforms.push(TransformInfo::read(br)?);
+                }
+                (iugt, wph, nbx, xforms)
+            };
 
         // 4. Channel layout. For VarDCT mode with no extra channels the
         //    GlobalModular section carries zero modular channels — the
         //    colour channels arrive via LfCoefficients (G.2.2) +
         //    PassGroup HF (G.4.3) instead. Round 11: accept the empty
-        //    case rather than reject early.
-        let descs = derive_channel_descs(fh, metadata)?;
+        //    case rather than reject early. Round 15: when prelim_descs
+        //    is empty, the inner ModularHeader is also skipped (above).
+        let descs = prelim_descs;
         if descs.len() > MAX_CHANNELS {
             return Err(Error::InvalidData(format!(
                 "JXL GlobalModular: {} channels exceeds cap {}",

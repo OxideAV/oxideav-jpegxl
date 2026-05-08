@@ -890,31 +890,68 @@ fn decode_vardct_round13(
     let lf_group_slot = |lf_group_idx: u64| -> usize { 1 + lf_group_idx as usize };
     let hf_global_slot = 1 + num_lf_groups as usize;
 
-    // Pull LfGlobal bytes off the TOC and decode.
-    let lf_global_bytes = section_byte_range(lf_global_slot)?;
-    let mut lf_br = BitReader::new_section(lf_global_bytes);
-    let lf_global = LfGlobal::read(&mut lf_br, fh, metadata)?;
+    // Round 15: F.3.1 says when `num_groups == 1 && num_passes == 1`
+    // the TOC has a SINGLE entry containing all section bytes
+    // concatenated WITHOUT byte alignment between sections. Each section
+    // continues from the previous section's bit cursor.  When the TOC
+    // has multiple entries, each section is sliced into its own byte
+    // range and read against a fresh BitReader.
+    let single_toc = toc.entries.len() == 1
+        && num_groups == 1
+        && fh.passes.num_passes == 1
+        && num_lf_groups == 1;
 
-    // VarDCT requires Quantizer + HfBlockContext + LfChannelCorrelation
-    // to all be present (LfGlobal::read populates all three when
-    // encoding == kVarDCT). Defensive guard.
+    let (lf_global, lf_group, _hf_global) = if single_toc {
+        // Single-TOC-entry path: chain section reads on the same bit
+        // reader, no byte-aligned slicing between sections.
+        let lf_global_bytes = section_byte_range(lf_global_slot)?;
+        let mut shared_br = BitReader::new_section(lf_global_bytes);
+        let lf_global = LfGlobal::read(&mut shared_br, fh, metadata)?;
+        let _quantizer = lf_global
+            .quantizer
+            .ok_or_else(|| Error::InvalidData("JXL VarDCT round 13: Quantizer missing".into()))?;
+        let _ = lf_global.hf_block_context.as_ref().ok_or_else(|| {
+            Error::InvalidData("JXL VarDCT round 13: HfBlockContext missing".into())
+        })?;
+        let _ = lf_global.lf_channel_correlation.ok_or_else(|| {
+            Error::InvalidData("JXL VarDCT round 13: LfChannelCorrelation missing".into())
+        })?;
+
+        let lf_group = crate::lf_group::LfGroup::read(&mut shared_br, fh, &lf_global, 0)?;
+
+        let hf_global = crate::hf_global::HfGlobal::read(&mut shared_br, num_groups)?;
+        (lf_global, lf_group, hf_global)
+    } else {
+        // Multi-TOC-entry path: slice each section into its own byte
+        // range and read against a fresh BitReader.
+        let lf_global_bytes = section_byte_range(lf_global_slot)?;
+        let mut lf_br = BitReader::new_section(lf_global_bytes);
+        let lf_global = LfGlobal::read(&mut lf_br, fh, metadata)?;
+        let _quantizer = lf_global
+            .quantizer
+            .ok_or_else(|| Error::InvalidData("JXL VarDCT round 13: Quantizer missing".into()))?;
+        let _ = lf_global.hf_block_context.as_ref().ok_or_else(|| {
+            Error::InvalidData("JXL VarDCT round 13: HfBlockContext missing".into())
+        })?;
+        let _ = lf_global.lf_channel_correlation.ok_or_else(|| {
+            Error::InvalidData("JXL VarDCT round 13: LfChannelCorrelation missing".into())
+        })?;
+
+        let lf_group_bytes = section_byte_range(lf_group_slot(0))?;
+        let mut lg_br = BitReader::new_section(lf_group_bytes);
+        let lf_group = crate::lf_group::LfGroup::read(&mut lg_br, fh, &lf_global, 0)?;
+
+        let hf_global_bytes = section_byte_range(hf_global_slot)?;
+        let mut hg_br = BitReader::new_section(hf_global_bytes);
+        let hf_global = crate::hf_global::HfGlobal::read(&mut hg_br, num_groups)?;
+        (lf_global, lf_group, hf_global)
+    };
+
+    // Re-extract Quantizer for the dequant path below (it was already
+    // checked for presence above in both branches).
     let quantizer = lf_global
         .quantizer
         .ok_or_else(|| Error::InvalidData("JXL VarDCT round 13: Quantizer missing".into()))?;
-    let _ = lf_global
-        .hf_block_context
-        .as_ref()
-        .ok_or_else(|| Error::InvalidData("JXL VarDCT round 13: HfBlockContext missing".into()))?;
-    let _ = lf_global.lf_channel_correlation.ok_or_else(|| {
-        Error::InvalidData("JXL VarDCT round 13: LfChannelCorrelation missing".into())
-    })?;
-
-    // LfGroup (slot 1) — contains LfCoefficients + ModularLfGroup +
-    // HfMetadata when encoding == kVarDCT. Round 13 only handles
-    // num_lf_groups == 1.
-    let lf_group_bytes = section_byte_range(lf_group_slot(0))?;
-    let mut lg_br = BitReader::new_section(lf_group_bytes);
-    let lf_group = crate::lf_group::LfGroup::read(&mut lg_br, fh, &lf_global, 0)?;
 
     let lf_coeff = lf_group.lf_coeff.ok_or_else(|| {
         Error::InvalidData("JXL VarDCT round 13: LfCoefficients missing on VarDCT LfGroup".into())
@@ -930,12 +967,8 @@ fn decode_vardct_round13(
     let lf_h = lf_group.mlf_group.lf_group_height;
     let _dct_grid = crate::dct_select::derive_dct_select(&hf_meta, lf_w, lf_h)?;
 
-    // HfGlobal (slot 1+num_lf_groups) — round 13 supports only the
-    // u(1)=1 default-encoding fast path for dequant matrices + the
-    // C.6.4 num_hf_presets field.
-    let hf_global_bytes = section_byte_range(hf_global_slot)?;
-    let mut hg_br = BitReader::new_section(hf_global_bytes);
-    let _hf_global = crate::hf_global::HfGlobal::read(&mut hg_br, num_groups)?;
+    // HfGlobal already decoded above (in either single-TOC or multi-TOC
+    // branch); `_hf_global` is the parsed bundle for round 14+ wiring.
 
     // F.1 LF dequantisation (Listing F.1) over the per-LfGroup
     // LfCoefficients. Unwrap the lf_quant Vec into a fixed-size [3]

@@ -9,6 +9,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Round 15 (2024-spec)** — GlobalModular zero-channel ModularHeader
+  gating (FDIS §C.9.1 last sentence) + single-TOC-entry section chaining
+  for the VarDCT pipeline. Unblocks the d1 fixture past the LfGlobal
+  boundary.
+
+  Round-14 left the d1 (`vardct_256x256_d1.jxl`) fixture stuck on
+  `JXL TransformId: invalid value 3`. Round-15 root-causes + fixes two
+  consecutive bugs:
+
+  1. **GlobalModular ModularHeader gating** (`global_modular` module) —
+     `GlobalModular::read` was unconditionally reading the inner
+     ModularHeader (`use_global_tree`, `WPHeader`, `nb_transforms`,
+     `TransformInfo[]`) even when the channel count was zero.
+     Bit-position trace of d1 confirmed the libjxl reference decoder
+     ends LfGlobal at the bit where our code starts reading
+     `inner_use_global_tree` — i.e. the entire ModularHeader is gated
+     by `N > 0` per FDIS §C.9.1 ("In the trivial case where N is zero,
+     the decoder takes no action."). Fix: skip the inner ModularHeader
+     when `derive_channel_descs` returns an empty list (the typical
+     VarDCT-without-extras case).
+
+  2. **Single-TOC-entry section chaining** (`decode_vardct_round13`) —
+     when `num_groups == 1 && num_passes == 1`, F.3.1 says the TOC has
+     a single entry containing all sections concatenated bit-aligned
+     without byte alignment between them. `decode_vardct_round13` was
+     slicing each TOC slot into its own byte range, which only works
+     for multi-entry TOCs. Fix: when `toc.entries.len() == 1`, chain
+     `LfGlobal::read` → `LfGroup::read` → `HfGlobal::read` on a
+     shared `BitReader`.
+
+  Acceptance: `vardct_256x256_d1.jxl` now reaches the HfMetadata
+  transforms-inside-HF-metadata round-13+ deferral message instead of
+  failing in LfGlobal. Round-15 sentinel test
+  (`round15_d1_past_global_modular.rs`) asserts the d1 progression and
+  the five small lossless fixtures stay regression-free.
+
 - **Round 14 (2024-spec)** — HfBlockContext non-default-table branch
   (§I.2.2 custom encoding) + HfGlobal §I.2.4 dequant-matrix
   `encoding_mode` parse (Listing C.10 / Table I.5).
