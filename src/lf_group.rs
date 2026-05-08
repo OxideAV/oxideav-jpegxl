@@ -21,9 +21,28 @@
 //! [`LfGroup::read`] composes the LfCoefficients sub-bitstream with the
 //! ModularLfGroup sub-bitstream (G.2.3) — for now ModularLfGroup is
 //! decoded only as far as the empty-channel-list case (no GlobalModular
-//! channel had `hshift, vshift` both ≥ 3). HfMetadata (G.2.4) is parsed
-//! as a single placeholder field (`nb_blocks`); end-to-end HF metadata
-//! decode lands round 12+.
+//! channel had `hshift, vshift` both ≥ 3).
+//!
+//! ## Round 12 — HfMetadata (FDIS C.5.4)
+//!
+//! Round 12 lands [`HfMetadata::read`] — the 4-channel modular
+//! sub-bitstream that follows LfCoefficients in Table G.3 for VarDCT
+//! frames. Spec mapping:
+//!
+//! * `nb_blocks - 1 = u(ceil(log2(ceil(width/8) * ceil(height/8))))` —
+//!   the stored field is offset by one so the smallest LfGroup uses 0
+//!   bits.
+//! * 4 channels, in order:
+//!     - `XFromY` (HF colour correlation X), `ceil(h/64) × ceil(w/64)`.
+//!     - `BFromY` (HF colour correlation B), same dims.
+//!     - `BlockInfo`, `nb_blocks` cols × 2 rows; row-0 = transform type
+//!       per Table C.16, row-1 = `quantization_multiplier - 1`.
+//!     - `Sharpness`, `ceil(h/8) × ceil(w/8)`.
+//! * `stream_index = 1 + 2*num_lf_groups + lf_group_index` per Table H.4.
+//!
+//! Derivation of DctSelect / HfMul fields from BlockInfo (FDIS C.5.4
+//! prose) defers to round 13+ since the consumer (HF decode + IDCT) is
+//! also round-13+ work.
 //!
 //! ## Round 6 / 7 history (still relevant)
 //!
@@ -253,12 +272,206 @@ pub struct ModularLfGroup {
     pub lf_group_height: u32,
 }
 
-/// `HfMetadata` (G.2.4) — `kVarDCT` only. Round 7+ work.
+/// `HfMetadata` (G.2.4 / FDIS C.5.4) — `kVarDCT` only.
+///
+/// Round 12 lands the 4-channel modular sub-bitstream decode + nb_blocks
+/// header field per spec, but does *not* yet derive the DctSelect /
+/// HfMul / Sharpness fields from BlockInfo (that step requires the
+/// transform-type table from C.16 and the round-13 IDCT/CfL pipeline to
+/// consume it). The decoded raw channels are stored as-is so a future
+/// round can derive DctSelect by walking BlockInfo column-by-column.
 #[derive(Debug, Clone)]
 pub struct HfMetadata {
-    /// `nb_blocks - 1` is read as a `u(ceil(log2(ceil(width / 8) *
-    /// ceil(height / 8))))` per spec.
+    /// Number of varblocks in the LfGroup. The spec reads
+    /// `nb_blocks - 1` as `u(ceil(log2(ceil(width / 8) * ceil(height / 8))))`
+    /// (i.e. the stored field is offset by one so the smallest LfGroup
+    /// can use 0 bits). `nb_blocks ≥ 1`.
     pub nb_blocks: u32,
+    /// XFromY (HF colour correlation factor for the X channel),
+    /// `ceil(height/64) × ceil(width/64)` row-major.
+    pub x_from_y: Vec<i32>,
+    /// BFromY (HF colour correlation factor for the B channel),
+    /// `ceil(height/64) × ceil(width/64)` row-major.
+    pub b_from_y: Vec<i32>,
+    /// BlockInfo: 2 rows × `nb_blocks` columns; first row is the
+    /// per-varblock transform-type index (Table C.16), second row is
+    /// `quantization_multiplier - 1` (so HfMul = 1 + value).
+    pub block_info: Vec<i32>,
+    /// Sharpness: `ceil(height/8) × ceil(width/8)` row-major. Restoration
+    /// filter parameter.
+    pub sharpness: Vec<i32>,
+    /// Per-channel widths for the four channels in the order
+    /// `[XFromY, BFromY, BlockInfo, Sharpness]`.
+    pub channel_widths: [u32; 4],
+    /// Per-channel heights for the four channels in the order
+    /// `[XFromY, BFromY, BlockInfo, Sharpness]`.
+    pub channel_heights: [u32; 4],
+}
+
+impl HfMetadata {
+    /// Compute the four-channel pixel dimensions for the HfMetadata
+    /// modular sub-bitstream per FDIS C.5.4. Returns `[(w, h); 4]` for
+    /// channels `[XFromY, BFromY, BlockInfo, Sharpness]` in that order.
+    pub fn channel_dims(
+        lf_group_width: u32,
+        lf_group_height: u32,
+        nb_blocks: u32,
+    ) -> [(u32, u32); 4] {
+        let cfl_w = lf_group_width.div_ceil(64).max(1);
+        let cfl_h = lf_group_height.div_ceil(64).max(1);
+        let s_w = lf_group_width.div_ceil(8).max(1);
+        let s_h = lf_group_height.div_ceil(8).max(1);
+        [
+            (cfl_w, cfl_h),        // XFromY
+            (cfl_w, cfl_h),        // BFromY
+            (nb_blocks.max(1), 2), // BlockInfo: nb_blocks cols × 2 rows
+            (s_w, s_h),            // Sharpness
+        ]
+    }
+
+    /// Decode the HfMetadata bundle (FDIS C.5.4).
+    ///
+    /// `lf_w / lf_h` are the LF group's pixel dimensions; `lf_global`
+    /// supplies the optional shared MA tree; `lf_group_index` and
+    /// `num_lf_groups` together give the stream_index per Table H.4
+    /// (`1 + 2*num_lf_groups + lf_group_idx`).
+    pub fn read(
+        br: &mut BitReader<'_>,
+        lf_global: &LfGlobal,
+        lf_w: u32,
+        lf_h: u32,
+        lf_group_index: LfGroupIndex,
+        num_lf_groups: u64,
+    ) -> Result<Self> {
+        // C.5.4 paragraph 1: nb_blocks = u(ceil(log2(num_blocks_max))) + 1
+        // where num_blocks_max = ceil(width/8) * ceil(height/8). The
+        // stored value is offset by one so that for a single-block
+        // LfGroup the bit count is 0 (the only legal value being 0
+        // → nb_blocks = 1).
+        let num_blocks_max = (lf_w.div_ceil(8) as u64).saturating_mul(lf_h.div_ceil(8) as u64);
+        if num_blocks_max == 0 {
+            return Err(Error::InvalidData(format!(
+                "JXL HfMetadata: degenerate LfGroup dims {lf_w}x{lf_h}"
+            )));
+        }
+        // ceil(log2(N)). For N == 1, this is 0 (1 << 0 == 1 ≥ 1).
+        let nbits = ceil_log2_u64(num_blocks_max);
+        let nb_blocks_minus_1 = if nbits == 0 { 0 } else { br.read_bits(nbits)? };
+        if nb_blocks_minus_1 as u64 + 1 > num_blocks_max {
+            return Err(Error::InvalidData(format!(
+                "JXL HfMetadata: nb_blocks-1 = {nb_blocks_minus_1} out of range \
+                 (num_blocks_max = {num_blocks_max})"
+            )));
+        }
+        let nb_blocks = nb_blocks_minus_1 + 1;
+
+        // Build the 4-channel ChannelDesc list per Table C.5.4.
+        let dims = Self::channel_dims(lf_w, lf_h, nb_blocks);
+        let descs: Vec<ChannelDesc> = dims
+            .iter()
+            .map(|&(w, h)| ChannelDesc {
+                width: w,
+                height: h,
+                hshift: 0,
+                vshift: 0,
+            })
+            .collect();
+
+        // Inner ModularHeader (Table H.1) per Annex H.2.
+        let inner_use_global_tree = br.read_bool()?;
+        let wp_header = WpHeader::read(br)?;
+        let nb_transforms = br.read_u32([
+            U32Dist::Val(0),
+            U32Dist::Val(1),
+            U32Dist::BitsOffset(4, 2),
+            U32Dist::BitsOffset(8, 18),
+        ])?;
+        const MAX_TRANSFORMS: u32 = 274;
+        if nb_transforms > MAX_TRANSFORMS {
+            return Err(Error::InvalidData(format!(
+                "JXL HfMetadata: nb_transforms {nb_transforms} exceeds {MAX_TRANSFORMS}"
+            )));
+        }
+        let mut transforms: Vec<TransformInfo> = Vec::with_capacity(nb_transforms as usize);
+        for _ in 0..nb_transforms {
+            transforms.push(TransformInfo::read(br)?);
+        }
+        if !transforms.is_empty() {
+            return Err(Error::Unsupported(format!(
+                "JXL HfMetadata: {} transforms inside HF metadata sub-bitstream not yet \
+                 supported (round 13+)",
+                transforms.len()
+            )));
+        }
+
+        let mut tree = if inner_use_global_tree {
+            lf_global
+                .global_modular
+                .global_tree
+                .as_ref()
+                .ok_or_else(|| {
+                    Error::InvalidData(
+                        "JXL HfMetadata: inner sub-bitstream wants global tree but none was \
+                         decoded in GlobalModular"
+                            .into(),
+                    )
+                })?
+                .cloned_with_fresh_state()
+        } else {
+            MaTreeFdis::read(br)?
+        };
+
+        // stream_index per Table H.4: `1 + 2*num_lf_groups + lf_group_idx`.
+        let stream_index = 1i64 + 2i64 * (num_lf_groups as i64) + (lf_group_index as i64);
+        if !(i32::MIN as i64..=i32::MAX as i64).contains(&stream_index) {
+            return Err(Error::InvalidData(format!(
+                "JXL HfMetadata: stream_index {stream_index} overflows i32"
+            )));
+        }
+        let img =
+            decode_channels_at_stream(br, &descs, &mut tree, &wp_header, stream_index as i32)?;
+        if img.channels.len() != 4 {
+            return Err(Error::InvalidData(format!(
+                "JXL HfMetadata: expected 4 decoded channels, got {}",
+                img.channels.len()
+            )));
+        }
+        let channel_widths = [
+            img.descs[0].width,
+            img.descs[1].width,
+            img.descs[2].width,
+            img.descs[3].width,
+        ];
+        let channel_heights = [
+            img.descs[0].height,
+            img.descs[1].height,
+            img.descs[2].height,
+            img.descs[3].height,
+        ];
+        let mut iter = img.channels.into_iter();
+        let x_from_y = iter.next().unwrap();
+        let b_from_y = iter.next().unwrap();
+        let block_info = iter.next().unwrap();
+        let sharpness = iter.next().unwrap();
+        Ok(Self {
+            nb_blocks,
+            x_from_y,
+            b_from_y,
+            block_info,
+            sharpness,
+            channel_widths,
+            channel_heights,
+        })
+    }
+}
+
+/// `ceil(log2(n))` for `n >= 1`. `0` when `n == 1`.
+fn ceil_log2_u64(n: u64) -> u32 {
+    if n <= 1 {
+        return 0;
+    }
+    // 64 - leading_zeros(n - 1).
+    64 - (n - 1).leading_zeros()
 }
 
 impl LfGroup {
@@ -317,17 +530,16 @@ impl LfGroup {
             if (fh.flags & K_USE_LF_FRAME) != 0 {
                 return Err(Error::Unsupported(
                     "JXL LfGroup: kUseLfFrame flag (LF reused from a separate LFFrame) not yet \
-                     supported (round 12+)"
+                     supported (round 13+)"
                         .into(),
                 ));
             }
             let lf = LfCoefficients::read(br, fh, lf_global, lf_w, lf_h, lf_group_index)?;
-            // HfMetadata (G.2.4) — round-11 stops here; the round-11
-            // acceptance test exercises only LfCoefficients. Returning
-            // a placeholder `HfMetadata { nb_blocks: 0 }` keeps the
-            // type shape; round-12 will replace this with a real
-            // parse + DctSelect / HfMul / XFromY / BFromY decode.
-            (Some(lf), None::<HfMetadata>)
+            // HfMetadata (G.2.4 / FDIS C.5.4) — round-12 wires the
+            // 4-channel modular sub-bitstream. Derivation of DctSelect
+            // / HfMul from BlockInfo defers to round 13+.
+            let hf = HfMetadata::read(br, lf_global, lf_w, lf_h, lf_group_index, num_lf_groups)?;
+            (Some(lf), Some(hf))
         } else {
             (None, None)
         };
@@ -590,8 +802,17 @@ mod tests {
         assert!(lf_global.lf_channel_correlation.is_some());
         assert_eq!(lf_global.global_modular.image.channels.len(), 0);
 
-        // Compose the LfGroup (LfCoefficients) bitstream.
+        // Compose the LfGroup (LfCoefficients + HfMetadata) bitstream.
+        //
+        // Section A — LfCoefficients (FDIS C.5.3): 3 channels of 1×1
+        // each, MA tree with one Zero-predictor leaf, alphabet_size=1
+        // so every decoded symbol is 0. Section B — HfMetadata (FDIS
+        // C.5.4): nb_blocks_minus_1 read with 0 bits (num_blocks_max=1
+        // for the 8×8 LfGroup), then a 4-channel modular sub-bitstream
+        // (XFromY 1×1, BFromY 1×1, BlockInfo 2×1, Sharpness 1×1). Same
+        // alphabet_size=1 trick → all decoded HF metadata samples are 0.
         let lf_coeff_bits: Vec<(u32, u32)> = vec![
+            // === Section A: LfCoefficients ===
             // 1. extra_precision = u(2) = 0
             (0, 2),
             // 2. inner ModularHeader: inner_use_global_tree = 0
@@ -629,6 +850,41 @@ mod tests {
             (0, 1),
             //    prefix code with alphabet_size = 1: 0 bits
             // 6. Pixel decode: 3 samples × 0 bits = 0 bits.
+            // === Section B: HfMetadata (FDIS C.5.4) ===
+            // 1. nb_blocks_minus_1 = u(0) = 0 → nb_blocks = 1.
+            //    (no bits read since ceil_log2(1) = 0)
+            // 2. inner ModularHeader: inner_use_global_tree = 0
+            (0, 1),
+            //    WPHeader.default_wp = 1
+            (1, 1),
+            //    nb_transforms = 0 (U32 sel=00 → Val(0))
+            (0, 2),
+            // 3. MA tree-stream entropy prelude (D.3 over 6 distributions):
+            //    lz77_enabled = 0
+            (0, 1),
+            //    clustering: is_simple = 1, nbits = 0 → 6 × u(0) = 0 bits
+            (1, 1),
+            (0, 2),
+            //    use_prefix_code = 1
+            (1, 1),
+            //    1 × HybridUintConfig: split_exponent = 15
+            (15, 4),
+            //    per-cluster prefix count: u(1) = 0 → count = 1
+            (0, 1),
+            //    prefix code with alphabet_size = 1: 0 bits
+            // 4. Tree decode: 1 leaf, no bits.
+            // 5. Symbol stream prelude (1 distribution):
+            //    lz77_enabled = 0
+            (0, 1),
+            //    use_prefix_code = 1
+            (1, 1),
+            //    1 × HybridUintConfig: split_exp = 15
+            (15, 4),
+            //    per-cluster prefix count: u(1) = 0 → count = 1
+            (0, 1),
+            //    prefix code with alphabet_size = 1: 0 bits
+            // 6. Pixel decode: XFromY 1, BFromY 1, BlockInfo 2,
+            //    Sharpness 1 = 5 samples × 0 bits = 0 bits.
         ];
 
         let lf_coeff_bytes = pack_lsb(&lf_coeff_bits);
@@ -656,8 +912,71 @@ mod tests {
         assert_eq!(lf_group.mlf_group.lf_group_index, 0);
         assert_eq!(lf_group.mlf_group.lf_group_width, 8);
         assert_eq!(lf_group.mlf_group.lf_group_height, 8);
-        // HfMetadata not yet wired in round 11.
-        assert!(lf_group.hf_meta.is_none());
+        // HfMetadata wired in round 12: 4-channel sub-bitstream + nb_blocks.
+        let hf = lf_group.hf_meta.expect("HfMetadata should be present");
+        // nb_blocks for an 8×8 LfGroup = 1 (only one varblock fits).
+        assert_eq!(hf.nb_blocks, 1);
+        // Channel dims: XFromY 1×1, BFromY 1×1, BlockInfo 1×2,
+        // Sharpness 1×1.
+        assert_eq!(hf.channel_widths, [1, 1, 1, 1]);
+        assert_eq!(hf.channel_heights, [1, 1, 2, 1]);
+        // alphabet_size=1 means every sample is 0.
+        assert_eq!(hf.x_from_y, vec![0]);
+        assert_eq!(hf.b_from_y, vec![0]);
+        assert_eq!(hf.block_info, vec![0, 0]);
+        assert_eq!(hf.sharpness, vec![0]);
+    }
+
+    #[test]
+    fn ceil_log2_u64_edges() {
+        assert_eq!(ceil_log2_u64(0), 0);
+        assert_eq!(ceil_log2_u64(1), 0);
+        assert_eq!(ceil_log2_u64(2), 1);
+        assert_eq!(ceil_log2_u64(3), 2);
+        assert_eq!(ceil_log2_u64(4), 2);
+        assert_eq!(ceil_log2_u64(5), 3);
+        assert_eq!(ceil_log2_u64(8), 3);
+        assert_eq!(ceil_log2_u64(9), 4);
+        assert_eq!(ceil_log2_u64(1024), 10);
+    }
+
+    #[test]
+    fn hf_metadata_channel_dims_8x8_one_block() {
+        // 8×8 LfGroup, nb_blocks = 1.
+        // XFromY / BFromY: ceil(8/64) = 1 → 1×1.
+        // BlockInfo: nb_blocks cols × 2 rows = 1×2.
+        // Sharpness: ceil(8/8) = 1 → 1×1.
+        let dims = HfMetadata::channel_dims(8, 8, 1);
+        assert_eq!(dims[0], (1, 1));
+        assert_eq!(dims[1], (1, 1));
+        assert_eq!(dims[2], (1, 2));
+        assert_eq!(dims[3], (1, 1));
+    }
+
+    #[test]
+    fn hf_metadata_channel_dims_64x64_one_block() {
+        // 64×64 LfGroup, nb_blocks = 1 (e.g. one giant DCT64×64).
+        // XFromY / BFromY: ceil(64/64) = 1 → 1×1.
+        // BlockInfo: 1×2.
+        // Sharpness: ceil(64/8) = 8 → 8×8.
+        let dims = HfMetadata::channel_dims(64, 64, 1);
+        assert_eq!(dims[0], (1, 1));
+        assert_eq!(dims[1], (1, 1));
+        assert_eq!(dims[2], (1, 2));
+        assert_eq!(dims[3], (8, 8));
+    }
+
+    #[test]
+    fn hf_metadata_channel_dims_128x64_64_blocks() {
+        // 128×64 LfGroup, 64 8×8 blocks max.
+        // XFromY / BFromY: ceil(128/64) × ceil(64/64) = 2 × 1 = 2×1.
+        // BlockInfo: 64×2.
+        // Sharpness: 16×8.
+        let dims = HfMetadata::channel_dims(128, 64, 64);
+        assert_eq!(dims[0], (2, 1));
+        assert_eq!(dims[1], (2, 1));
+        assert_eq!(dims[2], (64, 2));
+        assert_eq!(dims[3], (16, 8));
     }
 
     #[test]

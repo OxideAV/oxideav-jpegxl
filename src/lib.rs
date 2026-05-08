@@ -370,6 +370,7 @@ pub mod extensions;
 pub mod frame_header;
 pub mod global_modular;
 pub mod icc;
+pub mod lf_dequant;
 pub mod lf_global;
 pub mod lf_group;
 pub mod matree;
