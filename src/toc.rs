@@ -44,22 +44,31 @@ pub struct Toc {
     pub group_offsets: Vec<u64>,
 }
 
-/// Compute the number of TOC entries per FDIS C.3.1 from
-/// `(num_groups, num_passes, encoding)`.
+/// Compute the number of TOC entries per ISO/IEC 18181-1:2024 §F.3.1
+/// from `(num_groups, num_passes, encoding)`.
 ///
 /// Returns 1 if `num_groups == 1 && num_passes == 1` (the
 /// "single TOC entry" shortcut), otherwise the full layout count.
-pub fn num_toc_entries(num_groups: u64, num_passes: u32, encoding: Encoding) -> u64 {
+///
+/// **Round 9 fix**: the 2024 spec lists `HfGlobal` UNCONDITIONALLY (one
+/// section, regardless of `encoding`). Per the spec NOTE 1: "Some of
+/// these sections may be empty in case `encoding == kModular`, i.e.
+/// their size in bytes is zero" — i.e. for kModular, HfGlobal has
+/// 0-byte size but the slot still occupies a TOC entry. Round 8's
+/// reading skipped HfGlobal for kModular which off-by-oned every
+/// PassGroup index in multi-group kModular frames (synth_320 then
+/// took entries[2] = HfGlobal as PassGroup[0][0] and saw a bogus
+/// 0-byte first PassGroup). Also, HfPass is part of the HfGlobal
+/// section per Annex G.3 Table G.4 — it does NOT contribute additional
+/// TOC entries.
+pub fn num_toc_entries(num_groups: u64, num_passes: u32, _encoding: Encoding) -> u64 {
     if num_groups == 1 && num_passes == 1 {
         return 1;
     }
     let num_lf_groups_term = num_groups; // caller passes num_lf_groups, see [`from_frame_header`]
     let mut count: u64 = 1; // LfGlobal
     count += num_lf_groups_term; // LfGroup[num_lf_groups]
-    if encoding == Encoding::VarDct {
-        count += 1; // HfGlobal
-        count += num_passes as u64; // HfPass[num_passes]
-    }
+    count += 1; // HfGlobal (unconditional; 0-byte for kModular)
     count += num_groups * num_passes as u64; // PassGroup[num_groups × num_passes]
     count
 }
@@ -84,15 +93,16 @@ impl Toc {
         let num_groups = fh.num_groups();
         let num_lf_groups = fh.num_lf_groups();
         let num_passes = fh.passes.num_passes;
+        // Round 9 fix: HfGlobal is unconditional (one TOC entry, 0-byte
+        // for kModular per F.3.1 NOTE 1). HfPass is part of the
+        // HfGlobal section per Annex G.3 Table G.4, NOT separate TOC
+        // entries.
         let total = if num_groups == 1 && num_passes == 1 {
             1u64
         } else {
             let mut count: u64 = 1; // LfGlobal
             count += num_lf_groups; // LfGroup[num_lf_groups]
-            if fh.encoding == Encoding::VarDct {
-                count += 1; // HfGlobal
-                count += num_passes as u64; // HfPass[num_passes]
-            }
+            count += 1; // HfGlobal (unconditional; 0-byte for kModular)
             count += num_groups * num_passes as u64;
             count
         };
@@ -396,8 +406,10 @@ mod tests {
     fn num_toc_entries_modular_path() {
         // num_lf_groups passed in via num_groups param (see fn comment);
         // use the formula with num_groups=4, num_passes=1, Modular →
-        // 1 (LfGlobal) + 4 (LfGroup) + 4*1 (PassGroup) = 9.
-        assert_eq!(num_toc_entries(4, 1, Encoding::Modular), 9);
+        // 1 (LfGlobal) + 4 (LfGroup) + 1 (HfGlobal, 0-byte for kModular)
+        // + 4*1 (PassGroup) = 10. Round 9 fix: HfGlobal is unconditional
+        // per ISO/IEC 18181-1:2024 §F.3.1.
+        assert_eq!(num_toc_entries(4, 1, Encoding::Modular), 10);
     }
 
     /// Build a Toc from an unpermuted, byte-aligned byte string.
@@ -479,18 +491,18 @@ mod tests {
         // Build a FrameHeader with num_groups=2 to force multiple TOC
         // entries. Easiest: width=512, height=128 with
         // group_size_shift=1 → kGroupDim=256 → 2x1=2 groups, plus
-        // num_lf_groups=1 (kGroupDim*8=2048 > 512). Total entries:
-        //   1 (LfGlobal) + 1 (LfGroup) + 2 (PassGroup) = 4 entries
-        //   (Modular encoding, no HfGlobal/HfPass).
+        // num_lf_groups=1 (kGroupDim*8=2048 > 512). Total entries
+        // (round-9 §F.3.1 fix): 1 (LfGlobal) + 1 (LfGroup) + 1 (HfGlobal,
+        // 0-byte for kModular) + 2 (PassGroup) = 5 entries.
         let mut fh = build_test_frame_header(512, 128);
         fh.encoding = Encoding::Modular;
-        // Build 4 entries with sizes 7, 11, 13, 17 (all < 1024 → use
-        // distribution 0 (Bits(10))).
+        // Build 5 entries with sizes 7, 11, 0, 13, 17 (HfGlobal=0; all
+        // < 1024 → use distribution 0 (Bits(10))).
         let mut bw = TestBw::new();
         bw.w(0, 1); // permuted_toc = 0
                     // ZeroPad to byte
         bw.pad();
-        for v in [7u32, 11, 13, 17] {
+        for v in [7u32, 11, 0, 13, 17] {
             bw.w(0, 2); // sel = 0 → Bits(10)
             bw.w(v, 10);
         }
@@ -498,8 +510,8 @@ mod tests {
         let bytes = bw.into_bytes();
         let mut br = BitReader::new(&bytes);
         let toc = Toc::read(&mut br, &fh).unwrap();
-        assert_eq!(toc.entries, vec![7, 11, 13, 17]);
-        assert_eq!(toc.group_offsets, vec![0, 7, 18, 31]);
+        assert_eq!(toc.entries, vec![7, 11, 0, 13, 17]);
+        assert_eq!(toc.group_offsets, vec![0, 7, 18, 18, 31]);
     }
 
     /// Tiny LSB-first bit writer for tests, with byte-pad helper.

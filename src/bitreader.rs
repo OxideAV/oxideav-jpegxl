@@ -10,6 +10,16 @@ pub struct BitReader<'a> {
     data: &'a [u8],
     byte_pos: usize,
     bit_pos: u8,
+    /// When `true`, reads past the end of `data` return 0 instead of
+    /// erroring. Per ISO/IEC 18181-1:2024 §F.3 first paragraph: "When
+    /// decoding a section, no more bits are read from the codestream
+    /// than 8 times the byte size indicated in the TOC; if fewer bits
+    /// are read, then the remaining bits of the section all have the
+    /// value zero." Section sub-readers are created with this flag
+    /// set so that ANS / hybrid-uint / pixel-decode loops can read
+    /// renormalisation bits past the real section data without
+    /// erroring — those bits are guaranteed by the spec to be zero.
+    pad_eof_with_zeros: bool,
 }
 
 impl<'a> BitReader<'a> {
@@ -18,6 +28,19 @@ impl<'a> BitReader<'a> {
             data,
             byte_pos: 0,
             bit_pos: 0,
+            pad_eof_with_zeros: false,
+        }
+    }
+
+    /// Construct a section-scoped reader that returns zero for any read
+    /// past the end of `data`. Used for per-TOC-section sub-readers
+    /// (LfGlobal / LfGroup / HfGlobal / PassGroup) per §F.3.
+    pub fn new_section(data: &'a [u8]) -> Self {
+        Self {
+            data,
+            byte_pos: 0,
+            bit_pos: 0,
+            pad_eof_with_zeros: true,
         }
     }
 
@@ -31,6 +54,18 @@ impl<'a> BitReader<'a> {
 
     pub fn read_bit(&mut self) -> Result<u32> {
         if self.byte_pos >= self.data.len() {
+            if self.pad_eof_with_zeros {
+                // Section ran out of real bits — per §F.3 the remaining
+                // bits of the section all have value zero. We DO advance
+                // the cursor so `bits_read` reflects the (logical) read
+                // count.
+                self.bit_pos += 1;
+                if self.bit_pos == 8 {
+                    self.bit_pos = 0;
+                    self.byte_pos += 1;
+                }
+                return Ok(0);
+            }
             return Err(Error::InvalidData("unexpected end of JXL bitstream".into()));
         }
         let b = (self.data[self.byte_pos] >> self.bit_pos) & 1;
@@ -105,7 +140,7 @@ impl<'a> BitReader<'a> {
         }
         let total_bits_remaining =
             (self.data.len() * 8).saturating_sub(self.byte_pos * 8 + self.bit_pos as usize);
-        if (n as usize) > total_bits_remaining {
+        if (n as usize) > total_bits_remaining && !self.pad_eof_with_zeros {
             return Err(Error::InvalidData(
                 "JXL advance_bits(): unexpected end of bitstream".into(),
             ));

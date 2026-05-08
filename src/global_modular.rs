@@ -412,6 +412,7 @@ fn apply_inverse_squeeze(image: &mut ModularImage, squeeze_params: &[SqueezePara
 
 /// Apply transform metadata to the channel layout so the decoded
 /// channel data has the correct shape per H.6:
+///
 /// * `kPalette` — adds one meta-channel of dims `nb_colours × num_c`
 ///   at the front; the original `num_c` channels are reduced to a
 ///   single index channel.
@@ -419,7 +420,13 @@ fn apply_inverse_squeeze(image: &mut ModularImage, squeeze_params: &[SqueezePara
 /// * `kSqueeze` — for each step, halves one dim of `num_c` source
 ///   channels (round-up) and inserts a residu channel of the same
 ///   width × half-height (or half-width × height) for each.
-fn apply_transforms_to_channel_layout(
+///
+/// Public since round 9 so per-PassGroup decode can reuse it for
+/// nested per-group transforms (Palette / RCT / Squeeze inside a
+/// PassGroup ModularHeader, observed in cjxl 0.11.1's synth_320
+/// fixture's edge groups). See [`apply_inverse_transforms`] for the
+/// reverse step.
+pub fn apply_transforms_to_channel_layout(
     mut descs: Vec<ChannelDesc>,
     transforms: &[TransformInfo],
 ) -> Result<Vec<ChannelDesc>> {

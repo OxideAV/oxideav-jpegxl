@@ -206,6 +206,58 @@
 //!    16x8 / 16x16 / 32x32 / 64x64 / DCT4 / IDENTITY / AFV,
 //!    Chroma-from-Luma, Gaborish smoothing, EPF) is round-9+
 //!    work.
+//!
+//! ## Round-9 (2024-spec) additions
+//!
+//! Three concurrent fixes that together unblock the synth_320 fixture
+//! (multi-group lossless grey, 320×320, num_groups=9):
+//!
+//! 1. **§F.3.1 HfGlobal slot is unconditional** — the 2024 spec
+//!    bullets list `HfGlobal` for every TOC, with NOTE 1 calling out
+//!    that the slot is 0-byte for `encoding == kModular`. Round 8's
+//!    `num_toc_entries` / [`toc::Toc::read`] gated HfGlobal on
+//!    `encoding == kVarDCT`, off-by-oning every PassGroup index in
+//!    multi-group kModular frames. Also: `HfPass[num_passes]` is part
+//!    of the `HfGlobal` section per Annex G.3 Table G.4 — round 8 had
+//!    incorrectly counted it as separate TOC entries. With both off-
+//!    by-ones fixed, synth_320's TOC reads as 12 entries
+//!    `[33, 0, 0, 9, 20, 7, 20, 9, 24, 7, 23, 7]` (slot 2 is the 0-
+//!    byte HfGlobal, not PG[0][0]).
+//!
+//! 2. **§F.3 first-paragraph zero-padding** — "When decoding a
+//!    section, no more bits are read from the codestream than 8 times
+//!    the byte size indicated in the TOC; if fewer bits are read,
+//!    then the remaining bits of the section all have the value
+//!    zero." Round 8's [`bitreader::BitReader`] errored on EOF for
+//!    section sub-readers, breaking PassGroup ANS decodes whose
+//!    modular sub-bitstreams consumed fewer real bits than the
+//!    TOC-stated section size. Round 9 adds
+//!    [`bitreader::BitReader::new_section`] which returns 0 for any
+//!    read past the end of the section data; the legacy
+//!    [`bitreader::BitReader::new`] preserves strict EOF for whole-
+//!    codestream parsing.
+//!
+//! 3. **Per-PassGroup transforms (Annex H.6 inside G.4.2)** —
+//!    observed in cjxl 0.11.1's synth_320 edge groups: the encoder
+//!    emits a per-group Palette transform (`begin_c=0, num_c=1,
+//!    nb_colours=191`) for the 64-pixel-wide column-2 / row-2 groups.
+//!    [`pass_group::decode_modular_group_into`] now applies the
+//!    transform layout adjustment to the per-group channel descs,
+//!    decodes against the adjusted descs, and applies the inverse
+//!    transforms LOCALLY before copying samples back into the parent
+//!    image. [`global_modular::apply_transforms_to_channel_layout`]
+//!    is now `pub` so the per-group reuse path doesn't duplicate the
+//!    table.
+//!
+//! **Round-9 status** — synth_320 reaches end-of-frame without
+//! erroring and ~21k of 102400 pixels match the expected
+//! `(y + x) & 0xFF` gradient (the first 6 rows across the first two
+//! group columns); the remaining pixels drift mid-decode in the
+//! smaller edge groups. Full pixel-correctness is round-10 work
+//! (suspected residual: ANS state nuance specific to F.3 zero-
+//! padded tail OR per-group WP bookkeeping). All five small
+//! lossless fixtures still pixel-correct vs round 4's
+//! `expected.png`.
 
 pub mod abrac;
 pub mod ans;
@@ -491,14 +543,18 @@ fn decode_codestream(codestream: &[u8], pts: Option<i64>) -> Result<VideoFrame> 
         Ok(&frame_bytes[start..end])
     };
 
-    // Slot index helpers per Annex F TOC layout for kModular encoding:
+    // Slot index helpers per ISO/IEC 18181-1:2024 §F.3.1 TOC layout
+    // (round-9 fix: HfGlobal slot is unconditional, 0-byte for
+    // kModular; HfPass is part of HfGlobal, NOT separate slots):
     //   slot 0       — LfGlobal
     //   slots 1..1+num_lf_groups — LfGroup[*]
-    //   slots 1+num_lf_groups + p*num_groups + g — PassGroup[p][g]
+    //   slot 1+num_lf_groups — HfGlobal (0-byte for kModular)
+    //   slots 2+num_lf_groups + p*num_groups + g — PassGroup[p][g]
     let lf_global_slot = 0usize;
     let lf_group_slot = |lf_group_idx: u64| -> usize { 1 + lf_group_idx as usize };
+    let hf_global_slot = 1 + num_lf_groups as usize;
     let pass_group_slot = |pass_idx: u32, group_idx: u32| -> usize {
-        1 + num_lf_groups as usize + (pass_idx as u64 * num_groups + group_idx as u64) as usize
+        2 + num_lf_groups as usize + (pass_idx as u64 * num_groups + group_idx as u64) as usize
     };
 
     // 8. LfGlobal (slot 0) — read the GlobalModular prelude. For images
@@ -512,7 +568,7 @@ fn decode_codestream(codestream: &[u8], pts: Option<i64>) -> Result<VideoFrame> 
         LfGlobal::read(&mut br, &fh, &metadata)?
     } else {
         let lf_global_bytes = section_byte_range(lf_global_slot)?;
-        let mut lf_br = BitReader::new(lf_global_bytes);
+        let mut lf_br = BitReader::new_section(lf_global_bytes);
         LfGlobal::read(&mut lf_br, &fh, &metadata)?
     };
 
@@ -533,7 +589,7 @@ fn decode_codestream(codestream: &[u8], pts: Option<i64>) -> Result<VideoFrame> 
             for group_idx in 0..(num_groups as u32) {
                 let slot = pass_group_slot(pass_idx, group_idx);
                 let pg_bytes = section_byte_range(slot)?;
-                let mut pg_br = BitReader::new(pg_bytes);
+                let mut pg_br = BitReader::new_section(pg_bytes);
                 crate::pass_group::decode_modular_group_into(
                     &mut pg_br,
                     &fh,
@@ -555,6 +611,7 @@ fn decode_codestream(codestream: &[u8], pts: Option<i64>) -> Result<VideoFrame> 
         )?;
     }
     let _ = lf_group_slot; // currently only used by round-8 multi-LfGroup
+    let _ = hf_global_slot; // round-10+ VarDCT consumer; for kModular the slot is 0-byte
 
     // 9. Map the decoded modular image to a VideoFrame.
     //

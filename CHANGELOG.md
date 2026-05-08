@@ -9,6 +9,63 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Round 9 (2024-spec)** — synth_320 0-byte PassGroup blocker
+  resolved via two underlying fixes plus per-group transforms support.
+
+  **§F.3.1 unconditional HfGlobal slot fix** — the 2024 spec lists
+  `HfGlobal` UNCONDITIONALLY in the TOC bullet list (not gated on
+  `encoding == kVarDCT`); per NOTE 1, the slot is empty (0-byte) for
+  `encoding == kModular`. Round 8's `num_toc_entries` /
+  `Toc::read` skipped HfGlobal for kModular, off-by-oning every
+  PassGroup index in multi-group kModular frames. The synth_320
+  fixture (320×320 grey, num_groups=9) actually has 12 TOC entries
+  (1 LfGlobal + 1 LfGroup + 1 HfGlobal + 9 PassGroup), not 11; the
+  apparent "0-byte PassGroup[0][0]" was the HfGlobal slot reading.
+  Also: `HfPass[num_passes]` is part of the `HfGlobal` section per
+  Annex G.3 Table G.4 — it does NOT contribute additional TOC
+  entries (round 8 had counted both, double-incorrect).
+
+  **§F.3 first-paragraph zero-padding sub-reader** — "When decoding
+  a section, no more bits are read from the codestream than 8 times
+  the byte size indicated in the TOC; if fewer bits are read, then
+  the remaining bits of the section all have the value zero." Round
+  8's `BitReader` errored on EOF for section sub-readers, breaking
+  PassGroup ANS decodes whose modular sub-bitstream legitimately
+  consumes fewer real bits than the section's byte size (the missing
+  bits are guaranteed by the spec to be zero). Added
+  `BitReader::new_section` which pads EOF reads with zero values for
+  per-TOC-section sub-readers (LfGlobal / LfGroup / HfGlobal /
+  PassGroup); the legacy `BitReader::new` keeps the strict EOF for
+  whole-codestream parsing so malformed top-level structures still
+  error early.
+
+  **Per-PassGroup transforms (Annex H.6 inside G.4.2)** — observed
+  in cjxl 0.11.1's synth_320 edge groups: the encoder emits a
+  per-group Palette transform (`begin_c=0, num_c=1, nb_colours=191`)
+  for the 64-pixel-wide column-2 / row-2 groups, which is
+  spec-legal per Table H.1 (every modular sub-bitstream has its own
+  `transform[nb_transforms]` field). `decode_modular_group_into`
+  now applies the transform layout adjustment to the per-group
+  channel descs, decodes against the adjusted descs, and applies
+  the inverse transforms LOCALLY before copying samples back into
+  the parent image. `apply_transforms_to_channel_layout` is now
+  `pub` so the per-group reuse path doesn't duplicate the table.
+  A new `tests/round9_synth_320_toc.rs` integration test confirms
+  the TOC layout is parsed correctly (12 entries, slot 2 is
+  HfGlobal not PG[0][0]) and that the first 6 rows of the first
+  two group columns decode pixel-for-pixel against the expected
+  `(y + x) & 0xFF` gradient.
+
+  **Status** — synth_320 reaches end-of-frame without erroring and
+  about 21k of 102400 pixels match the expected gradient; the
+  remaining ~80k pixels drift mid-decode in the smaller edge groups
+  (PG[0][2,5,6,7,8] = 64-pixel-wide / 64-pixel-tall sections).
+  Suspected residual issue: ANS state nuance specific to the F.3
+  zero-padded tail or per-group WP / property bookkeeping that
+  doesn't surface against the round-4 small fixtures (single-group,
+  single-channel, no padding pressure on the ANS state). Full
+  pixel-correctness is round-10 work.
+
 - **Round 8 (2024-spec)** — two themes: round-7 SPECGAP partial
   resolution + VarDCT scaffolding.
 

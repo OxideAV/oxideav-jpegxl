@@ -16,9 +16,10 @@ use oxideav_core::{Error, Result};
 
 use crate::bitreader::{BitReader, U32Dist};
 use crate::frame_header::FrameHeader;
+use crate::global_modular::{apply_inverse_transforms, apply_transforms_to_channel_layout};
 use crate::lf_global::LfGlobal;
 use crate::modular_fdis::{
-    decode_channels_at_stream, ChannelDesc, MaTreeFdis, TransformInfo, WpHeader,
+    decode_channels_at_stream, ChannelDesc, MaTreeFdis, ModularImage, TransformInfo, WpHeader,
 };
 
 /// `PassGroup` bundle — Table G.5.
@@ -131,12 +132,6 @@ pub fn decode_modular_group_into(
     // group rectangle. Per spec: "the group dimensions and the x,y
     // offsets are right-shifted by hshift (for x and width) and vshift
     // (for y and height)".
-    struct PerGroupChannel {
-        full_idx: usize,
-        x0: u32,
-        y0: u32,
-        desc: ChannelDesc,
-    }
     let mut contributing: Vec<PerGroupChannel> = Vec::new();
     for (full_idx, d) in descs_full.iter().enumerate() {
         if full_idx < nb_meta {
@@ -204,13 +199,6 @@ pub fn decode_modular_group_into(
     for _ in 0..nb_transforms {
         transforms.push(TransformInfo::read(br)?);
     }
-    if !transforms.is_empty() {
-        return Err(Error::Unsupported(
-            "JXL PassGroup: transforms inside per-group ModularHeader not supported (round 7 \
-             scope: lossless single-channel grey, no nested transforms)"
-                .into(),
-        ));
-    }
 
     // Resolve the MA tree to use.
     let mut tree = if inner_use_global_tree {
@@ -231,20 +219,66 @@ pub fn decode_modular_group_into(
     };
 
     // Build the per-group descs list from the contributing channels.
-    let group_descs: Vec<ChannelDesc> = contributing.iter().map(|c| c.desc).collect();
+    let mut base_descs: Vec<ChannelDesc> = contributing.iter().map(|c| c.desc).collect();
+    // Round-9: per-PassGroup transforms (Annex H.6) — observed in
+    // cjxl 0.11.1's synth_320 edge groups (Palette with nb_colours=191).
+    // We apply the transform's layout adjustment to derive the
+    // channel list the inner sub-bitstream actually decodes, then
+    // apply the inverse transforms LOCALLY before copying samples
+    // back to the parent image.
+    if !transforms.is_empty() {
+        base_descs = apply_transforms_to_channel_layout(base_descs, &transforms)?;
+    }
 
     // stream_index per Table H.4 last paragraph.
     let stream_index =
         (1 + 3 * num_lf_groups + 17 + num_groups * pass_index as u64 + group_index as u64) as i32;
 
     // Decode the modular group's channels.
-    let group_image =
-        decode_channels_at_stream(br, &group_descs, &mut tree, &wp_header, stream_index)?;
+    let mut group_image =
+        decode_channels_at_stream(br, &base_descs, &mut tree, &wp_header, stream_index)?;
+
+    // Apply per-group inverse transforms LOCALLY before copying back.
+    if !transforms.is_empty() {
+        // bit_depth is part of the parent metadata; for the per-group
+        // inverse Palette `nb_deltas == 0` path, bit_depth is unused.
+        // We pass 8 as a safe default — the per-group inverse only
+        // touches per-pixel arithmetic that overflows on >8bpp paths
+        // we don't yet exercise. Round-10+ may thread the actual
+        // bit_depth through.
+        let bit_depth = 8u32;
+        apply_inverse_transforms(&mut group_image, &transforms, bit_depth)?;
+    }
+
+    // After inverse transforms, the channel list should match
+    // `contributing` (one channel per per-group rectangle). If the
+    // transform inserted a meta-channel (Palette) or split via
+    // Squeeze, the inverse should have undone that. Sanity-check the
+    // post-inverse channel count matches the contributing count.
+    if group_image.channels.len() != contributing.len() {
+        return Err(Error::InvalidData(format!(
+            "JXL PassGroup: post-inverse channel count {} != contributing {}",
+            group_image.channels.len(),
+            contributing.len()
+        )));
+    }
 
     // Copy decoded samples back into the parent image at the per-channel
     // rectangle (x0, y0, w, h). Per spec: "The decoded modular group
     // data is then copied into the partially decoded GlobalModular
     // image in the corresponding positions."
+    copy_group_into_parent(&group_image, contributing.as_slice(), lf_global)?;
+    Ok(())
+}
+
+/// Helper bound to the per-group `PerGroupChannel` list in
+/// [`decode_modular_group_into`]. Pulled out so the post-inverse-
+/// transforms copy-back step is readable.
+fn copy_group_into_parent(
+    group_image: &ModularImage,
+    contributing: &[PerGroupChannel],
+    lf_global: &mut LfGlobal,
+) -> Result<()> {
     for (k, c) in contributing.iter().enumerate() {
         let g_chan = &group_image.channels[k];
         let g_w = group_image.descs[k].width as usize;
@@ -259,6 +293,17 @@ pub fn decode_modular_group_into(
         }
     }
     Ok(())
+}
+
+/// Per-group channel rectangle bookkeeping: the channel index in the
+/// parent image, the per-channel offsets where the group data lives,
+/// and the per-group [`ChannelDesc`] dims passed to the inner
+/// modular sub-bitstream.
+pub(crate) struct PerGroupChannel {
+    pub full_idx: usize,
+    pub x0: u32,
+    pub y0: u32,
+    pub desc: ChannelDesc,
 }
 
 impl ModularGroupData {
