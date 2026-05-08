@@ -9,6 +9,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Round 17 (2024-spec, Auditor mode)** — d1 bit-position-drift bisect.
+  Round 16 left the d1 fixture surfacing
+  `InvalidData("JXL Modular Squeeze: end 40 >= channel count 4")`
+  and hypothesised an upstream bit-position drift in LfGlobal or
+  LfCoefficients. Round 17 confirms the drift via a step-by-step
+  bit-cursor walk through the LfGlobal/LfGroup decode, captured by the
+  new `tests/round17_d1_bit_trace.rs` diagnostic test.
+
+  Findings (full analysis in `round17-d1-bisect.md`):
+
+  - Our `LfGlobal::read` ends at codestream-relative bit **1026**, which
+    matches the cjxl ground-truth trace at
+    `docs/image/jpegxl/fixtures/vardct-256x256-d1/trace.txt`
+    (DC_GLOBAL_END=1026) **exactly**. LfGlobal is NOT the drift site.
+  - Our `LfCoefficients::read` consumes **11995 bits** for 3072 LF
+    samples — but the cjxl trace says the entire LfGroup bundle (=
+    LfCoefficients + ModularLfGroup + HfMetadata) is **11728 bits**
+    (DC_GROUP_END=12754). LfCoefficients alone is 267 bits **over** the
+    whole LfGroup budget, which means the per-channel decode is reading
+    ~2.3 bits more per sample than the spec demands.
+  - The decoded LF coefficient values look plausible (smooth gradient
+    in ch0, small chroma variation in ch1/ch2), suggesting the entropy
+    decoder produces "real" tokens but consumes too many trailing
+    extra bits per token.
+  - Round-16 hypothesis ranked HfBlockContext custom branch HIGH; round
+    17 RULES THAT OUT (HfBlockContext consumed 87 bits for the smallest
+    legal custom path, and LfGlobal ended at the cjxl-expected bit
+    boundary).
+
+  **Round-18 candidate** (deferred, not landed in r17):
+  `crates/oxideav-jpegxl/src/modular_fdis.rs::decode_uint_in_with_dist`
+  hybrid-uint extra-bits accounting on the global-tree-reused leaf
+  entropy stream. Either `HybridUintConfig` is mis-read in
+  `EntropyStream::read` (prelude bug) or a stray post-token
+  `u(extra_bits)` is being read on the wrong gate
+  (per-token bug).
+
+  No code-path fix landed in round 17 (Auditor mode: ship diagnostic
+  evidence + r18 candidate only). Test count: 328 → 329 (+1: new
+  d1 bit-trace diagnostic). Five small lossless fixtures + round-11..16
+  sentinels remain green.
+
 - **Round 16 (2024-spec)** — HfMetadata nested transforms (FDIS §C.5.4
   + §C.9.4) — the four-channel HfMetadata sub-bitstream now parses
   `nb_transforms` + `TransformInfo[]` and applies the inverse

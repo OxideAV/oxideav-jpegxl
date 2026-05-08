@@ -73,9 +73,15 @@
 //! beyond the four-channel baseline (e.g. `begin_c=39` on the very first
 //! step). The current `apply_transforms_to_channel_layout` validates
 //! `begin + num_c <= channel_count` and rejects with `InvalidData` —
-//! that's the round-17 candidate to investigate (likely an upstream
-//! bit-position drift in LfGlobal or LfCoefficients that puts our cursor
-//! at the wrong spot before HfMetadata's ModularHeader).
+//! round-17 (Auditor mode) bisected this to an upstream over-consumption
+//! inside `LfCoefficients`'s per-channel decode loop: the cjxl trace at
+//! `docs/image/jpegxl/fixtures/vardct-256x256-d1/trace.txt` budgets the
+//! whole `LfGroup` (LfCoefficients + ModularLfGroup + HfMetadata) at
+//! 11728 bits, but our `LfCoefficients::read` alone consumes 11995
+//! bits — about 2.3 bits/sample over budget across all 3072 LF samples.
+//! See `crates/oxideav-jpegxl/round17-d1-bisect.md` for the bit-precise
+//! analysis and the round-18 candidate (likely a wrong hybrid-uint
+//! extra-bits path inside `decode_uint_in_with_dist`).
 //!
 //! ## Round 6 / 7 history (still relevant)
 //!
