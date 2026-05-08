@@ -9,6 +9,64 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Round 8 (2024-spec)** — two themes: round-7 SPECGAP partial
+  resolution + VarDCT scaffolding.
+
+  **Theme 1: ANS distribution C.2.5 SPECGAP (interpretation C, partial)**
+  - `src/ans/distribution.rs` — `read_distribution` now returns
+    `(D, log_eff)` instead of just `D`; `log_eff` is the effective
+    log_alphabet_size for downstream alias-table sizing. For the
+    common case (alphabet_size <= table_size) `log_eff` equals the
+    signalled `log_alphabet_size`. For the SPECGAP case
+    (alphabet_size > table_size), the logcounts loop iterates
+    `min(alphabet_size, table_size)` entries; the encoder's
+    advertised wider alphabet is treated as a soft cap because
+    empirically cjxl 0.11.1 only serialises `table_size` per-symbol
+    entries. Interpretations A (grow D to a power-of-2 >=
+    alphabet_size) and B (drop writes at i >= table_size) were both
+    tried and rejected — see the module-level docstring on
+    `read_distribution` for the full rationale.
+  - `src/ans/cluster.rs`, `src/modular_fdis.rs`, `src/toc.rs` —
+    callers updated to consume the `(D, log_eff)` tuple and pass
+    `log_eff` to `AliasTable::build`.
+  - The synth_320 fixture's LfGlobal section now parses cleanly
+    past the round-7 SPECGAP error, but PassGroup decode is blocked
+    at a separate post-LfGlobal blocker (cjxl emits a 0-byte
+    PassGroup[0][0] slot which contradicts the spec's per-group
+    "all groups carry data per pass" rule). That secondary blocker
+    is round-9+ work; the synth_320 fixture is left in
+    `tests/fixtures/synth_320_grey/` unconsumed by tests pending
+    that round.
+
+  **Theme 2: VarDCT scaffolding**
+  - New `src/vardct.rs` module: structural recognition of a
+    VarDCT-encoded codestream + IDCT-II primitives for the smallest
+    block size (8×8). `recognise_vardct_codestream(fh, metadata)`
+    validates the round-8 envelope (single LF group, single pass,
+    no extra channels, Grey/RGB colour) and returns a
+    `VarDctScaffold` geometry record. `idct1d_8` and `idct2d_8x8`
+    implement the spec's inverse DCT-II formula directly (O(N²),
+    audit-friendly; faster Lee-style decompositions land alongside
+    LF/HF subband decode in round 9+).
+  - `src/lib.rs` — `decode_codestream`'s encoding gate now special-
+    cases `Encoding::VarDct` to invoke
+    `vardct::recognise_vardct_codestream` and emit a VarDCT-specific
+    `Error::Unsupported` message rather than the generic round-7
+    one.
+  - End-to-end VarDCT pixel decode (LF subband decode, HF subband
+    decode, dequant, inverse transform dispatch across block sizes
+    8×8/8×16/16×8/16×16/32×32/64×64/DCT4/DCT8/IDENTITY/AFV,
+    Chroma-from-Luma, Gaborish smoothing, EPF) is round-9+ work.
+
+  **Tests**
+  - `tests/round8_vardct_scaffold.rs` — verifies the 5 small
+    lossless fixtures still pixel-correct (regression sentinel
+    against the `(D, log_eff)` tuple refactor) plus VarDCT
+    primitive sanity checks.
+  - `src/ans/distribution.rs` — new
+    `branch3_alphabet_size_above_table_size_is_truncated` sentinel
+    test for the SPECGAP truncation behaviour.
+
 - **Round 7 (2024-spec)** — four-piece refactor wiring the GlobalModular
   partial-decode path to per-PassGroup decode + post-PassGroup inverse
   transforms (Annex G.1.3 last paragraph + G.4.2). The orchestration

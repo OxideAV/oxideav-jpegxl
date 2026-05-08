@@ -518,9 +518,15 @@ impl EntropyStream {
             })
         } else {
             // ANS path: per-cluster distribution + alias.
+            // Round-8 SPECGAP: each per-cluster distribution may have
+            // its own effective log_alphabet_size >= the signalled
+            // value (cjxl 0.11.1 emits alphabet_size > 1 <<
+            // log_alphabet_size for some clusters); the alias table is
+            // built against the effective value so the 4096-sum + Vose
+            // invariants hold.
             for _ in 0..n_clusters {
-                let dist = read_distribution(br, log_alphabet_size)?;
-                let alias = AliasTable::build(&dist, log_alphabet_size)?;
+                let (dist, log_eff) = read_distribution(br, log_alphabet_size)?;
+                let alias = AliasTable::build(&dist, log_eff)?;
                 entropies.push(ClusterEntropy::Ans { dist, alias });
             }
             // 2024-spec round-3 fix: ANS state init `u(32)` is read by

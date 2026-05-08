@@ -210,9 +210,11 @@ pub fn read_general_clustering(
         clusters
     } else {
         // ANS sub-stream: read one distribution, build alias table, init
-        // state, decode num_distributions integers.
-        let dist = read_distribution(br, log_alphabet_size)?;
-        let alias = AliasTable::build(&dist, log_alphabet_size)?;
+        // state, decode num_distributions integers. Round-8 SPECGAP:
+        // the distribution's effective log_alphabet_size is returned
+        // separately and used for alias-table sizing.
+        let (dist, log_eff) = read_distribution(br, log_alphabet_size)?;
+        let alias = AliasTable::build(&dist, log_eff)?;
         let mut ans = AnsDecoder::new(br)?;
         let mut clusters = Vec::with_capacity(num_distributions);
         for _ in 0..num_distributions {

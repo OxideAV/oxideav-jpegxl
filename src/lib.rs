@@ -162,13 +162,50 @@
 //! fixtures where the per-cluster ANS distribution's `alphabet_size`
 //! exceeds `1 << log_alphabet_size` (specifically: alphabet_size=33
 //! against table_size=32 when `log_alphabet_size = 5 + u(2) = 5`). The
-//! 2024 spec text in C.2.5 implies `alphabet_size <= table_size`, but
-//! the reference encoder consistently violates this for the multi-group
-//! path. The committed multi-group fixture
-//! (`tests/fixtures/synth_320_grey/`) is left unconsumed by tests
-//! pending a docs-collaborator clarification on whether the alphabet
-//! cap is normative or whether a different `log_alphabet_size`
-//! computation should apply for ANS streams.
+//! 2024 spec text in C.2.5 is silent on the cap (the introductory
+//! paragraph describes D as a `1 << log_alphabet_size`-element array
+//! but the listing's alphabet_size-iterating loop can exceed it).
+//!
+//! ## Round-8 (2024-spec) additions
+//!
+//! Two themes:
+//!
+//! 1. **C.2.5 SPECGAP partial resolution** ([`ans::distribution`]):
+//!    [`ans::distribution::read_distribution`] now returns
+//!    `(D, log_eff)` where `log_eff` is the effective log_alphabet_size
+//!    for downstream alias-table sizing. Round 8 picks
+//!    "interpretation C": iterate the logcounts loop for
+//!    `min(alphabet_size, table_size)` entries, treating the
+//!    bitstream's signalled `alphabet_size > table_size` as a
+//!    soft cap (the encoder advertises a wider alphabet but only
+//!    serialises `table_size` per-symbol entries). Empirically
+//!    validated by parsing the LfGlobal section of
+//!    `tests/fixtures/synth_320_grey/synth_320.jxl` cleanly past
+//!    the round-7 SPECGAP error. Interpretations A (grow D to
+//!    accommodate alphabet_size) and B (drop writes at i >=
+//!    table_size, accumulate total_count only over stored entries)
+//!    were both tried and rejected — see [`ans::distribution`]
+//!    crate docs for the comparison. The synth_320 fixture is
+//!    still NOT decoded end-to-end: a separate post-LfGlobal blocker
+//!    appears (cjxl emits a 0-byte PassGroup[0][0] slot which
+//!    contradicts the spec's "all groups carry data per pass"
+//!    rule); that is round-9+ work.
+//!
+//! 2. **VarDCT scaffold** ([`vardct`]): the FrameHeader's
+//!    `encoding == kVarDCT` path is now structurally recognised
+//!    rather than rejected with a generic `Error::Unsupported`.
+//!    The module exposes
+//!    [`vardct::recognise_vardct_codestream`] which validates the
+//!    round-8 envelope (single LF group, single pass, no extra
+//!    channels, Grey or RGB colour space) and returns a
+//!    [`vardct::VarDctScaffold`] geometry record. The IDCT-II
+//!    primitive for the 8x8 block size ([`vardct::idct1d_8`] +
+//!    [`vardct::idct2d_8x8`]) is also wired with unit tests. End-
+//!    to-end VarDCT pixel decode (LF subband, HF subband, dequant,
+//!    inverse transform dispatch across block sizes 8x8 / 8x16 /
+//!    16x8 / 16x16 / 32x32 / 64x64 / DCT4 / IDENTITY / AFV,
+//!    Chroma-from-Luma, Gaborish smoothing, EPF) is round-9+
+//!    work.
 
 pub mod abrac;
 pub mod ans;
@@ -189,6 +226,7 @@ pub mod modular_fdis;
 pub mod pass_group;
 pub mod predictors;
 pub mod toc;
+pub mod vardct;
 
 pub use container::{detect, extract_codestream, Signature};
 pub use metadata::{parse_headers, BitDepth, Headers, ImageMetadata, SizeHeader};
@@ -382,10 +420,27 @@ fn decode_codestream(codestream: &[u8], pts: Option<i64>) -> Result<VideoFrame> 
             fh.encoding,
         ));
     }
-    // Diagnostic on unhandled features.
+    // Diagnostic on unhandled features. Round 8 lands a VarDCT
+    // scaffold: structurally recognised + IDCT-8x8 primitive
+    // available via the [`vardct`] module, but pixel decode of a
+    // VarDCT codestream still defers — see crate::vardct docs.
+    if fh.encoding == crate::frame_header::Encoding::VarDct {
+        // Recognise structurally; reject before attempting pixel
+        // decode. This still returns `Error::Unsupported` but with a
+        // VarDCT-specific message so callers can distinguish a
+        // VarDCT codestream from a Modular one early.
+        let scaffold = crate::vardct::recognise_vardct_codestream(&fh, &metadata)?;
+        return Err(Error::Unsupported(format!(
+            "jxl VarDCT decoder (round 8 scaffold): codestream recognised \
+             ({}x{}, {} colour channels, group_dim={}) but pixel decode \
+             (LF/HF subbands + dequant + IDCT + CfL + Gaborish + EPF) is \
+             round-9+ work",
+            scaffold.width, scaffold.height, scaffold.num_colour_channels, scaffold.group_dim
+        )));
+    }
     if fh.encoding != crate::frame_header::Encoding::Modular {
         return Err(Error::Unsupported(format!(
-            "jxl decoder (round 7): encoding {:?} not supported (Modular only — VarDCT round-8+ work)",
+            "jxl decoder: encoding {:?} not supported",
             fh.encoding
         )));
     }

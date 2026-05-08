@@ -281,8 +281,12 @@ fn decode_permutation(br: &mut BitReader<'_>, size: usize) -> Result<Vec<u32>> {
     let mut dists: Vec<Vec<u16>> = Vec::with_capacity(n_clusters);
     let mut aliases: Vec<AliasTable> = Vec::with_capacity(n_clusters);
     for _ in 0..n_clusters {
-        let d = read_distribution(br, log_alphabet_size)?;
-        let a = AliasTable::build(&d, log_alphabet_size)?;
+        // Round-8 SPECGAP: read_distribution may return a D larger
+        // than `1 << log_alphabet_size` when alphabet_size exceeds
+        // table_size; the effective log_alphabet_size is returned for
+        // alias-table sizing.
+        let (d, log_eff) = read_distribution(br, log_alphabet_size)?;
+        let a = AliasTable::build(&d, log_eff)?;
         dists.push(d);
         aliases.push(a);
     }
