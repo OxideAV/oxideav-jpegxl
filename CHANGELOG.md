@@ -9,6 +9,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Round 13 (2024-spec)** — DctSelect / HfMul derivation from
+  BlockInfo (FDIS C.5.4 prose + Table C.16) + HfGlobal default-fast-
+  path (C.6) + VarDCT pipeline wiring of round-12's F.1 LF dequant +
+  F.2 adaptive smoothing.
+
+  Three pieces tighten the VarDCT decode path so round-12's
+  unit-tested F.1 / F.2 work actually runs on real codestreams:
+
+  1. **DctSelect / HfMul derivation** (`dct_select` module) — walks
+     each column of the per-LfGroup `BlockInfo` channel decoded in
+     round 12, looks up the transform type in Table C.16's 27-entry
+     table, and places the varblock at the next-empty 8×8 cell of
+     the LfGroup's block grid (raster order, top-left first as per
+     C.5.4 prose). `HfMul = 1 + mul` is computed and stored at the
+     varblock top-left only. Continuation cells track the interior
+     of multi-block varblocks.
+
+  2. **HfGlobal C.6 default-fast-path** (`hf_global` module) — reads
+     the `u(1)` dequant-default flag (when `1`, all 17 matrix slots
+     take their default encoding from C.6.3) and the
+     `num_hf_presets - 1 = u(ceil(log2(num_groups)))` field per
+     C.6.4. The non-default-encoding branch (per-matrix
+     `encoding_mode = u(3)` + Listing C.7 `ReadDctParams()`) returns
+     `Error::Unsupported` until round 14+.
+
+  3. **VarDCT pipeline wiring** (`decode_vardct_round13` in
+     `lib.rs`) — the top-level `decode_one_frame` no longer rejects
+     VarDCT codestreams at the round-8 scaffold gate. Instead, for
+     `num_lf_groups == 1 && num_passes == 1`, it now drives:
+     LfGlobal → LfGroup (LfCoefficients + HfMetadata) → DctSelect
+     derivation → HfGlobal → F.1 LF dequantisation (Listing F.1
+     `mXDC = m_x_lf_unscaled / (global_scale × quant_lf)` with
+     `1 << extra_precision` divide) → F.2 adaptive smoothing (when
+     `kSkipAdaptiveLFSmoothing` is clear and no channel is
+     subsampled). The pipeline returns `Error::Unsupported` with a
+     "round 14+: HF subband decode + IDCT not yet wired" message
+     AFTER all round-12 work has run on the real input.
+
+  Acceptance: 25 new unit tests covering Table C.16 indexing +
+  block_dims, DctSelect placement scenarios (DCT8×8, DCT16×16,
+  DCT32×32, DCT8×16, mixed grids, overflow, underflow), HfGlobal
+  default-fast-path with various `num_groups`, and 5 round-13
+  integration tests including round-trip parsing of two real
+  cjxl-encoded VarDCT fixtures (`vardct_256x256_d1.jxl`,
+  `vardct_256x256_d3.jxl`, copied in-tree from
+  `docs/image/jpegxl/fixtures/`). Both VarDCT fixtures now reach the
+  round-13 pipeline (no longer hit the round-8 scaffold gate). All 5
+  small lossless Modular fixtures stay regression-free.
+
 - **Round 11 (2024-spec)** — LF subband decode (Annex G.2.2 / I.2 /
   FDIS C.5.3).
 

@@ -347,28 +347,75 @@
 //! All five small lossless fixtures stay pixel-correct (see
 //! `tests/round11_lf_subband.rs`).
 //!
-//! Round-12 candidates (in dependency order):
+//! ## Round-13 (2024-spec) additions
 //!
-//! * Apply Listing F.1 dequant (`mXDC = m_x_lf_unscaled /
-//!   (global_scale × quant_lf)`, divide by `1 << extra_precision`).
-//! * Adaptive LF smoothing (FDIS F.2) gated by `kSkipAdaptiveLFSmoothing`.
-//! * HfMetadata (G.2.4): `nb_blocks` + XFromY/BFromY/BlockInfo/
-//!   Sharpness modular sub-bitstream + DctSelect/HfMul reconstruction.
-//! * HfGlobal HfPass[num_passes] decode (Annex G.3 Table G.4).
-//! * PassGroup HF (G.4.3): clustered ANS, coefficient order, dequant.
-//! * Inverse DCT dispatch across block sizes (8×8 wired round 8;
-//!   16×8 / 8×16 / 16×16 / 32×32 / 64×64 / DCT4 / DCT8×4 / IDENTITY
-//!   / AFV remain).
-//! * Chroma-from-Luma (Annex G), Gaborish, EPF.
+//! Three pieces tighten the VarDCT pipeline so round-12's unit-tested
+//! F.1 / F.2 work actually runs on real codestreams:
+//!
+//! 1. **DctSelect / HfMul derivation from BlockInfo** ([`dct_select`]):
+//!    walks each column of the per-LfGroup BlockInfo channel decoded
+//!    in round 12, looks up the transform type in Table C.16, and
+//!    places the varblock at the next-empty 8×8 cell of the LfGroup's
+//!    block grid (raster order). HfMul is computed as `1 + mul`. The
+//!    27-entry transform-type table is committed verbatim with
+//!    per-entry `(block_cols, block_rows)` from the FDIS spec.
+//!
+//! 2. **HfGlobal C.6 default-fast-path** ([`hf_global`]): reads the
+//!    `u(1)` dequant-default flag and the `num_hf_presets - 1 =
+//!    u(ceil(log2(num_groups)))` field. The non-default-encoding
+//!    branch (per-matrix `encoding_mode = u(3)` + Listing C.7
+//!    `ReadDctParams()`) returns `Error::Unsupported` until round 14+
+//!    wires the full table.
+//!
+//! 3. **VarDCT pipeline wiring** ([`decode_vardct_round13`]): the
+//!    top-level `decode_one_frame` no longer rejects VarDCT
+//!    codestreams at the round-8 scaffold gate. Instead, for
+//!    `num_lf_groups == 1 && num_passes == 1`, it now drives:
+//!    LfGlobal → LfGroup (LfCoefficients + HfMetadata) → DctSelect
+//!    derivation → HfGlobal → F.1 LF dequantisation → F.2 adaptive
+//!    smoothing (when not skipped). The round-13 pipeline returns
+//!    `Error::Unsupported` with a "round 14+: HF subband decode +
+//!    IDCT not yet wired" message AFTER all round-12 work has run on
+//!    the real input.
+//!
+//! Round-13 status — five small lossless Modular fixtures stay
+//! pixel-correct; both VarDCT fixtures (`vardct_256x256_d1.jxl` and
+//! `vardct_256x256_d3.jxl`, copied from `docs/image/jpegxl/fixtures/`)
+//! reach the round-13 pipeline (no longer hit the round-8 scaffold
+//! gate).
+//!
+//! Round-14 candidates (in dependency order):
+//!
+//! * HfBlockContext non-default-table branch (per-LF thresholds + qf
+//!   thresholds + clustering map), required for any cjxl-encoded VarDCT
+//!   fixture that doesn't take the `u(1)=1` default-table fast path.
+//! * HfGlobal C.6.2 dequant-matrix encoding modes (Listing C.7) +
+//!   Listing C.10 `GetDCTQuantWeights` for per-DctSelect dequant
+//!   matrices.
+//! * HfPass C.7.1 coefficient orders (`used_orders` 13-bit mask,
+//!   `DecodePermutation`) + C.7.2 histograms (495 × num_hf_presets ×
+//!   nb_block_ctx clustered distributions).
+//! * PassGroup HF coefficients C.8.3: per-block `hfp =
+//!   u(ceil(log2(num_hf_presets)))` + clustered ANS coeff decode +
+//!   F.3 HF dequantisation (Listing F.2 + per-channel scale +
+//!   per-DctSelect dequant matrix multiply).
+//! * Inverse DCT dispatch across block sizes (8×8 IDCT wired round 8;
+//!   8×16 / 16×8 / 16×16 / 32×32 / 64×64 / DCT4 / DCT4×8 / DCT8×4 /
+//!   IDENTITY / AFV remain).
+//! * Listing I.5 LLF-from-downsampled-LF composition (the bridge from
+//!   F.2-smoothed LF samples to varblock LF coefficients).
+//! * Chroma-from-Luma (Annex G), Gaborish (Annex J?), EPF.
 
 pub mod abrac;
 pub mod ans;
 pub mod begabrac;
 pub mod bitreader;
 pub mod container;
+pub mod dct_select;
 pub mod extensions;
 pub mod frame_header;
 pub mod global_modular;
+pub mod hf_global;
 pub mod icc;
 pub mod lf_dequant;
 pub mod lf_global;
@@ -575,23 +622,18 @@ fn decode_codestream(codestream: &[u8], pts: Option<i64>) -> Result<VideoFrame> 
             fh.encoding,
         ));
     }
-    // Diagnostic on unhandled features. Round 8 lands a VarDCT
-    // scaffold: structurally recognised + IDCT-8x8 primitive
-    // available via the [`vardct`] module, but pixel decode of a
-    // VarDCT codestream still defers — see crate::vardct docs.
+    // Diagnostic on unhandled features. Round 13 wires LfGlobal +
+    // LfGroup (incl. LfCoefficients + HfMetadata) + HfGlobal + F.1 LF
+    // dequant + F.2 adaptive smoothing into the VarDCT pipeline. End-
+    // to-end pixel decode (HF coefficient subband + IDCT dispatch +
+    // CfL + restoration filters) is round-14+ work — the fast path
+    // below errors with a precise round-14 message AFTER consuming
+    // the LfGlobal/LfGroup/HfGlobal sections + computing the
+    // dequantised LF samples per Listing F.1 + applying F.2 smoothing
+    // when `kSkipAdaptiveLFSmoothing == 0`.
     if fh.encoding == crate::frame_header::Encoding::VarDct {
-        // Recognise structurally; reject before attempting pixel
-        // decode. This still returns `Error::Unsupported` but with a
-        // VarDCT-specific message so callers can distinguish a
-        // VarDCT codestream from a Modular one early.
         let scaffold = crate::vardct::recognise_vardct_codestream(&fh, &metadata)?;
-        return Err(Error::Unsupported(format!(
-            "jxl VarDCT decoder (round 8 scaffold): codestream recognised \
-             ({}x{}, {} colour channels, group_dim={}) but pixel decode \
-             (LF/HF subbands + dequant + IDCT + CfL + Gaborish + EPF) is \
-             round-9+ work",
-            scaffold.width, scaffold.height, scaffold.num_colour_channels, scaffold.group_dim
-        )));
+        return decode_vardct_round13(&fh, &metadata, &toc, &mut br, scaffold);
     }
     if fh.encoding != crate::frame_header::Encoding::Modular {
         return Err(Error::Unsupported(format!(
@@ -771,6 +813,173 @@ fn decode_codestream(codestream: &[u8], pts: Option<i64>) -> Result<VideoFrame> 
         debug_assert_eq!(planes[i].data.len(), w * h);
     }
     Ok(VideoFrame { pts, planes })
+}
+
+/// VarDCT round-13 driver. Reads LfGlobal + LfGroup + HfGlobal off
+/// the TOC for a single-LfGroup frame, computes per-channel LF
+/// multipliers per Listing C.1 / F.1, runs Listing F.1 dequant on the
+/// LfCoefficients, and (when `kSkipAdaptiveLFSmoothing` is clear and no
+/// channel is subsampled) applies F.2 adaptive smoothing in place. The
+/// dequantised LF samples are then dropped — round 14 will pick up from
+/// here and dispatch IDCT / CfL / Gaborish / EPF. Returns
+/// `Error::Unsupported` with a precise "round 14+: HF subband decode +
+/// IDCT not yet wired" message at the end of the round-13 pipeline.
+fn decode_vardct_round13(
+    fh: &FrameHeader,
+    metadata: &ImageMetadataFdis,
+    toc: &Toc,
+    br: &mut BitReader<'_>,
+    scaffold: crate::vardct::VarDctScaffold,
+) -> Result<VideoFrame> {
+    let num_groups = fh.num_groups();
+    let num_lf_groups = fh.num_lf_groups();
+    if num_lf_groups != 1 || fh.passes.num_passes != 1 {
+        return Err(Error::Unsupported(format!(
+            "jxl VarDCT decoder (round 13): num_lf_groups={num_lf_groups} num_passes={} \
+             — multi-LfGroup / multi-pass VarDCT defers to round 14+",
+            fh.passes.num_passes
+        )));
+    }
+
+    let frame_data_start = br.bytes_consumed();
+    let codestream_data = br.data();
+    if frame_data_start > codestream_data.len() {
+        return Err(Error::InvalidData(
+            "JXL VarDCT round 13: frame data start past codestream end".into(),
+        ));
+    }
+    let frame_bytes = &codestream_data[frame_data_start..];
+    let total_frame_len: u64 = toc.entries.iter().map(|&e| e as u64).sum();
+    if total_frame_len > frame_bytes.len() as u64 {
+        return Err(Error::InvalidData(format!(
+            "JXL VarDCT round 13: TOC declares {total_frame_len} frame bytes but only {} \
+             remaining",
+            frame_bytes.len()
+        )));
+    }
+    let mut section_starts: Vec<usize> = Vec::with_capacity(toc.entries.len());
+    let mut acc: u64 = 0;
+    for &e in &toc.entries {
+        section_starts.push(acc as usize);
+        acc = acc.saturating_add(e as u64);
+    }
+    let section_byte_range = |idx: usize| -> Result<&[u8]> {
+        if idx >= toc.entries.len() {
+            return Err(Error::InvalidData(format!(
+                "JXL VarDCT round 13: TOC slot {idx} out of range (entries={})",
+                toc.entries.len()
+            )));
+        }
+        let start = section_starts[idx];
+        let len = toc.entries[idx] as usize;
+        let end = start + len;
+        if end > frame_bytes.len() {
+            return Err(Error::InvalidData(format!(
+                "JXL VarDCT round 13: section {idx} byte range [{start}..{end}) exceeds frame bytes ({})",
+                frame_bytes.len()
+            )));
+        }
+        Ok(&frame_bytes[start..end])
+    };
+
+    // Slot indexing per F.3.1 (round-9 fix: HfGlobal slot is unconditional):
+    //   slot 0 — LfGlobal
+    //   slots 1..1+num_lf_groups — LfGroup[*]
+    //   slot 1+num_lf_groups — HfGlobal (contains HfPass for kVarDCT)
+    let lf_global_slot = 0usize;
+    let lf_group_slot = |lf_group_idx: u64| -> usize { 1 + lf_group_idx as usize };
+    let hf_global_slot = 1 + num_lf_groups as usize;
+
+    // Pull LfGlobal bytes off the TOC and decode.
+    let lf_global_bytes = section_byte_range(lf_global_slot)?;
+    let mut lf_br = BitReader::new_section(lf_global_bytes);
+    let lf_global = LfGlobal::read(&mut lf_br, fh, metadata)?;
+
+    // VarDCT requires Quantizer + HfBlockContext + LfChannelCorrelation
+    // to all be present (LfGlobal::read populates all three when
+    // encoding == kVarDCT). Defensive guard.
+    let quantizer = lf_global
+        .quantizer
+        .ok_or_else(|| Error::InvalidData("JXL VarDCT round 13: Quantizer missing".into()))?;
+    let _ = lf_global
+        .hf_block_context
+        .as_ref()
+        .ok_or_else(|| Error::InvalidData("JXL VarDCT round 13: HfBlockContext missing".into()))?;
+    let _ = lf_global.lf_channel_correlation.ok_or_else(|| {
+        Error::InvalidData("JXL VarDCT round 13: LfChannelCorrelation missing".into())
+    })?;
+
+    // LfGroup (slot 1) — contains LfCoefficients + ModularLfGroup +
+    // HfMetadata when encoding == kVarDCT. Round 13 only handles
+    // num_lf_groups == 1.
+    let lf_group_bytes = section_byte_range(lf_group_slot(0))?;
+    let mut lg_br = BitReader::new_section(lf_group_bytes);
+    let lf_group = crate::lf_group::LfGroup::read(&mut lg_br, fh, &lf_global, 0)?;
+
+    let lf_coeff = lf_group.lf_coeff.ok_or_else(|| {
+        Error::InvalidData("JXL VarDCT round 13: LfCoefficients missing on VarDCT LfGroup".into())
+    })?;
+    let hf_meta = lf_group.hf_meta.ok_or_else(|| {
+        Error::InvalidData("JXL VarDCT round 13: HfMetadata missing on VarDCT LfGroup".into())
+    })?;
+
+    // Derive DctSelect / HfMul from BlockInfo per FDIS C.5.4 prose.
+    // The grid covers the LfGroup's pixel rectangle; for a single-
+    // LfGroup frame that's the full frame.
+    let lf_w = lf_group.mlf_group.lf_group_width;
+    let lf_h = lf_group.mlf_group.lf_group_height;
+    let _dct_grid = crate::dct_select::derive_dct_select(&hf_meta, lf_w, lf_h)?;
+
+    // HfGlobal (slot 1+num_lf_groups) — round 13 supports only the
+    // u(1)=1 default-encoding fast path for dequant matrices + the
+    // C.6.4 num_hf_presets field.
+    let hf_global_bytes = section_byte_range(hf_global_slot)?;
+    let mut hg_br = BitReader::new_section(hf_global_bytes);
+    let _hf_global = crate::hf_global::HfGlobal::read(&mut hg_br, num_groups)?;
+
+    // F.1 LF dequantisation (Listing F.1) over the per-LfGroup
+    // LfCoefficients. Unwrap the lf_quant Vec into a fixed-size [3]
+    // array as expected by `dequant_lf`.
+    if lf_coeff.lf_quant.len() != 3 {
+        return Err(Error::InvalidData(format!(
+            "JXL VarDCT round 13: LfCoefficients has {} channels, expected 3",
+            lf_coeff.lf_quant.len()
+        )));
+    }
+    let lf_quant: [Vec<i32>; 3] = [
+        lf_coeff.lf_quant[0].clone(),
+        lf_coeff.lf_quant[1].clone(),
+        lf_coeff.lf_quant[2].clone(),
+    ];
+    let multipliers = crate::lf_dequant::LfMultipliers::compute(&lf_global.lf_dequant, &quantizer);
+    let mut dequant = crate::lf_dequant::dequant_lf(
+        &lf_quant,
+        lf_coeff.lf_quant_widths,
+        lf_coeff.lf_quant_heights,
+        lf_coeff.extra_precision,
+        &multipliers,
+    );
+
+    // F.2 adaptive LF smoothing (gated by kSkipAdaptiveLFSmoothing flag
+    // + no channel subsampled).
+    if crate::lf_dequant::should_apply_adaptive_lf_smoothing(fh) {
+        crate::lf_dequant::apply_adaptive_lf_smoothing(&mut dequant, &multipliers);
+    }
+    // The dequantised LF samples in `dequant` are now the inputs to
+    // round-14's IDCT / CfL / Gaborish / EPF chain. For now we drop
+    // them and report a precise "next round" Unsupported.
+    let _ = dequant;
+
+    Err(Error::Unsupported(format!(
+        "jxl VarDCT decoder (round 13): codestream parsed and LfCoefficients dequantised + \
+         smoothed ({}x{}, {} colour channels, group_dim={}, num_groups={}) — HF coefficient \
+         subband + IDCT dispatch + CfL + Gaborish + EPF defer to round 14+",
+        scaffold.width,
+        scaffold.height,
+        scaffold.num_colour_channels,
+        scaffold.group_dim,
+        num_groups
+    )))
 }
 
 /// FDIS-side `Headers` returned by [`probe_fdis`]. Mirrors the
