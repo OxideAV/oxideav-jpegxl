@@ -607,6 +607,37 @@ pub struct MaTreeFdis {
 }
 
 impl MaTreeFdis {
+    /// Construct an empty placeholder tree for the N=0 sub-bitstream
+    /// case (FDIS C.9.1 last sentence: "In the trivial case where N is
+    /// zero, the decoder takes no action."). The returned shell has no
+    /// nodes; [`decode_channels_at_stream`] short-circuits before
+    /// touching it when `descs.is_empty()`.
+    pub fn empty_shell() -> Self {
+        let lz_len_conf = crate::ans::hybrid_config::HybridUintConfig {
+            split_exponent: 8,
+            msb_in_token: 0,
+            lsb_in_token: 0,
+            split: 1 << 8,
+        };
+        let entropy = EntropyStream {
+            use_prefix_code: true,
+            log_alphabet_size: 5,
+            configs: Vec::new(),
+            entropies: Vec::new(),
+            lz77: crate::ans::hybrid::Lz77Params::default(),
+            lz_len_conf,
+            cluster_map: Vec::new(),
+            ans_state: None,
+        };
+        let hybrid = HybridUintState::new(entropy.lz77, entropy.lz_len_conf);
+        Self {
+            nodes: Vec::new(),
+            num_ctx: 0,
+            entropy,
+            hybrid,
+        }
+    }
+
     /// Return a fresh copy with the entropy-stream state and hybrid
     /// state reset. Used when reusing a "global" tree across multiple
     /// per-section sub-bitstreams (Annex H.2 — clustered distributions

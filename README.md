@@ -86,11 +86,19 @@ the `old` branch are universally off-limits per
 
 Round 8+ candidates (in priority order):
 
-1. **Resolve C.2.5 alphabet_size SPECGAP** — close the round-7
-   `alphabet_size > table_size` blocker so the committed
-   `synth_320_grey/` fixture decodes pixel-correct.
-2. **VarDCT decode** (Annex I) — start with `vardct-256x256-d1`
-   then move to `vardct-256x256-d3` and `large-1024x768-d2`.
+1. **Resolve C.2.5 alphabet_size SPECGAP** — round-8 partial
+   resolution; round-9 lifted the synth_320 fixture to ~21k
+   pixel-correct samples; remaining drift parked for an
+   Auditor-mode bisect (see round-10 CHANGELOG).
+2. **VarDCT decode** (Annex I) — round-8 lands the IDCT-8x8
+   primitive + structural recognition; **round-11** wires the
+   LfGlobal VarDCT bundles (Quantizer + HfBlockContext default
+   table + LfChannelCorrelation) and the LfCoefficients
+   sub-bitstream (per-LfGroup `extra_precision` + 3-channel
+   modular decode at `ceil(group_dim/8)` resolution). Round 12+:
+   Listing F.1 LF dequant + adaptive LF smoothing + HfMetadata +
+   PassGroup HF + remaining IDCT block sizes + Chroma-from-Luma +
+   Gaborish + EPF.
 3. **XYB inverse colour transform** (§K) — needed for VarDCT
    downstream, plus some Modular images that use XYB.
 4. **ICC bytes propagation** — coordinate with `oxideav-core` to

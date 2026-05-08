@@ -296,6 +296,70 @@
 //! pixels matching the gradient (first 24 rows of PG[0][0] and
 //! PG[0][1] are pixel-correct; drift begins at y=24, x=14). All
 //! five small lossless fixtures still pixel-correct.
+//!
+//! ## Round-11 (2024-spec) additions
+//!
+//! Three pieces wire LF subband decode (Annex G.2.2 / I.2):
+//!
+//! 1. **LfGlobal VarDCT bundles** ([`lf_global`]):
+//!    [`lf_global::Quantizer`] (FDIS C.4.3 — `global_scale` +
+//!    `quant_lf`) drives LF dequant per Listing C.1.
+//!    [`lf_global::LfChannelCorrelation`] (C.4.4) carries the CfL
+//!    factors used by Annex G to reconstruct X/B from dY (default
+//!    `colour_factor=84`, `base_correlation_x=0.0`,
+//!    `base_correlation_b=1.0`). [`lf_global::HfBlockContext`]
+//!    (C.8.4) implements only the `u(1)==1` default-table fast path
+//!    in round 11; the per-LF-threshold / qf-threshold / clustering-
+//!    map branch returns `Error::Unsupported`. With these bundles
+//!    wired, `LfGlobal::read` advances correctly past the VarDCT-only
+//!    region of the LfGlobal slot rather than rejecting outright.
+//!
+//! 2. **GlobalModular zero-channel acceptance**
+//!    ([`global_modular`]): `GlobalModular::read` previously rejected
+//!    any frame where `derive_channel_descs` returned 0 channels (the
+//!    common VarDCT-without-extras case). Round 11 accepts the empty
+//!    case: the inner ModularHeader (`use_global_tree`, `WPHeader`,
+//!    `nb_transforms`) is still consumed, but the MA-tree and per-
+//!    cluster distribution decode are skipped per FDIS C.9.1 last
+//!    sentence ("In the trivial case where N is zero, the decoder
+//!    takes no action.").
+//!
+//! 3. **LfGroup + LfCoefficients** ([`lf_group`]):
+//!    [`lf_group::LfCoefficients::read`] reads `extra_precision = u(2)`
+//!    per FDIS C.5.3, builds the per-LfGroup channel layout (3 LF
+//!    channels of `ceil(group_w/8) × ceil(group_h/8)` samples,
+//!    optionally further right-shifted by `frame_header.jpeg_upsampling`
+//!    on chroma planes), then drives a Modular sub-bitstream with
+//!    `stream_index = 1 + lf_group_index` per Table H.4.
+//!    [`lf_group::LfGroup::read`] composes ModularLfGroup (G.2.3 —
+//!    round-11 only handles the empty-channel-list case for now)
+//!    with LfCoefficients. HfMetadata (G.2.4) is round-12+ work.
+//!
+//! Acceptance fixture: hand-built minimal VarDCT bitstream — no cjxl
+//! dependency, encoded directly from spec listings — covering an
+//! 8×8 frame with 1×1 LF coefficient channels, MA tree of one
+//! Zero-predictor leaf, and prefix-code symbol stream with
+//! alphabet_size=1 (so every decoded LF coefficient is 0). The
+//! fixture parses through `LfGlobal::read` → `LfGroup::read` →
+//! `LfCoefficients::read` end-to-end. Test:
+//! `lf_group::tests::round11_lfgroup_minimal_vardct_one_block_parses`.
+//!
+//! All five small lossless fixtures stay pixel-correct (see
+//! `tests/round11_lf_subband.rs`).
+//!
+//! Round-12 candidates (in dependency order):
+//!
+//! * Apply Listing F.1 dequant (`mXDC = m_x_lf_unscaled /
+//!   (global_scale × quant_lf)`, divide by `1 << extra_precision`).
+//! * Adaptive LF smoothing (FDIS F.2) gated by `kSkipAdaptiveLFSmoothing`.
+//! * HfMetadata (G.2.4): `nb_blocks` + XFromY/BFromY/BlockInfo/
+//!   Sharpness modular sub-bitstream + DctSelect/HfMul reconstruction.
+//! * HfGlobal HfPass[num_passes] decode (Annex G.3 Table G.4).
+//! * PassGroup HF (G.4.3): clustered ANS, coefficient order, dequant.
+//! * Inverse DCT dispatch across block sizes (8×8 wired round 8;
+//!   16×8 / 8×16 / 16×16 / 32×32 / 64×64 / DCT4 / DCT8×4 / IDENTITY
+//!   / AFV remain).
+//! * Chroma-from-Luma (Annex G), Gaborish, EPF.
 
 pub mod abrac;
 pub mod ans;

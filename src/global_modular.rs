@@ -136,31 +136,12 @@ impl GlobalModular {
             transforms.push(TransformInfo::read(br)?);
         }
 
-        // 3. Local MA tree + per-context distributions, OR reuse the
-        //    global tree. We CLONE the global tree (with fresh ANS
-        //    state) so the original can be retained on the bundle for
-        //    later per-PassGroup sub-bitstreams that also opt in to
-        //    `use_global_tree=true`.
-        let mut tree = if inner_use_global_tree {
-            global_tree
-                .as_ref()
-                .ok_or_else(|| {
-                    Error::InvalidData(
-                        "JXL GlobalModular: inner sub-bitstream wants global tree but none was decoded".into(),
-                    )
-                })?
-                .cloned_with_fresh_state()
-        } else {
-            MaTreeFdis::read(br)?
-        };
-
-        // 4. Channel layout.
+        // 4. Channel layout. For VarDCT mode with no extra channels the
+        //    GlobalModular section carries zero modular channels — the
+        //    colour channels arrive via LfCoefficients (G.2.2) +
+        //    PassGroup HF (G.4.3) instead. Round 11: accept the empty
+        //    case rather than reject early.
         let descs = derive_channel_descs(fh, metadata)?;
-        if descs.is_empty() {
-            return Err(Error::InvalidData(
-                "JXL GlobalModular: zero channels — VarDCT path not yet supported".into(),
-            ));
-        }
         if descs.len() > MAX_CHANNELS {
             return Err(Error::InvalidData(format!(
                 "JXL GlobalModular: {} channels exceeds cap {}",
@@ -209,6 +190,34 @@ impl GlobalModular {
             }
         }
         let fully_decoded = deferred_indices.is_empty();
+
+        // 5b. MA tree + per-context distributions are emitted in the
+        //     bitstream AFTER the ModularHeader transforms list AND only
+        //     when the decoder has at least one channel to decode in
+        //     this sub-bitstream. Per FDIS C.9.1 last sentence: "In the
+        //     trivial case where N is zero, the decoder takes no
+        //     action." That includes skipping the MA-tree decode.
+        //     For VarDCT-mode GlobalModular the typical case is exactly
+        //     N=0 (descs empty) — colour channels arrive via
+        //     LfCoefficients + PassGroup HF rather than this section.
+        let mut tree = if decoded_descs.is_empty() {
+            // No tree, no distributions, no ANS state — return a
+            // throwaway empty MA tree shell. `decode_channels_at_stream`
+            // short-circuits on empty descs so no field of `tree` is
+            // actually read.
+            MaTreeFdis::empty_shell()
+        } else if inner_use_global_tree {
+            global_tree
+                .as_ref()
+                .ok_or_else(|| {
+                    Error::InvalidData(
+                        "JXL GlobalModular: inner sub-bitstream wants global tree but none was decoded".into(),
+                    )
+                })?
+                .cloned_with_fresh_state()
+        } else {
+            MaTreeFdis::read(br)?
+        };
 
         // 6. Pixel decode (per Annex H.3) for the non-deferred subset.
         //    The full descs list is preserved in `image` (deferred
