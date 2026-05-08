@@ -9,6 +9,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Round 16 (2024-spec)** — HfMetadata nested transforms (FDIS §C.5.4
+  + §C.9.4) — the four-channel HfMetadata sub-bitstream now parses
+  `nb_transforms` + `TransformInfo[]` and applies the inverse
+  transforms in reverse bitstream order to recover the four-channel
+  base layout `[XFromY, BFromY, BlockInfo, Sharpness]`.
+
+  Round 15 closed two stacked bugs (GlobalModular ModularHeader N=0
+  gate + single-TOC-entry section chaining), exposing the round-12
+  HfMetadata deferral on the d1 fixture: `nb_transforms > 0` errored
+  out as `"transforms inside HF metadata sub-bitstream not yet
+  supported (round 13+)"`. Round 16 wires the parse:
+
+  - `HfMetadata::read` now takes the `metadata: &ImageMetadataFdis`
+    bundle (forwarded from `LfGroup::read`) so the inverse Palette
+    transform can read `bit_depth.bits_per_sample` for delta-palette
+    prediction.
+  - The four-channel HfMetadata baseline is fed through
+    `apply_transforms_to_channel_layout` (mirroring
+    `GlobalModular::read`) so the inner per-channel decode operates on
+    the post-transform list.
+  - After `decode_channels_at_stream`, `apply_inverse_transforms` is
+    invoked with the same `transforms` list so RCT / Palette / Squeeze
+    are undone and the four-channel baseline is recovered. The decoded
+    `nb_blocks` and per-channel widths/heights are validated against
+    the §C.5.4 baseline before being returned.
+
+  Acceptance: the d1 (`vardct_256x256_d1.jxl`) fixture now reaches a
+  strictly-later blocker — its HfMetadata sub-bitstream emits an
+  explicit Squeeze whose `SqueezeParam.begin_c` references channels
+  beyond the four-channel baseline (`begin_c=39` on the very first
+  step), and `apply_transforms_to_channel_layout`'s
+  `begin_c + num_c <= channel_count` invariant fires with
+  `Error::InvalidData("JXL Modular Squeeze: end 40 >= channel count
+  4")`. That's the round-17 candidate to investigate (suspected
+  upstream bit-position drift in LfGlobal or LfCoefficients). Round-16
+  sentinel test (`round16_hfmeta_transforms.rs`) asserts the d1
+  progression and the five small lossless fixtures stay
+  regression-free.
+
 - **Round 15 (2024-spec)** — GlobalModular zero-channel ModularHeader
   gating (FDIS §C.9.1 last sentence) + single-TOC-entry section chaining
   for the VarDCT pipeline. Unblocks the d1 fixture past the LfGlobal

@@ -44,6 +44,39 @@
 //! prose) defers to round 13+ since the consumer (HF decode + IDCT) is
 //! also round-13+ work.
 //!
+//! ## Round 16 — HfMetadata transforms (FDIS §C.5.4 + §C.9.4)
+//!
+//! Round 16 wires the nested-transform parse inside `HfMetadata::read`.
+//! Per FDIS §C.5.4 the four-channel HfMetadata sub-bitstream is a
+//! regular §C.9 modular sub-bitstream with the standard ModularHeader
+//! (`use_global_tree`, `WPHeader`, `nb_transforms`, `transform[]`). The
+//! transforms re-shape the channel list before the inner per-channel
+//! decode and are inverted afterwards.
+//!
+//! [`HfMetadata::read`] now:
+//!
+//! 1. Reads `nb_transforms` and `TransformInfo[]` exactly as
+//!    `GlobalModular::read` does.
+//! 2. Calls
+//!    [`crate::global_modular::apply_transforms_to_channel_layout`] to
+//!    derive the post-transform channel list the inner decode operates
+//!    on.
+//! 3. After per-channel decode, calls
+//!    [`crate::global_modular::apply_inverse_transforms`] in reverse
+//!    bitstream order to recover the four-channel base layout
+//!    `[XFromY, BFromY, BlockInfo, Sharpness]`. The `bit_depth`
+//!    parameter is consulted only by the inverse Palette transform's
+//!    delta-palette prediction.
+//!
+//! The d1 fixture's HfMetadata sub-bitstream is observed to encode an
+//! explicit Squeeze whose `SqueezeParam.begin_c` references channels
+//! beyond the four-channel baseline (e.g. `begin_c=39` on the very first
+//! step). The current `apply_transforms_to_channel_layout` validates
+//! `begin + num_c <= channel_count` and rejects with `InvalidData` —
+//! that's the round-17 candidate to investigate (likely an upstream
+//! bit-position drift in LfGlobal or LfCoefficients that puts our cursor
+//! at the wrong spot before HfMetadata's ModularHeader).
+//!
 //! ## Round 6 / 7 history (still relevant)
 //!
 //! Multi-group decode required four coordinated pieces:
@@ -62,7 +95,9 @@ use oxideav_core::{Error, Result};
 
 use crate::bitreader::{BitReader, U32Dist};
 use crate::frame_header::{Encoding, FrameHeader};
+use crate::global_modular::{apply_inverse_transforms, apply_transforms_to_channel_layout};
 use crate::lf_global::LfGlobal;
+use crate::metadata_fdis::ImageMetadataFdis;
 use crate::modular_fdis::{
     decode_channels_at_stream, ChannelDesc, MaTreeFdis, TransformInfo, WpHeader,
 };
@@ -335,9 +370,21 @@ impl HfMetadata {
     /// supplies the optional shared MA tree; `lf_group_index` and
     /// `num_lf_groups` together give the stream_index per Table H.4
     /// (`1 + 2*num_lf_groups + lf_group_idx`).
+    ///
+    /// `metadata` is consulted only for `bit_depth.bits_per_sample`,
+    /// which the inverse Palette transform (if any) needs to compute the
+    /// delta-palette prediction factor. Per FDIS §C.9 the modular sub-
+    /// bitstream nested inside HfMetadata can carry transforms (RCT /
+    /// Palette / Squeeze) just like the GlobalModular section: this
+    /// function parses them, applies the channel-layout adjustment
+    /// before the per-channel decode (so the inner decoder reads the
+    /// transform-rewritten channel list), then applies inverse
+    /// transforms in reverse bitstream order to recover the four base
+    /// channels [XFromY, BFromY, BlockInfo, Sharpness].
     pub fn read(
         br: &mut BitReader<'_>,
         lf_global: &LfGlobal,
+        metadata: &ImageMetadataFdis,
         lf_w: u32,
         lf_h: u32,
         lf_group_index: LfGroupIndex,
@@ -365,9 +412,10 @@ impl HfMetadata {
         }
         let nb_blocks = nb_blocks_minus_1 + 1;
 
-        // Build the 4-channel ChannelDesc list per Table C.5.4.
+        // Build the 4-channel ChannelDesc list per Table C.5.4 (the
+        // BASELINE channel list, before any nested-bitstream transforms).
         let dims = Self::channel_dims(lf_w, lf_h, nb_blocks);
-        let descs: Vec<ChannelDesc> = dims
+        let base_descs: Vec<ChannelDesc> = dims
             .iter()
             .map(|&(w, h)| ChannelDesc {
                 width: w,
@@ -396,13 +444,14 @@ impl HfMetadata {
         for _ in 0..nb_transforms {
             transforms.push(TransformInfo::read(br)?);
         }
-        if !transforms.is_empty() {
-            return Err(Error::Unsupported(format!(
-                "JXL HfMetadata: {} transforms inside HF metadata sub-bitstream not yet \
-                 supported (round 13+)",
-                transforms.len()
-            )));
-        }
+
+        // Apply the transform sequence to the channel layout per
+        // §C.9.4 — Squeeze inserts residual channels, Palette inserts a
+        // leading meta-channel and collapses the source channels to a
+        // single index channel, RCT does not change the layout. The
+        // resulting `decode_descs` is the channel list that the per-
+        // sample decode loop sees on the wire.
+        let decode_descs = apply_transforms_to_channel_layout(base_descs.clone(), &transforms)?;
 
         let mut tree = if inner_use_global_tree {
             lf_global
@@ -428,14 +477,48 @@ impl HfMetadata {
                 "JXL HfMetadata: stream_index {stream_index} overflows i32"
             )));
         }
-        let img =
-            decode_channels_at_stream(br, &descs, &mut tree, &wp_header, stream_index as i32)?;
+        let mut img = decode_channels_at_stream(
+            br,
+            &decode_descs,
+            &mut tree,
+            &wp_header,
+            stream_index as i32,
+        )?;
+
+        // Apply inverse transforms (in REVERSE bitstream order) to
+        // recover the four base channels. `bit_depth` only matters for
+        // the inverse Palette transform's delta-palette prediction
+        // (Annex H.6.4); HfMetadata channels are integer-valued and the
+        // bit_depth value passes straight through.
+        if !transforms.is_empty() {
+            // Sanity: at least one of the post-transform channels can be
+            // a Squeeze residual or a Palette meta-channel — accept
+            // whatever shape `decode_channels_at_stream` produced and
+            // let `apply_inverse_transforms` undo the layout.
+            let bit_depth = metadata.bit_depth.bits_per_sample.max(1);
+            apply_inverse_transforms(&mut img, &transforms, bit_depth)?;
+        }
+
+        // Verify the recovered shape matches the four-channel HfMetadata
+        // baseline.
         if img.channels.len() != 4 {
             return Err(Error::InvalidData(format!(
-                "JXL HfMetadata: expected 4 decoded channels, got {}",
-                img.channels.len()
+                "JXL HfMetadata: expected 4 channels after inverse transforms, got {} \
+                 (transforms = {})",
+                img.channels.len(),
+                transforms.len()
             )));
         }
+        for (i, (got, want)) in img.descs.iter().zip(base_descs.iter()).enumerate() {
+            if got.width != want.width || got.height != want.height {
+                return Err(Error::InvalidData(format!(
+                    "JXL HfMetadata: channel {i} dims {}x{} after inverse transforms ≠ \
+                     baseline {}x{}",
+                    got.width, got.height, want.width, want.height
+                )));
+            }
+        }
+
         let channel_widths = [
             img.descs[0].width,
             img.descs[1].width,
@@ -494,6 +577,7 @@ impl LfGroup {
         br: &mut BitReader<'_>,
         fh: &FrameHeader,
         lf_global: &LfGlobal,
+        metadata: &ImageMetadataFdis,
         lf_group_index: LfGroupIndex,
     ) -> Result<Self> {
         let num_lf_groups = fh.num_lf_groups();
@@ -535,10 +619,18 @@ impl LfGroup {
                 ));
             }
             let lf = LfCoefficients::read(br, fh, lf_global, lf_w, lf_h, lf_group_index)?;
-            // HfMetadata (G.2.4 / FDIS C.5.4) — round-12 wires the
-            // 4-channel modular sub-bitstream. Derivation of DctSelect
-            // / HfMul from BlockInfo defers to round 13+.
-            let hf = HfMetadata::read(br, lf_global, lf_w, lf_h, lf_group_index, num_lf_groups)?;
+            // HfMetadata (G.2.4 / FDIS C.5.4) — round-16 wires nested
+            // transforms (Squeeze / Palette / RCT) inside the 4-channel
+            // modular sub-bitstream per §C.9.4.
+            let hf = HfMetadata::read(
+                br,
+                lf_global,
+                metadata,
+                lf_w,
+                lf_h,
+                lf_group_index,
+                num_lf_groups,
+            )?;
             (Some(lf), Some(hf))
         } else {
             (None, None)
@@ -647,6 +739,16 @@ mod tests {
         fh
     }
 
+    /// Build a minimal default ImageMetadataFdis bundle for tests that
+    /// need to exercise `LfGroup::read` (which now threads metadata
+    /// through to `HfMetadata::read` for the inverse Palette path's
+    /// `bit_depth`).
+    fn build_metadata_default() -> ImageMetadataFdis {
+        let bytes = crate::ans::test_helpers::pack_lsb(&[(1, 1)]);
+        let mut br = BitReader::new(&bytes);
+        ImageMetadataFdis::read(&mut br).unwrap()
+    }
+
     /// Build a minimal empty-image LfGlobal stub for round-11 tests
     /// where the LfCoefficients sub-bitstream is the only thing being
     /// exercised. The GlobalModular's `image` is empty (no channels);
@@ -703,9 +805,10 @@ mod tests {
     fn lf_group_read_rejects_out_of_range_index() {
         let fh = build_fh(64, 64);
         let lf_global = build_empty_lf_global();
+        let metadata = build_metadata_default();
         let bytes = vec![0u8; 16];
         let mut br = BitReader::new(&bytes);
-        let r = LfGroup::read(&mut br, &fh, &lf_global, 99);
+        let r = LfGroup::read(&mut br, &fh, &lf_global, &metadata, 99);
         assert!(matches!(r, Err(Error::InvalidData(_))));
     }
 
@@ -889,7 +992,7 @@ mod tests {
 
         let lf_coeff_bytes = pack_lsb(&lf_coeff_bits);
         let mut br_lc = BitReader::new(&lf_coeff_bytes);
-        let lf_group = LfGroup::read(&mut br_lc, &fh, &lf_global, 0)
+        let lf_group = LfGroup::read(&mut br_lc, &fh, &lf_global, &metadata, 0)
             .expect("LfGroup minimal VarDCT should parse");
 
         // Assertions:

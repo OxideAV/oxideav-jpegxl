@@ -405,6 +405,32 @@
 //! * Listing I.5 LLF-from-downsampled-LF composition (the bridge from
 //!   F.2-smoothed LF samples to varblock LF coefficients).
 //! * Chroma-from-Luma (Annex G), Gaborish (Annex J?), EPF.
+//!
+//! ## Round-16 (2024-spec) additions
+//!
+//! [`lf_group::HfMetadata::read`] now wires nested transforms (FDIS
+//! §C.5.4 + §C.9.4): the four-channel HfMetadata sub-bitstream parses
+//! `nb_transforms` + `TransformInfo[]` exactly like the GlobalModular
+//! section, applies the transform-rewritten channel layout via
+//! [`global_modular::apply_transforms_to_channel_layout`] before the
+//! inner per-channel decode, then walks
+//! [`global_modular::apply_inverse_transforms`] in reverse bitstream
+//! order to recover the four-channel base layout
+//! `[XFromY, BFromY, BlockInfo, Sharpness]`.
+//!
+//! Round-15 left the d1 fixture stuck on the round-12 deferral inside
+//! `HfMetadata::read` (`nb_transforms > 0` errored with "transforms
+//! inside HF metadata sub-bitstream not yet supported"). With round 16
+//! the parse succeeds; the d1 fixture surfaces a strictly-later
+//! blocker — its HfMetadata Squeeze step references channels beyond
+//! the four-channel baseline (`begin_c=39` on step 0), tripping the
+//! `apply_transforms_to_channel_layout` channel-count invariant.
+//! That's the round-17 candidate (suspected upstream bit-position
+//! drift in LfGlobal or LfCoefficients).
+//!
+//! `HfMetadata::read` and `LfGroup::read` now both take a
+//! `&ImageMetadataFdis` argument so the inverse Palette transform can
+//! read `bit_depth.bits_per_sample` for delta-palette prediction.
 
 pub mod abrac;
 pub mod ans;
@@ -917,7 +943,7 @@ fn decode_vardct_round13(
             Error::InvalidData("JXL VarDCT round 13: LfChannelCorrelation missing".into())
         })?;
 
-        let lf_group = crate::lf_group::LfGroup::read(&mut shared_br, fh, &lf_global, 0)?;
+        let lf_group = crate::lf_group::LfGroup::read(&mut shared_br, fh, &lf_global, metadata, 0)?;
 
         let hf_global = crate::hf_global::HfGlobal::read(&mut shared_br, num_groups)?;
         (lf_global, lf_group, hf_global)
@@ -939,7 +965,7 @@ fn decode_vardct_round13(
 
         let lf_group_bytes = section_byte_range(lf_group_slot(0))?;
         let mut lg_br = BitReader::new_section(lf_group_bytes);
-        let lf_group = crate::lf_group::LfGroup::read(&mut lg_br, fh, &lf_global, 0)?;
+        let lf_group = crate::lf_group::LfGroup::read(&mut lg_br, fh, &lf_global, metadata, 0)?;
 
         let hf_global_bytes = section_byte_range(hf_global_slot)?;
         let mut hg_br = BitReader::new_section(hf_global_bytes);
