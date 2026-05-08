@@ -176,7 +176,7 @@ impl Default for Lz77Params {
 /// `dist_multiplier` is 0 unless the call site (frame decode path)
 /// specifies otherwise; the LZ77 distance branch using
 /// [`K_SPECIAL_DISTANCES`] is gated on a non-zero `dist_multiplier`.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct HybridUintState {
     /// 1 MiB sliding window for LZ77 copies. Indexed via `idx & 0xFFFFF`.
     window: Vec<u32>,

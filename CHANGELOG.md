@@ -9,6 +9,67 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Round 7 (2024-spec)** — four-piece refactor wiring the GlobalModular
+  partial-decode path to per-PassGroup decode + post-PassGroup inverse
+  transforms (Annex G.1.3 last paragraph + G.4.2). The orchestration
+  is in place; pixel-correct decode of the committed multi-group
+  fixture is blocked at a documented spec-vs-reference SPECGAP (cjxl
+  0.11.1's multi-group ANS streams emit `alphabet_size > table_size`
+  for log_alpha=5, which the spec text in C.2.5 implies should be
+  rejected). Round-8 will resolve the SPECGAP once docs collaborator
+  clarifies the alphabet cap.
+  - **`src/global_modular.rs`** — `GlobalModular::read` now obeys
+    G.1.3's "stops decoding at channels exceeding `group_dim`" rule.
+    Channels too large for GlobalModular are zero-filled placeholders
+    and `fully_decoded = false`; the bundle stashes
+    `nb_meta_channels`, `transforms`, and `global_tree` for the
+    per-PassGroup decode to consume. New
+    `apply_inverse_transforms(image, transforms, bit_depth)` is the
+    transform pass that the multi-group path invokes AFTER all
+    PassGroups complete (G.4.2 last paragraph).
+  - **`src/modular_fdis.rs`** — new public
+    `decode_channels_at_stream(br, descs, tree, wp, stream_index)`
+    threads the Table H.4 stream-index property through the channel-
+    decode loop (the legacy `decode_channels` is a thin wrapper that
+    passes `stream_index = 0`). `MaTreeFdis::cloned_with_fresh_state`
+    lets per-section sub-bitstreams reuse the global tree's static
+    shape + clustered distributions while reading a fresh ANS state
+    init for each section (per H.2's "global MA tree and its clustered
+    distributions are used as decoded from the GlobalModular section").
+    `MaTreeFdis`, `EntropyStream`, `ClusterEntropy`, `HybridUintState`,
+    `AnsDecoder` all gain `Clone`.
+  - **`src/pass_group.rs`** —
+    `decode_modular_group_into(br, fh, lf_global, pass_idx, group_idx)`
+    decodes one PassGroup's modular sub-bitstream. The contributing-
+    channel filter implements G.4.2's criterion (channel exceeds
+    group_dim, hshift<3 OR vshift<3, minshift<=min(hshift,vshift)<
+    maxshift, not already decoded). The decoded samples are copied
+    back into `lf_global.global_modular.image` at the rectangle
+    derived from the group's frame-coordinates origin shifted by
+    hshift/vshift. `compute_pass_shift_range` now takes `num_passes`
+    and models an implicit `n=num_ds` final-resolution entry that the
+    spec text omits (documented SPECGAP — without it, single-pass
+    frames would have minshift=maxshift=3 and decode no modular data).
+  - **`src/toc.rs`** — TOC entries of value 0 are now accepted (an
+    empty LfGroup or PassGroup section is legal when no channel
+    matches that section's filter). Round 6 over-strictly rejected
+    `entry == 0`.
+  - **`src/ans/cluster.rs`** — `read_general_clustering` now handles
+    the prefix-coded sub-stream branch (the simple-clustering path
+    covered by the round-2..6 fixtures avoided this branch
+    altogether).
+  - **`src/lib.rs`** — `decode_codestream` reads each TOC slot as a
+    fresh sub-bitstream-bounded `BitReader`, dispatches LfGlobal
+    (slot 0), then iterates `pass_idx × group_idx` PassGroups (slots
+    `1 + num_lf_groups + p*num_groups + g`), then applies inverse
+    transforms over the assembled image. Single-group / single-pass
+    frames continue to use the round-3..6 fast path so the five
+    pixel-correct lossless fixtures remain regression-free.
+  - **`tests/fixtures/synth_320_grey/`** — a 320×320 grey gradient
+    encoded by cjxl 0.11.1 (`-d 0 -m 1 -e 1 -g 0 -R 0`) producing a
+    9-group multi-group lossless modular fixture. Committed for round-8
+    once the SPECGAP above is resolved.
+
 - **Round 6 (2024-spec)** — Annex E.4 ICC profile decode + LfGroup /
   PassGroup type scaffolding.
   - **`src/icc.rs`** — full ICC profile decoder per Annex E.4. Reads

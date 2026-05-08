@@ -24,6 +24,7 @@ use crate::ans::alias::AliasTable;
 use crate::ans::distribution::read_distribution;
 use crate::ans::hybrid::{HybridUintState, Lz77Params};
 use crate::ans::hybrid_config::HybridUintConfig;
+use crate::ans::prefix::read_prefix_code;
 use crate::ans::symbol::AnsDecoder;
 use crate::bitreader::BitReader;
 
@@ -164,23 +165,6 @@ pub fn read_general_clustering(
 
     let cfg = HybridUintConfig::read(br, log_alphabet_size)?;
 
-    if use_prefix_code {
-        // Sub-stream uses prefix codes (D.2). For the cluster-index
-        // case in practice we don't see this branch on real codestreams
-        // — the spec permits it but it requires a full prefix-code
-        // histogram on top of the HybridUintConfig. Defer to a
-        // follow-up round: error out cleanly so callers don't get
-        // silently wrong data.
-        return Err(Error::Unsupported(
-            "JXL D.3.5 general clustering: prefix-coded sub-stream not yet supported".into(),
-        ));
-    }
-
-    // ANS sub-stream: read one distribution, build alias table, init
-    // state, decode num_distributions integers.
-    let dist = read_distribution(br, log_alphabet_size)?;
-    let alias = AliasTable::build(&dist, log_alphabet_size)?;
-    let mut ans = AnsDecoder::new(br)?;
     let mut state = HybridUintState::new(
         Lz77Params {
             enabled: false,
@@ -190,18 +174,60 @@ pub fn read_general_clustering(
         cfg,
     );
 
-    let mut clusters = Vec::with_capacity(num_distributions);
-    for _ in 0..num_distributions {
-        let value = state.decode(
-            br,
-            0,
-            0,
-            0,
-            |br_inner, _ctx| Ok(ans.decode_symbol(br_inner, &dist, &alias)? as u32),
-            |_ctx| cfg,
-        )?;
-        clusters.push(value);
-    }
+    let mut clusters = if use_prefix_code {
+        // Sub-stream uses prefix codes (D.2). Per C.2.1 / C.2.4 with
+        // exactly one cluster:
+        //   count_bit (1 bit) | (n + (1<<n) + u(n)) → prefix code histogram.
+        let count = if br.read_bit()? == 0 {
+            1u32
+        } else {
+            let n = br.read_bits(4)?;
+            if n > 14 {
+                return Err(Error::InvalidData(format!(
+                    "JXL D.3.5 prefix sub-stream: count n {n} > 14"
+                )));
+            }
+            1 + (1u32 << n) + br.read_bits(n)?
+        };
+        if count > (1 << 15) {
+            return Err(Error::InvalidData(format!(
+                "JXL D.3.5 prefix sub-stream: count {count} > 1<<15"
+            )));
+        }
+        let code = read_prefix_code(br, count)?;
+        let mut clusters = Vec::with_capacity(num_distributions);
+        for _ in 0..num_distributions {
+            let value = state.decode(
+                br,
+                0,
+                0,
+                0,
+                |br_inner, _ctx| code.decode(br_inner),
+                |_ctx| cfg,
+            )?;
+            clusters.push(value);
+        }
+        clusters
+    } else {
+        // ANS sub-stream: read one distribution, build alias table, init
+        // state, decode num_distributions integers.
+        let dist = read_distribution(br, log_alphabet_size)?;
+        let alias = AliasTable::build(&dist, log_alphabet_size)?;
+        let mut ans = AnsDecoder::new(br)?;
+        let mut clusters = Vec::with_capacity(num_distributions);
+        for _ in 0..num_distributions {
+            let value = state.decode(
+                br,
+                0,
+                0,
+                0,
+                |br_inner, _ctx| Ok(ans.decode_symbol(br_inner, &dist, &alias)? as u32),
+                |_ctx| cfg,
+            )?;
+            clusters.push(value);
+        }
+        clusters
+    };
 
     if use_mtf {
         inverse_mtf(&mut clusters);

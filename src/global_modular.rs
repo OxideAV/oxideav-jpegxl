@@ -27,8 +27,9 @@ use crate::bitreader::{BitReader, U32Dist};
 use crate::frame_header::{Encoding, FrameHeader};
 use crate::metadata_fdis::{ColourSpace, ImageMetadataFdis};
 use crate::modular_fdis::{
-    decode_channels, horiz_isqueeze, inverse_palette, inverse_rct, vert_isqueeze, ChannelDesc,
-    MaTreeFdis, ModularImage, SqueezeParam, TransformId, TransformInfo, WpHeader, MAX_CHANNELS,
+    decode_channels_at_stream, horiz_isqueeze, inverse_palette, inverse_rct, vert_isqueeze,
+    ChannelDesc, MaTreeFdis, ModularImage, SqueezeParam, TransformId, TransformInfo, WpHeader,
+    MAX_CHANNELS,
 };
 
 /// Decoded `GlobalModular` — the channel descriptions and the actual
@@ -46,10 +47,36 @@ pub struct GlobalModular {
     pub nb_transforms: u32,
     pub transforms: Vec<TransformInfo>,
     pub image: ModularImage,
+    /// Number of leading meta-channels in `image.channels` (those
+    /// inserted by Palette transforms). Used by per-group decode to
+    /// know which channels are NOT split across groups.
+    pub nb_meta_channels: usize,
+    /// True if every non-meta colour/extra channel was fully decoded
+    /// inside GlobalModular (small-image case per G.1.3 last paragraph).
+    /// False when at least one channel exceeds `group_dim` in width or
+    /// height — the per-group sections then carry the bulk of pixel
+    /// data and the inverse transforms must wait until after all
+    /// PassGroups complete.
+    pub fully_decoded: bool,
+    /// MA tree carried over to per-group sub-bitstreams that opt to
+    /// reuse the global tree (`use_global_tree=true` inside their inner
+    /// ModularHeader). Only present when GlobalModular's outer
+    /// `use_global_tree` was true.
+    pub global_tree: Option<MaTreeFdis>,
 }
 
 impl GlobalModular {
-    /// Decode the GlobalModular section per FDIS C.4.8.
+    /// Decode the GlobalModular section per ISO/IEC 18181-1:2024 G.1.3.
+    ///
+    /// Per the spec's last paragraph: only the first `nb_meta_channels`
+    /// channels and any further channels that have a width and height
+    /// both at most `group_dim` are decoded inside GlobalModular. Any
+    /// channel exceeding `group_dim` in either dimension stops the
+    /// channel-decode loop and is left for per-PassGroup decode (G.4.2).
+    /// If `fully_decoded` is true, the inverse transforms have been
+    /// applied. Otherwise, the caller must apply transforms via
+    /// [`apply_inverse_transforms`] AFTER all PassGroups complete (last
+    /// paragraph of G.4.2).
     pub fn read(
         br: &mut BitReader<'_>,
         fh: &FrameHeader,
@@ -110,14 +137,19 @@ impl GlobalModular {
         }
 
         // 3. Local MA tree + per-context distributions, OR reuse the
-        //    global tree.
+        //    global tree. We CLONE the global tree (with fresh ANS
+        //    state) so the original can be retained on the bundle for
+        //    later per-PassGroup sub-bitstreams that also opt in to
+        //    `use_global_tree=true`.
         let mut tree = if inner_use_global_tree {
-            global_tree.ok_or_else(|| {
-                Error::InvalidData(
-                    "JXL GlobalModular: inner sub-bitstream wants global tree but none was decoded"
-                        .into(),
-                )
-            })?
+            global_tree
+                .as_ref()
+                .ok_or_else(|| {
+                    Error::InvalidData(
+                        "JXL GlobalModular: inner sub-bitstream wants global tree but none was decoded".into(),
+                    )
+                })?
+                .cloned_with_fresh_state()
         } else {
             MaTreeFdis::read(br)?
         };
@@ -146,34 +178,89 @@ impl GlobalModular {
         //     channels at the correct dimensions.
         let descs = apply_transforms_to_channel_layout(descs, &transforms)?;
 
-        // 5. Pixel decode (per Annex H.3).
-        let mut image = decode_channels(br, &descs, &mut tree, &wp_header)?;
+        // Count meta-channels at the head of the descs list. Per H.1
+        // these are the channels with hshift=-1, vshift=-1 (Palette
+        // meta channel signature) inserted at the front.
+        let nb_meta_channels = descs
+            .iter()
+            .take_while(|d| d.hshift == -1 && d.vshift == -1)
+            .count();
 
-        // 6. Inverse transforms — apply in REVERSE bitstream order
-        //    (Annex H.6 §inverse-transform-application order).
-        let bit_depth = metadata.bit_depth.bits_per_sample.max(1);
-        for t in transforms.iter().rev() {
-            match t.tr {
-                TransformId::Rct => {
-                    let begin = t.begin_c.unwrap_or(0) as usize;
-                    let rct_type = t.rct_type.unwrap_or(0);
-                    inverse_rct(&mut image, begin, rct_type)?;
-                }
-                TransformId::Palette => {
-                    let begin = t.begin_c.unwrap_or(0) as usize;
-                    let num_c = t.num_c.unwrap_or(1);
-                    let nb_colours = t.nb_colours.unwrap_or(0);
-                    let nb_deltas = t.nb_deltas.unwrap_or(0);
-                    let d_pred = t.d_pred.unwrap_or(0);
-                    inverse_palette(
-                        &mut image, begin, num_c, nb_colours, nb_deltas, d_pred, bit_depth,
-                    )?;
-                }
-                TransformId::Squeeze => {
-                    apply_inverse_squeeze(&mut image, &t.squeeze_params)?;
-                }
+        // 5. G.1.3 last paragraph — decode only the first
+        //    `nb_meta_channels` channels and any further channel whose
+        //    `width <= group_dim AND height <= group_dim`. Any further
+        //    channel that exceeds group_dim stops the GlobalModular
+        //    channel-decode loop and is deferred to per-PassGroup
+        //    decode (G.4.2).
+        let group_dim = fh.group_dim();
+        let mut decoded_descs: Vec<ChannelDesc> = Vec::with_capacity(descs.len());
+        let mut deferred_indices: Vec<usize> = Vec::new();
+        let mut stop = false;
+        for (idx, d) in descs.iter().enumerate() {
+            if idx < nb_meta_channels {
+                decoded_descs.push(*d);
+                continue;
+            }
+            if !stop && d.width <= group_dim && d.height <= group_dim {
+                decoded_descs.push(*d);
+            } else {
+                stop = true;
+                deferred_indices.push(idx);
             }
         }
+        let fully_decoded = deferred_indices.is_empty();
+
+        // 6. Pixel decode (per Annex H.3) for the non-deferred subset.
+        //    The full descs list is preserved in `image` (deferred
+        //    channels become zero-filled placeholders that PassGroups
+        //    fill in afterwards).
+        let partial_image = decode_channels_at_stream(
+            br,
+            &decoded_descs,
+            &mut tree,
+            &wp_header,
+            0, // GlobalModular: stream_index = 0.
+        )?;
+
+        // Reassemble into a full ModularImage with deferred channels as
+        // zero buffers (will be filled by per-PassGroup decode in
+        // G.4.2). decoded_descs ordering matches descs[0..decoded_count].
+        let mut full_channels: Vec<Vec<i32>> = Vec::with_capacity(descs.len());
+        let mut iter_decoded = partial_image.channels.into_iter();
+        for (idx, d) in descs.iter().enumerate() {
+            if deferred_indices.contains(&idx) {
+                let n = (d.width as usize).saturating_mul(d.height as usize);
+                full_channels.push(vec![0i32; n]);
+            } else {
+                full_channels.push(iter_decoded.next().ok_or_else(|| {
+                    Error::InvalidData(
+                        "JXL GlobalModular: decoded-channel iter exhausted prematurely".into(),
+                    )
+                })?);
+            }
+        }
+        let mut image = ModularImage {
+            channels: full_channels,
+            descs,
+        };
+
+        // 7. Apply inverse transforms (Annex H.6) ONLY when the image
+        //    is fully decoded inside GlobalModular. Otherwise defer to
+        //    after all PassGroups complete (G.4.2 last paragraph).
+        let bit_depth = metadata.bit_depth.bits_per_sample.max(1);
+        if fully_decoded {
+            apply_inverse_transforms(&mut image, &transforms, bit_depth)?;
+        }
+
+        // Stash the global tree on the bundle so per-PassGroup decode
+        // can reuse it without re-reading. Per H.2: when a per-group
+        // sub-bitstream's `use_global_tree=true`, "the global MA tree
+        // and its clustered distributions are used as decoded from the
+        // GlobalModular section". The stored tree carries the static
+        // shape + clustered distributions; per-group reuse goes through
+        // [`MaTreeFdis::cloned_with_fresh_state`] to reset the ANS
+        // state for each new sub-bitstream.
+        let global_tree_for_pass = global_tree;
 
         Ok(Self {
             global_tree_present: global_use_tree,
@@ -182,8 +269,46 @@ impl GlobalModular {
             nb_transforms,
             transforms,
             image,
+            nb_meta_channels,
+            fully_decoded,
+            global_tree: global_tree_for_pass,
         })
     }
+}
+
+/// Apply the modular inverse-transform sequence (RCT / Palette /
+/// Squeeze) to `image` per Annex H.6, in REVERSE bitstream order. This
+/// is invoked from [`GlobalModular::read`] for the small-image fast path
+/// AND from `decode_codestream` AFTER all PassGroups complete (G.4.2
+/// last paragraph) for the multi-group path.
+pub fn apply_inverse_transforms(
+    image: &mut ModularImage,
+    transforms: &[TransformInfo],
+    bit_depth: u32,
+) -> Result<()> {
+    for t in transforms.iter().rev() {
+        match t.tr {
+            TransformId::Rct => {
+                let begin = t.begin_c.unwrap_or(0) as usize;
+                let rct_type = t.rct_type.unwrap_or(0);
+                inverse_rct(image, begin, rct_type)?;
+            }
+            TransformId::Palette => {
+                let begin = t.begin_c.unwrap_or(0) as usize;
+                let num_c = t.num_c.unwrap_or(1);
+                let nb_colours = t.nb_colours.unwrap_or(0);
+                let nb_deltas = t.nb_deltas.unwrap_or(0);
+                let d_pred = t.d_pred.unwrap_or(0);
+                inverse_palette(
+                    image, begin, num_c, nb_colours, nb_deltas, d_pred, bit_depth,
+                )?;
+            }
+            TransformId::Squeeze => {
+                apply_inverse_squeeze(image, &t.squeeze_params)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Apply the Inverse Squeeze transform's per-step pair-merge for every

@@ -121,6 +121,54 @@
 //! * Multi-LfGroup / multi-group / multi-pass / VarDCT frames fail
 //!   with precise round-7-targeting error messages instead of the
 //!   round-3 generic "TOC with N entries" rejection.
+//!
+//! ## Round-7 (2024-spec) additions
+//!
+//! Four-piece refactor coordinating the GlobalModular partial-decode
+//! path with per-PassGroup decode + post-PassGroup transforms (Annex
+//! G.1.3 last paragraph + G.4.2):
+//!
+//! * **Partial GlobalModular** — [`global_modular::GlobalModular::read`]
+//!   stops decoding at any non-meta channel exceeding `group_dim`
+//!   (G.1.3 last paragraph). Such channels are zero-filled placeholders
+//!   in `image.channels` until per-PassGroup decode fills them.
+//! * **`stream_index` threading** —
+//!   [`modular_fdis::decode_channels_at_stream`] takes the stream index
+//!   from Table H.4: `0` for GlobalModular,
+//!   `1 + 3*num_lf_groups + 17 + num_groups * pass_idx + group_idx` for
+//!   ModularGroup. Threaded through `get_properties` so the MA tree's
+//!   `property[1] > value` decisions select the correct per-section
+//!   leaf.
+//! * **TOC layout + empty entries** — [`toc::Toc::read`] now accepts
+//!   zero-size entries (e.g. an empty LfGroup or PassGroup section is
+//!   legal when no channel matches that section's filter). The
+//!   `decode_codestream` consumer addresses sections by their TOC
+//!   offsets (computed from the entry running sum), with permutation
+//!   already handled in the round-2 TOC reader.
+//! * **Post-PassGroup transforms** —
+//!   [`global_modular::apply_inverse_transforms`] is invoked AFTER all
+//!   PassGroups complete (G.4.2 last paragraph), not inside
+//!   `GlobalModular::read`, so the inverse transform sees the
+//!   fully-assembled image rather than a half-decoded one.
+//!
+//! Per-PassGroup decode is in
+//! [`pass_group::decode_modular_group_into`]; the
+//! `(minshift, maxshift)` computation in [`pass_group::compute_pass_shift_range`]
+//! models an implicit `n=num_ds` final-resolution entry that the
+//! printed spec text omits but whose absence would make single-pass
+//! frames decode no modular data (documented SPECGAP).
+//!
+//! **Round-7 SPECGAP** — cjxl 0.11.1 emits multi-group lossless modular
+//! fixtures where the per-cluster ANS distribution's `alphabet_size`
+//! exceeds `1 << log_alphabet_size` (specifically: alphabet_size=33
+//! against table_size=32 when `log_alphabet_size = 5 + u(2) = 5`). The
+//! 2024 spec text in C.2.5 implies `alphabet_size <= table_size`, but
+//! the reference encoder consistently violates this for the multi-group
+//! path. The committed multi-group fixture
+//! (`tests/fixtures/synth_320_grey/`) is left unconsumed by tests
+//! pending a docs-collaborator clarification on whether the alphabet
+//! cap is normative or whether a different `log_alphabet_size`
+//! computation should apply for ANS streams.
 
 pub mod abrac;
 pub mod ans;
@@ -323,9 +371,9 @@ fn decode_codestream(codestream: &[u8], pts: Option<i64>) -> Result<VideoFrame> 
     let toc = Toc::read(&mut br, &fh)?;
 
     // 7. Single-group frames have a single TOC entry containing all
-    //    frame data. Round 6 still only handles that case but reports
-    //    the precise reason (multi-group vs multi-pass vs VarDCT) so
-    //    round-7 can target each gate individually.
+    //    frame data. Round 6 only handled that case; round 7 wires
+    //    multi-group via per-section bit readers, with inverse
+    //    transforms applied AFTER all PassGroups complete (G.4.2).
     let num_groups = fh.num_groups();
     let num_lf_groups = fh.num_lf_groups();
     if num_lf_groups > 1 {
@@ -334,22 +382,10 @@ fn decode_codestream(codestream: &[u8], pts: Option<i64>) -> Result<VideoFrame> 
             fh.encoding,
         ));
     }
-    if num_groups > 1 || fh.passes.num_passes > 1 {
-        return Err(crate::pass_group::unsupported_multi_group_error(
-            num_groups,
-            fh.passes.num_passes,
-        ));
-    }
-    if toc.entries.len() != 1 {
-        return Err(Error::Unsupported(format!(
-            "jxl decoder (round 6): TOC with {} entries unexpected for single-group/single-pass frame",
-            toc.entries.len()
-        )));
-    }
     // Diagnostic on unhandled features.
     if fh.encoding != crate::frame_header::Encoding::Modular {
         return Err(Error::Unsupported(format!(
-            "jxl decoder (round 6): encoding {:?} not supported (Modular only — VarDCT round-8+ work)",
+            "jxl decoder (round 7): encoding {:?} not supported (Modular only — VarDCT round-8+ work)",
             fh.encoding
         )));
     }
@@ -357,10 +393,113 @@ fn decode_codestream(codestream: &[u8], pts: Option<i64>) -> Result<VideoFrame> 
         return Err(Error::InvalidData("jxl decoder: zero-dim frame".into()));
     }
 
-    // 8. LfGlobal (FDIS C.4) — for a single-group Modular frame the TOC
-    //    points at one section that begins with LfGlobal and contains
-    //    nothing else (no LfGroup / HfGlobal / PassGroup follow).
-    let lf_global = LfGlobal::read(&mut br, &fh, &metadata)?;
+    // Map TOC entries to byte ranges (post-permutation order). Each
+    // section starts byte-aligned and runs `entries[i]` bytes. The
+    // bit reader is currently aligned to a byte (TOC consumed); the
+    // first section begins at the current byte offset.
+    let frame_data_start = br.bytes_consumed();
+    let codestream_data = br.data();
+    if frame_data_start > codestream_data.len() {
+        return Err(Error::InvalidData(
+            "JXL decoder: frame data start past codestream end".into(),
+        ));
+    }
+    let frame_bytes = &codestream_data[frame_data_start..];
+    // Validate total length against TOC sum.
+    let total_frame_len: u64 = toc.entries.iter().map(|&e| e as u64).sum();
+    if total_frame_len > frame_bytes.len() as u64 {
+        return Err(Error::InvalidData(format!(
+            "JXL decoder: TOC declares {total_frame_len} frame bytes but only {} remaining",
+            frame_bytes.len()
+        )));
+    }
+    // Compute per-section start offsets in the *bitstream* order from
+    // the running sum. The TOC permutation has already been applied to
+    // `entries` and `group_offsets` so they're in the order the spec
+    // says the sections appear on the wire (LfGlobal first, etc.).
+    let mut section_starts: Vec<usize> = Vec::with_capacity(toc.entries.len());
+    let mut acc: u64 = 0;
+    for &e in &toc.entries {
+        section_starts.push(acc as usize);
+        acc = acc.saturating_add(e as u64);
+    }
+    let section_byte_range = |idx: usize| -> Result<&[u8]> {
+        let start = section_starts[idx];
+        let len = toc.entries[idx] as usize;
+        let end = start + len;
+        if end > frame_bytes.len() {
+            return Err(Error::InvalidData(format!(
+                "JXL decoder: section {idx} byte range [{start}..{end}) exceeds frame bytes ({})",
+                frame_bytes.len()
+            )));
+        }
+        Ok(&frame_bytes[start..end])
+    };
+
+    // Slot index helpers per Annex F TOC layout for kModular encoding:
+    //   slot 0       — LfGlobal
+    //   slots 1..1+num_lf_groups — LfGroup[*]
+    //   slots 1+num_lf_groups + p*num_groups + g — PassGroup[p][g]
+    let lf_global_slot = 0usize;
+    let lf_group_slot = |lf_group_idx: u64| -> usize { 1 + lf_group_idx as usize };
+    let pass_group_slot = |pass_idx: u32, group_idx: u32| -> usize {
+        1 + num_lf_groups as usize + (pass_idx as u64 * num_groups + group_idx as u64) as usize
+    };
+
+    // 8. LfGlobal (slot 0) — read the GlobalModular prelude. For images
+    //    where every channel fits in group_dim, this fully populates
+    //    `lf_global.global_modular.image`. Otherwise the larger
+    //    channels are zero-filled placeholders that PassGroups fill.
+    let mut lf_global = if num_groups == 1 && fh.passes.num_passes == 1 && toc.entries.len() == 1 {
+        // Single-group fast path: read directly off the main bit
+        // reader (preserves round-6's behaviour for the five small
+        // lossless fixtures).
+        LfGlobal::read(&mut br, &fh, &metadata)?
+    } else {
+        let lf_global_bytes = section_byte_range(lf_global_slot)?;
+        let mut lf_br = BitReader::new(lf_global_bytes);
+        LfGlobal::read(&mut lf_br, &fh, &metadata)?
+    };
+
+    // 8b. LfGroups (slots 1..1+num_lf_groups) — round 7 only handles
+    //     num_lf_groups <= 1 (gated above). For num_lf_groups == 1 with
+    //     a fully-decoded GlobalModular image (small-image case), the
+    //     LfGroup section is empty (no channel has hshift>=3, vshift>=3
+    //     by default for round-7 lossless fixtures). We still consume
+    //     the slot bytes by reading the empty ModularLfGroup
+    //     sub-bitstream — for round 7 the slot is allowed to be
+    //     ignored when no channel matches the LfGroup criterion.
+
+    // 8c. PassGroups (slots 1+num_lf_groups + p*num_groups + g) —
+    //     decode each per-pass per-group modular sub-bitstream and
+    //     copy samples back into `lf_global.global_modular.image`.
+    if !lf_global.global_modular.fully_decoded || num_groups > 1 || fh.passes.num_passes > 1 {
+        for pass_idx in 0..fh.passes.num_passes {
+            for group_idx in 0..(num_groups as u32) {
+                let slot = pass_group_slot(pass_idx, group_idx);
+                let pg_bytes = section_byte_range(slot)?;
+                let mut pg_br = BitReader::new(pg_bytes);
+                crate::pass_group::decode_modular_group_into(
+                    &mut pg_br,
+                    &fh,
+                    &mut lf_global,
+                    pass_idx,
+                    group_idx,
+                )?;
+            }
+        }
+        // After all PassGroups complete, apply inverse transforms over
+        // the now fully-assembled GlobalModular image (G.4.2 last
+        // paragraph).
+        let bit_depth = metadata.bit_depth.bits_per_sample.max(1);
+        let transforms = lf_global.global_modular.transforms.clone();
+        crate::global_modular::apply_inverse_transforms(
+            &mut lf_global.global_modular.image,
+            &transforms,
+            bit_depth,
+        )?;
+    }
+    let _ = lf_group_slot; // currently only used by round-8 multi-LfGroup
 
     // 9. Map the decoded modular image to a VideoFrame.
     //

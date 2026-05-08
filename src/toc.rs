@@ -135,12 +135,12 @@ impl Toc {
         ];
         let mut entries: Vec<u32> = Vec::with_capacity(total_usize);
         for _ in 0..total_usize {
+            // Per C.3.3 / F.3 entries may be 0 (an empty LfGroup or
+            // empty PassGroup is legal; for example a Modular frame
+            // whose channels all have hshift>=3 vshift>=3 leaves the
+            // ModularGroup sub-bitstream empty). Round 6 over-strictly
+            // rejected zero; round 7 accepts.
             let v = br.read_u32(entry_dist)?;
-            if v == 0 {
-                return Err(Error::InvalidData(
-                    "JXL TOC: entry value 0 not allowed (C.3.3)".into(),
-                ));
-            }
             entries.push(v);
         }
         // ZeroPadToByte() after the last TOC entry per C.3.3 / 6.3.
@@ -443,13 +443,16 @@ mod tests {
     }
 
     #[test]
-    fn rejects_zero_entry_size() {
-        // Single TOC entry whose value decodes to 0 → invalid.
+    fn accepts_zero_entry_size() {
+        // Round 7: a TOC entry value of 0 is legal — an empty LfGroup
+        // / PassGroup section is allowed when no channel matches that
+        // section's criterion.
         let fh = build_test_frame_header(128, 128);
         // permuted=0 + zero pad, then U32 sel=0 (Bits(10)) value 0.
         let bytes = vec![0u8, 0x00, 0x00];
         let mut br = BitReader::new(&bytes);
-        assert!(Toc::read(&mut br, &fh).is_err());
+        let toc = Toc::read(&mut br, &fh).unwrap();
+        assert_eq!(toc.entries, vec![0]);
     }
 
     #[test]

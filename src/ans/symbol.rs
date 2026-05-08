@@ -26,7 +26,7 @@ pub const ANS_FINAL_STATE: u32 = 0x130000;
 ///
 /// One instance per ANS stream; multiple distributions / alias tables
 /// share the same state if they belong to the same stream.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct AnsDecoder {
     state: u32,
 }

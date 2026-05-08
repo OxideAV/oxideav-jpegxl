@@ -338,7 +338,7 @@ pub enum MaNode {
 /// Per-cluster entropy state — either an ANS pair (distribution +
 /// alias table) or a prefix code. Both modes share the per-cluster
 /// `HybridUintConfig` carried alongside.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum ClusterEntropy {
     Ans { dist: Vec<u16>, alias: AliasTable },
     Prefix { code: PrefixCode },
@@ -348,7 +348,7 @@ pub enum ClusterEntropy {
 /// clustering, use_prefix_code, per-cluster configs, per-cluster
 /// distributions/codes — followed by the ANS state init OR no prelude
 /// for prefix mode).
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct EntropyStream {
     pub use_prefix_code: bool,
     pub log_alphabet_size: u32,
@@ -447,6 +447,14 @@ impl EntropyStream {
         // clustering map (D.3.5). Round 1 had clustering before, but
         // black-box validation against cjxl 0.12.0 small-fixture traces
         // shows clustering follows use_prefix_code+log_alphabet_size.
+        // 2024-spec C.2.1: "If use_prefix_code is false, the decoder
+        // sets log_alphabet_size to 5 + u(2); otherwise, it sets
+        // log_alphabet_size to 15." This matches the small-fixture
+        // tests against cjxl 0.11.1.
+        // 2024-spec C.2.1: "If use_prefix_code is false, the decoder
+        // sets log_alphabet_size to 5 + u(2); otherwise, it sets
+        // log_alphabet_size to 15." This matches the small-fixture
+        // tests against cjxl 0.11.1.
         let use_prefix_code = br.read_bit()? == 1;
         let log_alphabet_size = if use_prefix_code {
             15
@@ -581,7 +589,7 @@ impl EntropyStream {
 
 /// MA-tree as decoded by D.4.2 (Listing D.9), plus the entropy stream
 /// used to decode per-channel symbols.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct MaTreeFdis {
     pub nodes: Vec<MaNode>,
     /// Number of distinct contexts (= number of leaves).
@@ -590,6 +598,27 @@ pub struct MaTreeFdis {
     pub entropy: EntropyStream,
     /// Hybrid uint state for the *symbol* stream (LZ77 + windowing).
     pub hybrid: HybridUintState,
+}
+
+impl MaTreeFdis {
+    /// Return a fresh copy with the entropy-stream state and hybrid
+    /// state reset. Used when reusing a "global" tree across multiple
+    /// per-section sub-bitstreams (Annex H.2 — clustered distributions
+    /// shared, but the entropy-coded stream itself is fresh per
+    /// section). Allocates new sliding-window buffers.
+    pub fn cloned_with_fresh_state(&self) -> Self {
+        let mut entropy = self.entropy.clone();
+        // Reset the ANS state — re-read from the bitstream when the
+        // first symbol decode is about to happen.
+        entropy.ans_state = None;
+        let hybrid = HybridUintState::new(entropy.lz77, entropy.lz_len_conf);
+        Self {
+            nodes: self.nodes.clone(),
+            num_ctx: self.num_ctx,
+            entropy,
+            hybrid,
+        }
+    }
 }
 
 impl MaTreeFdis {
@@ -1319,6 +1348,30 @@ pub fn decode_channels(
     tree: &mut MaTreeFdis,
     wp: &WpHeader,
 ) -> Result<ModularImage> {
+    decode_channels_at_stream(br, descs, tree, wp, 0)
+}
+
+/// Identical to [`decode_channels`] but takes the `stream_index` to be
+/// embedded in MA-tree property[1] (Table H.4). The 2024 spec defines
+/// six stream-index families:
+///
+/// * `0` — GlobalModular sub-bitstream.
+/// * `1 + lf_group_idx` — LfCoefficients (kVarDCT only).
+/// * `1 + num_lf_groups + lf_group_idx` — ModularLfGroup.
+/// * `1 + 2*num_lf_groups + lf_group_idx` — HFMetadata (kVarDCT only).
+/// * `1 + 3*num_lf_groups + parameters_index` — RAW dequant tables (kVarDCT only).
+/// * `1 + 3*num_lf_groups + 17 + num_groups * pass_idx + group_idx` — ModularGroup.
+///
+/// Properties 0..=15 use property[1] = `stream_index`. The MA tree may
+/// branch on this property to pick a different leaf depending on which
+/// section the sub-bitstream belongs to.
+pub fn decode_channels_at_stream(
+    br: &mut BitReader<'_>,
+    descs: &[ChannelDesc],
+    tree: &mut MaTreeFdis,
+    wp: &WpHeader,
+    stream_index: i32,
+) -> Result<ModularImage> {
     if descs.is_empty() {
         return Ok(ModularImage {
             channels: Vec::new(),
@@ -1377,7 +1430,10 @@ pub fn decode_channels(
     // channels that are to be decoded.") which makes no exclusion.
     let dist_multiplier = descs.iter().map(|d| d.width).max().unwrap_or(0);
 
-    let stream_index = 0i32; // GlobalModular only in round 1.
+    // `stream_index` is supplied by the caller; it threads through
+    // property[1] of the MA tree per Table H.4 and can change per
+    // sub-bitstream (GlobalModular = 0; per-PassGroup ModularGroup =
+    // 1 + 3*num_lf_groups + 17 + num_groups * pass_idx + group_idx).
 
     // Per-channel WP state. Allocate only when the MA tree has any
     // leaf with predictor 6 (or property[15] reads — the Self-correcting

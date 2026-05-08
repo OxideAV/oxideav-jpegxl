@@ -18,6 +18,22 @@ trace-doc-driven rounds 7-11 + encoder rounds 1-6 were retired
   pixel-correct vs `expected.png` (PNG-decoder-backed byte-for-byte
   comparison): `pixel-1x1`, `gray-64x64`, `gradient-64x64-lossless`,
   `palette-32x32`, `grey_8x8_lossless`.
+- **Round 7 (2024-spec)**: four-piece refactor wiring multi-group
+  decode infrastructure (Annex G.1.3 last paragraph + G.4.2):
+  `GlobalModular::read` honours the "stops decoding at channels
+  exceeding `group_dim`" rule; new
+  `decode_channels_at_stream(br, descs, tree, wp, stream_index)`
+  threads Table H.4 property[1]; `pass_group::decode_modular_group_into`
+  decodes per-PassGroup modular sub-bitstreams and copies samples back
+  into the parent image; post-PassGroup inverse transforms run AFTER
+  all groups complete (driven by `decode_codestream`). The committed
+  `synth_320_grey/` multi-group fixture (320×320 grey lossless,
+  `cjxl 0.11.1 -d 0 -m 1 -e 1 -g 0 -R 0` → 9 groups) is left
+  unconsumed by tests pending a SPECGAP clarification: cjxl emits
+  per-cluster ANS distributions with `alphabet_size > table_size`
+  (33 > 32 at log_alpha=5), which the 2024 spec text in C.2.5 implies
+  should be rejected. Round-8 lands the SPECGAP fix.
+
 - **Round 6 (2024-spec)**: Annex E.4 ICC profile decode +
   LfGroup / PassGroup type scaffolding.
   * `src/icc.rs` — full Annex E.4 ICC decoder. Reads `enc_size =
@@ -68,11 +84,11 @@ contaminated trace docs (`libjxl-trace-reverse-engineering.md`,
 the `old` branch are universally off-limits per
 `feedback_no_external_libs.md` workspace policy.
 
-Round 7+ candidates (in priority order):
+Round 8+ candidates (in priority order):
 
-1. **LfGroup / PassGroup decode wiring** — multi-group /
-   multi-pass support against a synthetic multi-group lossless
-   fixture (cjxl 0.12.0 against a 256×256+ lossless PNG).
+1. **Resolve C.2.5 alphabet_size SPECGAP** — close the round-7
+   `alphabet_size > table_size` blocker so the committed
+   `synth_320_grey/` fixture decodes pixel-correct.
 2. **VarDCT decode** (Annex I) — start with `vardct-256x256-d1`
    then move to `vardct-256x256-d3` and `large-1024x768-d2`.
 3. **XYB inverse colour transform** (§K) — needed for VarDCT

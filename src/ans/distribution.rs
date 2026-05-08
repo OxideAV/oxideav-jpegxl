@@ -270,6 +270,11 @@ pub fn read_distribution(br: &mut BitReader<'_>, log_alphabet_size: u32) -> Resu
         ));
     }
     let alphabet_size = br.read_u8_value()? as usize + 3;
+    if alphabet_size > ALPHABET_SIZE_MAX {
+        return Err(Error::InvalidData(
+            "JXL ANS distribution: alphabet_size exceeds ALPHABET_SIZE_MAX".into(),
+        ));
+    }
     if alphabet_size > table_size {
         return Err(Error::InvalidData(
             "JXL ANS distribution: alphabet_size > table_size".into(),
@@ -277,7 +282,7 @@ pub fn read_distribution(br: &mut BitReader<'_>, log_alphabet_size: u32) -> Resu
     }
 
     // logcounts is bounded by alphabet_size which is bounded by
-    // table_size which is at most 2^15. ALPHABET_SIZE_MAX gates this.
+    // table_size which is at most 2^15.
     let mut logcounts = vec![0u8; alphabet_size];
     let mut same = vec![0u32; alphabet_size];
     let mut omit_log: i32 = -1;
