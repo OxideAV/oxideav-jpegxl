@@ -69,6 +69,66 @@ pub const MAX_DIM: u32 = 65536;
 /// branch of [`decode_channels_at_stream`].
 pub static WP_ROUND_BIAS: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(3);
 
+/// Round-23 diagnostic: leaf-pick trace target encoded as
+/// `(channel << 24) | (y << 12) | x`. When the per-sample decode loop
+/// in [`decode_channels_at_stream`] reaches a sample whose `(i, x, y)`
+/// matches the encoded target, the MA-tree traversal records each
+/// interior decision (property index, threshold, evaluated property
+/// value, branch taken) plus the final leaf to
+/// [`LEAF_PICK_TRACE_BUF`], and the property vector to
+/// [`LEAF_PICK_TRACE_PROPS`]. Default = `u64::MAX` (no match).
+///
+/// Round-22 localised the d1 first-divergent sample to Y' sample 22
+/// (channel 0, x=22, y=0); the round-23 audit dumps the leaf-pick
+/// traversal at that exact point under both spec WP bias 3 and
+/// auditor-toggle bias 4 to identify the wrong-branch decision.
+pub static LEAF_PICK_TRACE_TARGET: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(u64::MAX);
+
+/// Round-23 helper: encode `(channel, x, y)` for [`LEAF_PICK_TRACE_TARGET`].
+pub fn encode_leaf_pick_target(channel: u32, x: u32, y: u32) -> u64 {
+    ((channel as u64) << 24) | ((y as u64 & 0xFFF) << 12) | (x as u64 & 0xFFF)
+}
+
+/// One leaf-pick decision step: `(node_index, property_index, threshold,
+/// property_value, branch)` where `branch = 1` means left (pv > value)
+/// and `branch = 0` means right.
+pub type LeafPickStep = (u32, u32, i32, i32, u32);
+
+/// Round-23 per-sample leaf-log entry: `(channel, x, y, leaf_ctx, prop15)`.
+pub type LeafPickLog = (u32, u32, u32, u32, i32);
+
+thread_local! {
+    /// Round-23 diagnostic: per-sample MA-tree decision steps captured
+    /// at the [`LEAF_PICK_TRACE_TARGET`] sample. Caller resets before
+    /// the decode and reads after.
+    pub static LEAF_PICK_TRACE_BUF: std::cell::RefCell<Vec<LeafPickStep>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    /// Round-23 diagnostic: full property vector at the
+    /// [`LEAF_PICK_TRACE_TARGET`] sample.
+    pub static LEAF_PICK_TRACE_PROPS: std::cell::RefCell<Vec<i32>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    /// Round-23 diagnostic: WP intermediates at the trace target —
+    /// `(te_w, te_n, te_nw, te_ne, w8, n8, nw8, ne8, wp_pred8, max_error)`.
+    pub static LEAF_PICK_TRACE_WP: std::cell::RefCell<Vec<i32>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    /// Round-23 diagnostic: final leaf at the trace target —
+    /// `(ctx, predictor, offset, multiplier)`.
+    pub static LEAF_PICK_TRACE_LEAF: std::cell::RefCell<Option<(u32, u32, i32, u32)>> =
+        const { std::cell::RefCell::new(None) };
+    /// Round-23 diagnostic: per-sample leaf-pick log across the whole
+    /// decode (only populated when [`LEAF_PICK_LOG_ENABLED`] is true).
+    /// Used to bisect the first leaf-flip between bias=3 and bias=4
+    /// runs after round-23 confirmed sample 22 leaf-pick is identical.
+    pub static LEAF_PICK_LOG: std::cell::RefCell<Vec<LeafPickLog>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Round-23 toggle: when true, every per-sample leaf pick is appended
+/// to [`LEAF_PICK_LOG`].
+pub static LEAF_PICK_LOG_ENABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// 2024-spec Table H.6 — Modular transform identifier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransformId {
@@ -1371,6 +1431,18 @@ pub fn get_properties(
 /// `d` test `property[d.property] > d.value`. True → `d.left_child`.
 /// False → `d.right_child`. Repeat until a leaf is reached.
 pub fn evaluate_tree<'a>(nodes: &'a [MaNode], properties: &[i32]) -> Result<&'a MaLeaf> {
+    evaluate_tree_inner(nodes, properties, false)
+}
+
+/// Round-23 diagnostic variant of [`evaluate_tree`] that, when
+/// `record_trace` is true, appends each decision step to
+/// [`LEAF_PICK_TRACE_BUF`] (and the final leaf to
+/// [`LEAF_PICK_TRACE_LEAF`]).
+fn evaluate_tree_inner<'a>(
+    nodes: &'a [MaNode],
+    properties: &[i32],
+    record_trace: bool,
+) -> Result<&'a MaLeaf> {
     if nodes.is_empty() {
         return Err(Error::InvalidData("JXL MA tree: empty tree".into()));
     }
@@ -1379,7 +1451,14 @@ pub fn evaluate_tree<'a>(nodes: &'a [MaNode], properties: &[i32]) -> Result<&'a 
     // by construction since left/right_child are forward-only).
     for _ in 0..=nodes.len() {
         match &nodes[cursor] {
-            MaNode::Leaf(l) => return Ok(l),
+            MaNode::Leaf(l) => {
+                if record_trace {
+                    LEAF_PICK_TRACE_LEAF.with(|s| {
+                        *s.borrow_mut() = Some((l.ctx, l.predictor, l.offset, l.multiplier));
+                    });
+                }
+                return Ok(l);
+            }
             MaNode::Decision {
                 property,
                 value,
@@ -1388,11 +1467,18 @@ pub fn evaluate_tree<'a>(nodes: &'a [MaNode], properties: &[i32]) -> Result<&'a 
             } => {
                 let p_idx = *property as usize;
                 let pv = properties.get(p_idx).copied().unwrap_or(0);
-                let next = if pv > *value {
+                let branch = if pv > *value { 1u32 } else { 0u32 };
+                let next = if branch == 1 {
                     *left_child as usize
                 } else {
                     *right_child as usize
                 };
+                if record_trace {
+                    LEAF_PICK_TRACE_BUF.with(|b| {
+                        b.borrow_mut()
+                            .push((cursor as u32, *property, *value, pv, branch));
+                    });
+                }
                 if next >= nodes.len() {
                     return Err(Error::InvalidData(format!(
                         "JXL MA tree: child index {next} out of range {}",
@@ -1545,8 +1631,80 @@ pub fn decode_channels_at_stream(
                         (0, [0; 4], 0)
                     };
 
+                // Round-23 leaf-pick trace gate: enable per-sample tree-
+                // walk recording only when this sample matches the
+                // configured target.
+                let leaf_target = LEAF_PICK_TRACE_TARGET.load(std::sync::atomic::Ordering::Relaxed);
+                let trace_this_sample = leaf_target != u64::MAX
+                    && leaf_target == encode_leaf_pick_target(i as u32, x, y);
+                if trace_this_sample {
+                    // Capture WP intermediates (te_w/te_n/te_nw/te_ne and
+                    // the 8x-scale neighbours plus wp_pred8 / max_error)
+                    // for the property-15 audit. Only meaningful when WP
+                    // state exists; otherwise zeros.
+                    let (te_w, te_n, te_nw, te_ne, w8, n8, nw8, ne8) =
+                        if let Some(state) = wp_states[i].as_ref() {
+                            let nb = Neighbours::at(&img, i, x as i32, y as i32);
+                            let xi = x as i32;
+                            let yi = y as i32;
+                            let te_w = state.true_err_at(xi - 1, yi);
+                            let te_n = state.true_err_at(xi, yi - 1);
+                            let te_nw = state.true_err_at(xi - 1, yi - 1);
+                            let te_ne = if (xi + 1) < state.width as i32 && yi > 0 {
+                                state.true_err_at(xi + 1, yi - 1)
+                            } else {
+                                te_n
+                            };
+                            (
+                                te_w,
+                                te_n,
+                                te_nw,
+                                te_ne,
+                                nb.w.wrapping_shl(3),
+                                nb.n.wrapping_shl(3),
+                                nb.nw.wrapping_shl(3),
+                                nb.ne.wrapping_shl(3),
+                            )
+                        } else {
+                            (0, 0, 0, 0, 0, 0, 0, 0)
+                        };
+                    LEAF_PICK_TRACE_WP.with(|s| {
+                        *s.borrow_mut() = vec![
+                            te_w,
+                            te_n,
+                            te_nw,
+                            te_ne,
+                            w8,
+                            n8,
+                            nw8,
+                            ne8,
+                            wp_pred8,
+                            wp_max_error,
+                        ];
+                    });
+                }
+
                 let props = get_properties(&img, i, x as i32, y as i32, stream_index, wp_max_error);
-                let leaf = *evaluate_tree(&tree.nodes, &props)?;
+                if trace_this_sample {
+                    LEAF_PICK_TRACE_PROPS.with(|s| {
+                        *s.borrow_mut() = props.clone();
+                    });
+                }
+                let leaf = *evaluate_tree_inner(&tree.nodes, &props, trace_this_sample)?;
+
+                // Round-23 per-sample leaf log (gated behind a separate
+                // toggle so the round-22 sentinel test stays cheap).
+                if LEAF_PICK_LOG_ENABLED.load(std::sync::atomic::Ordering::Relaxed) {
+                    LEAF_PICK_LOG.with(|b| {
+                        b.borrow_mut().push((
+                            i as u32,
+                            x,
+                            y,
+                            leaf.ctx,
+                            props.get(15).copied().unwrap_or(0),
+                        ));
+                    });
+                }
                 if (leaf.ctx as usize) >= tree.num_ctx {
                     return Err(Error::InvalidData(format!(
                         "JXL Modular: leaf ctx {} out of bounds {}",
