@@ -9,6 +9,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Round 24 (2024-spec, Auditor mode)** — pursued round-23 candidates
+  (1) per-cluster ANS distribution byte-trace for clusters 0+1 and
+  (2) per-call alias-mapping invariant audit. Result: **both paths
+  falsified**. Cluster 0 (19 nonzero entries) and cluster 1 (23
+  nonzero entries) both sum to 4096; the alias table built from each
+  D[] routes probability mass to symbols identically to the declared
+  D[] (per-symbol routed-mass divergence = 0 for both clusters);
+  across the FULL 3072-call ANS trace the spec C.3.2
+  `(symbol, offset) = AliasMapping(state & 0xFFF)` invariant holds
+  bit-for-bit when checked against either cluster 0 or cluster 1's
+  alias table (0 hard violations; 288 ambiguous calls where both
+  clusters yield the same `(symbol, offset, prob)`). Per-call state
+  arithmetic `state = prob * (state >> 12) + offset` also reproduces
+  the trace exactly. Cluster usage breakdown: c0=1755 calls,
+  c1=1317 calls, unknown=0 (no cross-talk into HFMetadata clusters
+  2/3/4). The d1 ANS final-state delta of `0x21914271 -
+  0x00130000 ≈ 562M` is therefore NOT caused by a per-cluster D[]
+  shape mismatch, alias-table self-map / Vose-pump bug,
+  alias-mapping lookup bug, per-call state-arithmetic bug, or
+  cluster-routing leakage. Round 25 candidates: (1) D[]-vs-cjxl
+  reference comparison (a single mismatched count would be the
+  smoking gun), (2) leaf-pick + cluster-routing audit at samples
+  beyond sample 22 up to sample 79 (where r23's first ctx-flip was
+  observed), (3) HFMetadata stream-boundary cross-talk audit. New
+  diagnostic `tests/round24_d1_disttrace.rs` (Auditor mode, never
+  asserts) with two tests:
+  `d1_per_cluster_distribution_byte_trace_round_24` (path 1) and
+  `d1_per_call_alias_mapping_invariant_round_24` (path 2). Full
+  audit notes in `crates/oxideav-jpegxl/round24-d1-disttrace.md`.
+  Test count 343 → 345 (+2).
+
 - **Round 22 (2024-spec, Auditor mode)** — pursued round-21 candidates
   (a) `lf_quant` first-256-sample dump per channel and (c) WP `(p+3)>>3`
   rounding bias toggle on the d1 `LfCoefficients` sub-bitstream. Result:
