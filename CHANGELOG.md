@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Round 21 (2024-spec, Auditor mode)** — pursued round-20 candidates
+  (1) per-cluster distribution decode bisect and (2) alias-table
+  self-map branch audit on the d1 `LfCoefficients` sub-bitstream.
+  Result: both paths falsified. The 5 per-cluster ANS distributions
+  (clusters 0..4) all sum to 4096 with sane shapes (cluster sizes
+  19/23/5/2/2 nonzero entries out of 64); cluster 1's full 64-entry
+  alias table reconciles with the round-19 bit-faithful trace at calls
+  #0 and #1. Critically, **none of the five clusters has any `D[i] ==
+  bucket_size` entry**, so the alias-table self-map branch (round-3
+  fix territory) is not triggered for d1. Documented one strict-spec
+  divergence in `AliasTable::build` (`else` vs spec's `else if
+  (cutoffs[i] < bucket_size)`) that has zero observational effect on
+  d1 — hand-tracing the equal-bucket path confirms output-equivalent
+  behaviour. New diagnostic `tests/round21_d1_dist_alias_dump.rs`
+  (Auditor mode, never asserts) captures per-cluster `(cfg, D, alias)`
+  triples + cluster-1 full alias dump as evidence; full bisect notes
+  in `crates/oxideav-jpegxl/round21-d1-distbisect.md`. Test count
+  336 → 337 (+1).
+
 - **Round 20 (2024-spec, Auditor mode)** — re-interpreted cjxl
   `JXL_TRACE` output's `bits_consumed` field as section-local (not
   cumulative file position), invalidating the round-17/18/19 claim of a
