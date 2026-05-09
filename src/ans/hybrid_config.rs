@@ -89,6 +89,7 @@ impl HybridUintConfig {
     /// in the shift to make malicious input fail safely.
     pub fn read_uint(&self, br: &mut BitReader<'_>, token: u32) -> Result<u32> {
         if token < self.split {
+            trace_uint(self, token, 0, token);
             return Ok(token);
         }
         let total_in_token = self
@@ -127,7 +128,9 @@ impl HybridUintConfig {
         let combined = (shifted | extra)
             .checked_shl(self.lsb_in_token)
             .ok_or_else(|| Error::InvalidData("JXL ReadUint: lsb shift overflow".into()))?;
-        Ok(combined | lsb)
+        let value = combined | lsb;
+        trace_uint(self, token, n, value);
+        Ok(value)
     }
 
     /// In-tree encoder for `read_uint`'s inverse — used only by unit
@@ -182,6 +185,66 @@ fn ceil_log2(x: u32) -> u32 {
     } else {
         32 - (x - 1).leading_zeros()
     }
+}
+
+// ---------------------------------------------------------------------------
+// Round-18 diagnostic trace for `read_uint` calls.
+//
+// A test (`tests/round18_*.rs`) flips [`TRACE_ENABLED`] to `true`, drives a
+// decode, then drains [`with_trace_records`] to inspect per-token bit
+// accounting. In production builds the atomic load is a single relaxed read
+// per call; the cost is negligible compared with the entropy decode itself.
+// ---------------------------------------------------------------------------
+
+use std::cell::RefCell;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// Enable / disable per-call tracing of [`HybridUintConfig::read_uint`]. Off
+/// by default; tests flip it on for the duration of one decode.
+pub static TRACE_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// One per-call trace record captured when [`TRACE_ENABLED`] is set.
+#[derive(Debug, Clone, Copy)]
+pub struct TraceRecord {
+    pub split_exponent: u32,
+    pub msb_in_token: u32,
+    pub lsb_in_token: u32,
+    pub token: u32,
+    /// Extra bits read after the entropy-coded token. 0 if `token < split`
+    /// (no extra bits) OR if `n` came out as 0.
+    pub n_extra_bits: u32,
+    pub value: u32,
+}
+
+thread_local! {
+    static TRACE_BUF: RefCell<Vec<TraceRecord>> = const { RefCell::new(Vec::new()) };
+}
+
+#[inline]
+fn trace_uint(cfg: &HybridUintConfig, token: u32, n_extra_bits: u32, value: u32) {
+    if TRACE_ENABLED.load(Ordering::Relaxed) {
+        TRACE_BUF.with(|b| {
+            b.borrow_mut().push(TraceRecord {
+                split_exponent: cfg.split_exponent,
+                msb_in_token: cfg.msb_in_token,
+                lsb_in_token: cfg.lsb_in_token,
+                token,
+                n_extra_bits,
+                value,
+            });
+        });
+    }
+}
+
+/// Drain the per-thread trace buffer and pass it to `f`. The buffer is
+/// emptied as a side-effect.
+pub fn with_trace_records<R>(f: impl FnOnce(&[TraceRecord]) -> R) -> R {
+    TRACE_BUF.with(|b| {
+        let mut buf = b.borrow_mut();
+        let r = f(&buf);
+        buf.clear();
+        r
+    })
 }
 
 #[cfg(test)]

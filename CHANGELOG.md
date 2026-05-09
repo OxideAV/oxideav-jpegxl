@@ -33,6 +33,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Round 18 (2024-spec, Auditor mode)** — per-token bit accounting
+  trace inside `HybridUintConfig::read_uint` (gated behind a public
+  `TRACE_ENABLED` atomic switch in `src/ans/hybrid_config.rs`) and
+  `tests/round18_d1_per_token.rs` exercising it on the d1 LfCoefficients
+  decode. The trace records `(split_exponent, msb_in_token,
+  lsb_in_token, token, n_extra_bits, value)` per call so that future
+  rounds can pinpoint the still-open 267-bit drift documented in
+  `round17-d1-bisect.md`.
+
+  Findings (full analysis in `round18-d1-per-token.md`):
+
+  - All 3072 LfCoefficients sample decodes hit a single hybrid-uint
+    config `(split_exp=4, msb=1, lsb=2)` with **821 extra-bits** total
+    (avg 0.267 / call) — well within the spec's expected per-token
+    accounting per FDIS Listing D.6, which **rules out the round-17
+    PRIMARY hypothesis** (per-token extra-bits drift).
+  - The remaining 11104 sample-loop bits decompose into 32 (ANS state
+    init) + 16 × 694 (ANS refills). 22.6 % refill rate is plausible
+    per-symbol but high in aggregate: the bug is in **ANS state
+    evolution**, not extra-bits or the prelude (the cjxl-traced
+    `bits=602` leaf-stream prelude bound is satisfied — our
+    GlobalModular ends at the cjxl-expected bit 1026 exactly).
+  - A trial revert of the round-3 conditional alias-mapping deviation
+    (returning `pos` instead of `offsets[i] + pos` in the not-in-redirect
+    branch) reduces d1's LfCoefficients consumption from 11 995 →
+    11 654 bits (within 74 of cjxl's 11 728 LfGroup TOTAL) but breaks
+    `gray-64x64.jxl` with `unexpected end of JXL bitstream`. Analytical
+    proof in the bisect doc shows the deviation IS correct against the
+    encoder for both fixtures, so the bug is elsewhere — round-19 should
+    extend the trace with cluster-index per call to verify whether the
+    cluster_map for the leaf-level stream is being computed correctly.
+  - All 5 small lossless fixtures + every round-11..17 sentinel test
+    stays green. New `d1_per_token_trace_round_18` test joins the
+    existing 329-test suite (now 330 tests, +1 net).
+
 - **Round 17 (2024-spec, Auditor mode)** — d1 bit-position-drift bisect.
   Round 16 left the d1 fixture surfacing
   `InvalidData("JXL Modular Squeeze: end 40 >= channel count 4")`
