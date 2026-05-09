@@ -98,6 +98,35 @@ pub type LeafPickStep = (u32, u32, i32, i32, u32);
 /// Round-23 per-sample leaf-log entry: `(channel, x, y, leaf_ctx, prop15)`.
 pub type LeafPickLog = (u32, u32, u32, u32, i32);
 
+/// Round-25 rich per-sample log entry. Captured for samples whose
+/// log-index is in `[RICH_RANGE_LO, RICH_RANGE_HI]` (inclusive). All
+/// fields are needed for the bias=3 vs bias=4 comparison driving the
+/// "first ctx-flip at sample 79" diagnosis:
+///
+/// * `(channel, x, y)` — sample identity (same as [`LeafPickLog`]).
+/// * `props` — full MA-tree property vector (16 base + previous-channel
+///   props, per Table H.4).
+/// * `wp` — WP intermediates as in [`LEAF_PICK_TRACE_WP`]:
+///   `[te_w, te_n, te_nw, te_ne, w8, n8, nw8, ne8, wp_pred8, max_error]`.
+/// * `leaf` — `(ctx, predictor, offset, multiplier)` from the MA-tree leaf.
+/// * `token` — decoded raw token (post-hybrid-uint reassembly).
+/// * `diff` — `unpack_signed(token) * multiplier + offset` (the final
+///   "diff" added to the prediction).
+/// * `pred` — the predictor's value (already rounded for predictor 6).
+/// * `value` — the final reconstructed sample value `diff + pred`.
+pub type RichLeafPickLog = (
+    u32,                  // channel
+    u32,                  // x
+    u32,                  // y
+    Vec<i32>,             // props
+    [i32; 10],            // wp intermediates
+    (u32, u32, i32, u32), // leaf (ctx, predictor, offset, multiplier)
+    u32,                  // token
+    i32,                  // diff (unpack_signed(token)*mult + offset)
+    i32,                  // pred
+    i32,                  // value
+);
+
 thread_local! {
     /// Round-23 diagnostic: per-sample MA-tree decision steps captured
     /// at the [`LEAF_PICK_TRACE_TARGET`] sample. Caller resets before
@@ -122,12 +151,43 @@ thread_local! {
     /// runs after round-23 confirmed sample 22 leaf-pick is identical.
     pub static LEAF_PICK_LOG: std::cell::RefCell<Vec<LeafPickLog>> =
         const { std::cell::RefCell::new(Vec::new()) };
+    /// Round-25 diagnostic: rich per-sample log for samples whose
+    /// 0-indexed sequential log position falls within the
+    /// `[RICH_RANGE_LO, RICH_RANGE_HI]` (inclusive) window. Built on
+    /// top of the same per-sample iteration as [`LEAF_PICK_LOG`] but
+    /// captures every state input/output needed to compare bias=3 vs
+    /// bias=4 step-by-step around the first ctx-flip at sample 79.
+    pub static RICH_LEAF_PICK_LOG: std::cell::RefCell<Vec<RichLeafPickLog>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// Round-23 toggle: when true, every per-sample leaf pick is appended
 /// to [`LEAF_PICK_LOG`].
 pub static LEAF_PICK_LOG_ENABLED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
+
+thread_local! {
+    /// Round-25 rich-range capture window — inclusive log-index bounds,
+    /// thread-local so parallel `cargo test` runs (per-thread) don't
+    /// clobber each other's window. Default `(u32::MAX, u32::MAX)`
+    /// disables capture. Caller drives via [`set_rich_range`].
+    static RICH_RANGE_LO: std::cell::Cell<u32> = const { std::cell::Cell::new(u32::MAX) };
+    static RICH_RANGE_HI: std::cell::Cell<u32> = const { std::cell::Cell::new(u32::MAX) };
+}
+
+/// Round-25 helper: configure the rich-range capture window for the
+/// CURRENT thread. Call with `(u32::MAX, u32::MAX)` to disable.
+pub fn set_rich_range(lo: u32, hi: u32) {
+    RICH_RANGE_LO.with(|c| c.set(lo));
+    RICH_RANGE_HI.with(|c| c.set(hi));
+}
+
+/// Round-25 helper: snapshot the current thread's rich-range window.
+fn rich_range_snapshot() -> (u32, u32) {
+    let lo = RICH_RANGE_LO.with(|c| c.get());
+    let hi = RICH_RANGE_HI.with(|c| c.get());
+    (lo, hi)
+}
 
 /// 2024-spec Table H.6 — Modular transform identifier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1615,6 +1675,12 @@ pub fn decode_channels_at_stream(
         descs.iter().map(|_| None).collect()
     };
 
+    // Round-25: per-sample sequential log index (matches the iteration
+    // order used by [`LEAF_PICK_LOG`] and [`RICH_LEAF_PICK_LOG`]).
+    let mut rich_log_idx: u32 = 0;
+    let (rich_lo, rich_hi) = rich_range_snapshot();
+    let rich_enabled = rich_lo != u32::MAX && rich_hi != u32::MAX;
+
     for (i, desc) in descs.iter().enumerate() {
         for y in 0..desc.height {
             for x in 0..desc.width {
@@ -1630,6 +1696,43 @@ pub fn decode_channels_at_stream(
                     } else {
                         (0, [0; 4], 0)
                     };
+
+                // Round-25: pre-compute the WP intermediates used by the
+                // rich log if this sample is in the capture window. Cheap
+                // no-op when disabled.
+                let rich_in_range =
+                    rich_enabled && rich_log_idx >= rich_lo && rich_log_idx <= rich_hi;
+                let rich_wp: [i32; 10] = if rich_in_range {
+                    if let Some(state) = wp_states[i].as_ref() {
+                        let nb = Neighbours::at(&img, i, x as i32, y as i32);
+                        let xi = x as i32;
+                        let yi = y as i32;
+                        let te_w = state.true_err_at(xi - 1, yi);
+                        let te_n = state.true_err_at(xi, yi - 1);
+                        let te_nw = state.true_err_at(xi - 1, yi - 1);
+                        let te_ne = if (xi + 1) < state.width as i32 && yi > 0 {
+                            state.true_err_at(xi + 1, yi - 1)
+                        } else {
+                            te_n
+                        };
+                        [
+                            te_w,
+                            te_n,
+                            te_nw,
+                            te_ne,
+                            nb.w.wrapping_shl(3),
+                            nb.n.wrapping_shl(3),
+                            nb.nw.wrapping_shl(3),
+                            nb.ne.wrapping_shl(3),
+                            wp_pred8,
+                            wp_max_error,
+                        ]
+                    } else {
+                        [0; 10]
+                    }
+                } else {
+                    [0; 10]
+                };
 
                 // Round-23 leaf-pick trace gate: enable per-sample tree-
                 // walk recording only when this sample matches the
@@ -1711,6 +1814,13 @@ pub fn decode_channels_at_stream(
                         leaf.ctx, tree.num_ctx
                     )));
                 }
+                // Round-25: snapshot the props vector for the rich log
+                // BEFORE the token decode (props is consumed by ANS).
+                let rich_props_snap: Vec<i32> = if rich_in_range {
+                    props.clone()
+                } else {
+                    Vec::new()
+                };
                 let token = decode_uint_in_with_dist(
                     &mut tree.hybrid,
                     &mut tree.entropy,
@@ -1777,6 +1887,31 @@ pub fn decode_channels_at_stream(
                         state.set_sub_err(k, x, y, se as i32);
                     }
                 }
+
+                // Round-25: append the rich per-sample log entry (only
+                // when rich-range capture is enabled and this sample's
+                // index is within the window).
+                if rich_in_range {
+                    let final_diff = (diff as i64)
+                        .saturating_mul(leaf.multiplier as i64)
+                        .saturating_add(leaf.offset as i64)
+                        as i32;
+                    RICH_LEAF_PICK_LOG.with(|b| {
+                        b.borrow_mut().push((
+                            i as u32,
+                            x,
+                            y,
+                            rich_props_snap,
+                            rich_wp,
+                            (leaf.ctx, leaf.predictor, leaf.offset, leaf.multiplier),
+                            token,
+                            final_diff,
+                            p,
+                            v,
+                        ));
+                    });
+                }
+                rich_log_idx = rich_log_idx.saturating_add(1);
             }
         }
     }
