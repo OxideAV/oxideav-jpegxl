@@ -90,33 +90,50 @@ impl AnsDecoder {
             self.state = new_state;
             0
         };
-        // Round-19 diagnostic: dump first 30 calls when ANS_TRACE env is set.
+        // Round-19 diagnostic: dump every call when STATE_TRACE_ENABLED is
+        // set (round 20 lifted the previous 30-call cap so end-of-stream
+        // bisects over multi-thousand-sample LF channels are tractable).
+        // Round-20 extension: also publish the LATEST post-decode state to
+        // [`LATEST_ANS_STATE`] so callers can verify end-of-stream against
+        // [`ANS_FINAL_STATE`] without holding a reference to the
+        // [`AnsDecoder`] (which lives inside a cloned `MaTreeFdis` and is
+        // dropped at the end of `decode_channels_at_stream`).
         if STATE_TRACE_ENABLED.load(std::sync::atomic::Ordering::Relaxed) {
             STATE_TRACE_BUF.with(|b| {
-                let mut v = b.borrow_mut();
-                if v.len() < 30 {
-                    v.push((
-                        pre_state,
-                        index,
-                        symbol,
-                        offset,
-                        prob,
-                        new_state,
-                        refill_bits,
-                    ));
-                }
+                b.borrow_mut().push((
+                    pre_state,
+                    index,
+                    symbol,
+                    offset,
+                    prob,
+                    new_state,
+                    refill_bits,
+                ));
             });
+            LATEST_ANS_STATE.store(self.state, std::sync::atomic::Ordering::Relaxed);
+            LATEST_ANS_CALL_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         Ok((symbol, refill_bits))
     }
 }
 
 use std::cell::RefCell;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize};
 
 /// Round-19 diagnostic flag — when on, the first 30 ANS state
-/// transitions (per thread) are recorded in [`STATE_TRACE_BUF`].
+/// transitions (per thread) are recorded in [`STATE_TRACE_BUF`] and the
+/// most-recent post-decode state is published to [`LATEST_ANS_STATE`].
 pub static STATE_TRACE_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// Round-20 diagnostic: most-recent post-decode ANS state value (see
+/// [`STATE_TRACE_ENABLED`]). Process-global; reset by the test harness
+/// before each decode under audit. Compare against [`ANS_FINAL_STATE`]
+/// to verify the spec's end-of-stream sentinel (D.3.3 last sentence).
+pub static LATEST_ANS_STATE: AtomicU32 = AtomicU32::new(0);
+
+/// Round-20 diagnostic: total `decode_symbol_with_refill` calls observed
+/// while [`STATE_TRACE_ENABLED`] was on. Reset by the test harness.
+pub static LATEST_ANS_CALL_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 /// One per-call ANS state transition: `(pre_state, alias_index, symbol,
 /// alias_offset, prob, new_state, refill_bits)`.

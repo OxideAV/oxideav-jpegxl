@@ -190,11 +190,17 @@ fn d1_cluster_and_refill_trace_round_19() {
     let consumed = shared_br.bits_read() - bp;
     eprintln!("[r19] LfCoefficients consumed {consumed} bits (cjxl LfGroup TOTAL = 11728)");
 
-    // Dump first 30 ANS state transitions for sanity-check.
+    // Dump first 30 ANS state transitions for sanity-check (round 20
+    // lifted the inner cap; cap the printed view here so the round-19
+    // diagnostic stays compact).
     STATE_TRACE_BUF.with(|b| {
         let v = b.borrow();
-        eprintln!("[r19] first {} ANS state transitions (pre, idx, sym, off, prob, new, refill):", v.len());
-        for (i, (pre, idx, sym, off, prob, new, refill)) in v.iter().enumerate() {
+        let n_print = v.len().min(30);
+        eprintln!(
+            "[r19] first {n_print} of {} ANS state transitions (pre, idx, sym, off, prob, new, refill):",
+            v.len()
+        );
+        for (i, (pre, idx, sym, off, prob, new, refill)) in v.iter().take(n_print).enumerate() {
             eprintln!(
                 "[r19]   #{i}: pre=0x{pre:08x} idx=0x{idx:03x} sym={sym} off={off} prob={prob} new=0x{new:08x} refill={refill}",
             );

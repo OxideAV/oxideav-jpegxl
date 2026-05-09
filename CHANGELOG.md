@@ -9,6 +9,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Round 20 (2024-spec, Auditor mode)** — re-interpreted cjxl
+  `JXL_TRACE` output's `bits_consumed` field as section-local (not
+  cumulative file position), invalidating the round-17/18/19 claim of a
+  267-bit overshoot in `LfCoefficients`. Empirical proof: in the same
+  trace, `AC_GLOBAL_END bits_consumed=307` while `DC_GLOBAL_END=1026`,
+  so `307 < 1026` precludes a cumulative reading. With the corrected
+  interpretation `DC_GROUP` is 12754 bits (not 11728), `LfCoefficients`
+  fits well within the budget, and `HfMetadata`'s slot is 759 bits.
+
+  Identified a stronger oracle for the actual divergence: per FDIS
+  D.3.3, the ANS state must equal `0x00130000` after the final symbol
+  in any stream. Wired `LATEST_ANS_STATE` / `LATEST_ANS_CALL_COUNT`
+  thread-locals (in `src/ans/symbol.rs`) so a test can read the
+  post-decode state without holding the per-stream `MaTreeFdis` clone.
+  On d1's `LfCoefficients` the final state is `0x21914271` after 3072
+  decode_symbol calls — proving a structural decode divergence (wrong
+  per-cluster distribution, wrong alias mapping, wrong sample count, or
+  wrong read in the per-sample loop). The state never reaches the
+  sentinel within 3072 calls, so it's not a sample-count off-by-one.
+
+  Lifted the previous 30-call cap on `STATE_TRACE_BUF` so end-of-stream
+  bisects over multi-thousand-sample LF channels are tractable. Five
+  new tests in `tests/round20_d1_*.rs`. See
+  `crates/oxideav-jpegxl/round20-d1-hfmeta.md` for the full audit and
+  the round-21 candidate ranking.
+
 - **Round 19 (2024-spec, Auditor mode)** — extended the per-token
   trace ring with `(ctx, cluster, ans_refill_bits)` and added a
   `STATE_TRACE_BUF` recording the first 30 ANS state transitions for
