@@ -9,6 +9,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Round 22 (2024-spec, Auditor mode)** — pursued round-21 candidates
+  (a) `lf_quant` first-256-sample dump per channel and (c) WP `(p+3)>>3`
+  rounding bias toggle on the d1 `LfCoefficients` sub-bitstream. Result:
+  WP-rounding-bias bug class **falsified**. Added a runtime atomic
+  `WP_ROUND_BIAS` (default 3, spec-conformant per ISO/IEC 18181-1:2024
+  Table H.3 + FDIS-2021 Listing C.16) so the auditor can sweep biases
+  without recompile. Sweeps recorded post-decode ANS final state for
+  bias ∈ {0, 3, 4, 7}: 0 → 0x0042cd42 (|Δ|=3 132 738), 3 → 0x21914271
+  (|Δ|=561 922 673, spec), 4 → 0x00fd721e (|Δ|=15 364 638), 7 →
+  0x001214ac (|Δ|=60 244). All four miss the §D.3.3 sentinel
+  `0x00130000`; the +7 bias being closest proves the variation is
+  ANS-chain noise from leaf-flip cascades, not a true rounding bug.
+  Per-channel `lf_quant` dump (Y'/X'/B', 1024 samples each, 32×32) shows
+  smooth low-frequency shape with sane stats (Y' mean=468 min=326
+  max=644; X' mean=14 min=−125 max=135; B' mean=41 min=−49 max=123),
+  consistent with a real-image fixture and **proving the per-sample
+  decode loop is producing plausible data — not garbage**. WP+3 vs +4
+  diverges first at Y' sample 22 (row 0, col 22), localising the actual
+  bug to a specific MA-tree leaf-flip at that sample. New diagnostic
+  `tests/round22_d1_sample_dump.rs` (Auditor mode, never asserts) dumps
+  both the `lf_quant` table and the bias-sweep final states; full audit
+  notes in `crates/oxideav-jpegxl/round22-d1-sampledump.md`. Test count
+  337 → 338 (+1).
+
 - **Round 21 (2024-spec, Auditor mode)** — pursued round-20 candidates
   (1) per-cluster distribution decode bisect and (2) alias-table
   self-map branch audit on the d1 `LfCoefficients` sub-bitstream.

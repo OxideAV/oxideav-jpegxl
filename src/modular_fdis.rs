@@ -59,6 +59,16 @@ pub const MAX_CHANNELS: usize = 64;
 /// decoder allocates a `Vec<i32>` of `width * height` per channel.
 pub const MAX_DIM: u32 = 65536;
 
+/// Round-22 diagnostic toggle: WP rounding bias. ISO/IEC 18181-1:2024
+/// Table H.3 (predictor 6) reads `(prediction + 3) >> 3` — i.e. the
+/// spec-literal bias is **3**. This atomic exists so the round-22
+/// auditor can flip the bias to 4 at runtime and report the resulting
+/// ANS-final-state delta on the d1 LfCoefficients sub-bitstream
+/// without a recompile. Default = 3 (spec-conformant). The toggle is
+/// read once per WP rounding step in [`predict`] and the predictor-6
+/// branch of [`decode_channels_at_stream`].
+pub static WP_ROUND_BIAS: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(3);
+
 /// 2024-spec Table H.6 — Modular transform identifier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransformId {
@@ -1209,10 +1219,13 @@ fn predict(
                 Error::InvalidData("JXL Modular: predictor 6 used but WP state missing".into())
             })?;
             let (pred8, preds, max_err) = wp_predict(state, &nb, x, y, wp);
-            // Round (prediction + 3) >> 3 → arithmetic shift, but the
-            // spec uses unsigned-style >> for non-negative values; for
-            // signed we use (pred8 + 3) >> 3 with arith shift.
-            let v = (pred8.wrapping_add(3)) >> 3;
+            // Round (prediction + bias) >> 3 → arithmetic shift, but
+            // the spec uses unsigned-style >> for non-negative values;
+            // for signed we use (pred8 + bias) >> 3 with arith shift.
+            // Default bias = 3 (Table H.3); auditor may flip via
+            // [`WP_ROUND_BIAS`].
+            let bias = WP_ROUND_BIAS.load(std::sync::atomic::Ordering::Relaxed);
+            let v = (pred8.wrapping_add(bias)) >> 3;
             return Ok((v, preds, max_err));
         }
         7 => nb.ne,                                            // NorthEast
@@ -1557,7 +1570,10 @@ pub fn decode_channels_at_stream(
                             "JXL Modular: leaf predictor 6 but no WP state".into(),
                         ));
                     }
-                    (wp_pred8.wrapping_add(3)) >> 3
+                    {
+                        let bias = WP_ROUND_BIAS.load(std::sync::atomic::Ordering::Relaxed);
+                        (wp_pred8.wrapping_add(bias)) >> 3
+                    }
                 } else {
                     let (v, _, _) = predict(
                         &img,
