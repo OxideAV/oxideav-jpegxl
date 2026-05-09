@@ -188,7 +188,14 @@ fn d1_cluster_and_refill_trace_round_19() {
     TRACE_ENABLED.store(false, Ordering::Relaxed);
     STATE_TRACE_ENABLED.store(false, Ordering::Relaxed);
     let consumed = shared_br.bits_read() - bp;
-    eprintln!("[r19] LfCoefficients consumed {consumed} bits (cjxl LfGroup TOTAL = 11728)");
+    // Round 20 corrected the cjxl `bits_consumed` reading: the `12754`
+    // for `DC_GROUP_END` is *section-local* (not a cumulative file
+    // position), so the LfGroup budget is 12754, not 11728. Our
+    // 11995-bit LfCoefficients fits well inside that, leaving 759 bits
+    // for HfMetadata. See `round20-d1-hfmeta.md`.
+    eprintln!(
+        "[r19] LfCoefficients consumed {consumed} bits (cjxl DC_GROUP TOTAL = 12754; HfMeta budget 759)"
+    );
 
     // Dump first 30 ANS state transitions for sanity-check (round 20
     // lifted the inner cap; cap the printed view here so the round-19
