@@ -767,7 +767,16 @@ impl MaTreeFdis {
         // Symbol stream — independent D.3 prelude. The ANS state init
         // (if any) is deferred to just before the first symbol decode
         // — see comments on `EntropyStream::read`.
+        // Round-19 diagnostic hook: emit prelude bit count when the
+        // hybrid-config trace flag is on.
+        let prelude_start = br.bits_read();
         let entropy = EntropyStream::read(br, num_ctx)?;
+        if crate::ans::hybrid_config::TRACE_ENABLED.load(std::sync::atomic::Ordering::Relaxed) {
+            let prelude_bits = br.bits_read() - prelude_start;
+            eprintln!(
+                "[r19-prelude] num_ctx={num_ctx} leaf-stream EntropyStream::read consumed {prelude_bits} bits (cjxl trace says 602 for 16/5/6)",
+            );
+        }
         let hybrid = HybridUintState::new(entropy.lz77, entropy.lz_len_conf);
 
         Ok(Self {
@@ -1084,9 +1093,16 @@ fn wp_predict(
             if x == (state.width as i32 - 1) {
                 err_sum = (err_sum + w_se as u64) & 0xFFFF_FFFF;
             }
-            // error2weight(err_sum, maxweight):
+            // FDIS 2021 Listing E.2 — error2weight:
             //   shift = floor(log2(err_sum + 1)) - 5; if shift < 0 shift = 0;
-            //   return 4 + ((maxweight * ((1 << 24) Idiv ((err_sum >> shift) + 1))) >> shift);
+            //   return 4 + maxweight * ((1 << 24) Idiv ((err_sum >> shift) + 1));
+            // NOTE: the 2024 published edition adds an outer `>> shift`
+            // on the result, which keeps the weight bounded for very
+            // large err_sum. Round-19 audit picks the 2024 reading
+            // because pure FDIS-2021 yields weights up to 2^32 for
+            // err_sum near 2^32 — those overflow u32 in the subsequent
+            // `(weight >> sh)` step. The outer shift was already in
+            // round-3.
             let err_sum32 = err_sum as u32;
             let bits = 32u32 - (err_sum32 + 1).leading_zeros();
             let shift = (bits.saturating_sub(1)).saturating_sub(5);
@@ -1121,7 +1137,9 @@ fn wp_predict(
         return (g, preds, 0);
     }
     // 2024-spec Listing H.5.2 — `s = (sum_weights >> 1) - 1`. Round 3
-    // missed the `- 1`.
+    // missed the `- 1`. Round-19 confirmed via the round-10 synth_320
+    // drift bisect: removing the `- 1` shifts the first-drift y-coord
+    // from 24 to 8, so the round-3 reading IS the right one.
     let s_init: i64 = (sum_weights >> 1) as i64 - 1;
     let s = (0..4).fold(s_init, |acc, k| acc + preds[k] as i64 * shifted[k] as i64);
     let mut prediction = ((s * (1i64 << 24).div_euclid(sum_weights as i64)) >> 24) as i32;
@@ -1666,9 +1684,18 @@ fn decode_uint_in_with_dist(
                 let ans = ans_state.as_mut().ok_or_else(|| {
                     Error::InvalidData("JXL EntropyStream: missing ANS state".into())
                 })?;
-                Ok(ans.decode_symbol(br_inner, dist, alias)? as u32)
+                let (sym, refill) = ans.decode_symbol_with_refill(br_inner, dist, alias)?;
+                // Round-19: forward (ctx, cluster, refill_bits) to the
+                // hybrid_config trace ring. Cheap no-op when tracing is
+                // off.
+                crate::ans::hybrid_config::push_trace_extras(c, cluster as u32, refill);
+                Ok(sym as u32)
             }
-            ClusterEntropy::Prefix { code } => code.decode(br_inner),
+            ClusterEntropy::Prefix { code } => {
+                let sym = code.decode(br_inner)?;
+                crate::ans::hybrid_config::push_trace_extras(c, cluster as u32, 0);
+                Ok(sym)
+            }
         }
     };
     hybrid.decode(br, ctx, lz_dist_ctx, dist_multiplier, read_token, cfg_for)

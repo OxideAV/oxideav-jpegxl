@@ -214,15 +214,33 @@ pub struct TraceRecord {
     /// (no extra bits) OR if `n` came out as 0.
     pub n_extra_bits: u32,
     pub value: u32,
+    /// Round-19: leaf context the call resolved to (caller-supplied
+    /// via [`push_trace_extras`] just before the trace record is
+    /// emitted).
+    pub ctx: u32,
+    /// Round-19: cluster index the context resolved to (caller-supplied
+    /// via [`push_trace_extras`]).
+    pub cluster: u32,
+    /// Round-19: ANS-state renormalisation bits consumed during this
+    /// call's symbol decode (sum of `u(16)` refills triggered while
+    /// decoding the entropy-coded token; 0 for prefix-coded streams or
+    /// when no refill fired).
+    pub ans_refill_bits: u32,
 }
 
 thread_local! {
     static TRACE_BUF: RefCell<Vec<TraceRecord>> = const { RefCell::new(Vec::new()) };
+    /// Round-19: set by the symbol-decode call site immediately before
+    /// `read_uint` so that the resulting trace record can carry
+    /// `(ctx, cluster, ans_refill_bits)` alongside the per-token
+    /// extra-bits accounting. Default values mean "unknown".
+    static TRACE_EXTRAS: RefCell<(u32, u32, u32)> = const { RefCell::new((u32::MAX, u32::MAX, 0)) };
 }
 
 #[inline]
 fn trace_uint(cfg: &HybridUintConfig, token: u32, n_extra_bits: u32, value: u32) {
     if TRACE_ENABLED.load(Ordering::Relaxed) {
+        let (ctx, cluster, ans_refill_bits) = TRACE_EXTRAS.with(|e| *e.borrow());
         TRACE_BUF.with(|b| {
             b.borrow_mut().push(TraceRecord {
                 split_exponent: cfg.split_exponent,
@@ -231,8 +249,25 @@ fn trace_uint(cfg: &HybridUintConfig, token: u32, n_extra_bits: u32, value: u32)
                 token,
                 n_extra_bits,
                 value,
+                ctx,
+                cluster,
+                ans_refill_bits,
             });
         });
+        // Reset extras so a stale value can't leak into the next record
+        // if a call site forgets to push one.
+        TRACE_EXTRAS.with(|e| *e.borrow_mut() = (u32::MAX, u32::MAX, 0));
+    }
+}
+
+/// Round-19: caller-supplied per-call diagnostic extras. The next
+/// trace record emitted on this thread will carry these fields. The
+/// values are reset to "unknown" after emission so a stale value can't
+/// silently propagate. Cheap no-op when [`TRACE_ENABLED`] is false.
+#[inline]
+pub fn push_trace_extras(ctx: u32, cluster: u32, ans_refill_bits: u32) {
+    if TRACE_ENABLED.load(Ordering::Relaxed) {
+        TRACE_EXTRAS.with(|e| *e.borrow_mut() = (ctx, cluster, ans_refill_bits));
     }
 }
 

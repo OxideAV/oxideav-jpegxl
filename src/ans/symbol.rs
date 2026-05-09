@@ -52,6 +52,20 @@ impl AnsDecoder {
         d: &[u16],
         alias: &AliasTable,
     ) -> Result<u16> {
+        let (sym, _refill) = self.decode_symbol_with_refill(br, d, alias)?;
+        Ok(sym)
+    }
+
+    /// Round-19: variant of [`decode_symbol`] that reports the bit
+    /// count consumed by renormalisation (`u(16)` if a refill was
+    /// triggered, 0 otherwise). Used by the per-token diagnostic trace.
+    pub fn decode_symbol_with_refill(
+        &mut self,
+        br: &mut BitReader<'_>,
+        d: &[u16],
+        alias: &AliasTable,
+    ) -> Result<(u16, u32)> {
+        let pre_state = self.state;
         let index = self.state & 0xFFF;
         let (symbol, offset) = alias.lookup(index);
         let prob = d.get(symbol as usize).copied().unwrap_or(0) as u32;
@@ -68,15 +82,52 @@ impl AnsDecoder {
             .checked_mul(self.state >> 12)
             .and_then(|v| v.checked_add(offset))
             .ok_or_else(|| Error::InvalidData("JXL ANS: state update overflow".into()))?;
-        self.state = if new_state < (1u32 << 16) {
+        let refill_bits = if new_state < (1u32 << 16) {
             let extra = br.read_bits(16)?;
-            (new_state << 16) | extra
+            self.state = (new_state << 16) | extra;
+            16
         } else {
-            new_state
+            self.state = new_state;
+            0
         };
-        Ok(symbol)
+        // Round-19 diagnostic: dump first 30 calls when ANS_TRACE env is set.
+        if STATE_TRACE_ENABLED.load(std::sync::atomic::Ordering::Relaxed) {
+            STATE_TRACE_BUF.with(|b| {
+                let mut v = b.borrow_mut();
+                if v.len() < 30 {
+                    v.push((
+                        pre_state,
+                        index,
+                        symbol,
+                        offset,
+                        prob,
+                        new_state,
+                        refill_bits,
+                    ));
+                }
+            });
+        }
+        Ok((symbol, refill_bits))
     }
+}
 
+use std::cell::RefCell;
+use std::sync::atomic::AtomicBool;
+
+/// Round-19 diagnostic flag — when on, the first 30 ANS state
+/// transitions (per thread) are recorded in [`STATE_TRACE_BUF`].
+pub static STATE_TRACE_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// One per-call ANS state transition: `(pre_state, alias_index, symbol,
+/// alias_offset, prob, new_state, refill_bits)`.
+pub type AnsStateTrace = (u32, u32, u16, u32, u32, u32, u32);
+
+thread_local! {
+    pub static STATE_TRACE_BUF: RefCell<Vec<AnsStateTrace>> =
+        const { RefCell::new(Vec::new()) };
+}
+
+impl AnsDecoder {
     /// Current state value. Useful for end-of-stream validation:
     /// after the final `decode_symbol` call, this should equal
     /// [`ANS_FINAL_STATE`].

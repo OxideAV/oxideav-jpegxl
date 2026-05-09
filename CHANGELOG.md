@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Round 19 (2024-spec, Auditor mode)** — extended the per-token
+  trace ring with `(ctx, cluster, ans_refill_bits)` and added a
+  `STATE_TRACE_BUF` recording the first 30 ANS state transitions for
+  spot-checking against raw codestream bits. New
+  `AnsDecoder::decode_symbol_with_refill` reports refill-bit cost. New
+  `tests/round19_d1_cluster.rs` drives d1 LfCoefficients under the
+  extended trace and emits per-cluster / per-ctx histograms plus a
+  diagnostic eprintln on the leaf-stream `EntropyStream::read` prelude
+  bit count. Findings: prelude is bit-exact (602 bits matching cjxl's
+  `num_contexts=16 num_histograms=5 log_alpha_size=6`), cluster_map is
+  bit-exact (16 → 5 distinct clusters), state transitions are
+  bit-faithful to raw codestream. The 267-bit overshoot remains
+  unexplained; deferred to round 20 with cjxl `--debug` per-call
+  bit-position trace as the proposed next-step. See
+  `crates/oxideav-jpegxl/round19-d1-cluster.md` for the full audit.
+
 ## [0.0.9](https://github.com/OxideAV/oxideav-jpegxl/compare/v0.0.8...v0.0.9) - 2026-05-08
 
 ### Other
