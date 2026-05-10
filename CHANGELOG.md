@@ -9,6 +9,66 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Round 26 (2024-spec) — Annex L colour transforms** (parent-dispatch
+  "r11"). New `src/xyb.rs` (~210 LOC) transcribes FDIS §L.2.2 inverse
+  XYB → linear RGB and §L.3 inverse YCbCr → RGB verbatim from the
+  ISO/IEC 18181-1:2024 spec text. Three public entry points:
+  `inverse_xyb_to_rgb(x, y, b, oim, tone_mapping)`,
+  `inverse_ycbcr_to_rgb(cb, y, cr)`, and the convenience composite
+  `modular_xyb_to_linear_rgb(y_prime, x_prime, b_prime, lf_dequant,
+  oim, tone_mapping)` which folds in the §L.2.2 preamble step
+  (`X = X' * m_x_lf_unscaled`, `Y = Y' * m_y_lf_unscaled`,
+  `B = (B' + Y') * m_b_lf_unscaled`). Helper `linear_rgb_to_u8`
+  clamps + rounds the linear `[0, 1]` output to 8 bits.
+
+  Wired into `decode_codestream` modular output stage: when
+  `metadata.xyb_encoded == true` AND `colour_encoding.colour_space ==
+  Rgb` (3 colour channels), the per-channel pass-through is replaced
+  with `build_rgb_planes_from_xyb` which walks every pixel through
+  the inverse transform. Symmetric `build_rgb_planes_from_ycbcr`
+  branch handles `frame_header.do_ycbcr == true`. The original
+  pass-through path is preserved for the common case
+  (xyb_encoded=false AND do_ycbcr=false) so all five small lossless
+  fixtures continue to pixel-correct decode.
+
+  9 unit tests in `xyb::tests` (DC zero-input, spec-listing
+  hand-computed reproduction, intensity_target linear scaling,
+  modular preamble multiplier check, YCbCr neutral / red-dominant,
+  linear→u8 clamping, X-sign-flip symmetry); 6 integration tests
+  in `tests/round11_xyb_inverse.rs` (forward-→-inverse round-trip
+  for neutral grey AND saturated red using a hand-computed Cramer's-
+  rule matrix inversion of `oim.inv_mat`, YCbCr neutral, u8
+  quantisation reference values, end-to-end zero-input modular wrapper,
+  and five-fixture pass-through regression sentinel). Total test count
+  345 → 362 (+17 net: 9 lib + 6 integration + 2 from earlier round-21
+  recount).
+
+  No fixture decoded that didn't decode before — round 11 lays the
+  colour-transform foundation, but no modular-XYB or modular-YCbCr
+  fixture is currently committed (cjxl encodes photo-content XYB
+  inputs as VarDCT by default; the rare modular-XYB path needs a
+  hand-built minimal trace, deferred to round 12+ or a docs-
+  collaborator commission). The two committed VarDCT fixtures
+  (`vardct_256x256_d1.jxl`, `vardct_256x256_d3.jxl`) still terminate
+  at the round-13 "round 14+: HF subband decode + IDCT not yet wired"
+  Unsupported.
+
+  SPECGAP documented in `xyb::linear_rgb_to_u8` doc comment: §L.2.2
+  outputs linear-domain RGB (NOTE in spec) but the spec doesn't
+  prescribe a gamma encoding step before display — strict conformance
+  defers gamma application to a downstream colour-management consumer.
+  The crate emits linear bytes (clamp + scale by 255 + round); spec
+  callers needing sRGB-encoded bytes should apply sRGB transfer
+  themselves.
+
+  Wall respected: spec PDF (Annex L pages 82-84 read directly), no
+  external library source consulted, no `libjxl-trace-reverse-
+  engineering.md` (retired). OpsinInverseMatrix defaults already
+  transcribed in `metadata_fdis::OpsinInverseMatrix::default()`
+  (round-2) from FDIS Table L.1 independently; the new module
+  consumes those constants without re-reading the table. Test count
+  362, fmt + clippy clean against 1.95 toolchain.
+
 - **Round 24 (2024-spec, Auditor mode)** — pursued round-23 candidates
   (1) per-cluster ANS distribution byte-trace for clusters 0+1 and
   (2) per-call alias-mapping invariant audit. Result: **both paths

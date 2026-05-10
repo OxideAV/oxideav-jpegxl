@@ -99,8 +99,15 @@ Round 8+ candidates (in priority order):
    Listing F.1 LF dequant + adaptive LF smoothing + HfMetadata +
    PassGroup HF + remaining IDCT block sizes + Chroma-from-Luma +
    Gaborish + EPF.
-3. **XYB inverse colour transform** (§K) — needed for VarDCT
-   downstream, plus some Modular images that use XYB.
+3. **XYB inverse colour transform** (§L.2) — **landed round 11**.
+   `xyb::inverse_xyb_to_rgb` and `xyb::inverse_ycbcr_to_rgb`
+   transcribe FDIS Annex L.2.2 + L.3 verbatim; the modular output
+   stage in `decode_codestream` now branches on
+   `metadata.xyb_encoded` / `frame_header.do_ycbcr` and applies the
+   inverse colour transform before mapping to `VideoFrame`. 9 unit
+   tests + 6 integration tests including a forward-→-inverse
+   round-trip oracle. Output gamma is left linear (downstream
+   colour-management's job per §L.2.2 NOTE).
 4. **ICC bytes propagation** — coordinate with `oxideav-core` to
    add `VideoFrame::icc_profile`.
 

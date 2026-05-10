@@ -431,6 +431,29 @@
 //! `HfMetadata::read` and `LfGroup::read` now both take a
 //! `&ImageMetadataFdis` argument so the inverse Palette transform can
 //! read `bit_depth.bits_per_sample` for delta-palette prediction.
+//!
+//! ## Round-26 (2024-spec) — Annex L colour transforms
+//!
+//! Parent-dispatch "r11". New [`xyb`] module transcribes FDIS §L.2.2
+//! inverse XYB → linear RGB and §L.3 inverse YCbCr → RGB verbatim
+//! from the ISO/IEC 18181-1:2024 PDF. Three public entry points:
+//! [`xyb::inverse_xyb_to_rgb`], [`xyb::inverse_ycbcr_to_rgb`], and
+//! the convenience composite [`xyb::modular_xyb_to_linear_rgb`]
+//! (§L.2.2 preamble + inverse XYB in one call).
+//!
+//! Wired into [`decode_codestream`] modular output stage: when
+//! `metadata.xyb_encoded == true` and `colour_encoding.colour_space`
+//! is `Rgb`, the per-channel pass-through is replaced with
+//! [`build_rgb_planes_from_xyb`]; symmetric branch for
+//! `frame_header.do_ycbcr == true`. Pre-round-26 pass-through path
+//! preserved for `xyb_encoded == false && do_ycbcr == false` modular
+//! frames so the five small lossless fixtures stay pixel-correct.
+//!
+//! Round-26 SPECGAP: §L.2.2 NOTE describes the output as
+//! linear-domain RGB but doesn't prescribe a gamma encoding step
+//! before display. [`xyb::linear_rgb_to_u8`] emits linear bytes
+//! (clamp + scale by 255 + round); callers that need sRGB-encoded
+//! bytes apply the sRGB transfer function downstream.
 
 pub mod abrac;
 pub mod ans;
@@ -455,6 +478,7 @@ pub mod pass_group;
 pub mod predictors;
 pub mod toc;
 pub mod vardct;
+pub mod xyb;
 
 pub use container::{detect, extract_codestream, Signature};
 pub use metadata::{parse_headers, BitDepth, Headers, ImageMetadata, SizeHeader};
@@ -791,7 +815,13 @@ fn decode_codestream(codestream: &[u8], pts: Option<i64>) -> Result<VideoFrame> 
     //   - RGB colour_space (3 channels → 3 planes in R/G/B order)
     //   - 8-bit integer bit depth
     //
-    // Other colour spaces (XYB, YCbCr) and float bit depths fall in
+    // Round-11 (2024-spec) adds: kModular + `metadata.xyb_encoded == true`
+    // path through Annex L.2.2 inverse XYB → linear RGB; and the
+    // `frame_header.do_ycbcr == true` path through Annex L.3 inverse
+    // YCbCr → RGB. Both paths land 3-channel RGB output (Grey colour
+    // encoding remains a 1-channel pass-through).
+    //
+    // Other colour spaces (CMYK, etc.) and float bit depths fall in
     // later rounds.
     if metadata.bit_depth.float_sample {
         return Err(Error::Unsupported(
@@ -822,6 +852,28 @@ fn decode_codestream(codestream: &[u8], pts: Option<i64>) -> Result<VideoFrame> 
             n_chans, expected_chans
         )));
     }
+
+    // Round-11 inverse colour transform decision. The decoded modular
+    // image's first three channels are reinterpreted per Annex L:
+    //   * `metadata.xyb_encoded` true → §L.2.2 inverse XYB → linear RGB
+    //     (channel order on input: Y', X', B').
+    //   * `frame_header.do_ycbcr` true (xyb_encoded must be false per
+    //     §L.1) → §L.3 inverse YCbCr → RGB (channel order: Cb, Y, Cr).
+    //   * else → channels are already in colour_encoding's space; pass
+    //     through (round-1 behaviour).
+    if expected_chans == 3 && metadata.xyb_encoded {
+        let planes = build_rgb_planes_from_xyb(&img, &lf_global.lf_dequant, &metadata)?;
+        return Ok(VideoFrame { pts, planes });
+    }
+    if expected_chans == 3 && fh.do_ycbcr {
+        let planes = build_rgb_planes_from_ycbcr(&img)?;
+        return Ok(VideoFrame { pts, planes });
+    }
+
+    // Pass-through path: each channel becomes a plane (no colour
+    // conversion). Pre-round-11 behaviour, retained for the five
+    // small lossless fixtures and any non-XYB / non-YCbCr modular
+    // image.
     let mut planes: Vec<VideoPlane> = Vec::with_capacity(n_chans);
     for (i, ch_data) in img.channels.iter().enumerate() {
         let desc = img.descs[i];
@@ -839,6 +891,129 @@ fn decode_codestream(codestream: &[u8], pts: Option<i64>) -> Result<VideoFrame> 
         debug_assert_eq!(planes[i].data.len(), w * h);
     }
     Ok(VideoFrame { pts, planes })
+}
+
+/// Convert a 3-channel decoded modular image whose channels carry
+/// `(Y', X', B')` XYB-domain integer samples into an `R G B` plane
+/// triple (per §L.2.2). All three channels must share the same
+/// dimensions; the output planes are byte-stride packed at the same
+/// width × height.
+fn build_rgb_planes_from_xyb(
+    img: &crate::modular_fdis::ModularImage,
+    lf_dequant: &crate::lf_global::LfChannelDequantization,
+    metadata: &ImageMetadataFdis,
+) -> Result<Vec<VideoPlane>> {
+    if img.channels.len() != 3 {
+        return Err(Error::InvalidData(format!(
+            "JXL XYB inverse: expected 3 channels (Y', X', B'), got {}",
+            img.channels.len()
+        )));
+    }
+    let desc0 = img.descs[0];
+    for (i, d) in img.descs.iter().enumerate().take(3) {
+        if d.width != desc0.width || d.height != desc0.height {
+            return Err(Error::InvalidData(format!(
+                "JXL XYB inverse: channel {i} dims {}x{} differ from channel 0 {}x{} \
+                 — chroma subsampling not supported in modular XYB output",
+                d.width, d.height, desc0.width, desc0.height
+            )));
+        }
+    }
+    let w = desc0.width as usize;
+    let h = desc0.height as usize;
+    let n = w * h;
+    if img.channels[0].len() < n || img.channels[1].len() < n || img.channels[2].len() < n {
+        return Err(Error::InvalidData(format!(
+            "JXL XYB inverse: channel sample count short of {}x{}={n}",
+            w, h
+        )));
+    }
+    let mut r_bytes = Vec::with_capacity(n);
+    let mut g_bytes = Vec::with_capacity(n);
+    let mut b_bytes = Vec::with_capacity(n);
+    let oim = &metadata.opsin_inverse_matrix;
+    let tm = &metadata.tone_mapping;
+    for idx in 0..n {
+        // Channel order on input is `(Y', X', B')` per FDIS §L.2.2
+        // first paragraph.
+        let y_prime = img.channels[0][idx];
+        let x_prime = img.channels[1][idx];
+        let b_prime = img.channels[2][idx];
+        let (r_lin, g_lin, b_lin) =
+            crate::xyb::modular_xyb_to_linear_rgb(y_prime, x_prime, b_prime, lf_dequant, oim, tm);
+        r_bytes.push(crate::xyb::linear_rgb_to_u8(r_lin));
+        g_bytes.push(crate::xyb::linear_rgb_to_u8(g_lin));
+        b_bytes.push(crate::xyb::linear_rgb_to_u8(b_lin));
+    }
+    Ok(vec![
+        VideoPlane {
+            stride: w,
+            data: r_bytes,
+        },
+        VideoPlane {
+            stride: w,
+            data: g_bytes,
+        },
+        VideoPlane {
+            stride: w,
+            data: b_bytes,
+        },
+    ])
+}
+
+/// Convert a 3-channel decoded modular image whose channels carry
+/// `(Cb, Y, Cr)` samples (YCbCr-encoded modular path) into an
+/// `R G B` plane triple per §L.3. Outputs 8-bit bytes; the spec
+/// formula treats inputs as floats in the [0, 1] interval, so we
+/// rescale `[0..=255]` integer samples by `1/255` first then re-
+/// quantise the RGB outputs by 255.
+fn build_rgb_planes_from_ycbcr(img: &crate::modular_fdis::ModularImage) -> Result<Vec<VideoPlane>> {
+    if img.channels.len() != 3 {
+        return Err(Error::InvalidData(format!(
+            "JXL YCbCr inverse: expected 3 channels (Cb, Y, Cr), got {}",
+            img.channels.len()
+        )));
+    }
+    let desc0 = img.descs[0];
+    for (i, d) in img.descs.iter().enumerate().take(3) {
+        if d.width != desc0.width || d.height != desc0.height {
+            return Err(Error::Unsupported(format!(
+                "JXL YCbCr inverse: channel {i} dims {}x{} differ from channel 0 {}x{} \
+                 — chroma subsampling not yet supported in YCbCr modular output",
+                d.width, d.height, desc0.width, desc0.height
+            )));
+        }
+    }
+    let w = desc0.width as usize;
+    let h = desc0.height as usize;
+    let n = w * h;
+    let mut r_bytes = Vec::with_capacity(n);
+    let mut g_bytes = Vec::with_capacity(n);
+    let mut b_bytes = Vec::with_capacity(n);
+    for idx in 0..n {
+        // Spec §L.3 channel order: (Cb, Y, Cr).
+        let cb = img.channels[0][idx] as f32 / 255.0;
+        let y = img.channels[1][idx] as f32 / 255.0;
+        let cr = img.channels[2][idx] as f32 / 255.0;
+        let (r_lin, g_lin, b_lin) = crate::xyb::inverse_ycbcr_to_rgb(cb, y, cr);
+        r_bytes.push(crate::xyb::linear_rgb_to_u8(r_lin));
+        g_bytes.push(crate::xyb::linear_rgb_to_u8(g_lin));
+        b_bytes.push(crate::xyb::linear_rgb_to_u8(b_lin));
+    }
+    Ok(vec![
+        VideoPlane {
+            stride: w,
+            data: r_bytes,
+        },
+        VideoPlane {
+            stride: w,
+            data: g_bytes,
+        },
+        VideoPlane {
+            stride: w,
+            data: b_bytes,
+        },
+    ])
 }
 
 /// VarDCT round-13 driver. Reads LfGlobal + LfGroup + HfGlobal off
