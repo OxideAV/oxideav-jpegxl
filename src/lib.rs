@@ -454,6 +454,29 @@
 //! before display. [`xyb::linear_rgb_to_u8`] emits linear bytes
 //! (clamp + scale by 255 + round); callers that need sRGB-encoded
 //! bytes apply the sRGB transfer function downstream.
+//!
+//! ## Round-27 (2024-spec) — IDCT dispatch
+//!
+//! Parent-dispatch "r12" item (5). New [`idct`] module wires the
+//! spec-conformant 1-D inverse DCT for power-of-two sizes
+//! `s ∈ {1, 2, 4, 8, 16, 32, 64, 128, 256}` (FDIS Annex I.2.1) and
+//! the 2-D inverse DCT (Annex I.2.2 Listing I.4) for rectangular
+//! `R × C` blocks. Three public entry points: [`idct::idct_1d`],
+//! [`idct::idct_2d`] (taking coefficients in spec `(short × long)`
+//! row-major natural-ordering layout per Annex I.2.4 and returning
+//! `(R × C)` row-major samples), and [`idct::idct_for_transform`]
+//! which dispatches on a [`dct_select::TransformType`] to the 2-D
+//! IDCT for the 18 plain-DCT block sizes in Table C.16.
+//!
+//! The 9 non-DCT transforms (Hornuss, DCT2x2, DCT4x4, DCT4x8,
+//! DCT8x4, AFV0..AFV3) — Listings I.7..I.13 — return
+//! `Err(Unsupported)` from [`idct::idct_for_transform`] and are
+//! deferred to round 28+ alongside HF coefficient decode + F.3
+//! dequantisation. The legacy [`vardct::idct1d_8`] /
+//! [`vardct::idct2d_8x8`] (round-8 scaffold, scaled-orthonormal
+//! IDCT) are retained for backward compatibility but are NOT
+//! spec-conformant; new HF-decode wiring will call through
+//! [`idct::idct_for_transform`] exclusively.
 
 pub mod abrac;
 pub mod ans;
@@ -466,6 +489,7 @@ pub mod frame_header;
 pub mod global_modular;
 pub mod hf_global;
 pub mod icc;
+pub mod idct;
 pub mod lf_dequant;
 pub mod lf_global;
 pub mod lf_group;

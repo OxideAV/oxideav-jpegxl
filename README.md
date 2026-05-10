@@ -95,10 +95,16 @@ Round 8+ candidates (in priority order):
    LfGlobal VarDCT bundles (Quantizer + HfBlockContext default
    table + LfChannelCorrelation) and the LfCoefficients
    sub-bitstream (per-LfGroup `extra_precision` + 3-channel
-   modular decode at `ceil(group_dim/8)` resolution). Round 12+:
-   Listing F.1 LF dequant + adaptive LF smoothing + HfMetadata +
-   PassGroup HF + remaining IDCT block sizes + Chroma-from-Luma +
-   Gaborish + EPF.
+   modular decode at `ceil(group_dim/8)` resolution); **round-12**
+   lands the spec-conformant 1-D + 2-D IDCT dispatch
+   (`idct::idct_for_transform`) covering the 18 plain-DCT block
+   sizes from Table C.16 (DCT8x8 through DCT256x256) per FDIS
+   I.2.1 + I.2.2 Listing I.4. The 9 non-DCT transforms (Hornuss,
+   DCT2x2, DCT4x4, DCT4x8, DCT8x4, AFV0..AFV3) return
+   `Err(Unsupported)` and are deferred to round 13+. Round 13+:
+   PassGroup HF coefficient ANS decode + F.3 dequantisation +
+   non-DCT IDCT (Listings I.7..I.13) + Chroma-from-Luma + Gaborish
+   + EPF.
 3. **XYB inverse colour transform** (§L.2) — **landed round 11**.
    `xyb::inverse_xyb_to_rgb` and `xyb::inverse_ycbcr_to_rgb`
    transcribe FDIS Annex L.2.2 + L.3 verbatim; the modular output

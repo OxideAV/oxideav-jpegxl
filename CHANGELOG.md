@@ -9,6 +9,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Round 27 (2024-spec) — IDCT dispatch** (parent-dispatch "r12" item
+  5). New `src/idct.rs` (~470 LOC including tests) wires the
+  spec-conformant 1-D inverse DCT (FDIS Annex I.2.1) for power-of-two
+  sizes `s ∈ {1, 2, 4, 8, 16, 32, 64, 128, 256}` and the 2-D inverse
+  DCT (Annex I.2.2 Listing I.4) handling rectangular `R × C` blocks.
+
+  Three public entry points: `idct_1d(input)` for the bare 1-D form,
+  `idct_2d(coefficients, output_rows, output_cols)` for the 2-D form
+  taking coefficients in the spec's `(short × long)` row-major natural-
+  ordering layout (Annex I.2.4) and returning samples in `(R × C)`
+  row-major, and `idct_for_transform(t, coefficients)` which dispatches
+  on a `dct_select::TransformType` to the appropriate 2-D IDCT for the
+  18 plain-DCT transform types in Table C.16 (DCT8x8, DCT16x16,
+  DCT32x32, DCT16x8, DCT8x16, DCT32x8, DCT8x32, DCT32x16, DCT16x32,
+  DCT64x64, DCT64x32, DCT32x64, DCT128x128, DCT128x64, DCT64x128,
+  DCT256x256, DCT256x128, DCT128x256). The 9 non-DCT transforms
+  (Hornuss, DCT2x2, DCT4x4, DCT4x8, DCT8x4, AFV0..AFV3) — Listings
+  I.7..I.13 — return `Err(Unsupported)` and are deferred to round 13+.
+
+  Companion helper `dct_pixel_dims(t)` returns the `(rows, cols)`
+  output shape for plain-DCT TransformType variants and `None` for the
+  non-DCT transforms.
+
+  31 lib unit tests in `idct::tests` (1-D length validation, DC-only
+  consistency for all 9 supported sizes, 1-D round-trip via private
+  forward DCT oracle for sizes 8/16/32/64, 1-D AC[1] hand-computed
+  spec-formula reference, 2-D length / shape validation, 2-D DC-only
+  consistency for 12 DCT block sizes, 2-D round-trip via 2-D forward
+  oracle for 8x8/16x8/8x16/16x16/32x32, dispatch validation for
+  DCT8x8/16x16/32x32/8x16/16x8 + every non-DCT TransformType returning
+  Unsupported, dct_pixel_dims completeness for both branches); 5
+  integration tests in `tests/round12_idct_dispatch.rs` (1-D DC-only
+  for all sizes, 2-D DC-only for every plain-DCT block size,
+  Unsupported sentinel for every non-DCT transform, 2-D round-trip for
+  asymmetric 8x16 and 16x8 via inline forward oracle, five-fixture
+  Modular regression sentinel). Total test count 345 → 381 (+36 net).
+
+  No new fixture coverage — the IDCT lands as a callable primitive that
+  round 13's PassGroup HF coefficient decode + F.3 dequantisation will
+  feed. The legacy `vardct::idct1d_8` and `vardct::idct2d_8x8` (round 8
+  scaffold, scaled-orthonormal IDCT) are kept untouched for backward
+  compatibility but are NOT spec-conformant; new HF-decode wiring will
+  call through `idct::idct_for_transform` exclusively.
+
 - **Round 26 (2024-spec) — Annex L colour transforms** (parent-dispatch
   "r11"). New `src/xyb.rs` (~210 LOC) transcribes FDIS §L.2.2 inverse
   XYB → linear RGB and §L.3 inverse YCbCr → RGB verbatim from the
