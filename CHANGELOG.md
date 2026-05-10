@@ -9,6 +9,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Round 28 (2024-spec) — non-DCT IDCT helpers** (parent-dispatch
+  "r13" item 3). Extends `src/idct.rs` with five new public helpers
+  that complete the IDCT surface for the non-DCT TransformType
+  variants:
+
+  - `aux_idct_2x2(block, S)` — Annex I.9.3 Hadamard-style butterfly on
+    the top-left `S × S` cells of an 8×8 buffer (`S ∈ {1, 2, 4, 8}`).
+  - `idct_dct2x2(coefficients)` — Annex I.9.3 closing recipe (chained
+    `aux_idct_2x2` calls at S=2, 4, 8).
+  - `idct_dct4x4(coefficients)` — Annex I.9.4: per-2×2-quadrant 4×4
+    IDCT_2D over interleaved coefficient cells with a DC patch from
+    `aux_idct_2x2(coefficients, 2)`.
+  - `idct_hornuss(coefficients)` — Annex I.9.5: per-quadrant
+    block-LF + residual-sum centre cell + neighbour-fill + corner
+    corrective.
+  - `idct_dct8x4(coefficients)` — Annex I.9.6: column-major Hadamard
+    pair into two 4×8 (rows × cols) IDCT_2D halves tiled into rows
+    `[0..4)` and `[4..8)` of the 8×8 output.
+  - `idct_dct4x8(coefficients)` — Annex I.9.7: dual of `dct8x4`,
+    row-major Hadamard pair into two 4×8 halves tiled by row.
+
+  `idct_for_transform(t, coefficients)` now dispatches `Hornuss`,
+  `Dct2x2`, `Dct4x4`, `Dct8x4`, `Dct4x8` to the dedicated helpers in
+  addition to the 18 plain-DCT variants from r12. `Afv0..Afv3` continue
+  to return `Err(Unsupported)` pending an independently verified
+  256-entry `AFVBasis` table (deferred to a later round to avoid a
+  high-risk OCR transcription).
+
+  New helper `non_dct_pixel_dims(t)` returns `Some((8, 8))` for the
+  nine non-DCT TransformType variants and `None` for plain-DCT — the
+  output of all five new helpers is always an 8×8 row-major buffer
+  (length 64), matching the closing entries of Listings I.9.3..I.9.8.
+
+  Test count: lib `idct::tests` 36 → 57 (+21 new — 8 covering
+  `aux_idct_2x2` validation/butterfly/preserve/DC, 6 covering DC-only
+  + per-quadrant correctness for the five helpers, 5 covering length
+  validation, 2 covering `non_dct_pixel_dims`); integration tests
+  +5 in new `tests/round13_non_dct_idct.rs` plus 1 updated
+  assertion in `tests/round12_idct_dispatch.rs` (renamed
+  `idct_for_transform_non_dct_transforms_return_unsupported` →
+  `idct_for_transform_afv_only_unsupported_after_round_13`,
+  reflecting that only the AFV variants remain unsupported).
+
+  Spec-gap notes inline in the module documentation enumerate the OCR
+  transcription work deferred for AFVBasis.
+
 - **Round 27 (2024-spec) — IDCT dispatch** (parent-dispatch "r12" item
   5). New `src/idct.rs` (~470 LOC including tests) wires the
   spec-conformant 1-D inverse DCT (FDIS Annex I.2.1) for power-of-two

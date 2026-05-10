@@ -99,12 +99,16 @@ Round 8+ candidates (in priority order):
    lands the spec-conformant 1-D + 2-D IDCT dispatch
    (`idct::idct_for_transform`) covering the 18 plain-DCT block
    sizes from Table C.16 (DCT8x8 through DCT256x256) per FDIS
-   I.2.1 + I.2.2 Listing I.4. The 9 non-DCT transforms (Hornuss,
-   DCT2x2, DCT4x4, DCT4x8, DCT8x4, AFV0..AFV3) return
-   `Err(Unsupported)` and are deferred to round 13+. Round 13+:
-   PassGroup HF coefficient ANS decode + F.3 dequantisation +
-   non-DCT IDCT (Listings I.7..I.13) + Chroma-from-Luma + Gaborish
-   + EPF.
+   I.2.1 + I.2.2 Listing I.4; **round-13** extends the dispatch to
+   the non-DCT IDCT helpers per Listings I.9.3..I.9.7 — `Hornuss`,
+   `DCT2×2`, `DCT4×4`, `DCT8×4`, `DCT4×8` — via new public
+   functions `aux_idct_2x2`, `idct_dct2x2`, `idct_dct4x4`,
+   `idct_hornuss`, `idct_dct8x4`, `idct_dct4x8`. The four AFVn
+   variants (Listing I.9.8) continue to return `Err(Unsupported)`
+   pending an independently verified 256-entry `AFVBasis` table.
+   Round 14+: PassGroup HF coefficient ANS decode + F.3
+   dequantisation + AFV completion + Chroma-from-Luma + Gaborish +
+   EPF.
 3. **XYB inverse colour transform** (§L.2) — **landed round 11**.
    `xyb::inverse_xyb_to_rgb` and `xyb::inverse_ycbcr_to_rgb`
    transcribe FDIS Annex L.2.2 + L.3 verbatim; the modular output

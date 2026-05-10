@@ -84,16 +84,25 @@ fn idct_2d_dc_only_constant_for_every_dct_block_size() {
 }
 
 #[test]
-fn idct_for_transform_non_dct_transforms_return_unsupported() {
-    // Hornuss, DCT2×2, DCT4×4, DCT4×8, DCT8×4, AFV0..AFV3 use the
-    // I.2.3.3..I.2.3.8 non-DCT IDCT paths; they're explicitly deferred
-    // to round 13+.
+fn idct_for_transform_afv_only_unsupported_after_round_13() {
+    // After round 13: Hornuss, DCT2×2, DCT4×4, DCT4×8, DCT8×4 dispatch
+    // through their dedicated I.9.3..I.9.7 helpers and succeed. Only
+    // AFV0..AFV3 remain `Err(Unsupported)` pending the verified
+    // AFVBasis table.
     for t in [
         TransformType::Hornuss,
         TransformType::Dct2x2,
         TransformType::Dct4x4,
         TransformType::Dct4x8,
         TransformType::Dct8x4,
+    ] {
+        let coeffs = vec![0.0f32; 64];
+        let r = idct_for_transform(t, &coeffs);
+        assert!(r.is_ok(), "{t:?}: expected Ok after round 13, got {r:?}");
+        let out = r.unwrap();
+        assert_eq!(out.len(), 64, "{t:?}: expected 8×8 output");
+    }
+    for t in [
         TransformType::Afv0,
         TransformType::Afv1,
         TransformType::Afv2,
@@ -101,7 +110,7 @@ fn idct_for_transform_non_dct_transforms_return_unsupported() {
     ] {
         let coeffs = vec![0.0f32; 64];
         let r = idct_for_transform(t, &coeffs);
-        assert!(r.is_err(), "{t:?}: expected Err");
+        assert!(r.is_err(), "{t:?}: AFV remains unsupported in round 13");
     }
 }
 
