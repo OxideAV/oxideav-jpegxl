@@ -866,9 +866,20 @@ fn decode_codestream(codestream: &[u8], pts: Option<i64>) -> Result<VideoFrame> 
             "jxl decoder (round 1): float bit depth not supported".into(),
         ));
     }
-    if metadata.bit_depth.bits_per_sample != 8 {
+    // Round 30 (2024-spec) — accept 1..=16 integer samples for the
+    // pass-through path. The 8-bit and 16-bit cases each have their
+    // own pack loop further down; other widths in 1..=16 emit byte
+    // planes whose samples are clamped into the integer range
+    // `[0, 2^bps - 1]` (1 byte/sample for `bps <= 8`, 2 bytes/sample
+    // little-endian for `9 <= bps <= 16`).
+    //
+    // FDIS Annex A.6 + Table A.22 (`bit_depth.bits_per_sample`).
+    // The XYB / YCbCr branches further down still hard-require 8-bit
+    // because their dequantisation lattice is calibrated against the
+    // 8-bit output range; high-bit-depth XYB / YCbCr is round-31+.
+    if metadata.bit_depth.bits_per_sample == 0 || metadata.bit_depth.bits_per_sample > 16 {
         return Err(Error::Unsupported(format!(
-            "jxl decoder (round 1): bits_per_sample {} not supported (8 only)",
+            "jxl decoder (round 30): bits_per_sample {} not supported (1..=16 only)",
             metadata.bit_depth.bits_per_sample
         )));
     }
@@ -907,10 +918,22 @@ fn decode_codestream(codestream: &[u8], pts: Option<i64>) -> Result<VideoFrame> 
     //   * else → channels are already in colour_encoding's space; pass
     //     through (round-1 behaviour).
     if expected_chans == 3 && metadata.xyb_encoded {
+        if metadata.bit_depth.bits_per_sample != 8 {
+            return Err(Error::Unsupported(format!(
+                "jxl decoder (round 30): XYB high-bit-depth (bps={}) deferred",
+                metadata.bit_depth.bits_per_sample
+            )));
+        }
         let planes = build_rgb_planes_from_xyb(&img, &lf_global.lf_dequant, &metadata)?;
         return Ok(VideoFrame { pts, planes });
     }
     if expected_chans == 3 && fh.do_ycbcr {
+        if metadata.bit_depth.bits_per_sample != 8 {
+            return Err(Error::Unsupported(format!(
+                "jxl decoder (round 30): YCbCr high-bit-depth (bps={}) deferred",
+                metadata.bit_depth.bits_per_sample
+            )));
+        }
         let planes = build_rgb_planes_from_ycbcr(&img)?;
         return Ok(VideoFrame { pts, planes });
     }
@@ -918,22 +941,50 @@ fn decode_codestream(codestream: &[u8], pts: Option<i64>) -> Result<VideoFrame> 
     // Pass-through path: each channel becomes a plane (no colour
     // conversion). Pre-round-11 behaviour, retained for the five
     // small lossless fixtures and any non-XYB / non-YCbCr modular
-    // image.
+    // image. Round 30 (2024-spec) extends the per-sample pack rule:
+    //
+    //   bps  ≤ 8 → 1 byte/sample, plane stride == width;
+    //   9 ≤ bps ≤ 16 → 2 bytes/sample, little-endian, plane stride
+    //                  == width × 2.
+    //
+    // Choice of LE pack: PNG ships its 16-bit samples big-endian
+    // (RFC 2083 §2.1) whereas the JXL ImageMetadata bit-depth field
+    // is endian-agnostic; we therefore pick LE so a downstream
+    // consumer can treat each plane as a `&[u16]` after a
+    // `bytemuck::cast_slice` or `<u16>::from_le_bytes` step on a
+    // little-endian host without a swap. The convention is
+    // documented in this crate's README under "Plane byte layout".
+    let bps = metadata.bit_depth.bits_per_sample;
+    let max_sample: i32 = (1i32 << bps) - 1;
     let mut planes: Vec<VideoPlane> = Vec::with_capacity(n_chans);
     for (i, ch_data) in img.channels.iter().enumerate() {
         let desc = img.descs[i];
         let w = desc.width as usize;
         let h = desc.height as usize;
-        let mut bytes = Vec::with_capacity(w * h);
-        for &v in ch_data.iter() {
-            bytes.push(v.clamp(0, 255) as u8);
-        }
-        planes.push(VideoPlane {
-            stride: w,
-            data: bytes,
-        });
+        let plane = if bps <= 8 {
+            let mut bytes = Vec::with_capacity(w * h);
+            for &v in ch_data.iter() {
+                bytes.push(v.clamp(0, max_sample) as u8);
+            }
+            VideoPlane {
+                stride: w,
+                data: bytes,
+            }
+        } else {
+            let mut bytes = Vec::with_capacity(w * h * 2);
+            for &v in ch_data.iter() {
+                let s = v.clamp(0, max_sample) as u16;
+                bytes.extend_from_slice(&s.to_le_bytes());
+            }
+            VideoPlane {
+                stride: w * 2,
+                data: bytes,
+            }
+        };
+        planes.push(plane);
         // Sanity check height while we're here.
-        debug_assert_eq!(planes[i].data.len(), w * h);
+        let expected_len = if bps <= 8 { w * h } else { w * h * 2 };
+        debug_assert_eq!(planes[i].data.len(), expected_len);
     }
     Ok(VideoFrame { pts, planes })
 }

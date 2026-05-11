@@ -9,6 +9,80 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Round 30 (2024-spec) — bit-depth-16 RGB pixel-correct decode +
+  16-bit LE plane-pack convention** (parent-dispatch "r15" option A).
+  Lifts the fixture count from 6 to 7 by adding `bit-depth-16`
+  (`docs/image/jpegxl/fixtures/bit-depth-16/input.jxl`, 421 B,
+  64×64 RGB lossless Modular at `bits_per_sample = 16`) and
+  documents the wider-than-8-bit pack convention forced on us by
+  `oxideav-core` 0.1.x's bit-depth-less `VideoPlane`.
+
+  Two narrow `src/lib.rs::decode_codestream` deltas:
+
+  1. **Bit-depth gate widened.** The pre-round-30 hard reject
+     `metadata.bit_depth.bits_per_sample != 8` now accepts
+     `bps ∈ 1..=16`. The XYB and YCbCr branches (FDIS Annex L.2.2 /
+     L.3) still hard-require `bps == 8` because their dequantisation
+     lattice is calibrated against the 8-bit output range — a
+     specific `Error::Unsupported("jxl decoder (round 30): XYB
+     high-bit-depth (bps={...}) deferred")` now precedes the
+     transform call. Float (`float_sample == true`) and `bps > 16`
+     remain unsupported.
+
+  2. **Pass-through plane pack dispatches on `bps`.** The previous
+     loop unconditionally clamped each `i32` sample to `[0, 255]`
+     and pushed one byte per sample with `stride == width`. The
+     new loop:
+     - `bps ≤ 8` — unchanged: 1 byte/sample, `stride == width`,
+       sample clamped to `[0, 2^bps - 1]`.
+     - `9 ≤ bps ≤ 16` — 2 bytes/sample **little-endian**,
+       `stride == width × 2`, sample clamped to `[0, 2^bps - 1]`,
+       packed via `u16::to_le_bytes`.
+
+     The LE-pack choice is documented in
+     `crates/oxideav-jpegxl/README.md` under "Plane byte layout"
+     (new section) so that downstream consumers (`cli-convert` /
+     etc.) know how to reinterpret a wide plane as `&[u16]`. PNG's
+     RFC 2083 §2.1 ships big-endian 16-bit samples; we deliberately
+     pick LE so a `bytemuck::cast_slice::<u8, u16>` on a
+     little-endian host is a zero-cost view (vs forcing a per-sample
+     swap).
+
+  Test count: `tests/round30_bit_depth_16.rs` adds 3 tests
+  (`bit_depth_16_rgb_pixel_correct_vs_expected_png` — full 64×64×3
+  16-bit byte-for-byte match against the committed
+  `bit_depth_16_expected.png`;
+  `bit_depth_16_le_pack_convention_self_consistent` — invariant
+  check on stride/length/round-trip;
+  `pre_round30_8bit_fixtures_still_byte_packed` — regression
+  sentinel for the four pre-existing 8-bit byte-packed fixtures).
+  Committed fixture pair under `tests/fixtures/`:
+  `bit_depth_16.jxl` (421 B) + `bit_depth_16_expected.png`
+  (375 B, 16-bit RGB PNG).
+
+  Cross-checked against `djxl v0.11.1` as a black-box oracle (PPM
+  output → byteswap BE→LE → byte-equal to our planes). Crate now
+  decodes 7 small lossless Modular fixtures pixel-correct vs
+  `expected.png` (was 6): pixel-1x1, gray-64x64,
+  gradient-64x64-lossless, palette-32x32, grey_8x8_lossless,
+  alpha-64x64, **bit-depth-16**.
+
+  Spec citations: FDIS Annex A.6 + Table A.22
+  (`bit_depth.bits_per_sample` bundle), Annex G.1.3 (Modular
+  channel-order rule — colour channels share the global
+  `bits_per_sample`, no per-channel bit-depth split for kModular
+  RGB), PNG RFC 2083 §2.1 (PNG ships 16-bit big-endian, so our
+  reference-PNG read uses `u16::from_be_bytes`).
+
+  Docs gaps identified probing adjacent fixtures during round 30:
+  `noise-64x64-lossless` (13.5 KB, `nodes=167 leaves=84` per
+  trace.txt) still fails inside `LfGlobal::read` with "unexpected
+  end of JXL bitstream" — large MA-tree decode path likely
+  mis-computes a hybrid-uint extra-bits count for a high-context
+  leaf; deferred to round 31. `vardct-256x256-d1` / `d3` and
+  `noise-feature-256x256` fixtures all hit independent VarDCT
+  pipeline gaps and are unrelated to round 30.
+
 - **Round 29 (2024-spec) — alpha-64x64 RGBA pixel-correct decode +
   ISOBMFF signature-strip fix** (parent-dispatch "r14" option A).
   Two narrow lib-level fixes in `src/lib.rs::decode_one_frame` /

@@ -18,10 +18,14 @@ trace-doc-driven rounds 7-11 + encoder rounds 1-6 were retired
   from 5 to 6 by adding `alpha-64x64` (4-channel RGBA, extra-channel
   path per FDIS G.1.3 colour-then-extras + ExtraChannelInfo of type
   Alpha) and fixing the ISOBMFF jxlc payload `FF 0A` strip in
-  `decode_one_frame`. Six committed fixtures decode pixel-correct
-  vs `expected.png` (PNG-decoder-backed byte-for-byte comparison):
-  `pixel-1x1`, `gray-64x64`, `gradient-64x64-lossless`,
-  `palette-32x32`, `grey_8x8_lossless`, **`alpha-64x64`**.
+  `decode_one_frame`. **Round 30** lifts the fixture count from 6
+  to 7 by adding `bit-depth-16` (3-channel RGB lossless Modular at
+  `bits_per_sample = 16`) and adopts the LE-pack plane convention
+  documented under "Plane byte layout" below. Seven committed
+  fixtures decode pixel-correct vs `expected.png`
+  (PNG-decoder-backed byte-for-byte comparison): `pixel-1x1`,
+  `gray-64x64`, `gradient-64x64-lossless`, `palette-32x32`,
+  `grey_8x8_lossless`, `alpha-64x64`, **`bit-depth-16`**.
 - **Round 7 (2024-spec)**: four-piece refactor wiring multi-group
   decode infrastructure (Annex G.1.3 last paragraph + G.4.2):
   `GlobalModular::read` honours the "stops decoding at channels
@@ -239,6 +243,44 @@ assert!(reg.make_decoder(&params).is_err());
   `Error::Unsupported` on instantiation); no encoder slot.
 - No demuxer is registered: this crate treats a JXL file as a single
   codestream buffer fed directly to `probe(...)`.
+
+## Plane byte layout
+
+`oxideav_core::VideoPlane` carries `(stride, data)` only — there is no
+per-plane bit-depth field in core 0.1.x. The decoder therefore packs
+samples into `data: Vec<u8>` according to the codestream's
+`metadata.bit_depth.bits_per_sample` (FDIS Annex A.6 + Table A.22):
+
+| `bits_per_sample` (`bps`) | Bytes / sample | Plane stride | Layout                              |
+|---------------------------|----------------|--------------|-------------------------------------|
+| `1 ..= 8`                 | 1              | `width`      | sample clamped to `[0, 2^bps - 1]`  |
+| `9 ..= 16`                | 2              | `width × 2`  | **little-endian** `u16` per sample  |
+
+Round 30 (2026-05) introduced the 16-bit row; the 8-bit row is the
+pre-round-30 default. Floating-point samples (`bit_depth.float_sample
+== true`) and `bps > 16` are not yet supported and surface as
+`Error::Unsupported`.
+
+The XYB (`metadata.xyb_encoded == true`) and YCbCr
+(`frame_header.do_ycbcr == true`) inverse-colour-transform paths still
+hard-require `bps == 8` because their dequantisation lattice is
+calibrated against the 8-bit output range; high-bit-depth XYB / YCbCr
+is round-31+.
+
+A downstream consumer that wants to recover native `u16` samples from
+a 16-bit plane does:
+
+```rust
+let samples: Vec<u16> = plane
+    .data
+    .chunks_exact(2)
+    .map(|c| u16::from_le_bytes([c[0], c[1]]))
+    .collect();
+```
+
+The convention deliberately mismatches PNG (RFC 2083 §2.1 specifies
+big-endian 16-bit samples) so that on a little-endian host
+`bytemuck::cast_slice::<u8, u16>(&plane.data)` is a zero-cost view.
 
 ## License
 
