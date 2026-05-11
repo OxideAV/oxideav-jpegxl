@@ -636,8 +636,22 @@ pub fn decode_one_frame(input: &[u8], pts: Option<i64>) -> Result<VideoFrame> {
     match sig {
         container::Signature::RawCodestream => decode_codestream(&input[2..], pts),
         container::Signature::Isobmff => {
+            // The jxlc/jxlp box payload concatenation is itself a JXL
+            // codestream and therefore begins with the 2-byte `FF 0A`
+            // codestream signature (FDIS Annex B.1). Skip those 2 bytes
+            // before handing off to `decode_codestream` (which expects
+            // bits *after* the signature, matching the raw-codestream
+            // entry point above). Without this strip the SizeHeader
+            // parse below would misalign by 16 bits and cascade into
+            // corrupted FrameHeader/TOC reads.
             let codestream_owned = container::extract_codestream(input)?;
-            decode_codestream(&codestream_owned, pts)
+            let cs: &[u8] = &codestream_owned;
+            if cs.len() < 2 || cs[0] != 0xFF || cs[1] != 0x0A {
+                return Err(Error::InvalidData(
+                    "JXL ISOBMFF: jxlc/jxlp payload missing FF 0A codestream signature".into(),
+                ));
+            }
+            decode_codestream(&cs[2..], pts)
         }
     }
 }
@@ -870,10 +884,17 @@ fn decode_codestream(codestream: &[u8], pts: Option<i64>) -> Result<VideoFrame> 
             )));
         }
     };
-    if n_chans != expected_chans {
+    // Round 29 (parent-dispatch r14) extends the channel-count contract:
+    // a kModular frame may carry `expected_chans` colour channels plus
+    // `metadata.num_extra_channels` extra channels (alpha, depth, …).
+    // The Modular decoder produces them as a flat channel array in
+    // colour-then-extras order (FDIS Annex G.1.3 "channel order" rule).
+    let n_extra = metadata.num_extra_channels as usize;
+    let expected_with_extras = expected_chans + n_extra;
+    if n_chans != expected_chans && n_chans != expected_with_extras {
         return Err(Error::Unsupported(format!(
-            "jxl decoder (round 1): {} channels but colour_space wants {}",
-            n_chans, expected_chans
+            "jxl decoder (round 29): {} channels but colour_space wants {} (with {} extra channels = {})",
+            n_chans, expected_chans, n_extra, expected_with_extras
         )));
     }
 

@@ -14,10 +14,14 @@ trace-doc-driven rounds 7-11 + encoder rounds 1-6 were retired
   H.4.1 (16 base properties of Table H.4 + per-previous-channel
   properties), Table H.3 predictors 0..13, full H.5 self-correcting
   WP predictor, RCT / Palette / Squeeze inverse transforms (H.6),
-  Grey + RGB output at 8 bpp. Five committed fixtures decode
-  pixel-correct vs `expected.png` (PNG-decoder-backed byte-for-byte
-  comparison): `pixel-1x1`, `gray-64x64`, `gradient-64x64-lossless`,
-  `palette-32x32`, `grey_8x8_lossless`.
+  Grey + RGB output at 8 bpp. **Round 29** lifts the fixture count
+  from 5 to 6 by adding `alpha-64x64` (4-channel RGBA, extra-channel
+  path per FDIS G.1.3 colour-then-extras + ExtraChannelInfo of type
+  Alpha) and fixing the ISOBMFF jxlc payload `FF 0A` strip in
+  `decode_one_frame`. Six committed fixtures decode pixel-correct
+  vs `expected.png` (PNG-decoder-backed byte-for-byte comparison):
+  `pixel-1x1`, `gray-64x64`, `gradient-64x64-lossless`,
+  `palette-32x32`, `grey_8x8_lossless`, **`alpha-64x64`**.
 - **Round 7 (2024-spec)**: four-piece refactor wiring multi-group
   decode infrastructure (Annex G.1.3 last paragraph + G.4.2):
   `GlobalModular::read` honours the "stops decoding at channels

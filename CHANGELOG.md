@@ -9,6 +9,69 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Round 29 (2024-spec) — alpha-64x64 RGBA pixel-correct decode +
+  ISOBMFF signature-strip fix** (parent-dispatch "r14" option A).
+  Two narrow lib-level fixes in `src/lib.rs::decode_one_frame` /
+  `decode_codestream` unblock the docs cleanroom `alpha-64x64`
+  4-channel Modular lossless fixture (`docs/image/jpegxl/fixtures/
+  alpha-64x64/input.jxl`, 86 B) for pixel-exact decode against the
+  committed `expected.png` (8-bit RGBA, 64×64):
+
+  1. **ISOBMFF `FF 0A` strip.** The jxlc/jxlp box payload IS a JXL
+     codestream and therefore begins with the 2-byte `FF 0A`
+     codestream signature (FDIS Annex B.1). The RawCodestream branch
+     already stripped those 2 bytes before handing off to
+     `decode_codestream`; the ISOBMFF branch did NOT. The result was
+     a 16-bit misalignment at the `SizeHeader::read` parse that
+     cascaded into apparently-unrelated downstream failures
+     (`bit-depth-16` tripped `JXL permutation: LZ77-enabled TOC
+     sub-stream not supported` because the TOC `permuted` flag bit
+     parsed as 1 instead of 0). Now the ISOBMFF branch validates the
+     `FF 0A` prefix and strips it symmetric with the raw path. A new
+     unit test wraps `gradient-64x64-lossless` in a minimal ISOBMFF
+     (signature + ftyp + jxlc) and asserts plane-by-plane equality
+     vs. the raw decode (`tests/round29_alpha_rgba_pixel.rs::
+     isobmff_wraps_raw_codestream_decodes_identically`).
+
+  2. **Extra-channel mapping.** The post-Modular channel-count check
+     `n_chans != expected_chans` rejected RGBA Modular frames
+     because the Modular decoder lays out colour and extra channels
+     in a flat array of length `expected_chans + num_extra_channels`
+     (FDIS Annex G.1.3 colour-then-extras channel-order rule). The
+     check now also accepts the with-extras length and emits a
+     trailing VideoFrame plane per extra channel. For
+     `alpha-64x64` this maps directly to 4 RGBA planes; for
+     hypothetical multi-extra fixtures (depth, spot colour, …) the
+     same path extends N-ways. The XYB-encoded / YCbCr branches are
+     unchanged — those still require exactly 3 colour channels and
+     fall through if extras are present (round-30+ work).
+
+  Test count: `tests/round29_alpha_rgba_pixel.rs` adds 3 tests
+  (`alpha_64x64_rgba_pixel_correct_vs_expected_png` — full 64×64×4
+  byte-for-byte match; `five_pre_round29_fixtures_still_pass` —
+  regression sentinel for pixel-1x1 / gray-64x64 / gradient-64x64 /
+  palette-32x32 / grey_8x8_lossless; `isobmff_wraps_raw_codestream_
+  decodes_identically` — synthetic ISOBMFF wrap of
+  gradient-64x64). Committed fixture pair under `tests/fixtures/`:
+  `alpha_64x64.jxl` (86 B) + `alpha_64x64_expected.png` (283 B).
+
+  Crate now decodes 6 small lossless Modular fixtures pixel-correct
+  vs `expected.png` (was 5): pixel-1x1, gray-64x64,
+  gradient-64x64-lossless, palette-32x32, grey_8x8_lossless,
+  **alpha-64x64**.
+
+  Spec citations: FDIS Annex B.1 (codestream signature),
+  Annex G.1.3 (channel order), Annex A.6 + A.9 + Table A.22
+  (ImageMetadata + ExtraChannelInfo).
+
+  Docs gaps identified probing adjacent fixtures: `bit-depth-16`
+  (421 B) reaches the 8-bit-only post-Modular check (decoder needs
+  a 16-bit output-pack path before VideoFrame mapping — deferred);
+  `noise-64x64-lossless` (13.5 KB) fails inside LfGlobal with
+  "unexpected end of JXL bitstream" suggesting the high-entropy
+  random-RGB MA tree exercises a code path not yet covered
+  (deferred).
+
 - **Round 28 (2024-spec) — non-DCT IDCT helpers** (parent-dispatch
   "r13" item 3). Extends `src/idct.rs` with five new public helpers
   that complete the IDCT surface for the non-DCT TransformType
