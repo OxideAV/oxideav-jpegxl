@@ -21,11 +21,18 @@ trace-doc-driven rounds 7-11 + encoder rounds 1-6 were retired
   `decode_one_frame`. **Round 30** lifts the fixture count from 6
   to 7 by adding `bit-depth-16` (3-channel RGB lossless Modular at
   `bits_per_sample = 16`) and adopts the LE-pack plane convention
-  documented under "Plane byte layout" below. Seven committed
-  fixtures decode pixel-correct vs `expected.png`
-  (PNG-decoder-backed byte-for-byte comparison): `pixel-1x1`,
-  `gray-64x64`, `gradient-64x64-lossless`, `palette-32x32`,
-  `grey_8x8_lossless`, `alpha-64x64`, **`bit-depth-16`**.
+  documented under "Plane byte layout" below. **Round 31** applies
+  FDIS §F.3's section zero-pad rule uniformly to the
+  single-TOC-entry LfGlobal fast path, so the
+  `noise-64x64-lossless` fixture (`cjxl -d 0 -e 7`, high-entropy
+  64×64 RGB lossless Modular, MA tree `leaves=84`) now
+  decode-completes (vs hard-EOF pre-r31); pixel-correctness for
+  that fixture is round-32 work — see CHANGELOG for the bisect
+  notes. Seven committed fixtures decode pixel-correct vs
+  `expected.png` (PNG-decoder-backed byte-for-byte comparison):
+  `pixel-1x1`, `gray-64x64`, `gradient-64x64-lossless`,
+  `palette-32x32`, `grey_8x8_lossless`, `alpha-64x64`,
+  **`bit-depth-16`**.
 - **Round 7 (2024-spec)**: four-piece refactor wiring multi-group
   decode infrastructure (Annex G.1.3 last paragraph + G.4.2):
   `GlobalModular::read` honours the "stops decoding at channels

@@ -794,13 +794,24 @@ fn decode_codestream(codestream: &[u8], pts: Option<i64>) -> Result<VideoFrame> 
     //    where every channel fits in group_dim, this fully populates
     //    `lf_global.global_modular.image`. Otherwise the larger
     //    channels are zero-filled placeholders that PassGroups fill.
-    let mut lf_global = if num_groups == 1 && fh.passes.num_passes == 1 && toc.entries.len() == 1 {
-        // Single-group fast path: read directly off the main bit
-        // reader (preserves round-6's behaviour for the five small
-        // lossless fixtures).
-        LfGlobal::read(&mut br, &fh, &metadata)?
-    } else {
-        let lf_global_bytes = section_byte_range(lf_global_slot)?;
+    //
+    // Round-31 (parent-dispatch r16, noise-64x64-lossless unblock):
+    //   The single-TOC-entry case still constitutes a section per
+    //   FDIS §F.3: "no more bits are read from the codestream than 8
+    //   times the byte size indicated in the TOC; if fewer bits are
+    //   read, then the remaining bits of the section all have the
+    //   value zero." High-entropy modular fixtures (e.g. `cjxl -e 7`
+    //   noise) can leave the ANS / hybrid-uint refill loop trying to
+    //   read past the last byte by a few bits — those reads must
+    //   return zero, not error. Pre-round-31 the fast path used the
+    //   non-padding main reader and rejected the `cjxl -e 7` noise
+    //   fixture with `unexpected end of JXL bitstream` mid-pixel
+    //   decode. Now every LfGlobal read goes through a section reader
+    //   sliced to the TOC-declared length so the §F.3 zero-pad rule
+    //   applies uniformly to single-TOC-entry frames and multi-TOC
+    //   frames alike.
+    let lf_global_bytes = section_byte_range(lf_global_slot)?;
+    let mut lf_global = {
         let mut lf_br = BitReader::new_section(lf_global_bytes);
         LfGlobal::read(&mut lf_br, &fh, &metadata)?
     };

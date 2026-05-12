@@ -9,6 +9,74 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Round 31 (2024-spec) — §F.3 zero-pad uniformly applied to the
+  single-TOC-entry LfGlobal fast path; noise-64x64-lossless now
+  decodes without EOF** (parent-dispatch "r16" option A). One
+  narrow `src/lib.rs::decode_codestream` delta:
+
+  - Pre-round-31, when `num_groups == 1 && passes == 1 &&
+    toc.entries.len() == 1`, the decoder routed `LfGlobal::read`
+    through the non-padding main `BitReader` (`pad_eof_with_zeros
+    == false`). The other LfGlobal path already used
+    `BitReader::new_section` (which implements FDIS §F.3's
+    section-bit-budget + zero-pad rule). For six of the seven small
+    lossless fixtures the entire LfGlobal section had enough
+    trailing slack that the read never touched the padding region;
+    `noise-64x64-lossless` (`cjxl -d 0 -e 7`, 64×64 high-entropy RGB
+    Modular, MA tree `nodes=167 leaves=84`) does NOT — its
+    per-pixel ANS / hybrid-uint refill loop on the final samples
+    reaches a few bits past the byte budget that the spec says must
+    read as zero. Pre-round-31 the non-padding reader errored
+    instead → `InvalidData("unexpected end of JXL bitstream")`.
+
+  - The fix collapses both LfGlobal-read branches into one path
+    that always uses `BitReader::new_section` against the
+    `toc`-declared section byte range. This makes the single-section
+    fast path bit-for-bit equivalent to the multi-section path on
+    its real-data prefix, and applies §F.3 zero-pad uniformly.
+
+  Spec citation: FDIS §F.3 first paragraph — "When decoding a
+  section, no more bits are read from the codestream than 8 times
+  the byte size indicated in the TOC; if fewer bits are read, then
+  the remaining bits of the section all have the value zero."
+
+  Test added: `tests/r31_noise_lossless.rs` with two cases —
+  `noise_64x64_lossless_decodes_without_eof_error` (locks the
+  shape of the post-fix `VideoFrame`: 3 RGB planes, stride=64,
+  data.len()=4096 each) and `pre_round31_seven_lossless_fixtures_
+  still_decode` (regression sentinel: the seven pre-round-31
+  fixtures all decode successfully under the unified path).
+  Committed fixture pair under `tests/fixtures/`:
+  `noise_64x64_lossless.jxl` (13 505 B) +
+  `noise_64x64_lossless_expected.png` (12 505 B, 8-bit RGB PNG).
+
+  Known limitation NOT fixed this round: while
+  `noise-64x64-lossless` now decode-completes (vs hard-EOF), the
+  produced pixels are not yet byte-identical to `expected.png`.
+  The first divergence is plane[0] (R) at (2, 3) — i.e. samples
+  0..193 of plane 0 match, and from sample 194 on ~98 % of samples
+  diverge. The divergence point is deterministic and well within
+  the section's real-byte budget, so the §F.3 fix is independent
+  of the residual pixel-divergence. Suspected root cause: a
+  latent state-evolution bug in either the MA-tree leaf decode
+  with `num_contexts > 16` (the leaf-stream `EntropyStream`'s
+  cluster_map is 84 → 3 clusters here, vs ≤ 6 → ≤ 4 in every
+  other lossless fixture), the Self-correcting WP state on
+  high-entropy neighbour history, or the hybrid-uint extra-bits
+  path for large `n_extra` values. Deferred to round 32 — needs
+  the round-24-style per-cluster trace replayed against the
+  cleanroom Python reference at ~30 distinct bit positions across
+  the 108 kbit symbol stream.
+
+  Docs gap noted: `docs/image/jpegxl-cleanroom/reference-impl/`
+  (referenced in the round-31 brief as the place to bisect
+  against) does not yet exist; the round-30 deferral note pointed
+  at it as a future bisect target. The §F.3 fix landed without
+  needing it — pure spec-text bisect against FDIS §F.3 was
+  sufficient. The reference-impl directory would still be useful
+  for the residual pixel-divergence bisect; ask the docs
+  collaborator to populate it for round 32.
+
 - **Round 30 (2024-spec) — bit-depth-16 RGB pixel-correct decode +
   16-bit LE plane-pack convention** (parent-dispatch "r15" option A).
   Lifts the fixture count from 6 to 7 by adding `bit-depth-16`
