@@ -7,6 +7,76 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Round 32 (2024-spec) — `noise-64x64-lossless` pixel-divergence
+  bisected to the Self-correcting weighted predictor at the first
+  `y >= 2, x >= 2` sample whose `predictor == 6`; root cause
+  localised, fix deferred pending a libjxl-trace doc that this
+  workspace does not yet ship.** The fixture count therefore stays
+  at 7 pixel-correct lossless fixtures (status quo). No source-file
+  semantic changes this round; the diagnostic harness used to
+  bisect was removed before commit and the regression set remains
+  green.
+
+  Round 31 left the noise fixture as a "decodes without EOF, but
+  pixels diverge from expected.png starting at plane[0] sample
+  194" follow-up. Round 32 reproduced that divergence and pinned
+  it down further:
+
+  - The first divergence is at plane[0] (y=3, x=2) — the FIRST
+    sample whose predictor is `6 (Self-correcting)` and which has
+    the full set of WP neighbours `N, W, NW, NE, NN, WW` populated
+    (i.e. `y >= 2 && x >= 2`). The prior `predictor == 6` samples
+    in rows `y = 0` and `y = 1` all decoded pixel-correct because
+    their WP path takes the `NN does not exist → NN = N`
+    fall-back. Two `predictor == 6` samples on row `y = 2` also
+    decoded correctly because `WW = W` was used (the bug requires
+    `WW ≠ W`, i.e. `x >= 2`).
+  - At sample 194 the WP machinery produces `wp_pred8 = 717`
+    (Listing E.3 weighted sum). The spec rounding `(wp_pred8 + 3)
+    >> 3` then yields `p = 90`, giving `v = diff + p = -55 + 90
+    = 35` — but `expected.png` says `34`. So `wp_pred8` is 1 too
+    high modulo the rounding (any value in `[709..716]` would give
+    `p = 89` and thence `v = 34`). The MA-tree leaf, the decoded
+    token, the diff `-55`, and `wp_max_error` all match what the
+    neighbour state legitimately implies — the discrepancy is
+    purely in the WP weighted sum.
+  - Bisected against `WP_ROUND_BIAS ∈ {0..=7}`, `s_init ∈
+    {(sum_weights >> 1) - 1, (sum_weights >> 1), sum_weights, 0}`,
+    the `subpred[3]` sign (FDIS `N + …` vs. round-3 code `N - …`),
+    and the clamp condition (`<= 0` vs `>= 0`). Every alternative
+    either re-introduces an EARLIER divergence (samples 68, 79,
+    142) on the noise fixture, OR breaks one of the seven
+    currently-pixel-correct lossless fixtures. So the bug is NOT
+    in any of the dimensions our spec text exposes a knob for.
+  - Suspected residual root cause: a subtle interaction between
+    the FDIS `error2weight` formula's outer `>> shift` step (only
+    in the 2024 published edition and the round-3 code; absent
+    from FDIS 2021 literal text), the four sub-predictor weights,
+    and the final `s × ((1 << 24) Idiv sum_weights) >> 24`
+    division. Most likely the libjxl reference uses an `s_init`
+    formula that depends on the **shifted** vs **unshifted**
+    `sum_weights` in a way the FDIS spec text does not disclose.
+    Resolving this needs either (a) a behavioural trace of the
+    libjxl WP path on the noise fixture at sample 194 captured by
+    the docs collaborator, or (b) the docs collaborator's
+    promised `docs/image/jpegxl/libjxl-trace-reverse-engineering.md`
+    section on §H.5.2 Sub-predictions (referenced in the
+    `project_jpegxl_pixel_blocked` memory note, but the file does
+    not yet exist in `docs/image/jpegxl/`).
+
+  Round-32 scope therefore closes with the bisect finding above
+  recorded and the regression set green. No `.gitignore` / Cargo
+  changes; no API surface deltas. The §F.3 zero-pad fix from
+  round 31 stays in place and `noise-64x64-lossless` continues to
+  decode-complete (just with non-byte-exact pixels).
+
+  Spec citations: FDIS Annex E.1 (Sub-predictions, Listing E.1),
+  E.2 (Prediction weights, Listing E.2), E.3 (Prediction, Listing
+  E.3), and Table H.3 row `predictor == 6` (`(prediction + 3)
+  >> 3`).
+
 ### Added
 
 - **Round 31 (2024-spec) — §F.3 zero-pad uniformly applied to the

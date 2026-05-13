@@ -26,13 +26,17 @@ trace-doc-driven rounds 7-11 + encoder rounds 1-6 were retired
   single-TOC-entry LfGlobal fast path, so the
   `noise-64x64-lossless` fixture (`cjxl -d 0 -e 7`, high-entropy
   64×64 RGB lossless Modular, MA tree `leaves=84`) now
-  decode-completes (vs hard-EOF pre-r31); pixel-correctness for
-  that fixture is round-32 work — see CHANGELOG for the bisect
-  notes. Seven committed fixtures decode pixel-correct vs
-  `expected.png` (PNG-decoder-backed byte-for-byte comparison):
-  `pixel-1x1`, `gray-64x64`, `gradient-64x64-lossless`,
-  `palette-32x32`, `grey_8x8_lossless`, `alpha-64x64`,
-  **`bit-depth-16`**.
+  decode-completes (vs hard-EOF pre-r31). **Round 32** bisects
+  the residual pixel-divergence on that fixture to the
+  Self-correcting weighted predictor at the first
+  `predictor == 6` sample whose WP path uses `WW` and `NN` both
+  as in-image values (i.e. `x >= 2 && y >= 2`); fix deferred
+  pending a docs-collaborator libjxl-WP behavioural trace at the
+  divergence point. Seven committed fixtures still decode
+  pixel-correct vs `expected.png` (PNG-decoder-backed
+  byte-for-byte comparison): `pixel-1x1`, `gray-64x64`,
+  `gradient-64x64-lossless`, `palette-32x32`,
+  `grey_8x8_lossless`, `alpha-64x64`, **`bit-depth-16`**.
 - **Round 7 (2024-spec)**: four-piece refactor wiring multi-group
   decode infrastructure (Annex G.1.3 last paragraph + G.4.2):
   `GlobalModular::read` honours the "stops decoding at channels
