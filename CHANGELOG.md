@@ -7,6 +7,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Round 77 (2024-spec) — animation-3frame SPECDIFF audit + docs
+  citation.** Two new audit-grade integration tests
+  (`tests/r77_animation_3frame_specdiff.rs`) characterise the
+  `docs/image/jpegxl/fixtures/animation-3frame/input.jxl` fixture
+  (cjxl 0.12.0, 78 B, 3 RGB Regular Modular frames of 32×32 with
+  `have_animation = 1`). The probe-level path is correct
+  (`probe_fdis` recovers SizeHeader + ImageMetadata with
+  `have_animation = true` + AnimationHeader populated); the
+  decode-level path remains blocked on a real spec-edition split
+  between ISO/IEC 18181-1:**2021** FDIS Table C.9 (which our
+  `RestorationFilter::read` follows; no leading `all_default`
+  field) and the published **2024** Table J.1 (which prepends an
+  `all_default Bool()` to the bundle plus a `u(32)` "(ignored)"
+  field after `epf_channel_scale`). Bit-trace bisect (recorded in
+  the test file's module docs):
+  - The two-bit RF SPECDIFF lifts our FrameHeader bit count from
+    39 to 40 for the animation fixture, which lets `permuted_toc
+    + pu0` correctly land the TOC entry U32 at byte 11 of the
+    codestream; that read yields `entry value = 16`, matching the
+    libjxl trace's `total_bytes = 16`.
+  - The seven currently-pixel-correct lossless fixtures were
+    encoded by cjxl 0.11.1 against the 2021 FDIS layout and do
+    NOT include the leading `all_default` bit; landing the
+    2024-Table-J.1 fix straightforwardly breaks
+    `alpha-64x64.jxl`. The audit recommendation (recorded in the
+    test docs) is to re-encode the seven fixtures with cjxl
+    0.12.0+ before applying the 2024-spec fix uniformly. This is
+    a docs-collaborator follow-up — there is no codestream-level
+    edition tag, so a single-pass parser cannot dispatch between
+    the two RF layouts without a heuristic.
+  - Spec citations: ISO/IEC 18181-1:2024 Table J.1
+    (`docs/image/jpegxl/ISO_IEC_18181-1-JPEG-XL-Core-2024.pdf`
+    page 70) and ISO/IEC FDIS 18181-1:2021 Table C.9
+    (pdftotext-extractable lines 4088-4101). Trace fixture at
+    `docs/image/jpegxl/fixtures/animation-3frame/trace.txt`.
+
+  Fixture count remains 7 pixel-correct lossless small fixtures
+  (no change). Test count grows by 2 (audit harness).
+
 ### Changed
 
 - **Round 32 (2024-spec) — `noise-64x64-lossless` pixel-divergence

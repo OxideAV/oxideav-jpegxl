@@ -37,6 +37,25 @@ trace-doc-driven rounds 7-11 + encoder rounds 1-6 were retired
   byte-for-byte comparison): `pixel-1x1`, `gray-64x64`,
   `gradient-64x64-lossless`, `palette-32x32`,
   `grey_8x8_lossless`, `alpha-64x64`, **`bit-depth-16`**.
+- **Round 77 (2024-spec)** lands an audit-grade SPECDIFF harness
+  for `docs/image/jpegxl/fixtures/animation-3frame/input.jxl` (3
+  Regular Modular frames, `have_animation = 1`, encoded by cjxl
+  0.12.0 against the 2024 final core spec). The probe-level path
+  is correct (`probe_fdis` recovers SizeHeader + ImageMetadata
+  with `have_animation = true` + AnimationHeader). The decode
+  path remains blocked on a 2-bit format split between ISO/IEC
+  18181-1:2021 FDIS Table C.9 (no leading `all_default` in
+  RestorationFilter — what our `RestorationFilter::read`
+  follows) and ISO/IEC 18181-1:2024 final Table J.1 (which
+  prepends `all_default Bool()` + adds a `u(32) (ignored)`
+  field). The seven small lossless fixtures were encoded by cjxl
+  0.11.1 against the 2021 layout, so a uniform 2024-spec patch
+  would break them; the audit doc-side recommendation is to
+  re-encode those fixtures with cjxl 0.12.0+ before flipping.
+  See `tests/r77_animation_3frame_specdiff.rs` module docs for
+  the byte-level bit-trace bisect that pins the discrepancy
+  down to a single byte boundary on the codestream's
+  FrameHeader → TOC junction.
 - **Round 7 (2024-spec)**: four-piece refactor wiring multi-group
   decode infrastructure (Annex G.1.3 last paragraph + G.4.2):
   `GlobalModular::read` honours the "stops decoding at channels
