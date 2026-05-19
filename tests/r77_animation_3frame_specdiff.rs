@@ -115,8 +115,13 @@
 
 use oxideav_jpegxl::probe_fdis;
 
-const ANIM_FIXTURE: &[u8] =
-    include_bytes!("../../../docs/image/jpegxl/fixtures/animation-3frame/input.jxl");
+// Fixture is also copied under `docs/image/jpegxl/fixtures/animation-3frame/input.jxl`
+// in the workspace's `docs/` repository (provenance: cjxl v0.12.0 commit `950c327`,
+// 78 B, SHA-256
+// `68d00bf562eb4c3810777e6ec987b0ed7eeb1dedc9e1b7d9606edbce8610e76f`). The
+// in-crate copy is required because library crates publish to crates.io
+// without the workspace's `docs/` tree alongside.
+const ANIM_FIXTURE: &[u8] = include_bytes!("fixtures/animation_3frame.jxl");
 
 #[test]
 fn animation_3frame_probe_succeeds_with_have_animation_flag() {
