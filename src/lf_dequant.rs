@@ -206,9 +206,10 @@ pub fn apply_adaptive_lf_smoothing(out: &mut LfDequantOutput, multipliers: &LfMu
     let snap_b = out.samples[2].clone();
 
     // Reciprocals so the smoothing inner loop avoids division on the
-    // hot path. Per spec the multipliers are positive (m_x/y/b_lf are
-    // F16 with libjxl defaults 4096 / 512 / 256, and global_scale +
-    // quant_lf are at least 1). Defensively guard against zero.
+    // hot path. Per spec the multipliers are positive (`m_x/y/b_lf`
+    // are positive F16 values in the O(10^2)..O(10^3) range, and
+    // `global_scale + quant_lf` are at least 1). Defensively guard
+    // against zero.
     let inv_m = [
         if multipliers.m_x_dc != 0.0 {
             1.0 / multipliers.m_x_dc
