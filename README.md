@@ -37,6 +37,23 @@ trace-doc-driven rounds 7-11 + encoder rounds 1-6 were retired
   byte-for-byte comparison): `pixel-1x1`, `gray-64x64`,
   `gradient-64x64-lossless`, `palette-32x32`,
   `grey_8x8_lossless`, `alpha-64x64`, **`bit-depth-16`**.
+- **Round 89 (2024-spec)** materialises the §I.2.4 / §I.2.5 +
+  Table I.6 default dequantization-matrix set. New
+  [`dct_quant_weights`] module transcribes the 2024 spec listing
+  for `Mult`, `Interpolate`, `GetDCTQuantWeights`, the per-mode
+  weights-derivation rules (DCT, DCT4, DCT2, Hornuss, DCT4x8,
+  AFV) and the AFV Listing C.11 freqs/bands ladder. Public API
+  exposes `materialise_default_dequant_set()` → the full 17-slot
+  × 3-channel set (Table I.4 dims, element-wise reciprocal of
+  the weights matrix). 26 new tests (15 unit + 11 integration);
+  every cell of every channel of every slot is positive-finite
+  per the spec's §I.2.4 last-paragraph invariant. Documented
+  spec-listing typo notes (FDIS 2021 bands/weights nested-loop
+  bug, corrected in 2024 published edition) and a SPECGAP for
+  the DCT2 `(0, 0)` cell (not specified by the spec text;
+  filled with `params(c, 0)` to keep the dequant reciprocal
+  finite). Unblocks downstream HF coefficient dequantisation
+  (§F.3) on the `u(1) == 1` HfGlobal default-encoding fast path.
 - **Round 77 (2024-spec)** lands an audit-grade SPECDIFF harness
   for `docs/image/jpegxl/fixtures/animation-3frame/input.jxl` (3
   Regular Modular frames, `have_animation = 1`, encoded by cjxl

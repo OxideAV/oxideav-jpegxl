@@ -9,6 +9,92 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Round 89 (2024-spec) — `GetDCTQuantWeights` + Table I.6 default
+  dequantization-matrix materialisation** (parent-dispatch r89). New
+  `src/dct_quant_weights.rs` (~1k LOC + tests) transcribes the
+  ISO/IEC 18181-1:2024 §I.2.4 / §I.2.5 + Table I.4 + Table I.6
+  listing block from page 58-60 of the published core PDF:
+
+  - `mult(v)` — spec `Mult` piecewise function
+    (`1+v if v > 0 else 1/(1-v)`).
+  - `interpolate(pos, max, bands)` — spec `Interpolate` with the
+    2024 corrected `A * pow(B/A, frac_index)` form. Includes
+    defensive clamping when `pos == max` (would otherwise index
+    past `bands.size() - 1`).
+  - `compute_dct_weights(params, x_dim, y_dim)` — spec
+    `GetDCTQuantWeights` per the post-typo-fix 2024 listing
+    (bands loop closes BEFORE the weights matrix double-loop,
+    correcting the FDIS 2021 PDF's nested-loop bug).
+  - `materialise_weights_for_dct_select(bundle, channel, X, Y)` —
+    per-mode (DCT, DCT4, DCT2, Hornuss, DCT4x8, AFV)
+    weights-matrix dispatch per §I.2.4 page 58 prose +
+    Listing C.11 for AFV.
+  - `materialise_dequant_for_channel(bundle, channel, X, Y)` —
+    element-wise reciprocal of the weights matrix per
+    §I.2.4 last paragraph. Validates the
+    "no non-positive or infinity" spec invariant.
+  - `materialise_default_dequant_set()` — the full 17-slot ×
+    3-channel default set per Table I.6 (page 60),
+    transcribed verbatim including the `SeqA` / `SeqB` /
+    `SeqC` abbreviated sequences from the spec footnote and
+    the `dct4x4_params` constant for slots 3 (DCT4×4) and 10
+    (AFV).
+  - `weights_matrix_dims_for_slot(slot)` — Table I.4 page 57
+    dimensions lookup (0..=16).
+  - `slot_for_transform(t)` — `TransformType` (Table C.16
+    0..=26) → Table I.4 slot (0..=16) mapping; multiple
+    transforms share a slot (e.g. DCT16×8 and DCT8×16 both
+    map to slot 6).
+
+  Test count: 26 new tests (15 unit tests in
+  `src/dct_quant_weights.rs` + 11 integration tests in
+  `tests/round33_dct_quant_weights.rs`). Every cell of every
+  channel of every default slot is verified positive-finite per
+  the §I.2.4 invariant. Spot-checks include:
+  - DCT8×8 slot 0 channel 0 (0,0) cell = 1 / 3150.0 (reciprocal of
+    Table I.6 row-0 head).
+  - Hornuss slot 1 (0,0) cell = 1.0 (spec sets weights(0,0) = 1).
+  - AFV slot 10 8×8 fully populated (Listing C.11 covers all 64
+    cells across the freqs interpolation + weights4x8 + weights4x4
+    fills).
+
+  Spec-listing typo notes (recorded in module doc-comment):
+  - FDIS 2021 PDF Listing C.10 has the `for (y, x) { ... }`
+    weights double-loop INSIDE the `for (i = 1; i < len; i++)`
+    bands loop — would compute the matrix `len - 1` times. The
+    2024 published edition (`docs/image/jpegxl/
+    ISO_IEC_18181-1-JPEG-XL-Core-2024.pdf` page 58) corrects this.
+    Module follows the 2024 form.
+  - 2024 `Interpolate` drops `len` (uses `bands.size()`) and
+    writes `pow(B / A, frac_index)` instead of FDIS 2021's
+    `A * (B / A)^frac_index`. Mathematically identical.
+
+  SPECGAP recorded: DCT2 cell (0, 0) is not assigned by the spec
+  listing block (page 58). Implementation fills it with
+  `params(c, 0)` (same value used for `i == 0` neighbours) so the
+  dequant reciprocal is finite. The 6-rectangle assignments cover
+  62 of 64 cells, plus (1, 1); (0, 0) is the only unmentioned
+  position. Recommend a spec clarification.
+
+  Unblocks: downstream HF coefficient dequantisation per §F.3 on
+  the HfGlobal `u(1) == 1` default-encoding fast path. The
+  non-default branch's `RAW` encoding mode still requires a
+  modular sub-bitstream decode (deferred to round 90+ alongside
+  the §F.3 wiring).
+
+  Spec citations: ISO/IEC 18181-1:2024 page 58 (Listing for
+  `Interpolate` / `Mult` / `GetDCTQuantWeights`), page 59
+  (Listing C.11 AFV weights + per-mode prose), page 60
+  (Table I.6 default matrix parameters), page 57 (Table I.4
+  weights-matrix dimensions). Cross-referenced against ISO/IEC
+  FDIS 18181-1:2021 PDF (extractable) Listing C.10 / Table C.18
+  / Table C.20 (the 2021 equivalents).
+
+  Fixture count remains 7 pixel-correct lossless small fixtures
+  (no change — round 89 is upstream of the pixel-decode flow;
+  HfGlobal default-encoding parsing remains unchanged in
+  behaviour).
+
 - **Round 77 (2024-spec) — animation-3frame SPECDIFF audit + docs
   citation.** Two new audit-grade integration tests
   (`tests/r77_animation_3frame_specdiff.rs`) characterise the

@@ -483,6 +483,7 @@ pub mod ans;
 pub mod begabrac;
 pub mod bitreader;
 pub mod container;
+pub mod dct_quant_weights;
 pub mod dct_select;
 pub mod extensions;
 pub mod frame_header;
