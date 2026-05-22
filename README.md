@@ -54,6 +54,37 @@ trace-doc-driven rounds 7-11 + encoder rounds 1-6 were retired
   filled with `params(c, 0)` to keep the dequant reciprocal
   finite). Unblocks downstream HF coefficient dequantisation
   (§F.3) on the `u(1) == 1` HfGlobal default-encoding fast path.
+- **Round 90 (2021-FDIS / 2024-spec) — HfPass + PassGroup HF
+  structural parsers.** Three new modules surface the §C.7.1 /
+  §C.7.2 HfPass bundle and the §C.8.3 PassGroup HF entry-points:
+  * `coeff_order` — §I.2.4 natural coefficient ordering for every
+    `OrderId` 0..=12 (Table I.1). Builds `LLF` prefix sorted by
+    `y × bwidth + x`, then `HF` tail sorted by `(key1, key2)`
+    per Listing I.14. Exposes `natural_coeff_order(OrderId)`,
+    `varblock_size_for_order`, `coefficient_count`, and the
+    `TransformType → OrderId` table.
+  * `hf_pass` — §C.7.1 Listing C.12 parser. The `used_orders ==
+    0` fast path materialises all 13 natural orders directly;
+    `used_orders != 0` returns `Error::Unsupported` (the
+    permutation reads need the shared 8-cluster ANS stream that
+    §C.7.2 histograms also feed — round 91 work). Exposes
+    `num_histogram_distributions = 495 × num_hf_presets ×
+    nb_block_ctx` so the next round knows the §C.7.2 read
+    count up-front.
+  * `pass_group_hf` — §C.8.3 first line + Listing C.13. Reads
+    `hfp = u(ceil(log2(num_hf_presets)))` and computes
+    `histogram_offset = 495 × nb_block_ctx × hfp`. Verbatim
+    transcriptions of `BlockContext`, `NonZerosContext`,
+    `CoefficientContext`, `PredictedNonZeros`, plus the two
+    64-element `CoeffFreqContext` /
+    `CoeffNumNonzeroContext` ladder tables.
+
+  49 new tests: 12 (`coeff_order`) + 7 (`hf_pass`) + 18
+  (`pass_group_hf`) + 12 (integration
+  `round34_hf_pass_pass_group_hf`). Unblocks downstream per-
+  block coefficient decode loop (the `used_orders == 0` typed
+  surface is now usable end-to-end; the `used_orders != 0`
+  branch + shared-ANS-stream wiring is the round-91 task).
 - **Round 77 (2024-spec)** lands an audit-grade SPECDIFF harness
   for `docs/image/jpegxl/fixtures/animation-3frame/input.jxl` (3
   Regular Modular frames, `have_animation = 1`, encoded by cjxl

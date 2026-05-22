@@ -9,6 +9,69 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Round 90 (2021-FDIS / 2024-spec) — HfPass + PassGroup HF
+  structural parsers**. Three new modules surface the §C.7.1 /
+  §C.7.2 HfPass bundle and the §C.8.3 PassGroup HF entry-points,
+  preparing the HF coefficient decode pipeline for the per-block
+  ANS-stream wiring scheduled for round 91+.
+
+  New `src/coeff_order.rs` (~430 LOC + 12 tests): §I.2.4 natural
+  coefficient ordering for every `OrderId` 0..=12 (Table I.1).
+  Builds the `LLF` prefix sorted by `y × bwidth + x` followed by
+  the `HF` tail sorted by `(key1, key2)` per Listing I.14. Public
+  API: `OrderId`, `varblock_size_for_order`, `natural_coeff_order`,
+  `coefficient_count`, `order_id_for_transform`,
+  `COEFFICIENTS_PER_ORDER`.
+
+  New `src/hf_pass.rs` (~290 LOC + 7 tests): §C.7.1 Listing C.12
+  parser. Reads `used_orders = U32(Val(0x5F), Val(0x13), Val(0),
+  Bits(13))`. The `used_orders == 0` fast path materialises all 13
+  natural orders directly per the listing's `else` branch.
+  `used_orders != 0` returns `Error::Unsupported` — the permutation
+  reads need the shared 8-cluster ANS stream that §C.7.2 histograms
+  also feed; wiring that shared stream is round-91 work. Exposes
+  `num_histogram_distributions = 495 × num_hf_presets ×
+  nb_block_ctx` so the next round knows the §C.7.2 read count
+  up-front. Also exposes `read_hf_pass_sequence` for the per-pass
+  loop.
+
+  New `src/pass_group_hf.rs` (~460 LOC + 18 tests): §C.8.3 first
+  line + Listing C.13. Reads `hfp = u(ceil(log2(num_hf_presets)))`,
+  validates `hfp < num_hf_presets`, computes
+  `histogram_offset = 495 × nb_block_ctx × hfp`. Verbatim
+  transcriptions of `block_context`, `non_zeros_context`,
+  `coefficient_context`, `predicted_non_zeros`, plus the two
+  64-element `CoeffFreqContext` / `CoeffNumNonzeroContext` ladder
+  tables as `pub const` arrays. The actual per-block ANS
+  coefficient decode loop defers to a later round (it requires the
+  shared per-pass ANS stream from §C.7.2).
+
+  New integration suite `tests/round34_hf_pass_pass_group_hf.rs`
+  (12 tests) exercises the typed surface end-to-end at the
+  structural level — HfPass `used_orders == 0` parse + all 13
+  natural orders, §C.8.3 hfp range checks, BlockContext default-
+  map paths, NonZerosContext continuity at the
+  `predicted == 8` boundary, CoefficientContext with the listed
+  ladder constants, PredictedNonZeros four-arm dispatch table.
+
+  Test delta: +49 tests (332 → 381 lib tests; new integration
+  suite contributes 12 more). No fixture-level pixel decode
+  changes; the seven small lossless fixtures continue to decode
+  pixel-correct, and the two committed VarDCT fixtures still hit
+  their existing round-13 deferral gate (next round's HF dequant
+  + per-block decode flips that gate).
+
+  Spec gap: none new. Listing C.12 / Listing C.13 / Listing I.14
+  / Table I.1 are unambiguous on the round-90 contract scope.
+
+  Followups (round 91+): (a) shared per-pass 8-cluster ANS stream
+  init, (b) `used_orders != 0` DecodePermutation reads, (c)
+  §C.7.2 histogram read (495 × num_hf_presets × nb_block_ctx
+  clustered distributions), (d) per-block coefficient decode loop
+  per the C.8.3 prose right after Listing C.13, (e) §F.3 HF
+  dequantisation gluing the round-89 dequant matrices to the
+  newly decoded coefficients.
+
 - **Round 89 (2024-spec) — `GetDCTQuantWeights` + Table I.6 default
   dequantization-matrix materialisation** (parent-dispatch r89). New
   `src/dct_quant_weights.rs` (~1k LOC + tests) transcribes the
