@@ -9,6 +9,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Round 95 (2021-FDIS / 2024-spec) — §F.3 HF dequantisation
+  pure-math step**. New `src/hf_dequant.rs` (~310 LOC + 13 unit
+  tests) implements the FDIS p. 72 Annex F.3 HF coefficient
+  dequantisation formula verbatim: Listing F.2 bias-adjust
+  (`*= quant_bias[c]` for `|q| <= 1`, `-= quant_bias_numerator /
+  quant` otherwise), per-block `HfMul` multiplier, per-channel
+  `0.8^(x_qm_scale - 2)` / `0.8^(b_qm_scale - 2)` factor (Y
+  channel exempt), and the §C.6.2 per-`(channel,
+  transform_type, coeff_index)` dequant-matrix entry from the
+  round-89 `dct_quant_weights::DequantMatrixSet`.
+
+  Public API: `bias_adjust(quant: i32, channel: usize, oim:
+  &OpsinInverseMatrix) -> f32`, `QmScaleFactors::for_frame(&FrameHeader)`,
+  `QmScaleFactors::for_channel(channel) -> f32`,
+  `dequant_hf_coefficient(quant, channel, hf_mul,
+  dequant_matrix_entry, oim, qm) -> f32`,
+  `dequant_hf_pre_matrix(...)` (partial product helper).
+
+  10 new integration tests
+  (`tests/round35_hf_dequant.rs`) pin Listing F.2 branch
+  boundaries (zero, ±1, |q|>1 subtractive bias sign-preservation),
+  the FDIS default `quant_bias_numerator = 0.145` fixed-point
+  `quant=2 → 1.9275`, the `0.8^(u(3) - 2)` exponent sweep, and
+  the cross-module composition against
+  `materialise_default_dequant_set()` for X / Y channels at the
+  DCT8×8 corner cell. Y channel verified to skip the qm-scale
+  factor; X channel under default `x_qm_scale = 3` verified to
+  pick up a 0.8 factor.
+
+  Made `FrameHeader::default_with` `pub(crate)` (was private) so
+  the new `hf_dequant` unit tests can construct a default
+  `FrameHeader` without going through bit-stream parsing.
+
+  Round 95 lands the bit-exact F.3 arithmetic so the future
+  round that wires the per-block ANS coefficient decode (the
+  round-90 followup blocked on the shared 8-cluster ANS stream
+  + §C.7.2 histograms) can drop the integer ANS reader on top
+  without re-deriving any formulae. CfL (Annex G) and IDCT
+  (Annex I.2) still chain afterwards.
+
 - **Round 90 (2021-FDIS / 2024-spec) — HfPass + PassGroup HF
   structural parsers**. Three new modules surface the §C.7.1 /
   §C.7.2 HfPass bundle and the §C.8.3 PassGroup HF entry-points,

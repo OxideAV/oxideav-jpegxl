@@ -85,6 +85,34 @@ trace-doc-driven rounds 7-11 + encoder rounds 1-6 were retired
   block coefficient decode loop (the `used_orders == 0` typed
   surface is now usable end-to-end; the `used_orders != 0`
   branch + shared-ANS-stream wiring is the round-91 task).
+- **Round 95 (2021-FDIS / 2024-spec) — §F.3 HF dequantisation
+  pure-math step.** New `src/hf_dequant.rs` glues the round-89
+  `dct_quant_weights` 17-slot default dequant set to the
+  round-90 `hf_pass` / `pass_group_hf` structural parsers via
+  the FDIS Listing F.2 bias-adjust + per-block `HfMul`
+  multiplier + `0.8^(qm_scale - 2)` per-channel factor.
+  Public API: `bias_adjust(quant, channel, oim) -> f32`
+  (Listing F.2 verbatim — `*= quant_bias[c]` for `|q| <= 1`
+  branch, `-= quant_bias_numerator / quant` otherwise);
+  `QmScaleFactors::for_frame(&FrameHeader)` (precompute the
+  per-frame X / B factors once, Y is implicitly 1.0);
+  `dequant_hf_coefficient(quant, channel, hf_mul,
+  dequant_matrix_entry, oim, qm) -> f32` (full FDIS p. 72
+  pipeline: bias-adjust → × `HfMul` → × qm-factor → × matrix
+  entry); `dequant_hf_pre_matrix(...)` (partial product
+  without the matrix entry, for callers that want to apply
+  the dequant-matrix multiplication in a vectorised pass).
+  23 new tests (13 unit + 10 integration
+  `round35_hf_dequant`); cross-module composition pins the
+  pipeline against `materialise_default_dequant_set()` for X
+  and Y channels at the DCT8×8 corner cell, the FDIS default
+  `quant_bias_numerator = 0.145` is fixed-point pinned at
+  `quant = 2 → 1.9275`, and the `0.8^(scale - 2)` formula is
+  swept over all 8 legal `u(3)` values for positive-finite
+  output. The per-block ANS coefficient decode + indexing
+  glue is still ahead of this step; round 95 lands the
+  bit-exact arithmetic so a future round can drop the integer
+  ANS reader on top without re-deriving any F.3 formulae.
 - **Round 77 (2024-spec)** lands an audit-grade SPECDIFF harness
   for `docs/image/jpegxl/fixtures/animation-3frame/input.jxl` (3
   Regular Modular frames, `have_animation = 1`, encoded by cjxl

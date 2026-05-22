@@ -489,6 +489,7 @@ pub mod dct_select;
 pub mod extensions;
 pub mod frame_header;
 pub mod global_modular;
+pub mod hf_dequant;
 pub mod hf_global;
 pub mod hf_pass;
 pub mod icc;

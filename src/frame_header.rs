@@ -689,7 +689,7 @@ impl FrameHeader {
         })
     }
 
-    fn default_with(params: &FrameDecodeParams) -> Self {
+    pub(crate) fn default_with(params: &FrameDecodeParams) -> Self {
         Self {
             all_default: true,
             frame_type: FrameType::Regular,
