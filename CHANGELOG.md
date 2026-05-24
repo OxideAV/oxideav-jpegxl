@@ -9,6 +9,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Round 121 (2021-FDIS / 2024-spec) — §I.2.5 LLF-from-LF
+  pure-math step (Listings I.15 + I.16)**. New `src/llf_from_lf.rs`
+  (~500 LOC + 28 unit tests + 16 integration tests in
+  `tests/round121_llf_from_lf.rs`) lands the bridge from §F.2's
+  dequantised+smoothed LF samples into the top-left LLF coefficient
+  block of each HF varblock — the step the trailing prose of
+  §F.2 hands off to §I.2.7 (renumbered §I.2.5 in the 2021 FDIS).
+  
+  Public API: `scale_i8(n, u)`, `scale_d8(n, u)`, `scale_i(n, u)`,
+  `scale_d(n, u)`, `scale_c(n_big, n_small, x)`,
+  `scale_f(n_big, n_small, x)` (FDIS Listing I.15 closed-form
+  helpers); `dct_1d(input) -> Result<Vec<f32>>` (FDIS §I.2.1
+  forward 1-D DCT, sizes 1..=32); `dct_2d(samples, rows, cols) ->
+  Result<Vec<f32>>` (§I.2.2 Listing I.3 forward 2-D DCT, algorithmic
+  inverse of [`idct::idct_2d`]); `llf_dims(t) -> (u32, u32)`
+  (LF-block dims per `TransformType`); `llf_from_lf(input, t) ->
+  Result<Vec<f32>>` (Listing I.16 verbatim, including the non-DCT
+  pass-through cases for Hornuss / DCT2×2 / DCT4×4 / DCT4×8 /
+  DCT8×4 / AFV0..3).
+  
+  44 new tests pin: (a) the Listing I.15 closed forms — I8(8, 0)
+  = sqrt(0.5)/2, D8 = 1/(N·I8), the N=8 branch of I/D, C(N, N, x)
+  = 1, C reciprocal-on-swap, ScaleF(1, 8, 0) = 1.0 (DCT8×8 corner
+  identity), (b) the §I.2.1 1-D forward DCT formula via the
+  unit-impulse closed form and the constant-signal DC-only result,
+  (c) byte-exact LLF blocks for DCT8×8 (single-cell identity),
+  DCT16×16 with both constant-block and impulse-block inputs
+  (`out[y·2+x] = 0.25 · SF(2,16,y) · SF(2,16,x)`),
+  DCT16×8 / DCT8×16 rectangular paths, DCT32×32 dimension
+  contract, and the non-DCT pass-through across all nine
+  single-8×8-block transforms.
+  
+  `dct_2d` ↔ `idct::idct_2d` round-trip verified at 4×4 to f32
+  epsilon, confirming the forward DCT is the precise algorithmic
+  inverse of the round-12 IDCT.
+
 - **Round 95 (2021-FDIS / 2024-spec) — §F.3 HF dequantisation
   pure-math step**. New `src/hf_dequant.rs` (~310 LOC + 13 unit
   tests) implements the FDIS p. 72 Annex F.3 HF coefficient

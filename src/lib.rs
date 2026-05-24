@@ -403,7 +403,11 @@
 //!   8×16 / 16×8 / 16×16 / 32×32 / 64×64 / DCT4 / DCT4×8 / DCT8×4 /
 //!   IDENTITY / AFV remain).
 //! * Listing I.5 LLF-from-downsampled-LF composition (the bridge from
-//!   F.2-smoothed LF samples to varblock LF coefficients).
+//!   F.2-smoothed LF samples to varblock LF coefficients) — pure-math
+//!   step landed round 121 as [`llf_from_lf`] (FDIS Listings I.15 +
+//!   I.16). Still pending: per-LfGroup wiring that drives the
+//!   per-varblock invocation from the [`pass_group_hf`] coefficient
+//!   buffer.
 //! * Chroma-from-Luma (Annex G), Gaborish (Annex J?), EPF.
 //!
 //! ## Round-16 (2024-spec) additions
@@ -497,6 +501,7 @@ pub mod idct;
 pub mod lf_dequant;
 pub mod lf_global;
 pub mod lf_group;
+pub mod llf_from_lf;
 pub mod matree;
 pub mod metadata;
 pub mod metadata_fdis;

@@ -85,6 +85,30 @@ trace-doc-driven rounds 7-11 + encoder rounds 1-6 were retired
   block coefficient decode loop (the `used_orders == 0` typed
   surface is now usable end-to-end; the `used_orders != 0`
   branch + shared-ANS-stream wiring is the round-91 task).
+- **Round 121 (2021-FDIS / 2024-spec) — §I.2.5 LLF-from-LF
+  pure-math step (Listings I.15 + I.16).** New `src/llf_from_lf.rs`
+  lands the bridge from §F.2's dequantised+smoothed LF samples
+  into the top-left LLF coefficient block of each HF varblock —
+  the step the trailing prose of §F.2 hands off to §I.2.7
+  (renumbered §I.2.5 in the 2021 FDIS). Public API: Listing I.15
+  closed-form helpers (`scale_i8`, `scale_d8`, `scale_i`,
+  `scale_d`, `scale_c`, `scale_f`); §I.2.1 / §I.2.2 forward DCT
+  (`dct_1d`, `dct_2d`) — the algorithmic inverse of the round-12
+  `idct::idct_2d`; `llf_dims(t) -> (u32, u32)` LF-block dims per
+  `TransformType`; `llf_from_lf(input, t)` (Listing I.16
+  verbatim, with non-DCT pass-through for Hornuss / DCT2×2 /
+  DCT4×4 / DCT4×8 / DCT8×4 / AFV0..3). 44 new tests (28 unit + 16
+  integration `round121_llf_from_lf`) pin the closed-form scale
+  identities (`ScaleF(1, 8, 0) = 1.0` exactly for DCT8×8 corner),
+  the §I.2.1 1-D DCT formula at the unit-impulse, byte-exact LLF
+  blocks for DCT16×16 (`out[y·2+x] = 0.25 · SF(2,16,y) ·
+  SF(2,16,x)` from a [1,0,0,0] LF impulse), rectangular
+  DCT16×8 / DCT8×16 paths, and a `dct_2d ↔ idct_2d` 4×4
+  round-trip to f32 epsilon. Per-LfGroup wiring that drives the
+  per-varblock invocation from the `pass_group_hf` coefficient
+  buffer is still ahead of this step; round 121 lands the
+  bit-exact arithmetic so a future round can wire it in without
+  re-deriving any I.15/I.16 formulae.
 - **Round 95 (2021-FDIS / 2024-spec) — §F.3 HF dequantisation
   pure-math step.** New `src/hf_dequant.rs` glues the round-89
   `dct_quant_weights` 17-slot default dequant set to the
