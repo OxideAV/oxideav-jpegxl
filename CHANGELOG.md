@@ -9,6 +9,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Round 129 (2021-FDIS / 2024-spec) — per-varblock LF→LLF
+  composition glue (§I.2.5 plumbing).** Three new public functions
+  in `vardct` that compose the round-121
+  [`llf_from_lf::llf_from_lf`] pure-math step with a single
+  channel's dequantised LF samples for a single varblock placement:
+
+  * `vardct::extract_lf_subblock(lf_samples, lf_width, lf_height,
+    bx, by, t)` — extracts the `cy × cx` LF sub-block at varblock
+    origin `(bx, by)` in row-major order, per FDIS §I.2.5 prose
+    "the corresponding X/8 × Y/8 samples from the dequantized LF
+    image". Returns `Err(InvalidData)` on dim-mismatch, origin
+    overflow, or varblock extending past the LF grid (defensive
+    bounds-checking before the indexing).
+  * `vardct::compose_lf_to_llf_block(lf_samples, lf_width,
+    lf_height, bx, by, t)` — `extract_lf_subblock` + `llf_from_lf`
+    in one call, returning the `cy × cx` LLF coefficient block of
+    the top-left of an HF varblock.
+  * `vardct::compose_lf_to_llf_block_3ch(&LfDequantOutput, bx, by,
+    t)` — convenience wrapper that invokes the per-channel helper
+    once for each of the three colour channels (X, Y, B) when no
+    channel is subsampled (the common case where §F.2 adaptive LF
+    smoothing applied); rejects mismatched per-channel dims with a
+    clear `InvalidData` message pointing the caller at the
+    per-channel `compose_lf_to_llf_block` for the subsampled case.
+
+  24 new tests (15 unit in `src/vardct.rs` + 9 integration in
+  `tests/round129_compose_lf_to_llf.rs`). Covers DCT8×8 / DCT16×16
+  / DCT32×32 squares, all six DCT16×8-class rectangles (DCT16×8,
+  DCT8×16, DCT32×8, DCT8×32, DCT32×16, DCT16×32), the nine non-DCT
+  pass-through transforms (Hornuss / DCT2×2 / DCT4×4 / DCT4×8 /
+  DCT8×4 / AFV0..AFV3), every kind of out-of-bounds varblock
+  placement (x-only, y-only, both, and DCT32×32 at the only
+  fitting origin), `LfDequantOutput` subsampling rejection, and
+  byte-exact agreement with the hand-derivable `dc * ScaleF(cy,
+  bheight, 0) * ScaleF(cx, bwidth, 0)` formula for every
+  rectangular transform on a constant input.
+
+  This is the **geometry glue** between rounds 12/13 (per-LfGroup
+  LF dequant + smoothing) and rounds 91+/95 (HF coefficient ANS
+  decode + HF dequantisation). A future round wiring the §F.x
+  pipeline into `decode_codestream` can drop these helpers in as
+  the per-varblock loop body without re-deriving any LF→LLF
+  geometry or §I.2.5 prose mechanics. Total lib tests: 422 → 437
+  (+15); total integration test files: 41 → 42 (+1).
+
+  Round 129 also intentionally **does not** chase the
+  `noise-64x64-lossless` sample-194 wp_pred8 = 717 vs spec
+  divergence: the trace doc retired 2026-05-06 still has no
+  replacement in `docs/image/jpegxl/` per the `project_jpegxl_
+  pixel_blocked` memory note (DOCS-GAP unchanged across r126 and
+  r129). The deep-trace plumbing from r126 remains the stable
+  baseline for the future Specifier round.
+
 - **Round 126 (2021-FDIS) — Self-correcting WP deep-trace plumbing
   + sample-194 hand-derivation against Listings E.1/E.2/E.3.** New
   `WP_DEEP_TRACE` + `WP_DEEP_TRACE_ARMED` thread-locals in

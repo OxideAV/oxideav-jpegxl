@@ -3,7 +3,24 @@
 Pure-Rust **JPEG XL** (ISO/IEC 18181-1:2024) decoder. Resumed
 2026-05-08 against the final published 2024 core spec after the
 trace-doc-driven rounds 7-11 + encoder rounds 1-6 were retired
-(see "Why retired (history)" below). This crate currently ships:
+(see "Why retired (history)" below).
+
+**Round 129 (2026-05-25)** lands the per-varblock LF→LLF
+composition glue: `vardct::extract_lf_subblock`,
+`compose_lf_to_llf_block`, and `compose_lf_to_llf_block_3ch`
+drive the round-121 [`llf_from_lf::llf_from_lf`] pure-math step
+from a single channel's dequantised LF samples for a single
+varblock placement (§I.2.5). 24 new tests; lib tests 422 → 437.
+This is the geometry glue between rounds 12/13 (per-LfGroup LF
+dequant + smoothing) and rounds 91+/95 (HF coefficient ANS
+decode + HF dequantisation) — a future round wiring §F.x into
+`decode_codestream` can drop these helpers in as the per-varblock
+loop body without re-deriving any LF→LLF geometry. The
+`noise-64x64-lossless` sample-194 wp_pred8 = 717 vs spec
+divergence remains DOCS-GAP-blocked per `project_jpegxl_pixel_
+blocked`.
+
+This crate currently ships:
 
 - Round-1..3 baseline (pre-retire): signature + container detection,
   `SizeHeader` + full `ImageMetadata` (FDIS A.6 form), FrameHeader +
