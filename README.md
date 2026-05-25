@@ -32,7 +32,22 @@ trace-doc-driven rounds 7-11 + encoder rounds 1-6 were retired
   `predictor == 6` sample whose WP path uses `WW` and `NN` both
   as in-image values (i.e. `x >= 2 && y >= 2`); fix deferred
   pending a docs-collaborator libjxl-WP behavioural trace at the
-  divergence point. Seven committed fixtures still decode
+  divergence point. **Round 126** extends the WP diagnostics
+  with `WP_DEEP_TRACE` (20-entry capture of `subpred[0..4]`,
+  `err_sum[0..4]`, post-shift weights, `sum_weights_pre/post`,
+  `log_weight`, `sh`, `nn8`, `ww8`, `pred_pre_clamp`,
+  `clamped_flag`) and pins the full sample-194 intermediates
+  (`wp_pred8 = 717`, `subpred = [1248, 734, 420, 563]`, weights
+  `= [3, 4, 3, 5]`). The hand-derivation against FDIS Listings
+  E.1/E.2/E.3 in `tests/r126_wp_intermediates_at_194.rs`'s
+  docstring proves NEITHER the `subpred[3]` sign knob NOR the
+  `s_init - 1` knob can recover the spec-correct prediction
+  window `[709..716]` from the captured neighbour state; the
+  divergence is in either `sub_err` history evolution or a
+  `WpHeader` parameter mismatch. The FDIS-literal `sub_err`
+  formula (line 6832) was tried and reverted (regresses
+  `synth_320` first-drift from `(y=24, x=14)` to
+  `(y=11, x=104)`). Seven committed fixtures still decode
   pixel-correct vs `expected.png` (PNG-decoder-backed
   byte-for-byte comparison): `pixel-1x1`, `gray-64x64`,
   `gradient-64x64-lossless`, `palette-32x32`,

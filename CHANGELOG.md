@@ -9,6 +9,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Round 126 (2021-FDIS) — Self-correcting WP deep-trace plumbing
+  + sample-194 hand-derivation against Listings E.1/E.2/E.3.** New
+  `WP_DEEP_TRACE` + `WP_DEEP_TRACE_ARMED` thread-locals in
+  `modular_fdis` capture the 20-entry intermediate snapshot
+  (`subpred[0..4]`, `err_sum[0..4]`, post-shift `weight_shifted[0..4]`,
+  `sum_weights_pre`, `log_weight`, `sh`, `sum_weights_post`, `nn8`,
+  `ww8`, `pred_pre_clamp`, `clamped_flag`) for the trace-target
+  sample. The existing `LEAF_PICK_TRACE_WP` only exposes
+  `(te_w, te_n, te_nw, te_ne, w8, n8, nw8, ne8, wp_pred8,
+  max_error)` — round 126 fills in the missing nn8/ww8 + Listing
+  E.1/E.2/E.3 internals so a by-hand FDIS re-derivation against
+  pinned ground-truth is possible.
+
+  New test `tests/r126_wp_intermediates_at_194.rs` (~150 lines,
+  2 tests + a docstring with the full hand-derivation). Pins:
+  `wp_pred8 = 717` at the `noise-64x64-lossless` sample 194
+  (y=3, x=2, channel 0); the 20-entry deep trace; the 3-plane
+  first-divergence scan vs `expected.png`. The hand-derivation
+  in the module docstring proves that NEITHER the subpred[3]
+  sign knob NOR the `s_init - 1` knob (the two FDIS-vs-current
+  deviations round 32 swept independently) can produce a
+  prediction in `[709..716]` from the captured neighbour state.
+  The fix must come from somewhere else — most likely a
+  state-evolution bug in `sub_err` or a `WpHeader` parameter
+  mismatch. Round 126 also tried the FDIS-literal sub_err
+  formula (`abs(((p_i + 3) >> 3) - true_value)` per FDIS line
+  6832 vs the legacy `(abs(p_i - tv*8) + 3) >> 3`); the noise
+  fixture's `wp_pred8` at sample 194 was unchanged, but the
+  synth_320 drift-bisect fixture regressed (first drift moved
+  from y=24,x=14 to y=11,x=104), so the change is reverted in
+  this round and parked for the docs-collaborator behavioural
+  trace promised in `project_jpegxl_pixel_blocked`.
+
+  Net deliverable: deeper diagnostic plumbing + a stable pinned
+  baseline for the next round to compare hypotheses against.
+  Seven small lossless fixtures + synth_320 baselines untouched;
+  the noise fixture's plane[0] first-mismatch boundary remains
+  at linear index 194 (`dec=35` vs `exp=34`).
+
 - **Round 121 (2021-FDIS / 2024-spec) — §I.2.5 LLF-from-LF
   pure-math step (Listings I.15 + I.16)**. New `src/llf_from_lf.rs`
   (~500 LOC + 28 unit tests + 16 integration tests in

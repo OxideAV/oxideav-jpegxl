@@ -159,6 +159,26 @@ thread_local! {
     /// bias=4 step-by-step around the first ctx-flip at sample 79.
     pub static RICH_LEAF_PICK_LOG: std::cell::RefCell<Vec<RichLeafPickLog>> =
         const { std::cell::RefCell::new(Vec::new()) };
+    /// Round-126 diagnostic: deeper WP capture for the trace-target
+    /// sample. Holds the four sub-predictions (8x scale), the four
+    /// per-subpred err_sumi, the four shifted weights (post `>> sh`),
+    /// the unshifted `sum_weights_pre`, `log_weight`, `sh`, the
+    /// post-shift `sum_weights`, the pre-clamp prediction, and the
+    /// nn8 / ww8 neighbour values that the existing capture omits.
+    /// Schema (length 20):
+    /// `[p0, p1, p2, p3, err_sum0, err_sum1, err_sum2, err_sum3,
+    ///   w0_shift, w1_shift, w2_shift, w3_shift,
+    ///   sum_weights_pre, log_weight, sh, sum_weights_post,
+    ///   nn8, ww8, pred_pre_clamp, clamped_flag]`. Populated only
+    /// when the caller arms [`WP_DEEP_TRACE_ARMED`] before calling
+    /// `wp_predict`.
+    pub static WP_DEEP_TRACE: std::cell::RefCell<Vec<i64>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    /// Round-126: per-thread arm flag for [`WP_DEEP_TRACE`]. Set
+    /// `true` immediately before the `wp_predict` call whose result is
+    /// to be captured; reset to `false` immediately after.
+    pub static WP_DEEP_TRACE_ARMED: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
 }
 
 /// Round-23 toggle: when true, every per-sample leaf pick is appended
@@ -1149,7 +1169,7 @@ fn wp_predict(
     let nw8 = nb.nw.wrapping_shl(3);
     let ne8 = nb.ne.wrapping_shl(3);
     let nn8 = nb.nn.wrapping_shl(3);
-    let _ww8 = nb.ww.wrapping_shl(3);
+    let ww8 = nb.ww.wrapping_shl(3);
 
     // true_err neighbours (already in 8x scale, stored that way).
     let te_w = state.true_err_at(x - 1, y);
@@ -1181,6 +1201,7 @@ fn wp_predict(
     let preds = [p0, p1, p2, p3];
 
     // Sum sub_err over the 5 neighbours: N, W, NW, WW, NE.
+    let mut err_sums_capture = [0u64; 4];
     let weights = {
         // err_sum_i = sum of sub_err[i] over (N, W, NW, WW, NE).
         let mut weights = [0u64; 4];
@@ -1234,6 +1255,7 @@ fn wp_predict(
             // `(weight >> sh)` step. The outer shift was already in
             // round-3.
             let err_sum32 = err_sum as u32;
+            err_sums_capture[k] = err_sum;
             let bits = 32u32 - (err_sum32 + 1).leading_zeros();
             let shift = (bits.saturating_sub(1)).saturating_sub(5);
             let denom = ((err_sum32 >> shift) as u64) + 1;
@@ -1272,14 +1294,20 @@ fn wp_predict(
     // from 24 to 8, so the round-3 reading IS the right one.
     let s_init: i64 = (sum_weights >> 1) as i64 - 1;
     let s = (0..4).fold(s_init, |acc, k| acc + preds[k] as i64 * shifted[k] as i64);
-    let mut prediction = ((s * (1i64 << 24).div_euclid(sum_weights as i64)) >> 24) as i32;
+    let pred_pre_clamp = ((s * (1i64 << 24).div_euclid(sum_weights as i64)) >> 24) as i32;
+    let mut prediction = pred_pre_clamp;
 
     // If true_errN, true_errW, true_errNW have the same sign,
     // clamp to [min(W, N, NE), max(W, N, NE)] (in 8x scale).
+    let mut clamped = 0i64;
     if (te_n ^ te_w) | (te_n ^ te_nw) <= 0 {
         let lo = w8.min(n8).min(ne8);
         let hi = w8.max(n8).max(ne8);
-        prediction = prediction.clamp(lo, hi);
+        let pc = prediction.clamp(lo, hi);
+        if pc != prediction {
+            clamped = 1;
+        }
+        prediction = pc;
     }
 
     // Listing E.4 — max_error.
@@ -1292,6 +1320,40 @@ fn wp_predict(
     }
     if te_ne.unsigned_abs() > max_error.unsigned_abs() {
         max_error = te_ne;
+    }
+
+    // Round-126 deep-trace push: when the thread-local capture flag is
+    // armed, write the full Listing E.1/E.2/E.3 intermediate state so
+    // a by-hand FDIS re-derivation can identify which step deviates
+    // from the literal spec. The caller arms via
+    // [`WP_DEEP_TRACE_ARMED`] just before its second `wp_predict` call
+    // (the one whose result is consumed as `wp_pred8`) and disarms
+    // immediately after.
+    if WP_DEEP_TRACE_ARMED.with(|c| c.get()) {
+        WP_DEEP_TRACE.with(|s| {
+            *s.borrow_mut() = vec![
+                preds[0] as i64,
+                preds[1] as i64,
+                preds[2] as i64,
+                preds[3] as i64,
+                err_sums_capture[0] as i64,
+                err_sums_capture[1] as i64,
+                err_sums_capture[2] as i64,
+                err_sums_capture[3] as i64,
+                shifted[0] as i64,
+                shifted[1] as i64,
+                shifted[2] as i64,
+                shifted[3] as i64,
+                sum_weights_pre as i64,
+                log_weight as i64,
+                sh as i64,
+                sum_weights as i64,
+                nn8 as i64,
+                ww8 as i64,
+                pred_pre_clamp as i64,
+                clamped,
+            ];
+        });
     }
 
     (prediction, preds, max_error)
@@ -1684,6 +1746,17 @@ pub fn decode_channels_at_stream(
     for (i, desc) in descs.iter().enumerate() {
         for y in 0..desc.height {
             for x in 0..desc.width {
+                // Round-126: arm WP_DEEP_TRACE for the trace target so the
+                // forthcoming `wp_predict` call captures Listing E.1/E.2/E.3
+                // intermediates. Computed early because we want the
+                // capture to occur on the WP call below.
+                let leaf_target_early =
+                    LEAF_PICK_TRACE_TARGET.load(std::sync::atomic::Ordering::Relaxed);
+                let trace_this_sample_early = leaf_target_early != u64::MAX
+                    && leaf_target_early == encode_leaf_pick_target(i as u32, x, y);
+                if trace_this_sample_early {
+                    WP_DEEP_TRACE_ARMED.with(|c| c.set(true));
+                }
                 // 2024-spec H.5.1: WP is invoked "for each sample (including
                 // samples that use a different predictor)". So compute the
                 // weighted-predictor result first when WP state exists; the
@@ -1696,6 +1769,9 @@ pub fn decode_channels_at_stream(
                     } else {
                         (0, [0; 4], 0)
                     };
+                if trace_this_sample_early {
+                    WP_DEEP_TRACE_ARMED.with(|c| c.set(false));
+                }
 
                 // Round-25: pre-compute the WP intermediates used by the
                 // rich log if this sample is in the capture window. Cheap
