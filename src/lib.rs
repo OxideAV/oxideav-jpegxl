@@ -486,6 +486,7 @@ pub mod abrac;
 pub mod ans;
 pub mod begabrac;
 pub mod bitreader;
+pub mod chroma_from_luma;
 pub mod coeff_order;
 pub mod container;
 pub mod dct_quant_weights;

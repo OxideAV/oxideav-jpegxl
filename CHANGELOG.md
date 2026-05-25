@@ -9,6 +9,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Round 138 (2021-FDIS / 2024-spec) — Annex G "Chroma from luma"
+  pure-math primitive (Listing G.1).** New `src/chroma_from_luma.rs`
+  module transcribes FDIS Annex G (page 73) verbatim: given the
+  per-frame [`lf_global::LfChannelCorrelation`] bundle (§C.4.4) and,
+  for HF coefficients, the per-64×64-tile factor samples from
+  [`lf_group::HfMetadata`]'s `x_from_y` / `b_from_y` channels
+  (§C.5.4), the module computes the CfL multipliers `(kX, kB)` and
+  applies the Listing G.1 reconstruction `X = dX + kX × Y`,
+  `B = dB + kB × Y`, `Y = dY` per sample. Public API:
+  `kx_kb_raw(base_x, base_b, colour_factor, x_factor, b_factor)`
+  (Listing G.1 lines 1-2), `kx_kb_lf(cfl)` (LF derivation
+  `x_factor = x_factor_lf - 127`, `b_factor = b_factor_lf - 127`),
+  `kx_kb_hf(cfl, x_factor_hf, b_factor_hf)` (HF derivation from the
+  64×64-tile factor sample), `apply_sample` / `apply_lf_sample` /
+  `apply_hf_sample` for the per-sample reconstruction, and the
+  plane-level `apply_lf_plane_inplace(dx, dy, db, cfl)` (constant
+  per-frame `(kX, kB)`) + `apply_hf_plane_inplace(dx, dy, db, w, h,
+  x_from_y, b_from_y, cfl)` (per-`tile_x=x/64`/`tile_y=y/64`
+  lookup, with a per-tile `(kX, kB)` cache). 20 new unit tests + 11
+  new integration tests (`round138_chroma_from_luma`) pin the
+  default-bundle multipliers (`kX = 1/84`, `kB = 1 + 1/84`), the
+  Y-identity line, the round-trip against the encoder-side
+  decorrelation `dX = X - kX × Y`, multi-tile HF plane lookup
+  (128×64 → 2 tiles wide, 65×65 → 4 tiles via `div_ceil`), and the
+  defensive `colour_factor == 0` rejection on both LF and HF paths.
+  Lib tests 442 → 462. This is a pure-math primitive in the same
+  shape as round-89 `dct_quant_weights`, round-95 `hf_dequant`, and
+  round-121 `llf_from_lf`: it lands the bit-exact arithmetic so a
+  future round wiring §F.3 + Annex G into the per-LfGroup VarDCT
+  pipeline can drop it in without re-deriving any G.1 formulae.
+  Does not handle subsampled chroma (Annex G excludes that case
+  outright) and does not drive the per-LfGroup loop (deferred).
+
 - **Round 133 (2021-FDIS / 2024-spec) — §C.7.1 `DecodePermutation()`
   for `used_orders != 0`.** `HfPass::read` now handles the
   non-natural coefficient-order path of Listing C.12: the shared

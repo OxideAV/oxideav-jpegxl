@@ -5,6 +5,25 @@ Pure-Rust **JPEG XL** (ISO/IEC 18181-1:2024) decoder. Resumed
 trace-doc-driven rounds 7-11 + encoder rounds 1-6 were retired
 (see "Why retired (history)" below).
 
+**Round 138 (2026-05-26)** lands the Annex G "Chroma from luma"
+pure-math primitive (Listing G.1). New `chroma_from_luma` module
+exposes `kx_kb_lf` / `kx_kb_hf` (per-tile `(kX, kB)` from a
+parsed `LfChannelCorrelation` + optional 64×64-tile factor pair),
+`apply_sample` / `apply_lf_sample` / `apply_hf_sample` for the
+per-sample reconstruction `Y = dY`, `X = dX + kX × Y`,
+`B = dB + kB × Y`, and the plane-level
+`apply_lf_plane_inplace` (constant per-frame multipliers) +
+`apply_hf_plane_inplace(.., w, h, x_from_y, b_from_y, cfl)`
+(per-`tile_x=x/64`/`tile_y=y/64` lookup with a per-tile cache).
+20 new unit tests + 11 integration tests
+(`round138_chroma_from_luma`); lib tests 442 → 462. This is a
+pure-math primitive in the same shape as round-89
+`dct_quant_weights`, round-95 `hf_dequant`, and round-121
+`llf_from_lf` — a future round wiring §F.3 + Annex G into the
+per-LfGroup VarDCT pipeline can drop these helpers in without
+re-deriving any G.1 formulae. Subsampled chroma is out of scope
+(Annex G explicitly skips that case).
+
 **Round 129 (2026-05-25)** lands the per-varblock LF→LLF
 composition glue: `vardct::extract_lf_subblock`,
 `compose_lf_to_llf_block`, and `compose_lf_to_llf_block_3ch`
