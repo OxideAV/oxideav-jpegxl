@@ -115,8 +115,23 @@ This crate currently ships:
   (`pass_group_hf`) + 12 (integration
   `round34_hf_pass_pass_group_hf`). Unblocks downstream per-
   block coefficient decode loop (the `used_orders == 0` typed
-  surface is now usable end-to-end; the `used_orders != 0`
-  branch + shared-ANS-stream wiring is the round-91 task).
+  surface is now usable end-to-end).
+- **Round 133 (2021-FDIS / 2024-spec) — §C.7.1 `DecodePermutation()`
+  for `used_orders != 0`.** Wires Listing C.12's non-natural
+  coefficient-order path. The shared "8 clustered distributions D"
+  are read once into a `modular_fdis::EntropyStream` (`num_dist = 8`)
+  with its ANS state initialised; each set `used_orders` bit then
+  runs the §C.3.2 Lehmer-code permutation against that same stream.
+  New `coeff_order::decode_permutation_from_stream(br, entropy,
+  hybrid, size, skip)` factors the §C.3.2 procedure (`GetContext`,
+  Lehmer read against `D[prev_elem]`, `temp`-shuffle) generically;
+  §C.7.1 supplies `size = coefficient_count(order)` and
+  `skip = size / 64`. The final order is
+  `order[i] = natural_coeff_order[nat_ord_perm[i]]`. `HfPass::read`
+  no longer returns `Unsupported` for `used_orders != 0`. 8 new
+  tests (`get_context`, four `lehmer_to_permutation` cases, two
+  `hf_pass` stream-path cases). Still lacks §C.7.2 histogram decode
+  + the per-block coefficient loop + CfL / Gaborish / EPF.
 - **Round 121 (2021-FDIS / 2024-spec) — §I.2.5 LLF-from-LF
   pure-math step (Listings I.15 + I.16).** New `src/llf_from_lf.rs`
   lands the bridge from §F.2's dequantised+smoothed LF samples

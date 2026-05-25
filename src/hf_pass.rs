@@ -33,21 +33,25 @@
 //! range while `BlockContext()` returns up to `nb_block_ctx` values,
 //! plus the various `NonZerosContext` offsets — see Listing C.13).
 //!
-//! ### Round-90 envelope
+//! ### Envelope (round 90 + round 133)
 //!
-//! The round-90 parse implements the `used_orders == 0` fast path
-//! end-to-end (all 13 orders take their natural-coefficient-order
-//! permutation per [`crate::coeff_order::natural_coeff_order`]). When
-//! `used_orders != 0` the parser returns
-//! `Error::Unsupported`. The reason: the spec requires that the
-//! "8 clustered distributions D" used by `DecodePermutation` be
-//! read from a single shared ANS stream that also carries the
-//! per-pass histograms; wiring that shared stream is round-91 work.
+//! Round 90 implemented the `used_orders == 0` fast path end-to-end
+//! (all 13 orders take their natural-coefficient-order per
+//! [`crate::coeff_order::natural_coeff_order`]).
 //!
-//! The §C.7.2 histogram read is similarly deferred to round 91 —
-//! the round-90 contract only computes and exposes
-//! [`HfPass::num_histogram_distributions`] so the next round knows
-//! exactly how many clustered distributions to read.
+//! **Round 133** lands the `used_orders != 0` path. Listing C.12's
+//! "read 8 clustered distributions D" is wired to a single shared
+//! [`crate::modular_fdis::EntropyStream`] (`num_dist = 8`), read once;
+//! every set `used_orders` bit then runs `DecodePermutation()` (§C.3.2,
+//! [`crate::coeff_order::decode_permutation_from_stream`]) against that
+//! same stream + ANS state. §C.7.1 fixes the parameters: `size` is the
+//! coefficient count covered by the order's `dcts`, and
+//! `skip = size / 64`. The final order is
+//! `order[i] = natural_coeff_order[nat_ord_perm[i]]`.
+//!
+//! The §C.7.2 histogram read remains deferred — the contract still
+//! computes and exposes [`HfPass::num_histogram_distributions`] so the
+//! next round knows exactly how many clustered distributions to read.
 //!
 //! ### What this parser exposes
 //!
@@ -59,10 +63,13 @@
 
 use oxideav_core::{Error, Result};
 
+use crate::ans::hybrid::HybridUintState;
 use crate::bitreader::{BitReader, U32Dist};
 use crate::coeff_order::{
-    coefficient_count, natural_coeff_order, OrderId, COEFFICIENTS_PER_ORDER, NUM_ORDERS,
+    coefficient_count, decode_permutation_from_stream, natural_coeff_order, OrderId,
+    COEFFICIENTS_PER_ORDER, NUM_ORDERS,
 };
+use crate::modular_fdis::EntropyStream;
 
 /// `HfPass` bundle for a single preset (§C.7.1 + §C.7.2).
 #[derive(Debug, Clone)]
@@ -74,8 +81,8 @@ pub struct HfPass {
     /// Final coefficient order per [`OrderId`]. Length = 13. For an
     /// order whose `used_orders` bit is 0, this is exactly
     /// [`natural_coeff_order(o)`]; for an order whose bit is 1, the
-    /// permutation is `natural_coeff_order[nat_ord_perm[i]]` (round
-    /// 90 defers the `nat_ord_perm` decode — see module docs).
+    /// permutation is `natural_coeff_order[nat_ord_perm[i]]`, where
+    /// `nat_ord_perm` is the §C.3.2 `DecodePermutation()` result.
     pub orders: [Vec<u32>; NUM_ORDERS],
     /// Number of clustered distributions the §C.7.2 step reads from
     /// the codestream: `495 × num_hf_presets × nb_block_ctx`. The
@@ -95,9 +102,13 @@ impl HfPass {
     ///   the parser uses them only to compute
     ///   `num_histogram_distributions`.
     ///
-    /// Returns `Err(Unsupported)` when `used_orders != 0` (deferred to
-    /// round 91 — see module docs); returns `Err(InvalidData)` when
-    /// the parsed `used_orders` exceeds its 13-bit cap (defensive: the
+    /// When `used_orders != 0` the decoder reads the shared 8-cluster
+    /// ANS stream (Listing C.12) once and then a `DecodePermutation()`
+    /// (§C.3.2) for each set bit, building the permuted coefficient
+    /// order `order[i] = natural_coeff_order[nat_ord_perm[i]]`.
+    ///
+    /// Returns `Err(InvalidData)` when the parsed `used_orders` exceeds
+    /// its 13-bit cap (defensive: the
     /// `U32(Val(0x5F), Val(0x13), Val(0), Bits(13))` selector should
     /// never yield a value > `0x1FFF` for the explicit-bits arm or one
     /// of the three sentinel values `0x5F` / `0x13` / `0`).
@@ -117,18 +128,19 @@ impl HfPass {
             )));
         }
 
-        if used_orders != 0 {
-            // The non-zero branch needs the shared 8-cluster ANS
-            // stream (which the §C.7.2 histograms also consume).
-            // Round 91 work.
-            return Err(Error::Unsupported(format!(
-                "JXL HfPass: used_orders = 0x{used_orders:X} (≠ 0) requires the per-pass shared \
-                 ANS stream + DecodePermutation() — round 91+ work"
-            )));
-        }
-
-        // used_orders == 0 → every order is the natural order.
-        let orders = build_natural_orders();
+        let orders = if used_orders != 0 {
+            // Listing C.12: "read 8 clustered distributions D according
+            // to subclause D.3". The same 8-distribution stream + ANS
+            // state is shared by EVERY DecodePermutation() call in the
+            // per-bit loop below — it is read ONCE here.
+            let mut entropy = EntropyStream::read(br, 8)?;
+            entropy.read_ans_state_init(br)?;
+            let mut hybrid = HybridUintState::new(entropy.lz77, entropy.lz_len_conf);
+            build_permuted_orders(br, &mut entropy, &mut hybrid, used_orders)?
+        } else {
+            // used_orders == 0 → every order is the natural order.
+            build_natural_orders()
+        };
 
         // §C.7.2: number of clustered distributions.
         let num_histogram_distributions = 495u64 * num_hf_presets as u64 * nb_block_ctx as u64;
@@ -163,6 +175,60 @@ fn build_natural_orders() -> [Vec<u32>; NUM_ORDERS] {
         natural_coeff_order(OrderId::Id11),
         natural_coeff_order(OrderId::Id12),
     ]
+}
+
+/// Build the 13-element order set when `used_orders != 0`, decoding a
+/// permutation for each set bit (Listing C.12 + §C.7.1 DecodePermutation).
+///
+/// Per Listing C.12, for every order ID `b` in 0..13:
+///
+/// * if `used_orders & (1 << b)` is set, decode `nat_ord_perm =
+///   DecodePermutation()` and set `order[i] =
+///   natural_coeff_order[nat_ord_perm[i]]`;
+/// * otherwise `order[i] = natural_coeff_order[i]` (the natural order).
+///
+/// §C.7.1 fixes the `DecodePermutation()` parameters: `size` is the
+/// number of coefficients covered by the order's `dcts` (i.e.
+/// [`coefficient_count`]), and `skip = size / 64`. The `entropy` +
+/// `hybrid` state is the single shared 8-distribution stream read once
+/// by the caller; it is threaded across every set-bit permutation.
+fn build_permuted_orders(
+    br: &mut BitReader<'_>,
+    entropy: &mut EntropyStream,
+    hybrid: &mut HybridUintState,
+    used_orders: u32,
+) -> Result<[Vec<u32>; NUM_ORDERS]> {
+    // Start from the all-natural baseline; overwrite the permuted ones.
+    let mut orders = build_natural_orders();
+    for b in 0..NUM_ORDERS as u32 {
+        if (used_orders & (1 << b)) == 0 {
+            continue;
+        }
+        let order_id = OrderId::from_index(b)?;
+        let natural = natural_coeff_order(order_id);
+        let size = natural.len();
+        let skip = size / 64;
+        let nat_ord_perm = decode_permutation_from_stream(br, entropy, hybrid, size, skip)?;
+        if nat_ord_perm.len() != size {
+            return Err(Error::InvalidData(format!(
+                "JXL HfPass: DecodePermutation for order {b} returned {} entries (expected {size})",
+                nat_ord_perm.len()
+            )));
+        }
+        // order[i] = natural_coeff_order[nat_ord_perm[i]].
+        let mut permuted = Vec::with_capacity(size);
+        for &p in &nat_ord_perm {
+            let pi = p as usize;
+            let v = *natural.get(pi).ok_or_else(|| {
+                Error::InvalidData(format!(
+                    "JXL HfPass: permutation index {pi} out of range for order {b} (size {size})"
+                ))
+            })?;
+            permuted.push(v);
+        }
+        orders[b as usize] = permuted;
+    }
+    Ok(orders)
 }
 
 /// Read all `num_hf_presets` HfPass bundles per §C.7.1 opening
@@ -238,20 +304,30 @@ mod tests {
     }
 
     #[test]
-    fn hf_pass_used_orders_5f_unsupported() {
+    fn hf_pass_used_orders_5f_attempts_stream() {
+        // used_orders = 0x5F (≠ 0) now takes the DecodePermutation path:
+        // the parser reads the shared 8-distribution stream. With only
+        // the `used_orders` selector bits packed, the truncated stream
+        // produces an error — but NOT the old `Unsupported` deferral.
         let bytes = pack_used_orders_5f();
         let mut br = BitReader::new(&bytes);
         let r = HfPass::read(&mut br, 1, 1);
-        assert!(matches!(r, Err(Error::Unsupported(_))));
+        assert!(r.is_err());
+        assert!(
+            !matches!(r, Err(Error::Unsupported(_))),
+            "used_orders != 0 must no longer return Unsupported"
+        );
     }
 
     #[test]
-    fn hf_pass_used_orders_explicit_bits_unsupported() {
-        // used_orders = 0x0007 (3 bits set; not 0).
+    fn hf_pass_used_orders_explicit_bits_attempts_stream() {
+        // used_orders = 0x0007 (3 bits set; not 0) → same: the stream
+        // read is attempted, no Unsupported deferral.
         let bytes = pack_used_orders_arbitrary(0x0007);
         let mut br = BitReader::new(&bytes);
         let r = HfPass::read(&mut br, 1, 1);
-        assert!(matches!(r, Err(Error::Unsupported(_))));
+        assert!(r.is_err());
+        assert!(!matches!(r, Err(Error::Unsupported(_))));
     }
 
     #[test]

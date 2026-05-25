@@ -69,7 +69,10 @@
 
 use oxideav_core::{Error, Result};
 
+use crate::ans::hybrid::HybridUintState;
+use crate::bitreader::BitReader;
 use crate::dct_select::TransformType;
+use crate::modular_fdis::{decode_uint_in_with_dist_pub, EntropyStream};
 
 /// `Order ID` per Table I.1. Each DctSelect value maps to one of 13
 /// order IDs; orders 1, 4, 5, 6, 8, 10, 12 are shared by two or three
@@ -290,6 +293,131 @@ fn listing_i14_keys(x: u32, y: u32, cx: u32, cy: u32, m: u32) -> (u32, i64) {
         key2 = -key2;
     }
     (key1 as u32, key2)
+}
+
+/// `GetContext(x) = min(8, ceil(log2(x + 1)))` per FDIS §C.3.2.
+///
+/// The eight clustered distributions `D` are indexed by `GetContext`,
+/// whose range is 0..=8. Callers cap the value at 7 before using it as
+/// a distribution context because there are only 8 distributions
+/// (indices 0..=7) — this matches the existing TOC permutation reader
+/// (`crate::toc`).
+fn get_context(x: u32) -> u32 {
+    if x <= 1 {
+        // ceil(log2(0+1)) = 0; ceil(log2(1+1)) = 1.
+        x
+    } else {
+        let nbits = 32 - x.leading_zeros();
+        nbits.min(8)
+    }
+}
+
+/// FDIS §C.3.2 — decode one permutation of length `size` from an already
+/// set-up entropy stream, with the given `skip`.
+///
+/// This is the generic Lehmer-code → permutation procedure used by both
+/// the TOC (`crate::toc`, with `skip = 0`, where the stream is built
+/// inline) and the HfPass `DecodePermutation()` step (Listing C.12,
+/// with `skip = size / 64`). For HfPass the **same** 8-distribution
+/// stream + ANS state is shared across every set `used_orders` bit
+/// (Listing C.12 reads "8 clustered distributions D" once), so this
+/// helper takes the `EntropyStream` + `HybridUintState` by mutable
+/// reference and threads them across calls.
+///
+/// Procedure (verbatim §C.3.2):
+///
+/// > The decoder first decodes an integer `end`, as specified in D.3.6,
+/// > using distribution `D[GetContext(size)]`. Then, `(end - skip)`
+/// > elements of the lehmer sequence are produced as follows. For each
+/// > element, an integer `lehmer[skip + i]` is read as specified in
+/// > D.3.6 using the distribution `D[prev_elem]`. `prev_elem` is
+/// > `lehmer[skip + i - 1]` if `i > 0`, or `0` otherwise. All other
+/// > elements of the sequence lehmer are 0.
+/// >
+/// > The decoder maintains a sequence `temp`, initially `[0, size)` in
+/// > increasing order, and a sequence `permutation`, initially empty.
+/// > Then, for each `i` in `[0, size)`, the decoder appends
+/// > `temp[lehmer[i]]` to permutation, then removes it from temp,
+/// > leaving the relative order of other elements unchanged.
+///
+/// The caller is responsible for having already read the §D.3 prelude
+/// (`EntropyStream::read(br, 8)`) and the ANS state init
+/// (`EntropyStream::read_ans_state_init`).
+pub fn decode_permutation_from_stream(
+    br: &mut BitReader<'_>,
+    entropy: &mut EntropyStream,
+    hybrid: &mut HybridUintState,
+    size: usize,
+    skip: usize,
+) -> Result<Vec<u32>> {
+    if skip > size {
+        return Err(Error::InvalidData(format!(
+            "JXL coeff permutation: skip {skip} exceeds size {size}"
+        )));
+    }
+    if size == 0 {
+        return Ok(Vec::new());
+    }
+
+    // `end` is decoded against D[GetContext(size)] (capped at 7: only
+    // 8 distributions exist).
+    let end_ctx = get_context(size as u32).min(7);
+    let end = decode_uint_in_with_dist_pub(hybrid, entropy, br, end_ctx, 0)? as usize;
+    if end < skip || end > size {
+        return Err(Error::InvalidData(format!(
+            "JXL coeff permutation: end {end} out of range [skip={skip}, size={size}]"
+        )));
+    }
+
+    // `(end - skip)` Lehmer entries are produced; indices [skip, end).
+    // All other lehmer entries stay 0.
+    let mut lehmer = vec![0u32; size];
+    let mut prev: u32 = 0;
+    for slot in lehmer.iter_mut().take(end).skip(skip) {
+        let ctx = get_context(prev).min(7);
+        let v = decode_uint_in_with_dist_pub(hybrid, entropy, br, ctx, 0)?;
+        // lehmer[i] indexes the (shrinking) `temp` array, so it must be
+        // strictly less than the remaining temp length at that step.
+        // The tightest static bound is `< size`; the exact-length check
+        // happens in the `temp.remove` loop below.
+        if v as usize >= size {
+            return Err(Error::InvalidData(format!(
+                "JXL coeff permutation: lehmer entry {v} >= size {size}"
+            )));
+        }
+        *slot = v;
+        prev = v;
+    }
+
+    lehmer_to_permutation(&lehmer)
+}
+
+/// FDIS §C.3.2 final step — turn a Lehmer code into a permutation.
+///
+/// > The decoder maintains a sequence `temp`, initially `[0, size)` in
+/// > increasing order, and a sequence `permutation`, initially empty.
+/// > Then, for each `i` in `[0, size)`, the decoder appends
+/// > `temp[lehmer[i]]` to permutation, then removes it from temp,
+/// > leaving the relative order of other elements unchanged.
+///
+/// `size` is `lehmer.len()`. Each `lehmer[i]` must index into the
+/// remaining `temp` (length `size - i`), so it must be in
+/// `[0, size - i)`; otherwise the code is malformed.
+fn lehmer_to_permutation(lehmer: &[u32]) -> Result<Vec<u32>> {
+    let size = lehmer.len();
+    let mut temp: Vec<u32> = (0..size as u32).collect();
+    let mut permutation: Vec<u32> = Vec::with_capacity(size);
+    for &lh in lehmer {
+        let idx = lh as usize;
+        if idx >= temp.len() {
+            return Err(Error::InvalidData(format!(
+                "JXL coeff permutation: lehmer index {idx} out of range (temp len {})",
+                temp.len()
+            )));
+        }
+        permutation.push(temp.remove(idx));
+    }
+    Ok(permutation)
 }
 
 #[cfg(test)]
@@ -524,5 +652,70 @@ mod tests {
         //   key2 = 1 - 0 = 1; key1 % 2 == 1 → key2 = -1.
         let (k1, k2) = listing_i14_keys(1, 0, 2, 1, 2);
         assert_eq!((k1, k2), (1, -1));
+    }
+
+    #[test]
+    fn get_context_matches_spec() {
+        // GetContext(x) = min(8, ceil(log2(x + 1))).
+        assert_eq!(get_context(0), 0); // ceil(log2(1)) = 0
+        assert_eq!(get_context(1), 1); // ceil(log2(2)) = 1
+        assert_eq!(get_context(2), 2); // ceil(log2(3)) = 2
+        assert_eq!(get_context(3), 2); // ceil(log2(4)) = 2
+        assert_eq!(get_context(4), 3); // ceil(log2(5)) = 3
+        assert_eq!(get_context(7), 3); // ceil(log2(8)) = 3
+        assert_eq!(get_context(8), 4); // ceil(log2(9)) = 4
+                                       // Saturates at 8.
+        assert_eq!(get_context(255), 8);
+        assert_eq!(get_context(256), 8);
+        assert_eq!(get_context(u32::MAX), 8);
+    }
+
+    #[test]
+    fn lehmer_all_zero_is_identity() {
+        // An all-zero Lehmer code always picks temp[0] each step → the
+        // identity permutation. This is the `end == skip` case (no
+        // non-zero Lehmer entries) that DecodePermutation produces for
+        // an unmodified natural order.
+        let lehmer = vec![0u32; 6];
+        let perm = lehmer_to_permutation(&lehmer).unwrap();
+        assert_eq!(perm, vec![0, 1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn lehmer_reverse_permutation() {
+        // To reverse [0,1,2,3]: pick the LAST remaining element each
+        // step. temp = [0,1,2,3]; lehmer = [3,2,1,0]:
+        //   i=0: temp[3]=3, temp=[0,1,2]
+        //   i=1: temp[2]=2, temp=[0,1]
+        //   i=2: temp[1]=1, temp=[0]
+        //   i=3: temp[0]=0
+        // → permutation = [3,2,1,0].
+        let perm = lehmer_to_permutation(&[3, 2, 1, 0]).unwrap();
+        assert_eq!(perm, vec![3, 2, 1, 0]);
+    }
+
+    #[test]
+    fn lehmer_spec_temp_shuffle_example() {
+        // temp = [0,1,2,3,4]; lehmer = [2,0,2,0,0]:
+        //   i=0: temp[2]=2, temp=[0,1,3,4]
+        //   i=1: temp[0]=0, temp=[1,3,4]
+        //   i=2: temp[2]=4, temp=[1,3]
+        //   i=3: temp[0]=1, temp=[3]
+        //   i=4: temp[0]=3
+        // → [2,0,4,1,3].
+        let perm = lehmer_to_permutation(&[2, 0, 2, 0, 0]).unwrap();
+        assert_eq!(perm, vec![2, 0, 4, 1, 3]);
+        // Result is always a valid permutation of 0..len.
+        let mut sorted = perm.clone();
+        sorted.sort_unstable();
+        assert_eq!(sorted, vec![0, 1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn lehmer_out_of_range_index_rejected() {
+        // lehmer[0] = 5 but temp only has 5 elements (indices 0..=4).
+        assert!(lehmer_to_permutation(&[5, 0, 0, 0, 0]).is_err());
+        // lehmer[1] = 4 after one removal temp has only 4 elements.
+        assert!(lehmer_to_permutation(&[0, 4, 0, 0, 0]).is_err());
     }
 }

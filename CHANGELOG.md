@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Round 133 (2021-FDIS / 2024-spec) — §C.7.1 `DecodePermutation()`
+  for `used_orders != 0`.** `HfPass::read` now handles the
+  non-natural coefficient-order path of Listing C.12: the shared
+  "8 clustered distributions D" are read once into a
+  `modular_fdis::EntropyStream` (`num_dist = 8`) with its ANS state
+  initialised, then each set `used_orders` bit runs the §C.3.2
+  Lehmer-code permutation against that same stream. New public
+  `coeff_order::decode_permutation_from_stream(br, entropy, hybrid,
+  size, skip)` factors the §C.3.2 procedure generically (the same
+  algorithm the TOC `permuted_toc` path uses); §C.7.1 supplies
+  `size = coefficient_count(order)` and `skip = size / 64`, yielding
+  `order[i] = natural_coeff_order[nat_ord_perm[i]]`. `HfPass::read`
+  no longer returns `Error::Unsupported` for `used_orders != 0`.
+  Adds `get_context` + `lehmer_to_permutation` unit coverage and
+  rewrites the two former `hf_pass` `Unsupported` tests to assert the
+  stream-read path is now taken.
+
 - **Round 129 (2021-FDIS / 2024-spec) — per-varblock LF→LLF
   composition glue (§I.2.5 plumbing).** Three new public functions
   in `vardct` that compose the round-121
