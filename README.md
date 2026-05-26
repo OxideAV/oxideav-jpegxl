@@ -5,6 +5,30 @@ Pure-Rust **JPEG XL** (ISO/IEC 18181-1:2024) decoder. Resumed
 trace-doc-driven rounds 7-11 + encoder rounds 1-6 were retired
 (see "Why retired (history)" below).
 
+**Round 141 (2026-05-26)** lands the Annex J.2 "Gabor-like
+transform" pure-math primitive (page 85). New `gaborish` module
+exposes the §6.5 `Mirror1D` boundary helper, `gab_kernel(w1, w2)
+-> [f32; 9]` (the normalised 3×3 symmetric kernel `(centre = 1,
+edges = w1, corners = w2)` rescaled so its nine entries sum to 1),
+`apply_channel` / `apply_channel_in_place` (per-channel
+convolution with an interior fast path plus mirror-extended edge
+fallback), and the three-channel
+`apply_xyb_planes_in_place(x, y, b, w, h, &RestorationFilter)`
+convenience that dispatches the per-channel `gab_x_*` /
+`gab_y_*` / `gab_b_*` weight pair. 23 new unit tests + 10
+integration tests (`round141_gaborish`) pin Mirror1D's identity,
+first-reflection, and single-row collapse cases, the default-
+weight kernel sum-to-one (`≈ 1.7057 → 1.0`) and centre tap
+(`≈ 0.586`), kernel symmetry, identity-kernel pass-through,
+constant-plane invariance, the impulse response on a 3×3 plane,
+linearity of the convolution operator, and the per-channel
+dispatch through `apply_xyb_planes_in_place`. Lib tests 462 →
+485. Pure-math primitive in the same shape as round-89
+`dct_quant_weights`, round-95 `hf_dequant`, round-121
+`llf_from_lf`, and round-138 `chroma_from_luma`. §J.3
+edge-preserving filter and the `rf.gab` boolean skip remain
+caller responsibilities (deferred to follow-up rounds).
+
 **Round 138 (2026-05-26)** lands the Annex G "Chroma from luma"
 pure-math primitive (Listing G.1). New `chroma_from_luma` module
 exposes `kx_kb_lf` / `kx_kb_hf` (per-tile `(kX, kB)` from a

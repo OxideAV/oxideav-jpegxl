@@ -493,6 +493,7 @@ pub mod dct_quant_weights;
 pub mod dct_select;
 pub mod extensions;
 pub mod frame_header;
+pub mod gaborish;
 pub mod global_modular;
 pub mod hf_dequant;
 pub mod hf_global;

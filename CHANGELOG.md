@@ -9,6 +9,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Round 141 (2021-FDIS / 2024-spec) — Annex J.2 "Gabor-like
+  transform" pure-math primitive (page 85).** New `src/gaborish.rs`
+  module transcribes FDIS §J.2 verbatim: given a per-channel plane
+  of f32 samples (the output of §I.2.5 LLF/HF reconstruction + the
+  round-138 Annex G chroma-from-luma chain) and the per-channel
+  `gab_C_weight1` / `gab_C_weight2` weights carried by
+  [`frame_header::RestorationFilter`] (Table C.9), the module applies
+  the spec's symmetric 3×3 convolution `(centre = 1, edges = w1,
+  corners = w2)`, rescaled uniformly so the nine kernel entries
+  sum to 1, with §6.5 `Mirror1D` boundary handling on
+  out-of-image references. Public API: `mirror1d(coord, size)`
+  (Listing 6.1 iterative form), `sample_mirror(plane, w, h, x, y)`
+  (direct §6.5 fetch), `gab_kernel(w1, w2) -> [f32; 9]`
+  (materialised normalized kernel in row-major order), `apply_channel`
+  (out-of-place per-channel convolution with an interior fast path
+  + edge-mirror fallback), `apply_channel_in_place` (single-buffer
+  scratch convenience), and `apply_xyb_planes_in_place(x, y, b, w,
+  h, &rf)` (the three-channel XYB-pipeline convenience using
+  `rf.gab_x_weight*` / `gab_y_weight*` / `gab_b_weight*`). 23 new
+  unit tests + 10 new integration tests (`round141_gaborish`) pin
+  Mirror1D's identity / first-reflection / single-row collapse
+  cases, the default-weight kernel sum-to-one and centre-tap
+  (`≈ 0.586`) values, the four-edge / four-corner kernel symmetry,
+  identity-kernel pass-through, constant-plane invariance, the
+  per-channel impulse response on a 3×3 plane, linearity of the
+  convolution operator, single-row mirror-collapse, and the
+  per-channel dispatch through `apply_xyb_planes_in_place`. Lib
+  tests 462 → 485. This is a pure-math primitive in the same shape
+  as round-89 `dct_quant_weights`, round-95 `hf_dequant`, round-121
+  `llf_from_lf`, and round-138 `chroma_from_luma`: it lands the
+  bit-exact arithmetic so a future round wiring §J.2 into the
+  per-frame restoration-filter pipeline can drop it in without
+  re-deriving the kernel or the mirror semantics. Does NOT
+  implement §J.3 (edge-preserving filter) and does NOT honour the
+  `rf.gab` skip — both are the caller's responsibility.
+
 - **Round 138 (2021-FDIS / 2024-spec) — Annex G "Chroma from luma"
   pure-math primitive (Listing G.1).** New `src/chroma_from_luma.rs`
   module transcribes FDIS Annex G (page 73) verbatim: given the
