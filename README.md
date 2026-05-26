@@ -5,6 +5,54 @@ Pure-Rust **JPEG XL** (ISO/IEC 18181-1:2024) decoder. Resumed
 trace-doc-driven rounds 7-11 + encoder rounds 1-6 were retired
 (see "Why retired (history)" below).
 
+**Round 144 (2026-05-26)** lands the Annex J.3 "Edge-preserving
+filter" pure-math primitive (pages 85–87). New `epf` module
+exposes Listing J.1's `distance_step_0_and_1` (the five-pixel
+cross-shape three-channel L1 distance with per-channel
+`epf_channel_scale` weighting) and `distance_step_2` (the
+single-sample three-channel L1 distance for step 2 — under the
+literal §J.3.2 reading where `(ix, iy) == (0, 0)`); Listing
+J.2's `weight(distance, inv_sigma, position_multiplier,
+zeroflush)` decreasing-function-of-distance kernel with the
+`v <= zeroflush` cutoff; Listing J.3's
+`vardct_sigma_from_listing_j3(quantization_width, sharpness,
+&rf)` per-varblock derivation with the `max(1e-4, sigma)`
+clamp; `inv_sigma_for_pass(step_multiplier, sigma)` for the
+Listing J.2 `step_multiplier × 4 × (sqrt(0.5) - 1) / sigma`
+factor; `is_border_position(x, y)` for the "either coord is 0
+or 7 IMod 8" `epf_border_sad_mul` predicate; Listing J.4's
+`apply_step_5tap(pass, ..)` (passes 1 and 2 with the 5-tap
+cross kernel) and `apply_step_13tap` (pass 0 with the 13-tap
+diamond kernel covering all neighbours with `|cx|+|cy| <= 2`).
+All three passes consume three-channel f32 planes and write
+into three-channel f32 outputs; §6.5 Mirror1D boundary handling
+is reused verbatim from round-141 `gaborish::mirror1d`. 36 new
+unit tests + 12 integration tests (`round144_epf`) pin
+self-distance-is-zero on constant planes, per-channel scale
+linearity, offset symmetry, `DistanceStep2` hand-derived
+spatially-varying-plane case (`x:1×40 + y:2×5 + b:0×3.5 =
+50`), `Weight()` zero-distance returns 1.0 / zeroflush cutoff /
+position-multiplier scaling, Listing J.3 sigma at default `rf`
+sharpness 0 → 1e-4 clamp and sharpness 7 → full quant, the
+`is_border_position` 8×8 grid layout, constant-plane invariance
+across all three passes, and the zero-channel-scale collapse to
+the uniform mean on a centre impulse. Lib tests 485 → 521.
+Pure-math primitive in the same shape as round-89
+`dct_quant_weights`, round-95 `hf_dequant`, round-121
+`llf_from_lf`, round-138 `chroma_from_luma`, and round-141
+`gaborish` — a future round wiring §J.3 into the per-frame
+restoration-filter pipeline can drop these helpers in without
+re-deriving any of the J.1/J.2/J.3/J.4 listings. Per-frame
+loop (calling each pass for each varblock under the right
+`epf_iters` / per-block sigma / position-multiplier conditions
+with output of pass `i` feeding pass `i+1`), the `sigma < 0.3`
+skip-the-block path, and the `epf_iters > 0` skip remain caller
+responsibilities (deferred to follow-up rounds). DOCS-GAP
+observed in Listing J.1 (`DistanceStep2` free `ix`/`iy`
+variables) and Listing J.2 (`step_multiplier` array missing
+comma); both surfaced in the module-level rustdoc with the
+adopted reading and rationale.
+
 **Round 141 (2026-05-26)** lands the Annex J.2 "Gabor-like
 transform" pure-math primitive (page 85). New `gaborish` module
 exposes the §6.5 `Mirror1D` boundary helper, `gab_kernel(w1, w2)

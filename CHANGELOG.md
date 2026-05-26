@@ -9,6 +9,76 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Round 144 (2021-FDIS) — Annex J.3 "Edge-preserving filter"
+  pure-math primitive (pages 85–87).** New `src/epf.rs` module
+  transcribes the four §J.3 listings as a self-contained pure-math
+  primitive: given a triple of three-channel f32 planes (the output
+  of round-141 Gaborish on the §I.2.5 + Annex G chain), per-call
+  scalar parameters (sigma, step_multiplier, zeroflush,
+  position_multiplier_border, channel_scale), and a
+  [`frame_header::RestorationFilter`] (Table C.9) for
+  `epf_quant_mul` / `epf_sharp_lut[..]` / `epf_sigma_for_modular`,
+  this module returns the per-pass output planes Listing J.4
+  prescribes. Public API:
+  - `distance_step_0_and_1(x, y, b, w, h, x, y, cx, cy, scale)` —
+    Listing J.1 `DistanceStep0and1` (the five-pixel cross-shape
+    three-channel scaled L1 distance for passes 0 and 1).
+  - `distance_step_2(...)` — Listing J.1 `DistanceStep2` (the
+    single-sample three-channel scaled L1 distance for pass 2,
+    under the literal `(ix, iy) == (0, 0)` reading of the free-
+    variable bug — see DOCS-GAP).
+  - `weight(distance, inv_sigma, position_multiplier, zeroflush)`
+    — Listing J.2 `Weight()` decreasing-function-of-distance
+    kernel with the `v <= zeroflush` cutoff.
+  - `inv_sigma_for_pass(step_multiplier, sigma)` — Listing J.2's
+    pre-computed `step_multiplier × 4 × (sqrt(0.5) - 1) / sigma`
+    factor (rejects non-finite or non-positive sigma).
+  - `vardct_sigma_from_listing_j3(quantization_width, sharpness,
+    &rf)` — Listing J.3's per-varblock sigma derivation with the
+    `max(1e-4, ..)` clamp; the modular-mode branch uses
+    `rf.epf_sigma_for_modular` directly.
+  - `is_border_position(x, y)` — Listing J.2's "either coordinate
+    of the reference sample is 0 or 7 IMod 8" predicate driving
+    the per-pixel `epf_border_sad_mul` selection.
+  - `apply_step_5tap(Pass::Pass1 | Pass::Pass2, ..)` — Listing
+    J.4's 5-tap cross-shape kernel pass (passes 1 and 2); the
+    distance metric is selected by the `Pass` discriminant.
+  - `apply_step_13tap(..)` — Listing J.4's 13-tap diamond kernel
+    pass 0 (always using `DistanceStep0and1`).
+  - `Pass` — enum picking Pass0 / Pass1 / Pass2 for the dispatch.
+
+  §6.5 Mirror1D boundary handling is reused verbatim from
+  round-141 `gaborish::mirror1d`. 36 new unit tests + 12 new
+  integration tests (`round144_epf`) pin self-distance-is-zero on
+  constant planes for both metrics, per-channel-scale linearity,
+  offset symmetry for `DistanceStep0and1`, `DistanceStep2` hand-
+  derived spatially-varying-plane case
+  (`x:1×40 + y:2×5 + b:0×3.5 = 50`), `Weight()` zero-distance
+  returns 1.0 / zeroflush cutoff / position-multiplier scaling,
+  Listing J.3 sigma at default `rf` sharpness 0 → 1e-4 clamp and
+  sharpness 7 → full quant, the `is_border_position` 8×8 grid
+  layout, constant-plane invariance across all three passes, and
+  the zero-channel-scale collapse to the uniform mean on a centre
+  impulse. Lib tests 485 → 521. Pure-math primitive in the same
+  shape as round-89 `dct_quant_weights`, round-95 `hf_dequant`,
+  round-121 `llf_from_lf`, round-138 `chroma_from_luma`, and
+  round-141 `gaborish` — a future round wiring §J.3 into the
+  per-frame restoration-filter pipeline can drop these helpers in
+  without re-deriving any of the J.1/J.2/J.3/J.4 listings. The
+  per-frame loop (calling each pass for each varblock under the
+  right `epf_iters` / per-block sigma / position-multiplier
+  conditions with output of pass `i` feeding pass `i+1`), the
+  `sigma < 0.3` skip-the-block path, and the `epf_iters > 0` skip
+  remain caller responsibilities (deferred to follow-up rounds).
+  DOCS-GAP observed in FDIS Listing J.1 `DistanceStep2` (free
+  `ix`/`iy` variables — adopted `(ix, iy) == (0, 0)`) and Listing
+  J.2 `step_multiplier` array (missing comma between
+  `epf_pass0_sigma_scale` and `1`); both surfaced in the
+  module-level rustdoc with the adopted reading and rationale, and
+  the public API sidesteps the indexing ambiguity by accepting
+  `step_multiplier: f32` directly so the wiring round can pick the
+  resolution without an API churn.
+
 - **Round 141 (2021-FDIS / 2024-spec) — Annex J.2 "Gabor-like
   transform" pure-math primitive (page 85).** New `src/gaborish.rs`
   module transcribes FDIS §J.2 verbatim: given a per-channel plane

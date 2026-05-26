@@ -491,6 +491,7 @@ pub mod coeff_order;
 pub mod container;
 pub mod dct_quant_weights;
 pub mod dct_select;
+pub mod epf;
 pub mod extensions;
 pub mod frame_header;
 pub mod gaborish;
