@@ -9,6 +9,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Round 150 (2021-FDIS) — Annex I.2.3.8 / Listing I.13 Inverse AFV
+  transform composition (`idct::idct_afv`).** Composes the round-147
+  `crate::afv::afv_idct` pure-math primitive (Listings I.5 + I.6)
+  with two `idct_2d` calls (one at 4×4, one at 4×8) per the
+  three-sub-block decomposition of Listing I.13 — yielding the
+  full 8×8 sample buffer for `TransformType::Afv0..Afv3`. With
+  this wiring the `idct::idct_for_transform` dispatcher routes
+  `Afv0..Afv3` to `idct_afv` instead of returning
+  `Err(Unsupported)`; all 10 non-DCT branches of Table I.4 are now
+  pure-math-complete (Hornuss / DCT2×2 / DCT4×4 / DCT8×4 / DCT4×8
+  + AFV0..AFV3). Each AFV variant's sub-block placement is
+  controlled by `flip_x = n & 1` / `flip_y = n >> 1` (§I.2.3.8);
+  the AFV sub-block additionally mirrors its read coordinates
+  (`flip_x == 1 ? 3 - ix : ix` and the iy dual) per the inner
+  loop of Listing I.13. Seven new property-style tests cover:
+  rejection of non-AFV transforms / wrong lengths; all-zero
+  input → all-zero output for all four variants; DC-only input
+  → constant `c(0,0)` output (the three DC patches `(c00+c01+c10)
+  × 4`, `c00-c01+c10`, `c00-c01` collapse to `4·1`, `1`, `1`
+  respectively, with each sub-block's IDCT mapping a DC-only
+  cell to a constant sub-block since AFVBasis row 0 = `[0.25;
+  16]` and `IDCT_2D` DC-only is constant); dense-AC input →
+  every cell written; AFV0↔AFV1 x-axis flip swaps the AFV
+  sub-block column reads; AFV0↔AFV2 y-axis flip swaps the 4×8
+  sub-block y-band placement; linearity. Test-count delta:
+  `+7` (531 → 538).
+
+  **FDIS typo documented in module docs.** Listing I.13's final
+  source line reads `samples_4×4(ix, iy)` but the inner loop
+  iterates `ix ∈ [0..8)` and `samples_4×4` only has columns
+  `0..3`, while the immediately preceding line computes
+  `samples_4×8 = IDCT_2D(coeffs_4×8)`. Implementation reads from
+  `samples_4×8` per context; the typo is now annotated alongside
+  the existing four Annex D / D.3 typos in the project
+  FDIS-typo memory.
+
 - **Round 147 (2021-FDIS) — Annex I.2.2 AFV basis + `AFV_IDCT`
   pure-math primitive (Listings I.5 + I.6, p. 76).** New
   `src/afv.rs` module transcribes the orthonormal `AFVBasis[16][16]`

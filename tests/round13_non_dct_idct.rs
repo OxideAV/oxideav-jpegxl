@@ -14,9 +14,10 @@
 //!
 //! These tests cross-check the public API surface and confirm that
 //! dispatching through `idct_for_transform` for the corresponding
-//! `TransformType` reaches the right helper. AFV0..AFV3 remain
-//! `Err(Unsupported)` — see the round-12 regression test for the
-//! AFV-stays-unsupported assertion.
+//! `TransformType` reaches the right helper. AFV0..AFV3 routing
+//! through `idct_afv` (Listing I.13) landed r150 — see the
+//! corresponding round-12 regression test for the four-AFV-dispatch
+//! assertion + `round147_afv_idct` for `AFV_IDCT` primitive coverage.
 
 use oxideav_jpegxl::dct_select::TransformType;
 use oxideav_jpegxl::idct::{

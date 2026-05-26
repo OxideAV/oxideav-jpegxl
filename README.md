@@ -5,6 +5,31 @@ Pure-Rust **JPEG XL** (ISO/IEC 18181-1:2024) decoder. Resumed
 trace-doc-driven rounds 7-11 + encoder rounds 1-6 were retired
 (see "Why retired (history)" below).
 
+**Round 150 (2026-05-26)** wires the round-147 `AFV_IDCT` primitive
+into `idct::idct_for_transform` via §I.2.3.8 / Listing I.13 (Inverse
+AFV transform). New `idct::idct_afv(coefficients: &[f32], t:
+TransformType) -> Result<Vec<f32>>` composes one `afv_idct` call (the
+AFV 4×4 sub-block, Listing I.6) with two `idct_2d` calls (one at
+4×4, one at 4×8) and the per-variant `flip_x = n & 1` / `flip_y = n
+>> 1` axes — yielding the full 8×8 sample buffer for
+`TransformType::Afv0..Afv3`. The dispatcher now routes all four AFV
+variants to `idct_afv` instead of returning `Err(Unsupported)`,
+finishing the non-DCT IDCT family (Hornuss / DCT2×2 / DCT4×4 /
+DCT8×4 / DCT4×8 + AFV0..AFV3 are all pure-math-complete). Seven new
+property-style tests cover length / non-AFV rejection, all-zero
+pass-through, DC-only → constant 1.0 (the three DC patches
+`(c00+c01+c10)×4`, `c00-c01+c10`, `c00-c01` reduce to `4`, `1`, `1`
+and each sub-block IDCT maps a DC-only cell to a constant
+sub-block), dense-AC coverage, the AFV0↔AFV1 x-axis flip, the
+AFV0↔AFV2 y-axis flip, and full-block linearity. Lib tests 531 →
+538. One additional FDIS typo documented in the module doc:
+Listing I.13's final source line reads `samples_4×4(ix, iy)` but
+`ix` iterates `0..8` while `samples_4×4` only has columns `0..3`,
+and the immediately preceding line computes `samples_4×8 =
+IDCT_2D(coeffs_4×8)`; implementation reads from `samples_4×8` per
+context. The full VarDCT IDCT dispatch (`idct_for_transform`) is
+now usable for every Table I.4 transform.
+
 **Round 147 (2026-05-26)** lands the Annex I.2.2 AFV basis +
 `AFV_IDCT` pure-math primitive (FDIS Listings I.5 + I.6, page 76).
 New `afv` module exposes the orthonormal `AFV_BASIS: [[f32; 16];

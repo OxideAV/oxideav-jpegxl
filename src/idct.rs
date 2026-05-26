@@ -70,11 +70,12 @@
 //! * [`idct_dct4x8`] — Annex I.9.7: dual of `dct8x4`, splitting the
 //!   first two coefficient rows into two 4×8 horizontal sub-blocks.
 //!
-//! AFV0..AFV3 (I.9.8) remain `Err(Unsupported)` pending an
-//! independently-verified `AFVBasis[16][16]` table (PDF transcription of
-//! 256 floats is too high-risk for this round; deferred so the table
-//! can be cross-checked against an orthonormality property test as a
-//! followup).
+//! Round 147 lands the `AFVBasis[16][16]` table + `AFV_IDCT` cell-sum
+//! (Listings I.5 + I.6) as `crate::afv::{AFV_BASIS, afv_idct}`. Round
+//! 150 then composes them with two `IDCT_2D` calls per Listing I.13
+//! (§I.2.3.8 Inverse AFV transform) in [`idct_afv`], lifting the
+//! AFV0..AFV3 branch of [`idct_for_transform`] out of its previous
+//! `Err(Unsupported)` state.
 
 use oxideav_core::{Error, Result};
 
@@ -281,10 +282,11 @@ pub fn dct_pixel_dims(t: TransformType) -> Option<(usize, usize)> {
         TransformType::Dct256x128 => Some((256, 128)),
         TransformType::Dct128x256 => Some((128, 256)),
         // Non-DCT transforms: Hornuss, DCT2x2, DCT4x4, DCT4x8, DCT8x4,
-        // AFV0..AFV3. Their IDCT path lives in I.9.3..I.9.8 and the
-        // dispatcher [`idct_for_transform`] routes them through
-        // dedicated helpers ([`idct_dct2x2`], [`idct_dct4x4`],
-        // [`idct_hornuss`], [`idct_dct8x4`], [`idct_dct4x8`]) instead.
+        // AFV0..AFV3. Their IDCT path lives in I.9.3..I.9.8 (and
+        // I.2.3.8 for AFV) and the dispatcher [`idct_for_transform`]
+        // routes them through dedicated helpers ([`idct_dct2x2`],
+        // [`idct_dct4x4`], [`idct_hornuss`], [`idct_dct8x4`],
+        // [`idct_dct4x8`], [`idct_afv`]) instead.
         TransformType::Hornuss
         | TransformType::Dct2x2
         | TransformType::Dct4x4
@@ -326,8 +328,9 @@ pub fn non_dct_pixel_dims(t: TransformType) -> Option<(usize, usize)> {
 /// * `DCT2×2` / `DCT4×4` / `Hornuss` / `DCT8×4` / `DCT4×8` route through
 ///   their dedicated helpers and return an 8×8 sample buffer
 ///   (`coefficients` and the result are both length 64, row-major).
-/// * `AFV0..AFV3` continue to return `Err(Unsupported)` pending the
-///   `AFVBasis` table (round 14+).
+/// * `AFV0..AFV3` route through [`idct_afv`] which composes the
+///   §I.2.2 `AFV_IDCT` primitive (landed r147) with two `IDCT_2D`
+///   sub-blocks per Listing I.13.
 pub fn idct_for_transform(t: TransformType, coefficients: &[f32]) -> Result<Vec<f32>> {
     if let Some((rows, cols)) = dct_pixel_dims(t) {
         return idct_2d(coefficients, rows, cols);
@@ -339,12 +342,179 @@ pub fn idct_for_transform(t: TransformType, coefficients: &[f32]) -> Result<Vec<
         TransformType::Dct8x4 => idct_dct8x4(coefficients),
         TransformType::Dct4x8 => idct_dct4x8(coefficients),
         TransformType::Afv0 | TransformType::Afv1 | TransformType::Afv2 | TransformType::Afv3 => {
-            Err(Error::Unsupported(format!(
-                "JXL idct_for_transform: AFV transform {t:?} (Annex I.9.8) requires a 256-entry AFVBasis table whose verified transcription is deferred to a later round"
-            )))
+            idct_afv(coefficients, t)
         }
         _ => unreachable!("dct_pixel_dims covers all plain-DCT TransformType variants"),
     }
+}
+
+/// `IDCT_AFV(coefficients, t)` per FDIS Listing I.13 (§I.2.3.8).
+///
+/// Composes the three pure-math primitives — [`crate::afv::afv_idct`]
+/// (the 4×4-as-flat-16 AFV inverse from Listing I.6, landed r147),
+/// plus two calls to [`idct_2d`] at shapes 4×4 and 4×8 — into the
+/// full 8×8 sample buffer for the `AFV0..AFV3` variants.
+///
+/// For `AFVn`, the spec defines two flips (`I.2.3.8` text):
+///
+/// ```text
+/// flip_x = n & 1
+/// flip_y = n Idiv 2  (i.e. n >> 1)
+/// ```
+///
+/// Listing I.13 builds the 8×8 sample block from three sub-blocks
+/// each of which receives a DC patch derived from the first two
+/// coefficient rows (`coefficients(0,0)`, `coefficients(0,1)`,
+/// `coefficients(1,0)`):
+///
+/// * **AFV 4×4 sub-block** (top-left after un-flip):
+///   ```text
+///   coeffs_afv(0, 0) = (c(0,0) + c(0,1) + c(1,0)) × 4.0
+///   coeffs_afv(ix, iy) = c(ix × 2, iy × 2) for the remaining cells
+///   samples_afv = AFV_IDCT(coeffs_afv)              // Listing I.6
+///   samples(flip_x × 4 + ix, flip_y × 4 + iy) =
+///       samples_afv(flip_x == 1 ? 3 - ix : ix,
+///                   flip_y == 1 ? 3 - iy : iy)
+///   ```
+///
+/// * **4×4 DCT sub-block** (top-right after un-flip):
+///   ```text
+///   coeffs_4x4(0, 0) = c(0,0) - c(0,1) + c(1,0)
+///   coeffs_4x4(ix, iy) = c(ix × 2 + 1, iy × 2) for the remaining cells
+///   samples_4x4 = IDCT_2D(coeffs_4x4)               // Listing I.9.2 at 4×4
+///   samples((flip_x == 1 ? 0 : 4) + ix, flip_y × 4 + iy) =
+///       samples_4x4(ix, iy)
+///   ```
+///
+/// * **4×8 DCT sub-block** (bottom half after un-flip):
+///   ```text
+///   coeffs_4x8(0, 0) = c(0,0) - c(1,0)
+///   coeffs_4x8(ix, iy) = c(ix, 1 + iy × 2) for the remaining cells
+///   samples_4x8 = IDCT_2D(coeffs_4x8)               // Listing I.9.2 at 4×8
+///   samples(ix, (flip_y == 1 ? 0 : 4) + iy) = samples_4x8(ix, iy)
+///   ```
+///
+/// **FDIS typo handled here.** The published FDIS PDF Listing I.13
+/// final line reads `samples(ix, (flip_y == 1 ? 0 : 4) + iy) =
+/// samples_4×4(ix, iy);` — but the inner loop iterates `ix ∈ [0..8)`
+/// and `samples_4×4` only has columns `0..3`, while the immediately
+/// preceding line computes `samples_4×8 = IDCT_2D(coeffs_4×8)`.
+/// The source must be `samples_4×8(ix, iy)`; we apply that obvious
+/// correction here. (This typo is appended to the project FDIS-typo
+/// memory; it joins the four pre-existing Annex D entries.)
+///
+/// Input layout: `coefficients` is 64 entries, row-major 8×8 — the
+/// caller-supplied dequantised coefficient block.
+///
+/// Output layout: 64 entries, row-major 8×8 sample buffer, ready to
+/// be added into the LF residual / post-EPF pipeline.
+///
+/// `t` must be one of `TransformType::Afv0..Afv3`; passing any
+/// other variant returns `Err(InvalidData)`.
+pub fn idct_afv(coefficients: &[f32], t: TransformType) -> Result<Vec<f32>> {
+    if coefficients.len() != 64 {
+        return Err(Error::InvalidData(format!(
+            "JXL idct_afv: coefficients length {} != 64",
+            coefficients.len()
+        )));
+    }
+    let (flip_x, flip_y): (usize, usize) = match t {
+        TransformType::Afv0 => (0, 0),
+        TransformType::Afv1 => (1, 0),
+        TransformType::Afv2 => (0, 1),
+        TransformType::Afv3 => (1, 1),
+        _ => {
+            return Err(Error::InvalidData(format!(
+                "JXL idct_afv: transform {t:?} is not an AFV variant"
+            )));
+        }
+    };
+
+    // coefficients(x, y) accessor (row-major 8×8).
+    let coef = |x: usize, y: usize| -> f32 { coefficients[y * 8 + x] };
+
+    let mut result = vec![0.0f32; 64];
+
+    // ---------------- AFV 4×4 sub-block (Listing I.13 part 1) ----------------
+    //
+    //   coeffs_afv(0, 0) = (c(0,0) + c(0,1) + c(1,0)) × 4.0
+    //   coeffs_afv(ix, iy) = c(ix×2, iy×2) for the remaining cells
+    //   samples_afv = AFV_IDCT(coeffs_afv)
+    //   samples(flip_x×4 + ix, flip_y×4 + iy) =
+    //       samples_afv(flip_x==1 ? 3-ix : ix, flip_y==1 ? 3-iy : iy)
+    let mut coeffs_afv = [0.0f32; 16]; // 4×4 row-major: index = iy*4 + ix
+    coeffs_afv[0] = (coef(0, 0) + coef(0, 1) + coef(1, 0)) * 4.0;
+    for iy in 0..4usize {
+        let start = if iy == 0 { 1 } else { 0 };
+        for ix in start..4 {
+            coeffs_afv[iy * 4 + ix] = coef(ix * 2, iy * 2);
+        }
+    }
+    let samples_afv = crate::afv::afv_idct(&coeffs_afv)?;
+    for iy in 0..4usize {
+        for ix in 0..4usize {
+            let src_x = if flip_x == 1 { 3 - ix } else { ix };
+            let src_y = if flip_y == 1 { 3 - iy } else { iy };
+            let dst_x = flip_x * 4 + ix;
+            let dst_y = flip_y * 4 + iy;
+            result[dst_y * 8 + dst_x] = samples_afv[src_y * 4 + src_x];
+        }
+    }
+
+    // ---------------- 4×4 DCT sub-block (Listing I.13 part 2) ----------------
+    //
+    //   coeffs_4x4(0, 0) = c(0,0) - c(0,1) + c(1,0)
+    //   coeffs_4x4(ix, iy) = c(ix×2 + 1, iy×2) for the remaining cells
+    //   samples_4x4 = IDCT_2D(coeffs_4x4)
+    //   samples((flip_x==1 ? 0 : 4) + ix, flip_y×4 + iy) =
+    //       samples_4x4(ix, iy)
+    let mut coeffs_4x4 = [0.0f32; 16]; // 4×4 row-major: index = iy*4 + ix
+    coeffs_4x4[0] = coef(0, 0) - coef(0, 1) + coef(1, 0);
+    for iy in 0..4usize {
+        let start = if iy == 0 { 1 } else { 0 };
+        for ix in start..4 {
+            coeffs_4x4[iy * 4 + ix] = coef(ix * 2 + 1, iy * 2);
+        }
+    }
+    let samples_4x4 = idct_2d(&coeffs_4x4, 4, 4)?;
+    let dx_base_4x4 = if flip_x == 1 { 0 } else { 4 };
+    for iy in 0..4usize {
+        for ix in 0..4usize {
+            let dst_x = dx_base_4x4 + ix;
+            let dst_y = flip_y * 4 + iy;
+            result[dst_y * 8 + dst_x] = samples_4x4[iy * 4 + ix];
+        }
+    }
+
+    // ---------------- 4×8 DCT sub-block (Listing I.13 part 3) ----------------
+    //
+    //   coeffs_4x8(0, 0) = c(0,0) - c(1,0)
+    //   coeffs_4x8(ix, iy) = c(ix, 1 + iy×2) for the remaining cells
+    //   samples_4x8 = IDCT_2D(coeffs_4x8)              // 4 rows × 8 cols
+    //   samples(ix, (flip_y==1 ? 0 : 4) + iy) = samples_4x8(ix, iy)
+    //
+    // (FDIS typo: spec wrote `samples_4×4(ix, iy)` on the last line —
+    // see the doc-comment above for the inversion proof. Applied
+    // correction: read from samples_4x8.)
+    let mut coeffs_4x8 = [0.0f32; 32]; // 4 rows × 8 cols: index = iy*8 + ix
+    coeffs_4x8[0] = coef(0, 0) - coef(1, 0);
+    for iy in 0..4usize {
+        let start = if iy == 0 { 1 } else { 0 };
+        for ix in start..8 {
+            coeffs_4x8[iy * 8 + ix] = coef(ix, 1 + iy * 2);
+        }
+    }
+    let samples_4x8 = idct_2d(&coeffs_4x8, 4, 8)?;
+    let dy_base_4x8 = if flip_y == 1 { 0 } else { 4 };
+    for iy in 0..4usize {
+        for ix in 0..8usize {
+            let dst_x = ix;
+            let dst_y = dy_base_4x8 + iy;
+            result[dst_y * 8 + dst_x] = samples_4x8[iy * 8 + ix];
+        }
+    }
+
+    Ok(result)
 }
 
 /// `AuxIDCT2x2(block, S)` per Annex I.9.3.
@@ -1049,16 +1219,29 @@ mod tests {
     }
 
     #[test]
-    fn idct_for_transform_afv_all_unsupported() {
+    fn idct_for_transform_afv_all_dispatch_to_idct_afv() {
+        // Round 150: AFV variants now route through `idct_afv` (Listing
+        // I.13) rather than returning `Err(Unsupported)`. Verify each
+        // variant produces a 64-entry sample buffer matching the direct
+        // `idct_afv` call.
         for t in [
             TransformType::Afv0,
             TransformType::Afv1,
             TransformType::Afv2,
             TransformType::Afv3,
         ] {
-            let coeffs = vec![0.0f32; 64];
-            let r = idct_for_transform(t, &coeffs);
-            assert!(matches!(r, Err(Error::Unsupported(_))), "{t:?}");
+            let coeffs: Vec<f32> = (0..64).map(|i| (i as f32) * 0.1).collect();
+            let via_dispatch = idct_for_transform(t, &coeffs).unwrap();
+            let direct = idct_afv(&coeffs, t).unwrap();
+            assert_eq!(via_dispatch.len(), 64, "{t:?}");
+            for i in 0..64 {
+                assert!(
+                    approx_eq(via_dispatch[i], direct[i], 1e-6),
+                    "{t:?} cell {i}: dispatch={} direct={}",
+                    via_dispatch[i],
+                    direct[i]
+                );
+            }
         }
     }
 
@@ -1401,18 +1584,207 @@ mod tests {
         }
     }
 
+    // ---------- Round 150 — Listing I.13 inverse AFV transform ----------
+
     #[test]
-    fn idct_for_transform_afv_message_mentions_round_13_blockage() {
-        let coeffs = vec![0.0f32; 64];
-        let r = idct_for_transform(TransformType::Afv0, &coeffs);
-        match r {
-            Err(Error::Unsupported(msg)) => {
-                assert!(
-                    msg.contains("AFVBasis"),
-                    "expected AFVBasis mention, got: {msg}"
+    fn idct_afv_rejects_wrong_length() {
+        let short = vec![0.0f32; 32];
+        assert!(idct_afv(&short, TransformType::Afv0).is_err());
+        let long = vec![0.0f32; 65];
+        assert!(idct_afv(&long, TransformType::Afv0).is_err());
+    }
+
+    #[test]
+    fn idct_afv_rejects_non_afv_transform() {
+        let c = vec![0.0f32; 64];
+        let r = idct_afv(&c, TransformType::Dct8x8);
+        assert!(matches!(r, Err(Error::InvalidData(_))));
+        let r = idct_afv(&c, TransformType::Hornuss);
+        assert!(matches!(r, Err(Error::InvalidData(_))));
+    }
+
+    #[test]
+    fn idct_afv_returns_64_entries_for_each_variant() {
+        let c = vec![0.0f32; 64];
+        for t in [
+            TransformType::Afv0,
+            TransformType::Afv1,
+            TransformType::Afv2,
+            TransformType::Afv3,
+        ] {
+            let s = idct_afv(&c, t).unwrap();
+            assert_eq!(s.len(), 64, "{t:?}");
+            for &v in &s {
+                assert_eq!(
+                    v, 0.0,
+                    "all-zero input must yield all-zero output for {t:?}"
                 );
             }
-            other => panic!("expected Err(Unsupported), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn idct_afv_dc_only_sub_block_corner_sums() {
+        // Per Listing I.13 the three DC patches are derived as:
+        //   coeffs_afv(0,0)   = (c(0,0) + c(0,1) + c(1,0)) × 4
+        //   coeffs_4x4(0,0)   = c(0,0) - c(0,1) + c(1,0)
+        //   coeffs_4x8(0,0)   = c(0,0) - c(1,0)
+        //
+        // With only c(0,0) = 1.0 nonzero, those become
+        //   afv DC = 4.0, 4x4 DC = 1.0, 4x8 DC = 1.0
+        // and all other AC cells of the three sub-blocks are 0.
+        //
+        // For the AFV sub-block: AFV_IDCT([4, 0, ..., 0]) =
+        //   [4 × 0.25, ..., 4 × 0.25] = [1.0; 16] (Listing I.5 row 0
+        //   is identically 0.25), so the AFV-side 4×4 of the output
+        //   is all 1.0.
+        //
+        // For the 4×4 IDCT_2D sub-block: IDCT_2D([1, 0, ..., 0]) at
+        //   shape 4×4 = [1.0; 16] (Annex I.7 DC-only is constant).
+        //
+        // For the 4×8 IDCT_2D sub-block: IDCT_2D([1, 0, ..., 0]) at
+        //   shape 4×8 = [1.0; 32] (DC-only is constant).
+        //
+        // Total output: all 64 cells = 1.0, regardless of flip variant.
+        let mut c = vec![0.0f32; 64];
+        c[0] = 1.0; // c(0, 0)
+        for t in [
+            TransformType::Afv0,
+            TransformType::Afv1,
+            TransformType::Afv2,
+            TransformType::Afv3,
+        ] {
+            let s = idct_afv(&c, t).unwrap();
+            for (i, &v) in s.iter().enumerate() {
+                assert!(
+                    approx_eq(v, 1.0, 1e-5),
+                    "{t:?} cell {i}: got {v} expected 1.0"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn idct_afv_writes_into_all_64_cells_for_each_variant() {
+        // Tile-coverage check: every output cell must be written to by
+        // exactly one of the three sub-blocks. With non-trivial AC the
+        // resulting 8×8 must have no exact-zero artifacts in cells that
+        // a sub-block was supposed to cover. Verify by feeding a
+        // dense-AC pattern and asserting all 64 cells are nonzero for
+        // each AFV variant.
+        let mut c = vec![0.0f32; 64];
+        for (i, slot) in c.iter_mut().enumerate() {
+            *slot = (i as f32) * 0.13 + 0.05;
+        }
+        for t in [
+            TransformType::Afv0,
+            TransformType::Afv1,
+            TransformType::Afv2,
+            TransformType::Afv3,
+        ] {
+            let s = idct_afv(&c, t).unwrap();
+            // Count cells whose absolute value is below f32 noise.
+            let zero_cells = s.iter().filter(|&&v| v.abs() < 1e-7).count();
+            assert!(
+                zero_cells <= 1,
+                "{t:?}: {zero_cells} cells suspiciously zero, expected dense \
+                 coverage from three sub-blocks"
+            );
+        }
+    }
+
+    #[test]
+    fn idct_afv_flip_axes_swap_outputs() {
+        // Comparing two variants that differ by exactly one flip axis
+        // produces a mirrored layout of the AFV sub-block (the only
+        // sub-block whose source coordinate depends on `flip_x`/`flip_y`).
+        //
+        // AFV0 (flip_x=0, flip_y=0) and AFV1 (flip_x=1, flip_y=0)
+        // place the AFV sub-block at (0..4, 0..4) and (4..8, 0..4)
+        // respectively, with the inner source mirrored in x. The
+        // 4×8-DCT sub-block lands in y∈4..8 for both (flip_y=0 → 4..8).
+        //
+        // So row 0 of AFV0 (cells 0..4) == row 0 of AFV1 (cells 7..4
+        // reversed). Verify.
+        let mut c = vec![0.0f32; 64];
+        for (i, slot) in c.iter_mut().enumerate() {
+            *slot = (i as f32) * 0.07 + 0.5;
+        }
+        let s0 = idct_afv(&c, TransformType::Afv0).unwrap();
+        let s1 = idct_afv(&c, TransformType::Afv1).unwrap();
+        // s0[(0..4, 0..4)] (AFV sub-block, no flip) should equal
+        // s1[(7..3, 0..4)] (AFV sub-block, flip_x).
+        for iy in 0..4usize {
+            for ix in 0..4usize {
+                let v0 = s0[iy * 8 + ix];
+                let v1 = s1[iy * 8 + (7 - ix)];
+                assert!(
+                    approx_eq(v0, v1, 1e-5),
+                    "AFV0 ({ix},{iy})={v0} vs AFV1 mirrored ({},{iy})={v1}",
+                    7 - ix
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn idct_afv_flip_y_swap_outputs() {
+        // AFV0 (flip_y=0) vs AFV2 (flip_y=1) differ in which y-band
+        // gets the AFV sub-block (0..4 vs 4..8) and which gets the
+        // 4×8-DCT sub-block (4..8 vs 0..4). The 4×4-DCT sub-block also
+        // moves between y-bands accordingly.
+        //
+        // Check that the 4×8-DCT band content is intact across both —
+        // they're computed from identical inputs and produce identical
+        // 4×8 samples, just landing in different y-bands.
+        let mut c = vec![0.0f32; 64];
+        for (i, slot) in c.iter_mut().enumerate() {
+            *slot = (i as f32) * 0.05 - 1.0;
+        }
+        let s0 = idct_afv(&c, TransformType::Afv0).unwrap();
+        let s2 = idct_afv(&c, TransformType::Afv2).unwrap();
+        // s0 places 4x8 at y∈4..8; s2 at y∈0..4. For each y∈0..4 the
+        // s2 row should equal the s0 row at y+4 (full 8-cell row).
+        for iy in 0..4usize {
+            for ix in 0..8usize {
+                let v0 = s0[(iy + 4) * 8 + ix];
+                let v2 = s2[iy * 8 + ix];
+                assert!(
+                    approx_eq(v0, v2, 1e-5),
+                    "4x8 band mismatch ({ix},{iy}): AFV0 y={} {} vs AFV2 y={} {}",
+                    iy + 4,
+                    v0,
+                    iy,
+                    v2
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn idct_afv_is_linear() {
+        // afv_idct(a × x + b × y) == a × afv_idct(x) + b × afv_idct(y),
+        // and the surrounding IDCT_2D paths are also linear, so the
+        // whole Listing I.13 composition is linear in the coefficient
+        // input. Verify for one variant.
+        let x: Vec<f32> = (0..64).map(|i| (i as f32) * 0.21 - 5.0).collect();
+        let y: Vec<f32> = (0..64).map(|i| (i as f32) * -0.11 + 2.5).collect();
+        let a = 0.7f32;
+        let b = -1.3f32;
+        let mut comb = vec![0.0f32; 64];
+        for i in 0..64 {
+            comb[i] = a * x[i] + b * y[i];
+        }
+        let sx = idct_afv(&x, TransformType::Afv0).unwrap();
+        let sy = idct_afv(&y, TransformType::Afv0).unwrap();
+        let sc = idct_afv(&comb, TransformType::Afv0).unwrap();
+        for i in 0..64 {
+            let expected = a * sx[i] + b * sy[i];
+            assert!(
+                approx_eq(sc[i], expected, 1e-3),
+                "cell {i}: combined-output {} != {expected}",
+                sc[i]
+            );
         }
     }
 }
