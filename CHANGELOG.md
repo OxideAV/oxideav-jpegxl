@@ -9,6 +9,65 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Round 159 (2021-FDIS) — §C.8.3 per-block HF coefficient decode
+  loop scaffolding (Listing C.13 + Listing C.14).** New public API in
+  `pass_group_hf`:
+  - `prev_for_context(k, num_blocks, size, non_zeros, prev_nonzero)`
+    — Listing C.14 verbatim (`k == num_blocks ? (non_zeros > size /
+    16 ? 1 : 0) : (prev_nonzero(k - 1) ? 1 : 0)`).
+  - `DecodedHfBlock { coeffs, remaining_non_zeros, coeffs_read }` —
+    return bundle for the per-block primitive.
+  - `decode_block_coefficients(natural_order, num_blocks, size,
+    initial_non_zeros, block_ctx, nb_block_ctx, decode_symbol)` —
+    Listing C.14's per-block raster-order loop with the §C.8.3
+    "stop when non_zeros reaches 0" early-exit, `UnpackSigned`
+    application, and `natural_order[k]` placement. The
+    `decode_symbol: FnMut(ctx) -> Result<u32>` closure abstracts
+    over the (still un-landed) §C.7.2 entropy histograms — a real
+    consumer wraps `EntropyStream` + `HybridUintState` + the
+    per-group `histogram_offset`; tests can hand-roll a symbol
+    sequence.
+  - `read_non_zeros_and_decode_block(.., predicted, .., read_non_zeros,
+    decode_symbol)` — convenience wrapper that issues the
+    `D[NonZerosContext(predicted) + offset]` read via the first
+    closure and drives `decode_block_coefficients` with the result.
+    Returns `(DecodedHfBlock, non_zeros)` so the caller can update
+    its NonZeros-grid bookkeeping per `NonZeros(x, y) = (non_zeros
+    + num_blocks - 1) Idiv num_blocks`.
+
+  Bounded scope: DCT8×8 alone — `num_blocks = 1`, `size = 64`,
+  `OrderId::Id0` natural-coefficient order (the simplest case that
+  exercises the full state machine). The primitive itself is
+  shape-agnostic; the larger variable-block sizes (DCT16×16,
+  DCT32×32, AFV0..3, …) need their `num_blocks` / `size` parameters
+  threaded through the varblock driver above this primitive.
+
+  11 new unit tests (`pass_group_hf::tests::*`) + 11 integration
+  tests (`round159_block_coefficient_loop`) cover: all-zero block
+  (no symbol reads); single non-zero at the first HF slot (one
+  read, `UnpackSigned(1) = -1` at `natural_order[1]`); three
+  consecutive non-zeros (loop stops after three reads); full
+  density (63 reads, LLF cell untouched); the size/16 threshold
+  for `prev` (crossover at `non_zeros == 5` for DCT8×8); the
+  "previous coefficient is zero / non-zero" flag tracking through
+  the loop's history; defensive rejection of malformed
+  natural-order vectors, zero `num_blocks`, and over-large
+  `initial_non_zeros`; closure-threaded end-to-end smoke through
+  `read_non_zeros_and_decode_block`. Lib tests 538 → 553 (+15).
+
+  Pure-math / pure-control-flow primitive in the same shape as
+  round-89 `dct_quant_weights`, round-95 `hf_dequant`, round-121
+  `llf_from_lf`, round-138 `chroma_from_luma`, round-141
+  `gaborish`, round-144 `epf`, and round-147 `afv_idct` — a future
+  round wiring §C.7.2 histograms into the per-pass entropy stream
+  can drop this primitive in as the per-block loop body without
+  re-deriving any C.13 / C.14 formulae. The §C.7.2 entropy
+  histogram decode (#799 DOCS-GAP), the per-channel (Y / X / B)
+  `non_zeros` read in the varblock driver above this primitive,
+  the per-pass NonZeros-grid update, and the per-varblock
+  `BlockContext()` derivation remain follow-up work for subsequent
+  rounds.
+
 - **Round 150 (2021-FDIS) — Annex I.2.3.8 / Listing I.13 Inverse AFV
   transform composition (`idct::idct_afv`).** Composes the round-147
   `crate::afv::afv_idct` pure-math primitive (Listings I.5 + I.6)

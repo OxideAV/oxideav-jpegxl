@@ -286,6 +286,263 @@ fn ceil_log2_u32(n: u32) -> u32 {
     32 - (n - 1).leading_zeros()
 }
 
+// ----------------------------------------------------------------------------
+// Round 159 — §C.8.3 per-block HF coefficient decode loop scaffolding.
+//
+// Bounded scope: this lands the per-block raster-order coefficient walk
+// from FDIS Listing C.13 prose + Listing C.14 (`prev` for context),
+// parameterised over the symbol-source (so the §C.7.2 entropy stream
+// can plug in once it lands) and over `(num_blocks, size)` (so the
+// scaffolding stays usable beyond DCT8×8). The two helpers below are
+// deliberately small — Listings C.13 / C.14 + the §C.8.3 prose
+// transcribed almost verbatim into a `for k in [num_blocks, size)`
+// loop — because every wiring choice (per-channel non_zeros read,
+// histogram-offset bookkeeping, NonZeros-grid maintenance) belongs to
+// the per-group driver above the per-block step. The driver itself is
+// follow-up; this round only commits the per-block primitive + its
+// stand-alone tests.
+//
+// The DCT8×8-alone shape (num_blocks = 1, size = 64) is the simplest
+// case that exercises the full state machine:
+//   * `prev` per Listing C.14 — `k == num_blocks` is the first
+//     iteration, so the `if (k == num_blocks)` branch fires for k = 1.
+//   * `non_zeros` decrements every nonzero coefficient and the loop
+//     stops as soon as it hits 0 (the spec prose right after Listing
+//     C.14: "If `ucoeff != 0`, the decoder decreases `non_zeros` by 1.
+//     If `non_zeros` reaches 0, the decoder stops decoding further
+//     coefficients for the current block.").
+//   * `CoefficientContext` indexes the two ladder tables
+//     `COEFF_FREQ_CONTEXT` / `COEFF_NUM_NONZERO_CONTEXT` and adds the
+//     histogram offset.
+// ----------------------------------------------------------------------------
+
+/// `prev` per FDIS Listing C.14.
+///
+/// `prev = 1` iff:
+///   * `k == num_blocks` and `non_zeros > size / 16`, **or**
+///   * `k != num_blocks` and the previously-decoded coefficient at
+///     position `k - 1` is non-zero.
+///
+/// Otherwise `prev = 0`. (Listing C.14 verbatim — the FDIS text uses
+/// `0` as the "previous coefficient was zero / this is the first read
+/// and non_zeros is low" sentinel, `1` as the "previous coefficient was
+/// non-zero / first read with high non_zeros" sentinel.)
+///
+/// Caller responsibility: `prev_coeff_nonzero(k - 1)` is undefined when
+/// `k == num_blocks`, so we never call it in that branch.
+pub fn prev_for_context<F>(
+    k: u32,
+    num_blocks: u32,
+    size: u32,
+    non_zeros: u32,
+    prev_nonzero: F,
+) -> u32
+where
+    F: Fn(u32) -> bool,
+{
+    if k == num_blocks {
+        if non_zeros > size / 16 {
+            1
+        } else {
+            0
+        }
+    } else if prev_nonzero(k - 1) {
+        1
+    } else {
+        0
+    }
+}
+
+/// Decoded block bundle returned by [`decode_block_coefficients`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecodedHfBlock {
+    /// Quantised HF coefficients placed in **natural-order index
+    /// space** (NOT in raster order): `coeffs[ natural_order[k] ]`
+    /// for `k in [num_blocks, size)` and 0 elsewhere. The caller maps
+    /// the natural-order index back to a `(y, x)` in the varblock per
+    /// `natural_order[k] = y * bwidth + x`.
+    pub coeffs: Vec<i32>,
+    /// `non_zeros` count after the per-block loop completed (always 0
+    /// when the loop runs to completion via the `if non_zeros reaches
+    /// 0` early-stop; non-zero only if every coefficient in the block
+    /// was actually non-zero — which the spec disallows for a real
+    /// block since `non_zeros` must reach 0 before the final `k`).
+    pub remaining_non_zeros: u32,
+    /// Number of coefficients the loop actually decoded (the symbol
+    /// reads performed against the entropy stream). Useful for tests
+    /// that want to assert "the loop terminated after N reads".
+    pub coeffs_read: u32,
+}
+
+/// FDIS §C.8.3 per-block coefficient decode loop — Listing C.14 +
+/// the surrounding prose.
+///
+/// Walks `k` from `num_blocks` to `size`, computing the
+/// `CoefficientContext` per Listing C.13, reading a `ucoeff` symbol
+/// from the caller-supplied `decode_symbol` closure (which is expected
+/// to issue a `D[ctx + offset]` read against the §C.7.2 entropy
+/// stream), placing `UnpackSigned(ucoeff)` at position
+/// `natural_order[k]` in the output block, and stopping as soon as
+/// `non_zeros` reaches 0.
+///
+/// The closure interface keeps this primitive independent of the
+/// (still un-landed) §C.7.2 histogram array. A real consumer will
+/// wrap a `EntropyStream` + `HybridUintState` + the per-group
+/// histogram offset into the closure; tests can hand-roll a symbol
+/// table.
+///
+/// The natural-order vector `natural_order` MUST have length `size`
+/// and contain a permutation of `[0, size)` (Listing C.12). For
+/// DCT8×8 alone, callers pass `crate::coeff_order::natural_coeff_order(
+/// OrderId::Id0)` (the LLF prefix is the single cell `(0, 0)`, so the
+/// HF tail starts at `k = 1`).
+///
+/// `block_ctx` is the already-computed `BlockContext()` value for the
+/// current varblock (§C.13). `nb_block_ctx` is the LfGlobal
+/// HfBlockContext invariant.
+///
+/// Returns a [`DecodedHfBlock`] with the coefficient buffer in
+/// natural-order **index space**, the final `non_zeros` value, and
+/// the number of symbol reads performed.
+pub fn decode_block_coefficients<F>(
+    natural_order: &[u32],
+    num_blocks: u32,
+    size: u32,
+    initial_non_zeros: u32,
+    block_ctx: u32,
+    nb_block_ctx: u32,
+    mut decode_symbol: F,
+) -> Result<DecodedHfBlock>
+where
+    F: FnMut(u32) -> Result<u32>,
+{
+    if num_blocks == 0 {
+        return Err(Error::InvalidData(
+            "JXL block coeff loop: num_blocks must be ≥ 1".into(),
+        ));
+    }
+    if size == 0 || num_blocks > size {
+        return Err(Error::InvalidData(format!(
+            "JXL block coeff loop: invalid (num_blocks={num_blocks}, size={size})"
+        )));
+    }
+    if natural_order.len() != size as usize {
+        return Err(Error::InvalidData(format!(
+            "JXL block coeff loop: natural_order len {} != size {size}",
+            natural_order.len()
+        )));
+    }
+    // Sanity-check: every natural-order entry must be in [0, size).
+    for &p in natural_order {
+        if p >= size {
+            return Err(Error::InvalidData(format!(
+                "JXL block coeff loop: natural_order entry {p} >= size {size}"
+            )));
+        }
+    }
+    if initial_non_zeros > size - num_blocks {
+        return Err(Error::InvalidData(format!(
+            "JXL block coeff loop: initial_non_zeros {initial_non_zeros} > size - num_blocks ({})",
+            size - num_blocks
+        )));
+    }
+
+    let mut coeffs = vec![0i32; size as usize];
+    let mut non_zeros = initial_non_zeros;
+    let mut coeffs_read: u32 = 0;
+
+    // Tracks "was the natural-order coefficient at position (k-1)
+    // non-zero" for Listing C.14. Indexed by k (so prev_nonzero[k-1]).
+    // For k == num_blocks we read prev via the size/16 path so the
+    // [k=num_blocks-1] slot is never accessed; we still size the vec to
+    // `size` for uniform indexing.
+    let mut prev_nonzero = vec![false; size as usize];
+
+    let mut k = num_blocks;
+    while k < size {
+        if non_zeros == 0 {
+            // Spec: "If non_zeros reaches 0, the decoder stops
+            // decoding further coefficients for the current block."
+            break;
+        }
+        let prev = prev_for_context(k, num_blocks, size, non_zeros, |kk| {
+            prev_nonzero[kk as usize]
+        });
+        let ctx = coefficient_context(
+            k,
+            non_zeros,
+            num_blocks,
+            size,
+            prev,
+            block_ctx,
+            nb_block_ctx,
+        )?;
+        let ucoeff = decode_symbol(ctx)?;
+        coeffs_read += 1;
+        let signed = crate::bitreader::unpack_signed(ucoeff);
+        let pos = natural_order[k as usize] as usize;
+        coeffs[pos] = signed;
+        if ucoeff != 0 {
+            prev_nonzero[k as usize] = true;
+            non_zeros = non_zeros.saturating_sub(1);
+        }
+        k += 1;
+    }
+
+    Ok(DecodedHfBlock {
+        coeffs,
+        remaining_non_zeros: non_zeros,
+        coeffs_read,
+    })
+}
+
+/// Convenience wrapper: read the per-channel `non_zeros` count from the
+/// caller-supplied closure, then drive [`decode_block_coefficients`].
+///
+/// `predicted_non_zeros` is the [`predicted_non_zeros`] value for the
+/// current varblock's top-left position; `block_ctx` is the
+/// [`block_context`] result. The closure issues a `D[
+/// NonZerosContext(predicted) + offset ]` read.
+///
+/// Returns `(decoded_block, non_zeros)` so the caller can update its
+/// NonZeros-grid bookkeeping per the spec's:
+///
+/// > NonZeros(x, y) is then (non_zeros + num_blocks - 1) Idiv num_blocks.
+#[allow(clippy::too_many_arguments)]
+pub fn read_non_zeros_and_decode_block<F, G>(
+    natural_order: &[u32],
+    num_blocks: u32,
+    size: u32,
+    predicted: u32,
+    block_ctx: u32,
+    nb_block_ctx: u32,
+    mut read_non_zeros: F,
+    decode_symbol: G,
+) -> Result<(DecodedHfBlock, u32)>
+where
+    F: FnMut(u32) -> Result<u32>,
+    G: FnMut(u32) -> Result<u32>,
+{
+    let nz_ctx = non_zeros_context(predicted, block_ctx, nb_block_ctx);
+    let non_zeros = read_non_zeros(nz_ctx)?;
+    if non_zeros > size - num_blocks {
+        return Err(Error::InvalidData(format!(
+            "JXL block coeff loop: non_zeros {non_zeros} > size - num_blocks ({}) at predicted={predicted}",
+            size - num_blocks
+        )));
+    }
+    let decoded = decode_block_coefficients(
+        natural_order,
+        num_blocks,
+        size,
+        non_zeros,
+        block_ctx,
+        nb_block_ctx,
+        decode_symbol,
+    )?;
+    Ok((decoded, non_zeros))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -531,5 +788,320 @@ mod tests {
         assert_eq!(COEFF_NUM_NONZERO_CONTEXT[22], 180);
         assert_eq!(COEFF_NUM_NONZERO_CONTEXT[33], 206);
         assert_eq!(COEFF_NUM_NONZERO_CONTEXT[63], 206);
+    }
+
+    // ------------------------------------------------------------------------
+    // Round 159 — per-block coefficient decode loop tests.
+    // ------------------------------------------------------------------------
+
+    use crate::coeff_order::{natural_coeff_order, OrderId};
+
+    #[test]
+    fn prev_for_context_first_iteration_high_non_zeros() {
+        // k == num_blocks, non_zeros > size / 16 → prev = 1.
+        // For DCT8×8: num_blocks = 1, size = 64, size/16 = 4. With
+        // non_zeros = 5 the first read uses prev = 1.
+        assert_eq!(prev_for_context(1, 1, 64, 5, |_| panic!("never called")), 1);
+    }
+
+    #[test]
+    fn prev_for_context_first_iteration_low_non_zeros() {
+        // k == num_blocks, non_zeros <= size / 16 → prev = 0.
+        // For DCT8×8: non_zeros = 4 → 4 > 64 / 16 == 4 is false → prev = 0.
+        assert_eq!(prev_for_context(1, 1, 64, 4, |_| panic!("never called")), 0);
+        assert_eq!(prev_for_context(1, 1, 64, 0, |_| panic!("never called")), 0);
+    }
+
+    #[test]
+    fn prev_for_context_subsequent_iteration_follows_prev_nonzero_flag() {
+        // k > num_blocks → prev = prev_nonzero(k - 1) ? 1 : 0.
+        // Stub a closure that says "the (k-1)=2 slot was non-zero" only
+        // when k == 3.
+        let f = |kk: u32| kk == 2;
+        assert_eq!(prev_for_context(3, 1, 64, 7, f), 1);
+        assert_eq!(prev_for_context(4, 1, 64, 7, f), 0);
+        assert_eq!(prev_for_context(5, 1, 64, 7, f), 0);
+    }
+
+    #[test]
+    fn decode_block_coefficients_rejects_zero_num_blocks() {
+        let order = natural_coeff_order(OrderId::Id0);
+        let r = decode_block_coefficients(&order, 0, 64, 0, 0, 1, |_| Ok(0));
+        assert!(matches!(r, Err(Error::InvalidData(_))));
+    }
+
+    #[test]
+    fn decode_block_coefficients_rejects_bad_natural_order_len() {
+        let bad = vec![0u32; 32]; // half of size = 64
+        let r = decode_block_coefficients(&bad, 1, 64, 0, 0, 1, |_| Ok(0));
+        assert!(matches!(r, Err(Error::InvalidData(_))));
+    }
+
+    #[test]
+    fn decode_block_coefficients_rejects_oob_natural_order_entry() {
+        let mut bad = natural_coeff_order(OrderId::Id0);
+        bad[5] = 99; // 99 >= size = 64
+        let r = decode_block_coefficients(&bad, 1, 64, 0, 0, 1, |_| Ok(0));
+        assert!(matches!(r, Err(Error::InvalidData(_))));
+    }
+
+    #[test]
+    fn decode_block_coefficients_rejects_too_many_non_zeros() {
+        let order = natural_coeff_order(OrderId::Id0);
+        // size - num_blocks = 64 - 1 = 63, so 64 is too many.
+        let r = decode_block_coefficients(&order, 1, 64, 64, 0, 1, |_| Ok(0));
+        assert!(matches!(r, Err(Error::InvalidData(_))));
+    }
+
+    #[test]
+    fn decode_block_coefficients_all_zero_block_reads_nothing() {
+        // initial_non_zeros = 0 → the spec's "If non_zeros reaches 0,
+        // the decoder stops" fires before any read happens. The loop
+        // body must not even compute prev / call the closure.
+        let order = natural_coeff_order(OrderId::Id0);
+        let mut call_count = 0;
+        let decoded = decode_block_coefficients(&order, 1, 64, 0, 0, 1, |_| {
+            call_count += 1;
+            Ok(0)
+        })
+        .unwrap();
+        assert_eq!(call_count, 0);
+        assert_eq!(decoded.coeffs_read, 0);
+        assert_eq!(decoded.remaining_non_zeros, 0);
+        assert!(decoded.coeffs.iter().all(|&v| v == 0));
+        assert_eq!(decoded.coeffs.len(), 64);
+    }
+
+    #[test]
+    fn decode_block_coefficients_single_nonzero_stops_after_one_read() {
+        // initial_non_zeros = 1, closure returns ucoeff = 1 on the
+        // first call. UnpackSigned(1) = -1 (1 is odd → -((1>>1)+1) =
+        // -1). non_zeros decrements to 0 → the loop should stop after
+        // exactly one read; subsequent k iterations must NOT call the
+        // closure.
+        let order = natural_coeff_order(OrderId::Id0);
+        let mut call_count = 0;
+        let decoded = decode_block_coefficients(&order, 1, 64, 1, 3, 15, |_ctx| {
+            call_count += 1;
+            // Return non-zero ucoeff on first read; never reached again.
+            Ok(1)
+        })
+        .unwrap();
+        assert_eq!(call_count, 1);
+        assert_eq!(decoded.coeffs_read, 1);
+        assert_eq!(decoded.remaining_non_zeros, 0);
+        // The first read lands at natural_order[1] (k = num_blocks = 1).
+        // For DCT8×8 the LLF prefix is the single (0, 0) cell → natural
+        // order index 0 is the LLF cell; natural_order[1] is the first
+        // HF cell. For OrderId::Id0 the HF tail starts with the smallest
+        // `(key1, key2)` from Listing I.14. We don't pin the exact
+        // raster index here (covered by `coeff_order` tests); we just
+        // assert the rest of the buffer is zero.
+        let nonzero_positions: Vec<(usize, i32)> = decoded
+            .coeffs
+            .iter()
+            .enumerate()
+            .filter(|&(_, &v)| v != 0)
+            .map(|(i, &v)| (i, v))
+            .collect();
+        assert_eq!(nonzero_positions.len(), 1);
+        assert_eq!(nonzero_positions[0].1, -1); // unpack_signed(1) == -1
+    }
+
+    #[test]
+    fn decode_block_coefficients_zero_ucoeff_does_not_decrement_non_zeros() {
+        // initial_non_zeros = 2, closure returns ucoeff = 0 then 2
+        // then 4 then... The first read returns 0 → non_zeros stays at
+        // 2; the second read returns 2 (signed = +1) → non_zeros drops
+        // to 1; the third read returns 4 (signed = +2) → non_zeros
+        // drops to 0 → loop stops. Expect exactly 3 reads.
+        let order = natural_coeff_order(OrderId::Id0);
+        let sequence = [0u32, 2, 4];
+        let mut idx = 0;
+        let decoded = decode_block_coefficients(&order, 1, 64, 2, 0, 1, |_ctx| {
+            let v = sequence[idx];
+            idx += 1;
+            Ok(v)
+        })
+        .unwrap();
+        assert_eq!(decoded.coeffs_read, 3);
+        assert_eq!(decoded.remaining_non_zeros, 0);
+        let nonzero_count = decoded.coeffs.iter().filter(|&&v| v != 0).count();
+        assert_eq!(nonzero_count, 2);
+    }
+
+    #[test]
+    fn decode_block_coefficients_prev_flag_tracks_decoded_nonzero() {
+        // Verify Listing C.14's "else { prev = ([[decoded coeff at
+        // position (k - 1) is 0]]) ? 0 : 1; }" branch fires by
+        // observing the context value passed to the closure.
+        //
+        // Plan: with initial_non_zeros = 2 and a sequence [2, 0, 2]
+        // (signed [+1, 0, +1]), iteration k = num_blocks + 1 must see
+        // prev = 1 (k-1's coeff was non-zero), iteration k = num_blocks
+        // + 2 must see prev = 0 (k-1's coeff was zero). The loop runs
+        // 3 times: nz=2 → 1 (first +1) → 1 (zero, no decrement) → 0
+        // (second +1) → stop. We don't pin the absolute ctx value
+        // (CoefficientContext is a tested helper above) — we re-derive
+        // the expected ctx from the spec formula and compare.
+        let order = natural_coeff_order(OrderId::Id0);
+        let sequence = [2u32, 0, 2]; // signed [+1, 0, +1] — 2 non-zero
+        let mut idx = 0;
+        let mut seen_ctx: Vec<u32> = Vec::new();
+        let block_ctx = 4;
+        let nb_block_ctx = 15;
+        let num_blocks = 1;
+        let size = 64;
+        let _ = decode_block_coefficients(
+            &order,
+            num_blocks,
+            size,
+            2,
+            block_ctx,
+            nb_block_ctx,
+            |ctx| {
+                seen_ctx.push(ctx);
+                let v = sequence[idx];
+                idx += 1;
+                Ok(v)
+            },
+        )
+        .unwrap();
+
+        // The loop runs exactly 3 times (nz=2 → 1 → 1 → 0 → stop).
+        assert_eq!(seen_ctx.len(), 3);
+
+        // k = 1, num_blocks = 1, non_zeros = 2. k == num_blocks → prev
+        // path is "non_zeros > size / 16 ? 1 : 0". 2 > 64/16=4 is false
+        // → prev = 0.
+        let expected_ctx_0 =
+            coefficient_context(1, 2, num_blocks, size, 0, block_ctx, nb_block_ctx).unwrap();
+        assert_eq!(seen_ctx[0], expected_ctx_0);
+
+        // k = 2, non_zeros after first nonzero is 1. prev = 1 (the
+        // previous coefficient was non-zero, ucoeff=2 ≠ 0).
+        let expected_ctx_1 =
+            coefficient_context(2, 1, num_blocks, size, 1, block_ctx, nb_block_ctx).unwrap();
+        assert_eq!(seen_ctx[1], expected_ctx_1);
+
+        // k = 3, non_zeros still 1 (ucoeff=0 didn't decrement). prev =
+        // 0 (the previous coefficient WAS zero).
+        let expected_ctx_2 =
+            coefficient_context(3, 1, num_blocks, size, 0, block_ctx, nb_block_ctx).unwrap();
+        assert_eq!(seen_ctx[2], expected_ctx_2);
+    }
+
+    #[test]
+    fn decode_block_coefficients_places_at_natural_order_position() {
+        // initial_non_zeros = 1, the first read returns ucoeff = 2 (signed
+        // +1). The non-zero must land at natural_order[1] (k = num_blocks
+        // for DCT8×8 with num_blocks=1). Verify the placement against
+        // crate::coeff_order::natural_coeff_order(OrderId::Id0)[1].
+        let order = natural_coeff_order(OrderId::Id0);
+        let decoded = decode_block_coefficients(&order, 1, 64, 1, 0, 1, |_| Ok(2)).unwrap();
+        let expected_pos = order[1] as usize;
+        assert_eq!(decoded.coeffs[expected_pos], 1);
+        // every other slot must be zero.
+        for (i, &v) in decoded.coeffs.iter().enumerate() {
+            if i == expected_pos {
+                continue;
+            }
+            assert_eq!(v, 0, "slot {i} should be zero, got {v}");
+        }
+    }
+
+    #[test]
+    fn read_non_zeros_and_decode_block_threads_predicted_through_context() {
+        // The first closure (read_non_zeros) sees the
+        // NonZerosContext(predicted, block_ctx, nb_block_ctx) value;
+        // returning a specific non_zeros count should feed straight
+        // into the second closure's coefficient-context derivation.
+        let order = natural_coeff_order(OrderId::Id0);
+        let block_ctx = 5;
+        let nb_block_ctx = 15;
+        let predicted = 32;
+
+        let mut saw_nz_ctx: Option<u32> = None;
+        let read_non_zeros = |ctx: u32| -> Result<u32> {
+            saw_nz_ctx = Some(ctx);
+            // Return 1 → one coefficient to decode.
+            Ok(1)
+        };
+        let mut saw_coeff_ctx: Option<u32> = None;
+        let decode_symbol = |ctx: u32| -> Result<u32> {
+            saw_coeff_ctx = Some(ctx);
+            // Return 2 → signed +1.
+            Ok(2)
+        };
+        let (decoded, non_zeros) = read_non_zeros_and_decode_block(
+            &order,
+            1,
+            64,
+            predicted,
+            block_ctx,
+            nb_block_ctx,
+            read_non_zeros,
+            decode_symbol,
+        )
+        .unwrap();
+
+        // The NonZerosContext closure saw exactly the spec formula
+        // (non_zeros_context returns block_ctx + nb_block_ctx ×
+        // (4 + 32/2) for predicted = 32).
+        let expected_nz_ctx = non_zeros_context(predicted, block_ctx, nb_block_ctx);
+        assert_eq!(saw_nz_ctx, Some(expected_nz_ctx));
+        assert_eq!(non_zeros, 1);
+
+        // The CoefficientContext closure saw the k=1, non_zeros=1
+        // formula with prev = 0 (1 > 64/16=4 is false).
+        let expected_coeff_ctx =
+            coefficient_context(1, 1, 1, 64, 0, block_ctx, nb_block_ctx).unwrap();
+        assert_eq!(saw_coeff_ctx, Some(expected_coeff_ctx));
+        assert_eq!(decoded.coeffs_read, 1);
+        assert_eq!(decoded.remaining_non_zeros, 0);
+    }
+
+    #[test]
+    fn read_non_zeros_and_decode_block_rejects_oversized_non_zeros() {
+        // non_zeros must satisfy `non_zeros <= size - num_blocks`. If
+        // the closure returns a too-large count we must reject before
+        // the inner loop runs.
+        let order = natural_coeff_order(OrderId::Id0);
+        let read_non_zeros = |_| Ok(64); // size - num_blocks = 63
+        let r = read_non_zeros_and_decode_block(
+            &order,
+            1,
+            64,
+            0,
+            0,
+            1,
+            read_non_zeros,
+            |_| -> Result<u32> { panic!("decode_symbol should not be called") },
+        );
+        assert!(matches!(r, Err(Error::InvalidData(_))));
+    }
+
+    #[test]
+    fn decode_block_coefficients_full_block_decodes_all_size_reads() {
+        // initial_non_zeros = size - num_blocks (the maximum allowed,
+        // every HF coefficient non-zero). Every closure call returns
+        // 2 → signed +1 → non_zeros decrements each step → the loop
+        // runs exactly `size - num_blocks = 63` times for DCT8×8.
+        let order = natural_coeff_order(OrderId::Id0);
+        let mut call_count = 0;
+        let decoded = decode_block_coefficients(&order, 1, 64, 63, 0, 1, |_| {
+            call_count += 1;
+            Ok(2)
+        })
+        .unwrap();
+        assert_eq!(call_count, 63);
+        assert_eq!(decoded.coeffs_read, 63);
+        assert_eq!(decoded.remaining_non_zeros, 0);
+        // 63 non-zero slots in the natural-order tail (positions
+        // natural_order[1..64]).
+        let nonzero_count = decoded.coeffs.iter().filter(|&&v| v != 0).count();
+        assert_eq!(nonzero_count, 63);
+        // Position natural_order[0] (the LLF cell) is untouched (== 0).
+        assert_eq!(decoded.coeffs[order[0] as usize], 0);
     }
 }

@@ -5,6 +5,61 @@ Pure-Rust **JPEG XL** (ISO/IEC 18181-1:2024) decoder. Resumed
 trace-doc-driven rounds 7-11 + encoder rounds 1-6 were retired
 (see "Why retired (history)" below).
 
+**Round 159 (2026-05-27)** lands the §C.8.3 per-block HF coefficient
+decode loop scaffolding (FDIS Listing C.13 + Listing C.14 +
+surrounding prose). New public API in `pass_group_hf`:
+
+- `prev_for_context(k, num_blocks, size, non_zeros, prev_nonzero)` —
+  Listing C.14 verbatim. At `k == num_blocks` returns `1` iff
+  `non_zeros > size / 16` else `0`; for `k > num_blocks` returns `1`
+  iff the previously-decoded coefficient (queried via the `prev_nonzero`
+  closure on `k - 1`) was non-zero.
+- `decode_block_coefficients(natural_order, num_blocks, size,
+  initial_non_zeros, block_ctx, nb_block_ctx, decode_symbol)` —
+  Listing C.14's per-block raster-order loop. Walks `k` from
+  `num_blocks` to `size`, computes `CoefficientContext` per Listing
+  C.13, calls the caller-supplied `decode_symbol(ctx)` closure to
+  read each `ucoeff`, applies `UnpackSigned`, places at
+  `natural_order[k]`, decrements `non_zeros` when `ucoeff != 0`,
+  and stops as soon as `non_zeros` reaches 0 ("If non_zeros reaches
+  0, the decoder stops decoding further coefficients" — §C.8.3
+  prose). Returns a `DecodedHfBlock` bundle (`coeffs: Vec<i32>` in
+  natural-order **index space** + `remaining_non_zeros` +
+  `coeffs_read` symbol count).
+- `read_non_zeros_and_decode_block(.., predicted, .., read_non_zeros,
+  decode_symbol)` — convenience wrapper that issues the
+  `D[NonZerosContext(predicted) + offset]` read via the first
+  closure and drives `decode_block_coefficients` with the result.
+  Returns `(DecodedHfBlock, non_zeros)` for NonZeros-grid
+  bookkeeping per `NonZeros(x, y) = (non_zeros + num_blocks - 1)
+  Idiv num_blocks`.
+
+The closure-based symbol-source interface keeps the primitive
+independent of the (still un-landed) §C.7.2 histogram array (#799
+remains DOCS-GAP-blocked). A future round wiring §C.7.2 into a real
+`EntropyStream` + `HybridUintState` closure can drop this primitive
+in as the per-block loop body without re-deriving any C.13 / C.14
+formulae. 11 new unit tests (`pass_group_hf::tests::*`) + 11
+integration tests (`round159_block_coefficient_loop`) cover:
+all-zero block (no symbol reads); single non-zero at the first HF
+slot (one read, `UnpackSigned(1) = -1` at `natural_order[1]`); three
+consecutive non-zeros (loop stops after three reads); full-density
+block (63 reads for DCT8×8, LLF cell untouched); the size/16
+threshold for `prev` (crossover at `non_zeros == 5` for DCT8×8); the
+"previous coefficient is zero / non-zero" flag tracking through the
+loop's history; defensive rejection of malformed natural-order
+vectors, zero `num_blocks`, and over-large `initial_non_zeros`;
+end-to-end smoke through `read_non_zeros_and_decode_block`. Lib
+tests 538 → 553 (+15); the existing `DCT8×8 alone` bounded scope
+(`num_blocks = 1`, `size = 64`, `OrderId::Id0`) is the simplest
+shape that exercises the full state machine — the primitive itself
+is shape-agnostic and ready for the larger variable-block sizes
+once their parameterisation lands. The §C.7.2 entropy histogram
+decode, the per-channel (Y / X / B) `non_zeros` read in the
+varblock driver above this primitive, the per-pass NonZeros-grid
+update, and the per-varblock `BlockContext()` derivation remain
+follow-up work for subsequent rounds.
+
 **Round 150 (2026-05-26)** wires the round-147 `AFV_IDCT` primitive
 into `idct::idct_for_transform` via §I.2.3.8 / Listing I.13 (Inverse
 AFV transform). New `idct::idct_afv(coefficients: &[f32], t:
