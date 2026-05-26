@@ -483,6 +483,7 @@
 //! [`idct::idct_for_transform`] exclusively.
 
 pub mod abrac;
+pub mod afv;
 pub mod ans;
 pub mod begabrac;
 pub mod bitreader;

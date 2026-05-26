@@ -5,6 +5,36 @@ Pure-Rust **JPEG XL** (ISO/IEC 18181-1:2024) decoder. Resumed
 trace-doc-driven rounds 7-11 + encoder rounds 1-6 were retired
 (see "Why retired (history)" below).
 
+**Round 147 (2026-05-26)** lands the Annex I.2.2 AFV basis +
+`AFV_IDCT` pure-math primitive (FDIS Listings I.5 + I.6, page 76).
+New `afv` module exposes the orthonormal `AFV_BASIS: [[f32; 16];
+16]` table (Listing I.5, 256 floats transcribed verbatim from the
+FDIS PDF), the §I.2.2 cell length constant `AFV_CELL_LEN = 16`
+(the 4×4-as-flat-16 mapping `index = 4×y + x`), and
+`afv_idct(coefficients: &[f32]) -> Result<[f32; 16]>` (Listing I.6
+`samples[i] = sum_j coefficients[j] × AFVBasis[j][i]`). 10 new
+unit tests + 9 integration tests (`round147_afv_idct`)
+independently verify the transcription at the table level: row 0
+is identically 0.25 in every column (Listing I.5 line 1), row 4
+has only two non-zero entries at columns 1 and 4 both at
+`±1/sqrt(2)` with zero elsewhere (Listing I.5 line 5), every row
+has unit L2 norm (orthonormality diagonal), every distinct pair
+of rows has zero inner product (orthonormality off-diagonal),
+`afv_idct` is linear and L2-energy-conserving, and one-hot
+coefficient input recovers `AFV_BASIS[j]` row-for-row — so a
+single transcription typo in any of the 256 entries would fail at
+least one orthonormality sum. Lib tests 521 → 531. Pure-math
+primitive in the same shape as round-89 `dct_quant_weights`,
+round-95 `hf_dequant`, round-121 `llf_from_lf`, round-138
+`chroma_from_luma`, round-141 `gaborish`, and round-144 `epf` — a
+future round wiring §I.2.3.8 Listing I.13 (Inverse AFV transform)
+into `idct_for_transform` can drop this helper in without
+re-deriving any I.5 or I.6 cells. The Listing I.13 composition
+(the `coeffs_afv` corner-load, the two `IDCT_2D` 4×4 / 4×8
+sub-blocks, the `flip_x` / `flip_y` AFVn flip) remains follow-up
+work; `idct_for_transform(Afv0..Afv3, ..)` continues to return
+`Err(Unsupported)` until that wiring lands.
+
 **Round 144 (2026-05-26)** lands the Annex J.3 "Edge-preserving
 filter" pure-math primitive (pages 85–87). New `epf` module
 exposes Listing J.1's `distance_step_0_and_1` (the five-pixel

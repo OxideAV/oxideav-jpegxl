@@ -9,6 +9,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Round 147 (2021-FDIS) — Annex I.2.2 AFV basis + `AFV_IDCT`
+  pure-math primitive (Listings I.5 + I.6, p. 76).** New
+  `src/afv.rs` module transcribes the orthonormal `AFVBasis[16][16]`
+  table from Listing I.5 verbatim and the Listing I.6 cell-sum
+  `samples[i] = sum_j coefficients[j] × AFVBasis[j][i]`. Public
+  API:
+  - `AFV_CELL_LEN: usize = 16` — the §I.2.2 4×4-as-flat-16 cell.
+  - `AFV_BASIS: [[f32; 16]; 16]` — verbatim Listing I.5.
+  - `afv_idct(coefficients: &[f32]) -> Result<[f32; 16]>` —
+    Listing I.6.
+
+  The 256-float transcription is independently verified at the
+  table level: row-0 = `[0.25; 16]` (Listing I.5 line 1); row-4 =
+  two non-zero entries at columns 1 and 4, both at ±`1/sqrt(2)`,
+  zero elsewhere (Listing I.5 line 5); per-row L2 unit-norm
+  (orthonormality diagonal); pairwise zero inner product
+  (orthonormality off-diagonal); `afv_idct` is linear; one-hot
+  coefficient input recovers `AFVBasis[j]` row-for-row;
+  `||samples||_2 == ||coefficients||_2` (L2 conservation, an
+  orthonormal-basis property). A single transcription typo in any
+  of the 256 entries would fail at least one orthonormality sum.
+
+  10 new unit tests + 9 integration tests
+  (`round147_afv_idct`); lib tests 521 → 531. Pure-math primitive
+  in the same shape as round-89 `dct_quant_weights`, round-95
+  `hf_dequant`, round-121 `llf_from_lf`, round-138
+  `chroma_from_luma`, round-141 `gaborish`, and round-144 `epf` —
+  a future round wiring §I.2.3.8 Inverse AFV transform (Listing
+  I.13) into `idct_for_transform` can drop this helper in without
+  re-deriving any I.5 / I.6 cells. The Listing I.13 composition
+  (the `coeffs_afv` corner-load, the two `IDCT_2D` 4×4 / 4×8
+  sub-blocks, the `flip_x` / `flip_y` AFVn flip) remains
+  follow-up work because it depends on `idct_2d` for non-square
+  blocks plus the AFVn dispatch wiring; the §I.2.2 arithmetic
+  core landed in this round unblocks that follow-up.
+
 - **Round 144 (2021-FDIS) — Annex J.3 "Edge-preserving filter"
   pure-math primitive (pages 85–87).** New `src/epf.rs` module
   transcribes the four §J.3 listings as a self-contained pure-math
