@@ -5,6 +5,49 @@ Pure-Rust **JPEG XL** (ISO/IEC 18181-1:2024) decoder. Resumed
 trace-doc-driven rounds 7-11 + encoder rounds 1-6 were retired
 (see "Why retired (history)" below).
 
+**Round 164 (2026-05-27)** lifts the round-159 raw-`(num_blocks,
+size, natural_order)` per-block coefficient loop into a typed,
+[`TransformType`]-driven entry point and pins it at DCT16×16 /
+DCT16×8 / DCT32×32 dimensions end-to-end. New public API in
+`pass_group_hf`:
+
+- `transform_block_params(t: TransformType) -> (num_blocks, size)`
+  — §I.2.4 opening paragraph + Listing C.14 derivation:
+  `num_blocks = (bwidth / 8) × (bheight / 8)` (the LLF prefix cell
+  count of the varblock) and `size = bwidth × bheight`. Every
+  Table C.16 transform satisfies `num_blocks * 64 == size`
+  (verified across all 27 entries).
+- `decode_block_coefficients_for_transform(t, initial_non_zeros,
+  block_ctx, nb_block_ctx, decode_symbol)` — typed wrapper that
+  derives `(num_blocks, size, natural_order)` from `t` (via
+  `coeff_order::order_id_for_transform` +
+  `coeff_order::natural_coeff_order`) and reduces to the round-159
+  `decode_block_coefficients` after defensive validation
+  (`initial_non_zeros > size - num_blocks` is rejected; for
+  DCT16×16 that's > 252).
+- `read_non_zeros_and_decode_block_for_transform(t, predicted,
+  block_ctx, nb_block_ctx, read_non_zeros, decode_symbol)` — the
+  analogous typed wrapper around the round-159
+  `read_non_zeros_and_decode_block` convenience entry point.
+
+20 new tests (8 unit + 12 integration
+`round164_dct16x16_block_coefficient_loop`) cover: every Table
+C.16 transform's `(num_blocks, size)` invariant; DCT16×16's
+`prev`-context threshold at `non_zeros == 17` (= size/16 + 1);
+typed-vs-raw byte-for-byte equivalence at DCT8×8 and DCT16×16 (on
+a mixed `[2, 0, 4, 0, 0, 6]` symbol sequence — 6 reads, 3
+non-zeros decrement non_zeros to 0); DCT16×16 all-zero / first-
+non-zero / three-consecutive-non-zeros / full-density (252 reads)
+shapes with coefficients landing at
+`natural_coeff_order(Id2)[4..]`; the rectangular DCT16×8 / DCT8×16
+pair collapsing to the same per-block outcome (they share
+`OrderId::Id4`); and one DCT32×32 smoke-test at `(num_blocks=16,
+size=1024)`. Lib tests 553 → 561 (+8). Pure-typed wrapper layer:
+no new bit reads, no spec re-derivation — the round-159 module
+note that the primitive is "shape-agnostic and ready for the
+larger variable-block sizes once their parameterisation lands" is
+now exercised from the caller-facing API.
+
 **Round 159 (2026-05-27)** lands the §C.8.3 per-block HF coefficient
 decode loop scaffolding (FDIS Listing C.13 + Listing C.14 +
 surrounding prose). New public API in `pass_group_hf`:

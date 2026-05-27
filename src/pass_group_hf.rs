@@ -66,6 +66,10 @@
 use oxideav_core::{Error, Result};
 
 use crate::bitreader::BitReader;
+use crate::coeff_order::{
+    coefficient_count, natural_coeff_order, order_id_for_transform, varblock_size_for_order,
+};
+use crate::dct_select::TransformType;
 use crate::hf_pass::HfPass;
 
 /// `CoeffFreqContext[k]` — Listing C.13 prelude. Indexed by the
@@ -541,6 +545,130 @@ where
         decode_symbol,
     )?;
     Ok((decoded, non_zeros))
+}
+
+// ----------------------------------------------------------------------------
+// Round 164 — `TransformType`-driven entry points for the per-block loop.
+//
+// Bounded scope: this lifts the round-159 raw-`(num_blocks, size)` API into
+// a typed wrapper that derives `num_blocks` and `size` from a
+// [`TransformType`] (Table C.16 + §I.2.4 opening paragraph), threading the
+// matching natural-order vector through the existing pure scaffolding.
+//
+// Listing C.14 is itself shape-agnostic — `num_blocks` and `size` enter
+// only as arithmetic — so this round adds the typed entry points + their
+// integration tests at DCT16×16 / DCT16×8 dimensions to pin "the
+// scaffolding stays usable beyond DCT8×8" (round-159 module docs) from a
+// caller's perspective. No new bit-level reads happen here; both
+// wrappers reduce to the existing `decode_block_coefficients` /
+// `read_non_zeros_and_decode_block` after parameter derivation.
+//
+// Per §I.2.4 opening paragraph + Listing C.14's `num_blocks` symbol:
+//
+// * `num_blocks = (bwidth / 8) × (bheight / 8)` — the LLF cell count of
+//   the varblock (its top-left rectangle the spec stamps as "the LLF
+//   prefix"); equals 1 for the 8×8-output transforms (DCT8×8, Hornuss,
+//   DCT2×2, DCT4×4, DCT4×8, DCT8×4, AFV0..AFV3), 4 for DCT16×16, 2 for
+//   the rectangular DCT16×8 / DCT8×16, and scales up to 1024 for
+//   DCT256×256.
+// * `size = bwidth × bheight` — the total coefficient count of the
+//   varblock = [`coefficient_count`] applied to the transform's
+//   [`OrderId`]. 64 for the 8×8-output transforms, 256 for DCT16×16,
+//   128 for DCT16×8, …, 65536 for DCT256×256.
+// ----------------------------------------------------------------------------
+
+/// `(num_blocks, size)` for a [`TransformType`] per §I.2.4 opening
+/// paragraph + Listing C.14.
+///
+/// * `num_blocks = (bwidth / 8) × (bheight / 8)` — the LLF prefix cell
+///   count of the varblock (its top-left rectangle the spec stamps as
+///   "the LLF prefix").
+/// * `size = bwidth × bheight` — the total coefficient count of the
+///   varblock.
+///
+/// Both are pure derivations from the [`varblock_size_for_order`]
+/// table; this helper keeps the per-call lookup terse for the typed
+/// per-block entry points.
+pub fn transform_block_params(t: TransformType) -> (u32, u32) {
+    let oid = order_id_for_transform(t);
+    let (bwidth, bheight) = varblock_size_for_order(oid);
+    let num_blocks = (bwidth / 8) * (bheight / 8);
+    let size = coefficient_count(oid);
+    (num_blocks, size)
+}
+
+/// Typed [`decode_block_coefficients`] driven from a [`TransformType`].
+///
+/// Picks `(num_blocks, size)` via [`transform_block_params`] and the
+/// natural-order vector via [`natural_coeff_order`] keyed by
+/// [`order_id_for_transform`]. The rest of the per-block state machine
+/// is identical to the raw entry point.
+///
+/// Defensively rejects `initial_non_zeros > size - num_blocks` (the
+/// spec invariant Listing C.14 maintains across reads); the typed
+/// wrapper also guarantees the natural-order length matches `size`,
+/// so callers cannot accidentally pass a DCT8×8 order against a
+/// DCT16×16 transform.
+pub fn decode_block_coefficients_for_transform<F>(
+    t: TransformType,
+    initial_non_zeros: u32,
+    block_ctx: u32,
+    nb_block_ctx: u32,
+    decode_symbol: F,
+) -> Result<DecodedHfBlock>
+where
+    F: FnMut(u32) -> Result<u32>,
+{
+    let (num_blocks, size) = transform_block_params(t);
+    let oid = order_id_for_transform(t);
+    let order = natural_coeff_order(oid);
+    decode_block_coefficients(
+        &order,
+        num_blocks,
+        size,
+        initial_non_zeros,
+        block_ctx,
+        nb_block_ctx,
+        decode_symbol,
+    )
+}
+
+/// Typed [`read_non_zeros_and_decode_block`] driven from a
+/// [`TransformType`].
+///
+/// Identical shape to the raw entry point but with `(num_blocks, size)`
+/// and natural-order derived from `t` per [`transform_block_params`]
+/// and [`natural_coeff_order`] and [`order_id_for_transform`]. The
+/// caller still owns the two closures and the NonZeros-grid
+/// bookkeeping above this primitive (per the FDIS prose right before
+/// Listing C.14: `NonZeros(x, y) = (non_zeros + num_blocks - 1) Idiv
+/// num_blocks`).
+#[allow(clippy::too_many_arguments)]
+pub fn read_non_zeros_and_decode_block_for_transform<F, G>(
+    t: TransformType,
+    predicted: u32,
+    block_ctx: u32,
+    nb_block_ctx: u32,
+    read_non_zeros: F,
+    decode_symbol: G,
+) -> Result<(DecodedHfBlock, u32)>
+where
+    F: FnMut(u32) -> Result<u32>,
+    G: FnMut(u32) -> Result<u32>,
+{
+    let (num_blocks, size) = transform_block_params(t);
+    let oid = order_id_for_transform(t);
+    let order = natural_coeff_order(oid);
+    read_non_zeros_and_decode_block(
+        &order,
+        num_blocks,
+        size,
+        predicted,
+        block_ctx,
+        nb_block_ctx,
+        read_non_zeros,
+        decode_symbol,
+    )
 }
 
 #[cfg(test)]
@@ -1103,5 +1231,241 @@ mod tests {
         assert_eq!(nonzero_count, 63);
         // Position natural_order[0] (the LLF cell) is untouched (== 0).
         assert_eq!(decoded.coeffs[order[0] as usize], 0);
+    }
+
+    // --- Round 164: typed `TransformType` entry points -----------------
+
+    /// `transform_block_params` derives `(num_blocks, size)` exactly per
+    /// §I.2.4 opening paragraph. Spot-check the four canonical shapes
+    /// this round exercises.
+    #[test]
+    fn transform_block_params_known_shapes() {
+        // DCT8×8 / Hornuss / DCT2×2 / DCT4×4 / DCT4×8 / DCT8×4 / AFV*:
+        // num_blocks = 1, size = 64.
+        assert_eq!(transform_block_params(TransformType::Dct8x8), (1, 64));
+        assert_eq!(transform_block_params(TransformType::Hornuss), (1, 64));
+        assert_eq!(transform_block_params(TransformType::Dct2x2), (1, 64));
+        assert_eq!(transform_block_params(TransformType::Dct4x4), (1, 64));
+        assert_eq!(transform_block_params(TransformType::Dct4x8), (1, 64));
+        assert_eq!(transform_block_params(TransformType::Dct8x4), (1, 64));
+        assert_eq!(transform_block_params(TransformType::Afv0), (1, 64));
+        assert_eq!(transform_block_params(TransformType::Afv3), (1, 64));
+        // DCT16×16 → num_blocks = 4, size = 256.
+        assert_eq!(transform_block_params(TransformType::Dct16x16), (4, 256));
+        // DCT16×8 → (bwidth, bheight) = (16, 8) → num_blocks = 2,
+        // size = 128.
+        assert_eq!(transform_block_params(TransformType::Dct16x8), (2, 128));
+        // DCT8×16 → same OrderId::Id4, so (num_blocks, size) collapses
+        // to (2, 128) too.
+        assert_eq!(transform_block_params(TransformType::Dct8x16), (2, 128));
+        // DCT32×32 → num_blocks = 16, size = 1024.
+        assert_eq!(transform_block_params(TransformType::Dct32x32), (16, 1024));
+        // DCT256×256 → num_blocks = 1024, size = 65536. (Sanity:
+        // num_blocks * 64 == size for every "square" DCTNxN since
+        // bwidth = bheight = N → num_blocks = (N/8)^2 → size = N^2 =
+        // num_blocks * 64.)
+        assert_eq!(
+            transform_block_params(TransformType::Dct256x256),
+            (1024, 65536)
+        );
+    }
+
+    /// `transform_block_params` round-trips every Table C.16 entry
+    /// through the `num_blocks * 64 == size`-for-DCT-NxN invariant
+    /// (and the rectangular DCT shapes). Catches typos in
+    /// [`varblock_size_for_order`] without re-pinning every cell.
+    #[test]
+    fn transform_block_params_size_equals_bwidth_times_bheight() {
+        let all = [
+            TransformType::Dct8x8,
+            TransformType::Hornuss,
+            TransformType::Dct2x2,
+            TransformType::Dct4x4,
+            TransformType::Dct16x16,
+            TransformType::Dct32x32,
+            TransformType::Dct16x8,
+            TransformType::Dct8x16,
+            TransformType::Dct32x8,
+            TransformType::Dct8x32,
+            TransformType::Dct32x16,
+            TransformType::Dct16x32,
+            TransformType::Dct4x8,
+            TransformType::Dct8x4,
+            TransformType::Afv0,
+            TransformType::Afv1,
+            TransformType::Afv2,
+            TransformType::Afv3,
+            TransformType::Dct64x64,
+            TransformType::Dct64x32,
+            TransformType::Dct32x64,
+            TransformType::Dct128x128,
+            TransformType::Dct128x64,
+            TransformType::Dct64x128,
+            TransformType::Dct256x256,
+            TransformType::Dct256x128,
+            TransformType::Dct128x256,
+        ];
+        for t in all {
+            let (num_blocks, size) = transform_block_params(t);
+            let oid = order_id_for_transform(t);
+            let (bwidth, bheight) = varblock_size_for_order(oid);
+            assert!(num_blocks >= 1, "{t:?}: num_blocks {num_blocks} < 1",);
+            assert_eq!(
+                num_blocks,
+                (bwidth / 8) * (bheight / 8),
+                "{t:?}: num_blocks derivation",
+            );
+            assert_eq!(size, bwidth * bheight, "{t:?}: size derivation",);
+            // num_blocks * 64 == size (every 8×8-tiled rectangular DCT
+            // varblock is a whole number of 8×8 cells).
+            assert_eq!(num_blocks * 64, size, "{t:?}: num_blocks * 64 != size",);
+        }
+    }
+
+    /// Typed entry point for DCT8×8 reduces to the raw entry point on
+    /// the matching natural-order vector and dimensions.
+    #[test]
+    fn decode_block_coefficients_for_transform_dct8x8_matches_raw() {
+        let order = natural_coeff_order(OrderId::Id0);
+        let typed =
+            decode_block_coefficients_for_transform(TransformType::Dct8x8, 1, 0, 1, |_| Ok(2))
+                .unwrap();
+        let raw = decode_block_coefficients(&order, 1, 64, 1, 0, 1, |_| Ok(2)).unwrap();
+        assert_eq!(typed, raw);
+    }
+
+    /// Typed entry point for DCT16×16 walks the (num_blocks=4, size=256)
+    /// scaffolding: a single non-zero at the first HF slot terminates
+    /// after one symbol read; the coefficient lands at
+    /// `natural_coeff_order(Id2)[num_blocks]`.
+    #[test]
+    fn decode_block_coefficients_for_transform_dct16x16_first_nonzero() {
+        let order = natural_coeff_order(OrderId::Id2);
+        assert_eq!(order.len(), 256);
+        let mut calls = 0;
+        let decoded =
+            decode_block_coefficients_for_transform(TransformType::Dct16x16, 1, 0, 1, |_| {
+                calls += 1;
+                Ok(1)
+            })
+            .unwrap();
+        assert_eq!(calls, 1);
+        assert_eq!(decoded.coeffs.len(), 256);
+        // num_blocks for DCT16×16 is 4 → first HF slot is k = 4.
+        let first_hf_pos = order[4] as usize;
+        assert_eq!(decoded.coeffs[first_hf_pos], -1, "UnpackSigned(1) == -1");
+        // Every other slot is zero.
+        for (i, &v) in decoded.coeffs.iter().enumerate() {
+            if i == first_hf_pos {
+                continue;
+            }
+            assert_eq!(v, 0);
+        }
+    }
+
+    /// `prev` Listing C.14 threshold for DCT16×16 is at
+    /// `non_zeros == size/16 + 1 = 17`. Exercises the
+    /// `non_zeros > size / 16` branch with the typed entry point's
+    /// `(num_blocks, size) = (4, 256)`.
+    #[test]
+    fn prev_for_context_dct16x16_threshold_at_17() {
+        // size / 16 = 16 for DCT16×16 → crossover at non_zeros == 17.
+        for nz in 0..=16 {
+            assert_eq!(
+                prev_for_context(4, 4, 256, nz, |_| panic!("never called")),
+                0,
+                "DCT16×16 prev at nz={nz}",
+            );
+        }
+        for nz in 17..=63 {
+            assert_eq!(
+                prev_for_context(4, 4, 256, nz, |_| panic!("never called")),
+                1,
+                "DCT16×16 prev at nz={nz}",
+            );
+        }
+    }
+
+    /// `read_non_zeros_and_decode_block_for_transform` threads
+    /// `(num_blocks, size, natural_order)` through both closures.
+    #[test]
+    fn read_non_zeros_and_decode_block_for_transform_dct16x16() {
+        let order = natural_coeff_order(OrderId::Id2);
+        let predicted = 4u32;
+        // NonZerosContext(4, 0, 1) = 0 + 1 × 4 = 4 (predicted < 8 branch).
+        let expected_nz_ctx = non_zeros_context(predicted, 0, 1);
+        assert_eq!(expected_nz_ctx, 4);
+        let mut nz_seen = u32::MAX;
+        let mut coeff_calls = 0u32;
+        let (decoded, non_zeros) = read_non_zeros_and_decode_block_for_transform(
+            TransformType::Dct16x16,
+            predicted,
+            0,
+            1,
+            |ctx| {
+                nz_seen = ctx;
+                Ok(3) // three non-zeros for this block
+            },
+            |_| {
+                coeff_calls += 1;
+                Ok(2) // signed +1 each
+            },
+        )
+        .unwrap();
+        assert_eq!(nz_seen, expected_nz_ctx);
+        assert_eq!(non_zeros, 3);
+        assert_eq!(coeff_calls, 3);
+        assert_eq!(decoded.coeffs_read, 3);
+        assert_eq!(decoded.remaining_non_zeros, 0);
+        // Three +1 values at positions natural_order[4..7] (DCT16×16
+        // num_blocks = 4 so HF tail starts at k = 4).
+        assert_eq!(decoded.coeffs[order[4] as usize], 1);
+        assert_eq!(decoded.coeffs[order[5] as usize], 1);
+        assert_eq!(decoded.coeffs[order[6] as usize], 1);
+    }
+
+    /// Rectangular DCT16×8 varblock — `(num_blocks, size) = (2, 128)`.
+    /// All-zero `initial_non_zeros` short-circuits to no symbol reads.
+    #[test]
+    fn decode_block_coefficients_for_transform_dct16x8_all_zero() {
+        let mut calls = 0;
+        let decoded =
+            decode_block_coefficients_for_transform(TransformType::Dct16x8, 0, 0, 1, |_| {
+                calls += 1;
+                Ok(0)
+            })
+            .unwrap();
+        assert_eq!(calls, 0);
+        assert_eq!(decoded.coeffs.len(), 128);
+        assert_eq!(decoded.coeffs_read, 0);
+        assert!(decoded.coeffs.iter().all(|&v| v == 0));
+    }
+
+    /// Typed entry point defensively rejects an initial_non_zeros that
+    /// exceeds `size - num_blocks` for the chosen transform.
+    /// For DCT16×16: max legal = 256 - 4 = 252.
+    #[test]
+    fn decode_block_coefficients_for_transform_rejects_oob_non_zeros() {
+        let r =
+            decode_block_coefficients_for_transform(TransformType::Dct16x16, 253, 0, 1, |_| Ok(0));
+        assert!(matches!(r, Err(Error::InvalidData(_))));
+        // 252 is OK at the validation layer (the loop itself will run
+        // 252 reads). Smoke-test that with a closure that returns 0
+        // (which never decrements non_zeros, so the loop exits on
+        // `k == size`).
+        let mut calls = 0;
+        let decoded =
+            decode_block_coefficients_for_transform(TransformType::Dct16x16, 252, 0, 1, |_| {
+                calls += 1;
+                Ok(0)
+            })
+            .unwrap();
+        // The loop walks k from num_blocks=4 to size=256 (= 252
+        // iterations) since every read returns 0 → non_zeros never
+        // decrements.
+        assert_eq!(calls, 252);
+        assert_eq!(decoded.coeffs_read, 252);
+        // All coefficients are zero (every UnpackSigned(0) = 0).
+        assert!(decoded.coeffs.iter().all(|&v| v == 0));
     }
 }

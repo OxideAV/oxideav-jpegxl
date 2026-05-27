@@ -9,6 +9,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Round 164 (2021-FDIS) — `TransformType`-driven entry points for
+  the §C.8.3 per-block HF coefficient decode loop (DCT16×16 /
+  DCT16×8 / DCT32×32 dimensions pinned end-to-end).** New public API
+  in `pass_group_hf`:
+  - `transform_block_params(t: TransformType) -> (num_blocks, size)`
+    — §I.2.4 opening paragraph + Listing C.14: `num_blocks =
+    (bwidth / 8) × (bheight / 8)`, `size = bwidth × bheight`.
+  - `decode_block_coefficients_for_transform(t, initial_non_zeros,
+    block_ctx, nb_block_ctx, decode_symbol)` — typed wrapper that
+    derives `(num_blocks, size, natural_order)` from `t` (via
+    [`coeff_order::order_id_for_transform`] +
+    [`coeff_order::natural_coeff_order`]) and reduces to the
+    round-159 `decode_block_coefficients`.
+  - `read_non_zeros_and_decode_block_for_transform(t, predicted,
+    block_ctx, nb_block_ctx, read_non_zeros, decode_symbol)` —
+    analogous typed wrapper around
+    `read_non_zeros_and_decode_block`.
+  20 new tests (8 unit in `pass_group_hf::tests` + 12 integration
+  in `tests/round164_dct16x16_block_coefficient_loop.rs`) pin the
+  `(num_blocks, size)` derivation for every Table C.16 transform
+  (every entry satisfies `num_blocks * 64 == size`); the DCT16×16
+  `prev` threshold at `non_zeros == 17` (= size/16 + 1); the typed
+  entry point at DCT8×8 reduces to the raw entry point; the typed
+  entry point at DCT16×16 walks `(num_blocks=4, size=256)` for
+  all-zero / single-non-zero / three-consecutive / full-density
+  (252 reads) cases with coefficients landing at
+  `natural_coeff_order(Id2)[4..]`; the typed and raw entry points
+  agree byte-for-byte on a mixed `[2, 0, 4, 0, 0, 6]` sequence;
+  `read_non_zeros_and_decode_block_for_transform` threads the
+  `NonZerosContext` value through the first closure; the rectangular
+  DCT16×8 / DCT8×16 collapse to the same per-block outcome (they
+  share OrderId::Id4); defensive rejection of `initial_non_zeros >
+  size - num_blocks` (= 252 max for DCT16×16); and one DCT32×32
+  smoke-test at `(num_blocks=16, size=1024)`. Lib tests 553 → 561
+  (+8). Pure-typed wrapper layer: no new bit reads, no spec
+  re-derivation — the round-159 module note ("the primitive itself
+  is shape-agnostic and ready for the larger variable-block sizes
+  once their parameterisation lands") is now exercised from the
+  caller-facing API.
 - **Round 159 (2021-FDIS) — §C.8.3 per-block HF coefficient decode
   loop scaffolding (Listing C.13 + Listing C.14).** New public API in
   `pass_group_hf`:
