@@ -9,6 +9,66 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Round 183 (2021-FDIS) — typed per-channel `NonZeros(x, y)` grid
+  container (FDIS §C.8.3 + Listing C.13 channel-keying).** New
+  `per_channel_non_zeros` module that owns one
+  `non_zeros_grid::NonZerosGrid` per channel, layered above the
+  round-177 single-channel primitive. Listing C.13's
+  `BlockContext()` factors `c` into `(c < 2 ? c ^ 1 : 2) × 13 + s`,
+  so the `NonZeros(x, y)` bookkeeping is keyed per-channel because
+  chroma subsampling + `TransformType` heterogeneity means each
+  channel's varblock-grid shape can differ:
+  - `PerChannelNonZerosGrids::new(dims: &[(u32, u32)]) -> Result<Self>`
+    — per-channel `(width, height)` slice, validated entry-by-entry
+    via `NonZerosGrid::new` (zero / `> 65535` dims rejected; empty
+    slice rejected).
+  - `PerChannelNonZerosGrids::new_uniform(num_channels, width,
+    height) -> Result<Self>` — convenience builder for the
+    unsubsampled 4:4:4-style container.
+  - `PerChannelNonZerosGrids::{num_channels, grid, grid_mut,
+    predicted, get, set, update_after_block,
+    update_after_block_for_transform}` — per-channel routing
+    accessors; out-of-range `c` errors cleanly.
+  - `PerChannelNonZerosGrids::decode_block_at_for_channel(c, x, y,
+    t, block_ctx, nb_block_ctx, read_non_zeros, decode_symbol)
+    -> Result<(DecodedHfBlock, u32)>` — typed per-channel driver
+    that wraps the round-177 `non_zeros_grid::decode_block_at`
+    with channel routing. Caller pre-computes `block_ctx` via
+    `pass_group_hf::block_context` with the matching `c`; the
+    container is a pure storage + routing primitive.
+  - `DEFAULT_NUM_CHANNELS = 3` — the YCbCr / XYB canonical channel
+    count.
+
+  36 new tests (24 unit in `per_channel_non_zeros::tests` + 12
+  integration in `tests/round183_per_channel_non_zeros.rs`) pin:
+  empty-channel-list rejection; zero-dim / oversize-dim rejection
+  on any channel; three-channel chroma-subsampled construction at
+  `[(16, 16), (8, 8), (8, 8)]`; `new_uniform` convenience;
+  out-of-range channel index errors on every accessor (8 paths);
+  `PredictedNonZeros(0, 0) = 32` on every channel; per-channel
+  write isolation; per-channel `predicted` horizontal chain on a
+  seeded channel-1 grid; `update_after_block_for_transform`
+  dispatch (raw `non_zeros = 17` → `{17, 5, 2}` at DCT8×8 /
+  DCT16×16 / DCT32×32 on three independent channels);
+  `decode_block_at_for_channel` routes the round-177 typed driver
+  per channel; post-update cell feeds the next-position predicted
+  value back per-channel; OOB `(x, y)` past the per-channel grid
+  errors cleanly; a two-step three-channel raster walk at
+  `(0, 0)` / `(1, 0)` with distinct `[4, 12, 20]` /
+  `[6, 18, 30]` per-channel raw_non_zeros sequences preserves
+  cross-channel isolation.
+
+  Lib tests 584 → 608 (+24). Pure-control-flow primitive in the
+  same shape as round-89 `dct_quant_weights`, round-95
+  `hf_dequant`, round-121 `llf_from_lf`, round-138
+  `chroma_from_luma`, round-141 `gaborish`, round-144 `epf`,
+  round-147 `afv_idct`, round-159 / 164 `pass_group_hf`, and
+  round-177 `non_zeros_grid` — no bit reads, no spec
+  re-derivation. A future round wiring §C.7.2 entropy histograms
+  (#799 DOCS-GAP) + the per-LfGroup varblock-shape grid +
+  per-channel `BlockContext()` history can drop these helpers in
+  as the per-channel step without re-deriving any Listing C.13 /
+  C.14 formulae.
 - **Round 177 (2021-FDIS) — typed `NonZeros(x, y)` grid bookkeeping +
   per-varblock decode driver (FDIS §C.8.3 + Listing C.13 prelude +
   Listing C.14 post-prose).** New `non_zeros_grid` module bridging

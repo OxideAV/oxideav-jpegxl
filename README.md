@@ -5,6 +5,73 @@ Pure-Rust **JPEG XL** (ISO/IEC 18181-1:2024) decoder. Resumed
 trace-doc-driven rounds 7-11 + encoder rounds 1-6 were retired
 (see "Why retired (history)" below).
 
+**Round 183 (2026-05-29)** lifts the round-177 single-channel
+[`non_zeros_grid::NonZerosGrid`] into a typed per-channel container
+[`per_channel_non_zeros::PerChannelNonZerosGrids`] that owns one
+grid per channel (YCbCr / XYB: Y / Y', Cb / X, Cr / B). Listing
+C.13's `BlockContext()` factors the channel index `c` into
+`(c < 2 ? c ^ 1 : 2) × 13 + s`, and the `NonZeros(x, y)`
+bookkeeping is keyed per-channel because chroma subsampling +
+`TransformType` heterogeneity means each channel's varblock-grid
+shape can differ. The new module is the routing primitive layered
+above round 177's per-position storage primitive:
+
+- [`per_channel_non_zeros::PerChannelNonZerosGrids::new`] takes a
+  `&[(width, height)]` slice (one pair per channel) so the caller
+  can construct an asymmetric Y / Cb / Cr container in one call —
+  validated entry-by-entry against [`NonZerosGrid::new`] (zero or
+  `> 65535` dims rejected).
+- [`per_channel_non_zeros::PerChannelNonZerosGrids::new_uniform`]
+  builds the unsubsampled 4:4:4-style container in one line.
+- [`per_channel_non_zeros::PerChannelNonZerosGrids::{grid, grid_mut,
+  predicted, get, set, update_after_block,
+  update_after_block_for_transform}`] route to the matching
+  per-channel grid; out-of-range `c` errors cleanly.
+- [`per_channel_non_zeros::PerChannelNonZerosGrids::decode_block_at_for_channel`]
+  — typed per-channel driver wrapping
+  [`non_zeros_grid::decode_block_at`] with channel routing. The
+  caller passes `block_ctx` computed via
+  [`pass_group_hf::block_context`] with the matching `c`; the
+  container is a pure storage + routing primitive and does not
+  re-derive [`pass_group_hf::block_context`].
+- [`per_channel_non_zeros::DEFAULT_NUM_CHANNELS`] = 3 — the
+  canonical YCbCr / XYB channel count.
+
+36 new tests (24 unit + 12 integration
+`round183_per_channel_non_zeros`) pin: empty-channel-list / zero-
+dim / oversize-dim rejection; three-channel construction at
+chroma-subsampled `[(16, 16), (8, 8), (8, 8)]` shapes;
+[`PerChannelNonZerosGrids::new_uniform`] convenience builder;
+out-of-range channel index errors on every accessor (`grid`,
+`grid_mut`, `predicted`, `get`, `set`, `update_after_block`,
+`update_after_block_for_transform`, `decode_block_at_for_channel`);
+`PredictedNonZeros(0, 0) = 32` on every channel; per-channel
+write isolation (`set(0, 1, 1, 99)` does not leak into channel
+1 or 2); per-channel `predicted` horizontal chain on a seeded
+channel-1 grid with channel 0 / channel 2 still at default;
+`update_after_block_for_transform` dispatch reduces a raw
+`non_zeros = 17` to `{17, 5, 2}` at DCT8×8 / DCT16×16 / DCT32×32
+on three independent channels; `decode_block_at_for_channel`
+routes the round-177 typed driver per channel (channel 2's
+`raw_non_zeros = 11` updates only channel 2's `(0, 0)` cell);
+the typed driver's post-update cell feeds the next-position
+predicted value back; OOB `(x, y)` past the per-channel grid
+errors cleanly; a full two-step three-channel raster walk at
+`(0, 0)` and `(1, 0)` with distinct `[4, 12, 20]` /
+`[6, 18, 30]` per-channel raw_non_zeros sequences preserves
+cross-channel isolation. Lib tests 584 → 608 (+24).
+
+Pure-control-flow primitive in the same shape as round-89
+`dct_quant_weights`, round-95 `hf_dequant`, round-121
+`llf_from_lf`, round-138 `chroma_from_luma`, round-141
+`gaborish`, round-144 `epf`, round-147 `afv_idct`, round-159 /
+164 `pass_group_hf`, and round-177 `non_zeros_grid` — no bit
+reads, no spec re-derivation. A future round wiring the §C.7.2
+entropy histograms (#799 DOCS-GAP) + the per-LfGroup
+varblock-shape grid + per-channel `BlockContext()` history can
+drop these helpers in as the per-channel step without
+re-deriving any Listing C.13 / C.14 formulae.
+
 **Round 177 (2026-05-29)** lands the typed per-pass / per-channel
 `NonZeros(x, y)` grid bookkeeping that bridges round 159's
 [`pass_group_hf::predicted_non_zeros`] (the four-branch
