@@ -511,6 +511,7 @@ pub mod metadata;
 pub mod metadata_fdis;
 pub mod modular;
 pub mod modular_fdis;
+pub mod non_zeros_grid;
 pub mod pass_group;
 pub mod pass_group_hf;
 pub mod predictors;

@@ -5,6 +5,79 @@ Pure-Rust **JPEG XL** (ISO/IEC 18181-1:2024) decoder. Resumed
 trace-doc-driven rounds 7-11 + encoder rounds 1-6 were retired
 (see "Why retired (history)" below).
 
+**Round 177 (2026-05-29)** lands the typed per-pass / per-channel
+`NonZeros(x, y)` grid bookkeeping that bridges round 159's
+[`pass_group_hf::predicted_non_zeros`] (the four-branch
+`PredictedNonZeros(x, y)` recurrence in FDIS Listing C.13 prelude)
+with round 164's
+[`pass_group_hf::read_non_zeros_and_decode_block_for_transform`]
+(the [`TransformType`]-driven per-block coefficient loop) — the
+storage layer the FDIS §C.8.3 prose after Listing C.14 describes:
+
+> NonZeros(x, y) is then `(non_zeros + num_blocks − 1) Idiv num_blocks`.
+
+New `non_zeros_grid` module:
+
+- [`non_zeros_grid::NonZerosGrid`] — rectangular `width × height`
+  varblock-grid storage of `NonZeros(x, y)` cells (one cell per
+  varblock origin, indexed in 8-sample units). `new`, `get`, `set`,
+  `width`, `height`, `cells` accessors + the two spec-driven
+  primitives:
+  - `predicted(x, y) -> u32` — delegates to
+    [`pass_group_hf::predicted_non_zeros`] against
+    `|xx, yy| self.get(xx, yy).unwrap_or(0)` so the four-branch
+    recurrence (`(0,0) → 32`, top-row → left-neighbour, left-col →
+    above-neighbour, interior → `(above + left + 1) >> 1`) is the
+    single source of truth.
+  - `update_after_block(x, y, non_zeros, num_blocks) -> u32` —
+    Listing C.14 post-prose formula `(non_zeros + num_blocks − 1)
+    Idiv num_blocks` (ceiling-divide identity, defensively
+    `saturating_add` to avoid panic at `u32::MAX`).
+  - `update_after_block_for_transform(x, y, non_zeros, t)` —
+    `num_blocks` derived from
+    [`pass_group_hf::transform_block_params`].
+- [`non_zeros_grid::decode_block_at`] — typed per-varblock driver
+  that threads
+  [`pass_group_hf::read_non_zeros_and_decode_block_for_transform`]
+  through the grid: computes `predicted = grid.predicted(x, y)`,
+  invokes the round-164 read-then-decode entry point with the
+  caller's two ANS closures, then calls
+  `grid.update_after_block_for_transform(x, y, raw_non_zeros, t)`
+  before returning the
+  [`pass_group_hf::DecodedHfBlock`] + raw `non_zeros` pair.
+
+35 new tests (23 unit + 12 integration
+`round177_non_zeros_grid`) pin: defensive rejection of zero /
+oversize (`> 65535`) dimensions and out-of-range `(x, y)`;
+zero-init cell semantics; `PredictedNonZeros(0, 0) = 32` across
+a sweep of grid shapes (1×1 through 32×32); the y == 0 / x == 0
+border-recurrence branches via horizontal / vertical raster
+chains; the interior `(above + left + 1) >> 1` average (odd-sum
+rounding); the `predicted_non_zeros` helper agreement
+byte-for-byte across an arbitrary seeded 3×3 grid; the
+post-Listing-C.14 ceiling-divide at `num_blocks ∈ {1, 4, 16}`
+(DCT8×8 / DCT16×16 / DCT32×32); the [`TransformType`] dispatch
+via `update_after_block_for_transform` reduces a raw
+`non_zeros = 17` to `{17, 5, 2}` at the three shapes; the
+typed driver's `predicted = 32` at the origin routes through
+the `predicted >= 8` `NonZerosContext` branch (`ctx = block_ctx
++ nb_block_ctx × (4 + 32 Idiv 2)`); `decode_block_at` reads
+back `(0, 0)`'s post-update cell when invoked at `(1, 0)`; OOB
+positions error cleanly; per-channel independence (two grids of
+the same shape evolve independently); and pathological
+`u32::MAX` does not panic. Lib tests 561 → 584 (+23).
+
+Pure-control-flow primitive in the same shape as round-89
+`dct_quant_weights`, round-95 `hf_dequant`, round-121
+`llf_from_lf`, round-138 `chroma_from_luma`, round-141
+`gaborish`, round-144 `epf`, round-147 `afv_idct`, and
+round-159 / 164 `pass_group_hf` — no bit reads, no spec
+re-derivation. A future round wiring the §C.7.2 entropy
+histograms (#799 DOCS-GAP) + the per-LfGroup varblock-shape
+grid + per-channel `BlockContext()` history can drop these
+helpers in as the per-varblock-position step without
+re-deriving any Listing C.13 / C.14 formulae.
+
 **Round 164 (2026-05-27)** lifts the round-159 raw-`(num_blocks,
 size, natural_order)` per-block coefficient loop into a typed,
 [`TransformType`]-driven entry point and pins it at DCT16×16 /

@@ -9,6 +9,66 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Round 177 (2021-FDIS) — typed `NonZeros(x, y)` grid bookkeeping +
+  per-varblock decode driver (FDIS §C.8.3 + Listing C.13 prelude +
+  Listing C.14 post-prose).** New `non_zeros_grid` module bridging
+  round 159 `pass_group_hf::predicted_non_zeros` (the four-branch
+  `PredictedNonZeros(x, y)` recurrence) with round 164
+  `pass_group_hf::read_non_zeros_and_decode_block_for_transform`
+  (the `TransformType`-driven per-block coefficient loop):
+  - `NonZerosGrid::new(width, height) -> Result<Self>` — rectangular
+    varblock-grid storage of `NonZeros(x, y)` cells. Defensive
+    rejection of zero dims + dims `> 65535`.
+  - `NonZerosGrid::{get, set, width, height, cells}` — accessors.
+  - `NonZerosGrid::predicted(x, y) -> Result<u32>` — delegates to
+    `pass_group_hf::predicted_non_zeros` against
+    `|xx, yy| self.get(xx, yy).unwrap_or(0)`.
+  - `NonZerosGrid::update_after_block(x, y, non_zeros, num_blocks)
+    -> Result<u32>` — FDIS post-Listing-C.14 prose formula
+    `(non_zeros + num_blocks - 1) Idiv num_blocks` (ceiling-divide
+    identity, `saturating_add` at `u32::MAX`).
+  - `NonZerosGrid::update_after_block_for_transform(x, y, non_zeros,
+    t)` — `num_blocks` from `pass_group_hf::transform_block_params`.
+  - `non_zeros_grid::decode_block_at(grid, x, y, t, block_ctx,
+    nb_block_ctx, read_non_zeros, decode_symbol) -> Result<
+    (DecodedHfBlock, u32)>` — typed per-varblock driver: computes
+    `predicted`, invokes
+    `read_non_zeros_and_decode_block_for_transform`, then calls
+    `update_after_block_for_transform` before returning the
+    `(DecodedHfBlock, raw_non_zeros)` pair.
+
+  35 new tests (23 unit in `non_zeros_grid::tests` + 12 integration
+  in `tests/round177_non_zeros_grid.rs`) pin: defensive rejection
+  of zero / oversize (`> 65535`) dims and out-of-range `(x, y)`;
+  zero-init cells; `PredictedNonZeros(0, 0) = 32` across a sweep
+  of grid shapes; the y == 0 and x == 0 border-recurrence branches
+  via horizontal / vertical raster chains; the interior
+  `(above + left + 1) >> 1` average (odd-sum rounding); the
+  `predicted_non_zeros` helper agreement byte-for-byte on a seeded
+  3×3 grid; the post-Listing-C.14 ceiling-divide formula at
+  `num_blocks ∈ {1, 4, 16}` (DCT8×8 / DCT16×16 / DCT32×32 — the
+  `TransformType` dispatch reduces a raw `non_zeros = 17` to
+  `{17, 5, 2}` at the three shapes); the typed driver's
+  `predicted = 32` at the origin routes through the `predicted >=
+  8` `NonZerosContext` branch (`ctx = block_ctx + nb_block_ctx ×
+  (4 + 32 Idiv 2) = 67` at `(block_ctx, nb_block_ctx) = (7, 3)`);
+  `decode_block_at` reads back `(0, 0)`'s post-update cell when
+  invoked at `(1, 0)`; OOB positions error cleanly; per-channel
+  independence (two grids of the same shape evolve
+  independently); row-major `cells()` layout pinned at `[0, 10,
+  20, 30]` after writing `(1,0)=10`, `(0,1)=20`, `(1,1)=30` on a
+  2×2 grid; and pathological `u32::MAX` does not panic.
+
+  Lib tests 561 → 584 (+23). Pure-control-flow primitive in the
+  same shape as round-89 `dct_quant_weights`, round-95
+  `hf_dequant`, round-121 `llf_from_lf`, round-138
+  `chroma_from_luma`, round-141 `gaborish`, round-144 `epf`,
+  round-147 `afv_idct`, and round-159 / 164 `pass_group_hf` — no
+  bit reads, no spec re-derivation. A future round wiring §C.7.2
+  entropy histograms (#799 DOCS-GAP) + the per-LfGroup
+  varblock-shape grid + per-channel `BlockContext()` history can
+  drop these helpers in as the per-varblock-position step without
+  re-deriving any Listing C.13 / C.14 formulae.
 - **Round 164 (2021-FDIS) — `TransformType`-driven entry points for
   the §C.8.3 per-block HF coefficient decode loop (DCT16×16 /
   DCT16×8 / DCT32×32 dimensions pinned end-to-end).** New public API
