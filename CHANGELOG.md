@@ -7,6 +7,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.10](https://github.com/OxideAV/oxideav-jpegxl/compare/v0.0.9...v0.0.10) - 2026-05-30
+
+### Other
+
+- round-191 (parent-dispatch r191) against ISO/IEC FDIS 18181-1:2021 — Annex E / §H.5.2 Weighted-Predictor oracle test driven by clean-room behavioural trace at noise-64x64-lossless sample 194
+- round-190 (parent-dispatch r190) against ISO/IEC FDIS 18181-1:2021 — typed per-pass NonZeros(x, y) grid container above the round-183 per-channel primitive
+- round-183 (parent-dispatch r183) against ISO/IEC FDIS 18181-1:2021 — typed per-channel NonZeros(x, y) grid container layered above round-177 single-channel primitive
+- round-177 (parent-dispatch r177) against ISO/IEC FDIS 18181-1:2021 — typed NonZeros(x, y) grid bookkeeping + per-varblock decode driver
+- round-164 (parent-dispatch r164) against ISO/IEC FDIS 18181-1:2021 — TransformType-driven entry points for the §C.8.3 per-block HF coefficient decode loop
+- round-159 (parent-dispatch r159) against ISO/IEC FDIS 18181-1:2021 — §C.8.3 per-block HF coefficient decode loop scaffolding (Listings C.13 + C.14)
+- round-150 (parent-dispatch r150) against ISO/IEC FDIS 18181-1:2021 — Annex I.2.3.8 Listing I.13 Inverse AFV transform wired into idct dispatch
+- round-147 (parent-dispatch r147) against ISO/IEC FDIS 18181-1:2021 — Annex I.2.2 AFV basis + AFV_IDCT pure-math primitive (Listings I.5 + I.6)
+- round-144 (parent-dispatch r144) against ISO/IEC FDIS 18181-1:2021 — Annex J.3 edge-preserving-filter pure-math primitive
+- round-141 (parent-dispatch r141) against ISO/IEC FDIS 18181-1:2021 — Annex J.2 Gabor-like-transform pure-math primitive
+- round-138 (parent-dispatch r138) against ISO/IEC FDIS 18181-1:2021 — Annex G Chroma-from-Luma pure-math primitive (Listing G.1)
+- round-133 (parent-dispatch r133) against ISO/IEC FDIS 18181-1:2021 — §C.7.1 DecodePermutation() for used_orders != 0
+- Round 129: per-varblock LF→LLF composition glue (§I.2.5 plumbing)
+- Round 126: WP deep-trace plumbing + sample-194 hand-derivation
+- round-121 (parent-dispatch r121) against ISO/IEC FDIS 18181-1:2021 — §I.2.5 LLF-from-LF pure-math step (Listings I.15 + I.16)
+- round-95 (parent-dispatch r95) against ISO/IEC FDIS 18181-1:2021 — §F.3 HF dequantisation pure-math step
+- round-90 (parent-dispatch r90) against ISO/IEC 18181-1:2021 FDIS — HfPass + PassGroup HF structural parsers
+- round-89 (parent-dispatch r89) against ISO/IEC 18181-1:2024 — GetDCTQuantWeights + Table I.6 default dequantization-matrix materialisation
+- rewrite lf_dequant comment to remove libjxl numeric-defaults citation
+- round-77 fixup — inline animation-3frame fixture under crate-local tests/fixtures/
+- round-77 (parent-dispatch r17) against ISO/IEC 18181-1:2024 — animation-3frame SPECDIFF audit harness
+- round-32 (parent-dispatch r17) against ISO/IEC 18181-1:2024 — noise-64x64-lossless pixel-divergence bisected to WP at first predictor=6 sample with WW/NN both in-image; fix deferred pending libjxl-WP behavioural trace
+- round-31 (parent-dispatch r16) against ISO/IEC 18181-1:2024 — §F.3 zero-pad uniformly applied to single-TOC-entry LfGlobal fast path
+- round-30 (parent-dispatch r15) against ISO/IEC 18181-1:2024 — bit-depth-16 RGB pixel-correct + 16-bit LE plane-pack convention
+- round-29 (parent-dispatch r14) against ISO/IEC 18181-1:2024 — alpha-64x64 RGBA pixel-correct + ISOBMFF FF 0A strip
+- round-28 (parent-dispatch r13) against ISO/IEC 18181-1:2024 — non-DCT IDCT helpers (Annex I.9.3..I.9.7)
+- round-27 (parent-dispatch r12) against ISO/IEC 18181-1:2024 — IDCT dispatch (Annex I.2.1 + I.2.2 Listing I.4)
+- round-26 (parent-dispatch r11) against ISO/IEC 18181-1:2024 — Annex L colour transforms (XYB inverse + YCbCr inverse)
+- round-25 (Auditor mode) against ISO/IEC 18181-1:2024 — d1 LfCoefficients per-sample rich-state range dump 22..=79
+- round-24 (Auditor mode) against ISO/IEC 18181-1:2024 — d1 per-cluster D[] byte trace + per-call alias-mapping invariant audit
+- round-23 (Auditor mode) against ISO/IEC 18181-1:2024 — d1 leaf-pick property dump at Y' sample 22 + WP y=0 boundary audit
+- round-22 (Auditor mode) against ISO/IEC 18181-1:2024 — d1 lf_quant sample dump + WP rounding bias toggle
+- round-21 (Auditor mode) against ISO/IEC 18181-1:2024 — d1 per-cluster distribution + alias-table self-map audit
+- round-20 followup — refresh round-19 trace eprintln with corrected DC_GROUP budget
+- round-20 (Auditor pivot) against ISO/IEC 18181-1:2024 — DC_GROUP boundary recount + ANS-final-state oracle
+- round-19 (Auditor mode) — d1 cluster + ANS state evolution audit
+- round-18 (Auditor mode) against ISO/IEC 18181-1:2024 — per-token bit accounting trace + drift narrowed
+
 ### Added
 
 - **Round 191 (2021-FDIS) — Annex E / §H.5.2 Weighted-Predictor
