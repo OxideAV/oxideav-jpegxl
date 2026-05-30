@@ -5,6 +5,90 @@ Pure-Rust **JPEG XL** (ISO/IEC 18181-1:2024) decoder. Resumed
 trace-doc-driven rounds 7-11 + encoder rounds 1-6 were retired
 (see "Why retired (history)" below).
 
+**Round 190 (2026-05-30)** lifts the round-183 per-channel
+[`per_channel_non_zeros::PerChannelNonZerosGrids`] into a typed
+per-pass container
+[`per_pass_non_zeros::PerPassNonZerosGrids`] that owns one
+per-channel container per pass index `p ∈ [0, num_passes)`. A
+frame's VarDCT path is decoded in `num_passes` ordered passes
+(declared in the [`frame_header::FrameHeader`]'s
+[`frame_header::Passes`] field); each pass scans every
+`PassGroup` once and §C.8.3 specifies that within a pass each
+channel of each varblock maintains its own `NonZeros(x, y)`
+state. Between passes the per-channel `NonZeros(x, y)`
+bookkeeping is reset because the per-pass histogram is selected
+by `hfp` from the per-pass `HfPass` array — a different pass
+uses a different histogram and the prediction recurrence is
+keyed against the current pass's own coefficient counts.
+
+The new module is the routing primitive layered above round
+183's per-channel container:
+
+- [`per_pass_non_zeros::PerPassNonZerosGrids::new`] takes a
+  `&[&[(u32, u32)]]` slice (one per-channel `(width, height)`
+  list per pass) so a callsite that already knows the per-pass
+  per-channel shapes can construct the container in one call
+  — validated entry-by-entry against
+  [`per_channel_non_zeros::PerChannelNonZerosGrids::new`].
+- [`per_pass_non_zeros::PerPassNonZerosGrids::new_uniform`]
+  builds the unsubsampled-and-uniform-across-passes container
+  in one line.
+- [`per_pass_non_zeros::PerPassNonZerosGrids::{num_passes,
+  pass, pass_mut, predicted, get, set, update_after_block,
+  update_after_block_for_transform}`] route to the matching
+  per-pass container; out-of-range `p` errors cleanly.
+- [`per_pass_non_zeros::PerPassNonZerosGrids::decode_block_at_for_pass_channel`]
+  — typed per-pass per-channel driver wrapping
+  [`per_channel_non_zeros::PerChannelNonZerosGrids::decode_block_at_for_channel`]
+  with pass routing. The caller passes `block_ctx` computed via
+  [`pass_group_hf::block_context`] with the matching `c`; the
+  container is a pure storage + routing primitive and does not
+  re-derive [`pass_group_hf::block_context`] nor materialise the
+  per-pass histogram.
+- Per-pass per-channel shapes are independent — ragged per-pass
+  channel counts are tolerated (e.g. a DC-only preview pass
+  with one channel followed by a three-channel main pass) so
+  the container does not encode a semantic choice that belongs
+  to the per-LfGroup driver.
+
+41 new tests (28 unit + 13 integration
+`round190_per_pass_non_zeros`) pin: empty-pass-list /
+zero-channel-pass / zero-dim rejection; two-pass
+chroma-subsampled construction at
+`[(16, 16), (8, 8), (8, 8)]` shapes; `new_uniform`
+convenience; out-of-range pass index errors on every accessor
+(`pass`, `pass_mut`, `predicted`, `get`, `set`,
+`update_after_block`, `update_after_block_for_transform`,
+`decode_block_at_for_pass_channel`);
+`PredictedNonZeros(0, 0) = 32` on every (pass, channel) pair;
+per-pass write isolation (`set(0, 1, 0, 0, 42)` does not leak
+into pass 1 or channel 0/2 of pass 0); per-pass `predicted`
+propagation (pass 1's `predicted(1, 1, 0)` reads back pass 1's
+own `(0, 0)`, not pass 0's); per-pass
+`update_after_block_for_transform` dispatch (`DCT8×8 /
+DCT16×16 / DCT32×32` reduces raw `non_zeros = 17` to
+`{17, 5, 2}` on three independent passes);
+`decode_block_at_for_pass_channel` routes the round-183 typed
+driver per pass and per channel; a two-pass three-channel
+raster walk at `(0, 0)` / `(1, 0)` with distinct per-pass
+per-channel `raw_non_zeros` sequences `[4, 8, 12]` /
+`[3, 6, 9]` preserves cross-pass isolation; ragged per-pass
+channel counts; `u32::MAX` no-panic saturating-add chain
+through the per-pass route. Lib tests 608 → 636 (+28).
+
+Pure-control-flow primitive in the same shape as round-89
+`dct_quant_weights`, round-95 `hf_dequant`, round-121
+`llf_from_lf`, round-138 `chroma_from_luma`, round-141
+`gaborish`, round-144 `epf`, round-147 `afv_idct`, round-159 /
+164 `pass_group_hf`, round-177 `non_zeros_grid`, and round-183
+`per_channel_non_zeros` — no bit reads, no spec
+re-derivation. A future round wiring the §C.7.2 entropy
+histograms (#799 DOCS-GAP) + the per-LfGroup varblock-shape
+grid + the per-pass `hfp` selection from the
+[`hf_pass::HfPass`] array can drop these helpers in as the
+per-pass routing step without re-deriving any Listing C.13 /
+C.14 formulae.
+
 **Round 183 (2026-05-29)** lifts the round-177 single-channel
 [`non_zeros_grid::NonZerosGrid`] into a typed per-channel container
 [`per_channel_non_zeros::PerChannelNonZerosGrids`] that owns one

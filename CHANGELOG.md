@@ -9,6 +9,62 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Round 190 (2021-FDIS) — typed per-pass `NonZeros(x, y)` grid
+  container (FDIS §C.8.3 + Listing C.13 per-pass keying).** New
+  `per_pass_non_zeros` module that owns one
+  `per_channel_non_zeros::PerChannelNonZerosGrids` per pass index
+  `p ∈ [0, num_passes)`, layered above the round-183 per-channel
+  container. A VarDCT frame is decoded in `num_passes` ordered passes
+  (declared in `FrameHeader.passes.num_passes`); each pass scans every
+  `PassGroup` once and §C.8.3 specifies that within a pass each
+  channel of each varblock maintains its own `NonZeros(x, y)` state.
+  Between passes the per-channel bookkeeping is reset because the
+  per-pass histogram is selected by `hfp` from the per-pass `HfPass`
+  array — a different pass uses a different histogram and the
+  prediction recurrence is keyed against the current pass's own
+  coefficient counts. The new module captures the per-pass routing
+  layer above round 183's per-channel routing layer:
+  - `PerPassNonZerosGrids::new(pass_dims: &[&[(u32, u32)]]) -> Result<Self>`
+    — per-pass per-channel `(width, height)` slice, validated
+    entry-by-entry via `PerChannelNonZerosGrids::new` (zero / oversize
+    dims rejected per channel; empty pass-list rejected).
+  - `PerPassNonZerosGrids::new_uniform(num_passes, num_channels, width,
+    height) -> Result<Self>` — convenience builder for the
+    uniform-per-pass case.
+  - `PerPassNonZerosGrids::{num_passes, pass, pass_mut, predicted, get,
+    set, update_after_block, update_after_block_for_transform}` —
+    per-pass routing accessors; out-of-range `p` errors cleanly.
+  - `PerPassNonZerosGrids::decode_block_at_for_pass_channel(p, c, x, y,
+    t, block_ctx, nb_block_ctx, read_non_zeros, decode_symbol)
+    -> Result<(DecodedHfBlock, u32)>` — typed per-pass per-channel
+    driver that wraps the round-183
+    `PerChannelNonZerosGrids::decode_block_at_for_channel` with pass
+    routing. Caller pre-computes `block_ctx` via
+    `pass_group_hf::block_context` with the matching `c`; the
+    container is a pure storage + routing primitive and does not
+    re-derive `pass_group_hf::block_context` nor materialise the
+    per-pass histogram.
+  - Per-pass per-channel shapes are independent — ragged per-pass
+    channel counts are tolerated.
+
+  41 new tests (28 unit in `per_pass_non_zeros::tests` + 13 integration
+  in `tests/round190_per_pass_non_zeros.rs`) pin: empty-pass-list /
+  zero-channel-pass / zero-dim rejection; two-pass chroma-subsampled
+  construction; `new_uniform` convenience; out-of-range pass index
+  errors on every accessor (8 paths); `PredictedNonZeros(0, 0) = 32`
+  on every (pass, channel); per-pass write isolation; per-pass
+  `predicted` propagation reads back each pass's own history (not
+  another pass's); per-pass `update_after_block_for_transform`
+  dispatch (raw `non_zeros = 17` → `{17, 5, 2}` at DCT8×8 / DCT16×16 /
+  DCT32×32 on three independent passes); per-pass
+  `decode_block_at_for_pass_channel` routing; two-pass three-channel
+  raster walk at `(0, 0)` / `(1, 0)` with distinct `[4, 8, 12]` /
+  `[3, 6, 9]` per-pass per-channel `raw_non_zeros` sequences preserves
+  cross-pass isolation; ragged per-pass channel counts (one-channel
+  DC-only preview followed by three-channel main); `u32::MAX`
+  no-panic saturating-add chain through the per-pass route. Lib
+  tests 608 → 636 (+28).
+
 - **Round 183 (2021-FDIS) — typed per-channel `NonZeros(x, y)` grid
   container (FDIS §C.8.3 + Listing C.13 channel-keying).** New
   `per_channel_non_zeros` module that owns one

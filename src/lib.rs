@@ -515,6 +515,7 @@ pub mod non_zeros_grid;
 pub mod pass_group;
 pub mod pass_group_hf;
 pub mod per_channel_non_zeros;
+pub mod per_pass_non_zeros;
 pub mod predictors;
 pub mod toc;
 pub mod vardct;
