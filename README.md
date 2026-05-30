@@ -5,6 +5,36 @@ Pure-Rust **JPEG XL** (ISO/IEC 18181-1:2024) decoder. Resumed
 trace-doc-driven rounds 7-11 + encoder rounds 1-6 were retired
 (see "Why retired (history)" below).
 
+**Round 191 (2026-05-30)** lands a Weighted-Predictor oracle
+test driven by the newly-staged clean-room behavioural trace at
+`docs/image/jpegxl/fixtures/noise-64x64-lossless/wp-trace-sample-194.md`
+(provenance: `wp-trace-provenance.md`). The trace records the
+FDIS-conformant per-listing intermediates a reference decoder
+produces at the `(channel 0, x=2, y=3)` divergence point bisected
+in rounds 31..126. A new `pub fn modular_fdis::wp_predict_pub`
+test wrapper exposes the production weighted-predictor as a pure
+function. `tests/r191_wp_trace_oracle.rs` (5 tests) drives it
+with the trace's `WpState` / `Neighbours` inputs and confirms our
+Annex E.2 Listings E.1 / E.2 / E.3 / E.4 arithmetic **is** spec-
+correct: the production `wp_predict` returns the trace's
+`subpred = [1248, 747, 420, 559]`, final `prediction = 709`, and
+`max_error = 737` exactly when fed the spec-conformant state.
+This isolates the still-unfixed sample-194 `wp_pred8 = 717` vs
+trace `709` off-by-8 divergence (= +1 in un-shifted pixel space,
+matching `r126_first_divergence_scan` dec=35 / exp=34) to
+**upstream WP state evolution** (the `set_true_err` /
+`set_sub_err` calls fired across samples 0..193), excluding the
+predictor itself from suspicion. A companion test pins the
+production-vs-trace delta as a roadmap for the next round's
+bisect: `Δ te_w = +21`, `Δ te_nw = -21` (symmetric pair → likely
+a single upstream defect), `Δ err_sum_0 = 0` (sub-predictor 0
+state evolution already correct), `Δ wp_pred8 = +8`. The
+`error2weight` cross-check also documents a minor FDIS-literal
+(inner Idiv first) vs production (multiplication-first) reading
+discrepancy that is a no-op at sample 194 — both readings give
+identical `[3, 4, 3, 6]` shifted weights after the Listing E.3
+`>> sh` step.
+
 **Round 190 (2026-05-30)** lifts the round-183 per-channel
 [`per_channel_non_zeros::PerChannelNonZerosGrids`] into a typed
 per-pass container

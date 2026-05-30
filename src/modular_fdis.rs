@@ -1359,6 +1359,27 @@ fn wp_predict(
     (prediction, preds, max_error)
 }
 
+/// Round-191 public oracle wrapper for [`wp_predict`].
+///
+/// Exposes the Annex E / §H.5.2 self-correcting predictor as a
+/// pure function over `(WpState, Neighbours, x, y, WpHeader)` so an
+/// integration test can drive it from clean-room behavioural-trace
+/// inputs (see `docs/image/jpegxl/fixtures/noise-64x64-lossless/
+/// wp-trace-sample-194.md`) without standing up an entire ANS / MA-tree
+/// decode pipeline.
+///
+/// Returns `(prediction_8x, [prediction_i_8x; 4], max_error)`. All
+/// values are in the spec's left-shifted-by-3 domain (Annex E.2).
+pub fn wp_predict_pub(
+    state: &WpState,
+    nb: &Neighbours,
+    x: i32,
+    y: i32,
+    wp: &WpHeader,
+) -> (i32, [i32; 4], i32) {
+    wp_predict(state, nb, x, y, wp)
+}
+
 /// Apply 2024-spec Table H.3 — `prediction(x, y, k)` for sample at
 /// `(x, y)` in channel `i`. Predictor 6 (Self-correcting) requires the
 /// caller to pass the per-channel `WpState` and `WpHeader`.

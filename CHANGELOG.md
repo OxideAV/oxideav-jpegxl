@@ -9,6 +9,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Round 191 (2021-FDIS) — Annex E / §H.5.2 Weighted-Predictor
+  oracle test driven by clean-room behavioural trace at sample 194 of
+  `noise-64x64-lossless`.** New `tests/r191_wp_trace_oracle.rs` (5
+  tests) and new `pub fn modular_fdis::wp_predict_pub` test wrapper
+  around the production `wp_predict`. The oracle consumes the
+  `docs/image/jpegxl/fixtures/noise-64x64-lossless/wp-trace-sample-194.md`
+  trace (provenance recorded alongside as `wp-trace-provenance.md`),
+  which records the FDIS-conformant per-listing intermediates an
+  instrumented reference decoder produces at the
+  `(channel 0, x=2, y=3)` divergence point bisected in rounds 31..126:
+  - `r191_wp_predict_matches_trace_at_sample_194` — drives the
+    production `wp_predict` with the trace's `WpState`/`Neighbours`
+    inputs; asserts the four sub-predictions `[1248, 747, 420, 559]`,
+    the final pre-round prediction `709`, and `max_error = 737` all
+    reproduce exactly. **Result: PASS** — proves Annex E.2 Listings
+    E.1 (sub-predictions), E.2 (`err_sum_i` + `error2weight`), E.3
+    (weighted sum + same-sign clamp), and E.4 (`max_error`) are
+    spec-correct in `wp_predict`, isolating the still-unfixed
+    sample-194 wp_pred8 = 717 vs trace 709 off-by-8 divergence to
+    **upstream state evolution** (`set_true_err` / `set_sub_err`
+    calls fired across samples 0..193) rather than the predictor
+    arithmetic itself.
+  - `r191_trace_err_sum_self_consistency` — pure-arithmetic sanity
+    check on the trace's `sub_err_{i,N/NE/NW}` table summing to the
+    reported `err_sum_i` (`[438, 330, 416, 240]`).
+  - `r191_trace_weights_match_error2weight` — hand-derives the
+    trace's `weight_i = [495694, 599189, 474830, 825112]` from
+    FDIS-literal `error2weight(err_sum_i, wp_w_i)`; documents a
+    1-unit inner-Idiv-vs-multiplication-first discrepancy with the
+    production reading that does NOT affect sample 194's shifted
+    weights (both readings give `[3, 4, 3, 6]` after the Listing E.3
+    `>> sh` step).
+  - `r191_trace_prediction_matches_listing_e3` — independent
+    hand-derivation of `prediction = 709` from Listing E.3 inputs,
+    including verification that the same-sign clamp predicate fires
+    but is a no-op (pre-clamp 709 ∈ [min(W,N,NE)=584, max(W,N,NE)=
+    1232]).
+  - `r191_pin_state_evolution_gap` — pins the production-vs-trace
+    delta as a roadmap for the next round's bisect: Δ te_w = +21,
+    Δ te_nw = -21 (symmetric pair → likely a single upstream
+    defect), Δ wp_pred8 = +8 in 8x scale = +1 in un-shifted pixel
+    space (matches `r126_first_divergence_scan` dec=35 vs exp=34).
+  Spec citations and provenance attestation embedded in the test
+  module docstring; references the in-repo FDIS §E.1-E.4 line
+  numbers and the trace doc's stated `prediction − true_value`
+  sign convention. Trace doc is the newly-staged
+  `docs/image/jpegxl/fixtures/noise-64x64-lossless/wp-trace-*.md`
+  pair landed alongside this round (tasks #820 + #1077). Issues #6,
+  #64, #799.
+
 - **Round 190 (2021-FDIS) — typed per-pass `NonZeros(x, y)` grid
   container (FDIS §C.8.3 + Listing C.13 per-pass keying).** New
   `per_pass_non_zeros` module that owns one
