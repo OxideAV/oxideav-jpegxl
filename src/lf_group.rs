@@ -172,7 +172,8 @@ impl LfCoefficients {
         for (c, slot) in out.iter_mut().enumerate() {
             let shift = fh.jpeg_upsampling.get(c).copied().unwrap_or(0);
             // Spec: "optionally right-shifted by one" — the practical
-            // interpretation (matching libjxl behaviour) is shift by 1
+            // interpretation (matching the reference-decoder behaviour
+            // observed via `cjxl`/`djxl` black-box) is shift by 1
             // when jpeg_upsampling[c] != 0. Round-11 follows that
             // reading; conformance-fixture-driven validation defers to
             // round 12+ when end-to-end VarDCT pixel decode is wired.

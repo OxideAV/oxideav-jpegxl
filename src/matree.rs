@@ -37,9 +37,10 @@ use crate::begabrac::Begabrac;
 /// keeps decoding "decision node" instead of "leaf" can run the
 /// decoder out of memory: each leaf carries its own [`Begabrac`] with
 /// two `Vec<u32>` of length `n+1`, so a million nodes is hundreds of
-/// MiB. Real-world JXL Modular trees in libjxl's reference encoder
-/// stay well below 100k leaves; we cap at 1 << 20 (~1 M) so abusive
-/// inputs trip an `InvalidData` instead of swapping the box to death.
+/// MiB. Real-world JXL Modular trees observed in `cjxl`-emitted
+/// fixtures stay well below 100k leaves; we cap at 1 << 20 (~1 M) so
+/// abusive inputs trip an `InvalidData` instead of swapping the box
+/// to death.
 pub const MAX_MA_TREE_NODES: usize = 1 << 20;
 
 /// Hard cap on the recursion depth of [`decode_subtree`] — i.e. on
@@ -47,7 +48,7 @@ pub const MAX_MA_TREE_NODES: usize = 1 << 20;
 /// nodes, so depth is bounded by that anyway, but Rust's default
 /// thread stack (8 MiB on Linux/macOS) overflows long before then.
 /// 1024 is comfortably below stack-overflow territory while leaving
-/// room for genuinely lopsided libjxl-emitted trees.
+/// room for genuinely lopsided reference-encoder-emitted trees.
 pub const MAX_MA_TREE_DEPTH: usize = 1024;
 
 /// Hard cap on the bit-depth `n` accepted by [`MaTree::decode`]. Each

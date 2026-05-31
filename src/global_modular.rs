@@ -118,7 +118,7 @@ impl GlobalModular {
         // ModularHeader so we can skip the header entirely on the
         // VarDCT-zero-extras case (where derive_channel_descs yields []).
         // Empirically: bit-position trace of the d1 fixture confirms the
-        // libjxl reference decoder ends LfGlobal at the bit where our
+        // reference behavioural trace ends LfGlobal at the bit where our
         // code starts reading `inner_use_global_tree` — so the entire
         // ModularHeader (use_global_tree + WPHeader + nb_transforms +
         // TransformInfo[]) is gated by N>0.

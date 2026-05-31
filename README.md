@@ -546,7 +546,7 @@ This crate currently ships:
   Self-correcting weighted predictor at the first
   `predictor == 6` sample whose WP path uses `WW` and `NN` both
   as in-image values (i.e. `x >= 2 && y >= 2`); fix deferred
-  pending a docs-collaborator libjxl-WP behavioural trace at the
+  pending a docs-collaborator WP behavioural trace at the
   divergence point. **Round 126** extends the WP diagnostics
   with `WP_DEEP_TRACE` (20-entry capture of `subpred[0..4]`,
   `err_sum[0..4]`, post-shift weights, `sum_weights_pre/post`,
@@ -837,8 +837,8 @@ Both are detected; the codestream is extracted transparently before the
 codestream preamble is parsed.
 
 The codestream preamble is parsed with an LSB-first bit reader
-(`bitreader::BitReader`) that matches the reference libjxl bit packing,
-including the JXL `U32` 2-bit-selector encoding. On top of it:
+(`bitreader::BitReader`) that matches the reference behavioural-trace
+bit packing, including the JXL `U32` 2-bit-selector encoding. On top of it:
 
 - **`SizeHeader`** — width + height, covering all four encodings the spec
   allows: the 5-bit "small (≤256, multiple of 8)" form, the 2-bit

@@ -947,8 +947,9 @@ impl ImageMetadataFdis {
         // SPECGAP: 2024-spec ImageMetadata tail (default_transform /
         // cw_mask / per-mask weights) — exact gating condition unclear.
         // Round 1 read these unconditionally on `!all_default`; the
-        // resulting bit cursor was 4-5 bits past where libjxl stops.
-        // Round 2 simply does not read them, falling back to defaults.
+        // resulting bit cursor was 4-5 bits past where the reference
+        // behavioural trace stops. Round 2 simply does not read them,
+        // falling back to defaults.
         out.default_transform = true;
         out.cw_mask = 0;
         Ok(out)

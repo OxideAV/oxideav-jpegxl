@@ -155,7 +155,7 @@ pub fn read_general_clustering(
     // 2024-spec C.2.1: use_prefix_code=1 → log_alpha=15, =0 → 5+u(2).
     // The FDIS-2021 listing (D.3.1) had the two branches swapped (typo
     // #5); the 2024 published edition's authoritative reading matches
-    // libjxl + the trace bit counts seen against `cjxl` fixtures.
+    // the trace bit counts seen against `cjxl` fixtures.
     let use_prefix_code = br.read_bit()? == 1;
     let log_alphabet_size = if use_prefix_code {
         15

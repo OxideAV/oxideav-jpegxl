@@ -290,7 +290,7 @@
 //!    (matches H.3). Round-11+ work will need a finer state-by-
 //!    state diff against djxl `--debug` (deferred to an Auditor
 //!    round) since the implementer wall bars djxl source / the
-//!    libjxl-trace doc.
+//!    reference-decoder-trace doc.
 //!
 //! **Round-10 status** — synth_320 still decodes ~21k of 102400
 //! pixels matching the gradient (first 24 rows of PG[0][0] and
