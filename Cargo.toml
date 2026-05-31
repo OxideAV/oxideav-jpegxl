@@ -22,3 +22,6 @@ oxideav-core = "0.1"
 # `png` is a single-purpose pure-Rust PNG decoder; no codec semantics
 # overlap with JPEG XL.
 png = "0.18"
+# r195+ WP trace tests require sequential execution due to shared
+# thread-local trace state.
+serial_test = "3"

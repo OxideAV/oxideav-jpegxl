@@ -47,6 +47,7 @@ use oxideav_jpegxl::modular_fdis::{
     encode_leaf_pick_target, WpHeader, LEAF_PICK_TRACE_TARGET, LEAF_PICK_TRACE_WP, WP_DEEP_TRACE,
     WP_DEEP_TRACE_ARMED,
 };
+use serial_test::serial;
 use std::sync::atomic::Ordering;
 
 const NOISE_JXL: &[u8] = include_bytes!("fixtures/noise_64x64_lossless.jxl");
@@ -81,6 +82,7 @@ mod trace_sample_193 {
 /// hypothesis: te_n at sample 193 should equal te_nw at sample 194
 /// (both read from sample 129, both -21 from spec).
 #[test]
+#[serial]
 fn r195_sample_193_te_n_equals_sample_194_te_nw() {
     // First capture sample 194's WP state
     LEAF_PICK_TRACE_TARGET.store(encode_leaf_pick_target(0, 2, 3), Ordering::Relaxed);
@@ -149,6 +151,7 @@ fn r195_sample_193_te_n_equals_sample_194_te_nw() {
 /// formula: wrong te_n (-21) causes wrong sub-predictions, which cause
 /// wrong final prediction (+21 in true_err).
 #[test]
+#[serial]
 fn r195_sample_193_prediction_propagation() {
     use trace_sample_193::*;
 
@@ -226,6 +229,7 @@ fn r195_sample_193_prediction_propagation() {
 /// This verifies that the -21 te_n error is SUFFICIENT to explain the +21
 /// prediction error (no other state corruption needed).
 #[test]
+#[serial]
 fn r195_sample_193_corrected_te_n_gives_spec_prediction() {
     use trace_sample_193::*;
 
@@ -340,6 +344,7 @@ fn r195_sample_193_corrected_te_n_gives_spec_prediction() {
 /// Scan earlier samples (row y=2) to find where the true_err divergence
 /// FIRST appears. This narrows down the root cause for the next round.
 #[test]
+#[serial]
 fn r195_true_err_divergence_scan_row_2() {
     eprintln!("[r195] Scanning row y=2 for true_err divergence...");
 
