@@ -5,6 +5,63 @@ Pure-Rust **JPEG XL** (ISO/IEC 18181-1:2024) decoder. Resumed
 trace-doc-driven rounds 7-11 + encoder rounds 1-6 were retired
 (see "Why retired (history)" below).
 
+**Round 202 (2026-06-01)** widens the round-191 / round-195
+weighted-predictor diagnostic from a one-sample pin into a
+full-row chain by validating the production WP state across the
+entire row `y = 3` window of the `noise-64x64-lossless` fixture
+(samples 192..=200) against the trace doc's surrounding-sample
+context table (`wp-trace-sample-194.md` lines 130-168). New
+`tests/r202_wp_row3_chain.rs` (7 tests) captures `wp_pred8` +
+`te_*` at each row-3 sample via the existing
+`LEAF_PICK_TRACE_WP` hook and:
+
+- Pins the per-sample `wp_pred8` / `stored true_err` delta
+  profile across row 3. New finding: the divergence is
+  **already large at sample 192** (`Δ pred8 = -50`,
+  `Δ stored = -50`), before the round-191-pinned `Δ pred8 = +8`
+  at sample 194. Profile (production vs spec):
+
+  ```text
+       s    pred8  spec   stored  spec    Δpred8 Δstored
+     192    388   +438    -804   -754       -50    -50
+     193    917   +896     317   +296       +21    +21
+     194    717   +709     437   +437        +8     +0
+     195    305   +302    -399   +222        +3   -621
+     196    570   +151     178   +119      +419   +59
+     197    769   +626    -839   -622      +143  -217
+     198   1368  +1171    -568   -669      +197  +101
+     199    810   +766     -14   +390       +44  -404
+     200    754   +413       0  -1323     +341     —
+  ```
+
+  The `+421` jump in `Δ pred8` at sample 196 (and 197..200
+  cascades) signals the WP state corruption flips an MA-tree
+  leaf-pick decision past sample 195 (production decodes
+  `v(195) = 88` vs spec `10` — an off-by-78, not the off-by-1 a
+  pure rounding defect would produce).
+- Validates the in-row read chain `te_w(s+1) == pred8(s) -
+  v_prod(s)*8` across samples 192..=194 (chain-correct in this
+  window). Sample 194's production decoded value `v_prod = 35`
+  (vs spec 34) is pinned in its own test.
+- Validates the cross-row chain `te_n(s+1) == te_ne(s)` and
+  `te_nw(s+1) == te_n(s)` across all 8 row-3 boundaries
+  (samples 192..=200) — both walk the row-2 stored-`true_err`
+  shadow as observed at row-3 read time; chain is
+  structurally-consistent throughout.
+- Pins sample 192's left-border zeroing (`te_w = te_nw = 0`
+  because `x = 0`), guarding the `WpState::at` border policy.
+- Pins sample 194's cross-row reads against the trace doc's
+  explicit table: `te_n@194 = -456` (matches spec at sample 130
+  — known good cell), `te_nw@194 = 716` (spec 737, Δ = -21 —
+  the round-191 smoking gun at sample 129), `te_ne@194 = -160`
+  (spec -165, Δ = +5 — at sample 131).
+
+This widens the bisect roadmap from one sample to nine and
+shows the upstream defect's footprint is asymmetric: sample 130
+matches spec exactly while its left-neighbour 129 is off by -21,
+ruling out a uniform row-2 shift and pointing at a per-sample
+state-evolution glitch.
+
 **Round 191 (2026-05-30)** lands a Weighted-Predictor oracle
 test driven by the newly-staged clean-room behavioural trace at
 `docs/image/jpegxl/fixtures/noise-64x64-lossless/wp-trace-sample-194.md`

@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Round 202 — `tests/r202_wp_row3_chain.rs` (7 tests) widens the
+  round-191 / round-195 weighted-predictor diagnostic from a
+  one-sample pin into a full-row chain across `noise-64x64-lossless`
+  samples 192..=200, validating the production WP state against the
+  trace doc's surrounding-sample context table
+  (`wp-trace-sample-194.md` lines 130-168). New finding: the WP
+  divergence is already large at sample 192 (`Δ pred8 = -50`,
+  `Δ stored = -50`), before the round-191-pinned `Δ pred8 = +8` at
+  sample 194. Tests pin in-row + cross-row read chains, sample 192's
+  left-border zeroing, sample 194's cross-row reads, and the
+  production decoded value `v(194) = 35`.
+
 ## [0.0.10](https://github.com/OxideAV/oxideav-jpegxl/compare/v0.0.9...v0.0.10) - 2026-05-30
 
 ### Other
