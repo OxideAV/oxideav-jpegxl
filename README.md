@@ -5,6 +5,53 @@ Pure-Rust **JPEG XL** (ISO/IEC 18181-1:2024) decoder. Resumed
 trace-doc-driven rounds 7-11 + encoder rounds 1-6 were retired
 (see "Why retired (history)" below).
 
+**Round 208 (2026-06-02)** lands the per-LfGroup varblock-walk
+driver — the "varblock-shape grid" the round-177 / 183 / 190
+module notes repeatedly deferred to. New `varblock_walk` module
+exposes the [`Varblock`] descriptor
+(`{x, y, transform, hf_mul}`), the borrow-based
+[`VarblockWalk`] raster-order iterator over a
+[`dct_select::DctSelectGrid`] that yields one entry per top-left
+cell (Continuation cells are skipped; a residual Empty cell errors
+cleanly), the [`count_varblocks`] cell-scan helper, and the typed
+per-pass per-channel driver
+[`decode_varblocks_for_pass_channel`] that walks the grid +
+invokes the caller's `block_ctx_for_varblock` closure (a
+Listing C.13 `BlockContext()` lookup, encapsulating the
+`block_ctx_map` + `qf_thresholds` + `lf_thresholds` ladder the
+walker does not own) + threads each varblock's `(p, c, x, y, t,
+block_ctx)` through
+[`per_pass_non_zeros::PerPassNonZerosGrids::decode_block_at_for_pass_channel`].
+Returns the in-raster-order `Vec<(Varblock, DecodedHfBlock,
+raw_non_zeros)>` triple so callers that need to write per-block
+coefficients into a per-channel buffer get a deterministic layout.
+
+26 new tests (14 unit + 12 integration
+`round208_varblock_walk`) pin: single-DCT8×8 walk yielding one
+varblock; raster-order 4×4 DCT8×8 grid (16 varblocks); single
+DCT16×16 covering 2×2 cells (1 TopLeft + 3 Continuation);
+mixed-transform `DCT16×8 + DCT8×8 + DCT8×8` placement order;
+mixed-transform `DCT8×16 + DCT8×8 + DCT8×8`; `count_varblocks`
+== walk-collect-length on every shape; residual-Empty-cell
+defensive error; all-Continuation tolerated as zero varblocks;
+`hf_mul` read from the top-left cell; typed driver routes per-pass
+per-channel (pass 1 / channel 2 mutation isolated from the other
+five (pass, channel) pairs); closure-error propagation; DCT16×16
+single-block typed-driver pass-through; multi-varblock distinct
+`hf_mul` (4, 8 from mul-1 = 3, 7) reaching the closure unchanged.
+Lib tests 636 → 650 (+14). Pure-control-flow primitive in the
+same shape as round-89 `dct_quant_weights`, round-95 `hf_dequant`,
+round-121 `llf_from_lf`, round-138 `chroma_from_luma`, round-141
+`gaborish`, round-144 `epf`, round-147 `afv_idct`, round-159 / 164
+`pass_group_hf`, round-177 `non_zeros_grid`, round-183
+`per_channel_non_zeros`, and round-190 `per_pass_non_zeros` — no
+bit reads, no spec re-derivation, no histogram materialisation.
+A future round wiring §C.7.2 entropy histograms (#799 DOCS-GAP)
++ the per-LfGroup `HfBlockContext` parameter sweep + per-channel
+`BlockContext()` history threading can drop this walker in as the
+per-LfGroup driver layer without re-deriving any §C.5.4 placement
+geometry or §C.8.3 raster-walk recurrence.
+
 **Round 202 (2026-06-01)** widens the round-191 / round-195
 weighted-predictor diagnostic from a one-sample pin into a
 full-row chain by validating the production WP state across the

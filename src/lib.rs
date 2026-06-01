@@ -518,6 +518,7 @@ pub mod per_channel_non_zeros;
 pub mod per_pass_non_zeros;
 pub mod predictors;
 pub mod toc;
+pub mod varblock_walk;
 pub mod vardct;
 pub mod xyb;
 

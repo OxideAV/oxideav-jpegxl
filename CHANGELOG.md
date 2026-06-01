@@ -9,6 +9,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Round 208 — `varblock_walk` module (per-LfGroup varblock-walk
+  driver, FDIS §C.5.4 + §C.8.3). Exposes the `Varblock` descriptor
+  (`{x, y, transform, hf_mul}`), the borrow-based `VarblockWalk`
+  raster-order iterator over a `dct_select::DctSelectGrid` (skips
+  Continuation cells; residual Empty cell errors cleanly), the
+  `count_varblocks` cell-scan helper, and the typed per-pass
+  per-channel driver `decode_varblocks_for_pass_channel` that
+  walks the grid + invokes the caller's `block_ctx_for_varblock`
+  closure (Listing C.13 `BlockContext()` lookup) + threads each
+  varblock through
+  `per_pass_non_zeros::PerPassNonZerosGrids::decode_block_at_for_pass_channel`.
+  Returns the in-raster-order `Vec<(Varblock, DecodedHfBlock,
+  raw_non_zeros)>` triple. 14 unit + 12 integration
+  (`round208_varblock_walk`) tests pin single-DCT8×8 / raster-order
+  4×4 / DCT16×16-covers-2×2 / mixed-transform placement order /
+  count-vs-walk parity / residual-Empty error / all-Continuation
+  tolerance / hf_mul top-left read / typed driver per-pass
+  per-channel routing isolation / closure-error propagation /
+  DCT16×16 typed-driver pass-through / multi-varblock distinct
+  hf_mul. Lib tests 636 → 650 (+14). Pure-control-flow primitive
+  in the round-89 / 95 / 121 / 138 / 141 / 144 / 147 / 159 / 164 /
+  177 / 183 / 190 family; no bit reads, no spec re-derivation, no
+  histogram materialisation.
+
 - Round 202 — `tests/r202_wp_row3_chain.rs` (7 tests) widens the
   round-191 / round-195 weighted-predictor diagnostic from a
   one-sample pin into a full-row chain across `noise-64x64-lossless`
