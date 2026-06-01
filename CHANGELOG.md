@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.11](https://github.com/OxideAV/oxideav-jpegxl/compare/v0.0.10...v0.0.11) - 2026-06-01
+
+### Other
+
+- round-202 (parent-dispatch r202) against ISO/IEC FDIS 18181-1:2021 — full-row WP state-evolution chain validation across noise-64x64-lossless samples 192..=200
+- Hat-2 scrub: replace 'libjxl' decorative-attribution lines with neutral terms
+- r195 fix — add serial_test for r195 WP trace tests
+
 ### Added
 
 - Round 202 — `tests/r202_wp_row3_chain.rs` (7 tests) widens the
