@@ -5,6 +5,68 @@ Pure-Rust **JPEG XL** (ISO/IEC 18181-1:2024) decoder. Resumed
 trace-doc-driven rounds 7-11 + encoder rounds 1-6 were retired
 (see "Why retired (history)" below).
 
+**Round 228 (2026-06-04)** lands the per-LfGroup **multi-pass**
+three-channel varblock decode driver
+`decode_multi_pass_three_channels_with_resolver` — the outer
+per-pass loop that wraps the round-221 inner three-channel driver
+and walks `p ∈ [0, num_passes)` against the FDIS §C.8.3 + Table
+C.6 `Passes` prose. New `multi_pass_decode` module reads
+`num_passes` off [`per_pass_non_zeros::PerPassNonZerosGrids::num_passes`]
+(round-190's container is the authoritative pass-count source),
+walks the [`dct_select::DctSelectGrid`] once per pass, invokes
+the caller's `qdc_at(p, &vb)` closure once per varblock per pass
+(so the closure may read from a per-pass quantised-LF buffer if
+the upstream signal evolves between passes), and threads each
+`(p, c)` call through
+[`per_pass_non_zeros::PerPassNonZerosGrids::decode_block_at_for_pass_channel`].
+Return shape is the typed
+[`MultiPassThreeChannelOutput = Vec<Vec<ThreeChannelVarblock>>`]
+where `out[p][i]` is the `i`-th varblock (raster order) decoded
+in pass `p`. The per-pass per-channel `NonZeros(x, y)`
+bookkeeping is already isolated by `p` (round-190 invariant), so
+the caller does not have to clear state between passes. The
+`read_non_zeros(p, channel, predicted)` / `decode_symbol(p,
+channel, coeff_ctx)` closures take the pass index as their first
+argument so the caller can route each call to the matching
+per-pass per-channel histogram without rebinding closures for
+each pass. The new `count_decoded_blocks(grid, num_passes)`
+helper returns `num_passes × count_varblocks(grid)` for callers
+that need to size a downstream coefficient buffer (defensive u64
+overflow guard on the multiplication). 14 unit + 12 integration
+(`round228_multi_pass_decode`) tests pin: single-pass single-
+DCT8×8 parity with the round-221 inner driver; 4×4 DCT8×8 grid
+(16 varblocks) preserving raster order in a single pass; two-
+pass 2×2 raster-order per-pass walk; per-pass `qdc` closure
+invocation count (3 passes × 4 varblocks = 12 calls, not 36);
+three-pass per-channel routing isolation with pass-distinct
+raw_non_zeros values landing on per-pass writeback cells without
+cross-pass leakage; pass error aborts remaining passes; pass-0
+inner error aborts before pass-1 starts (pass-1 closure never
+called); per-pass predicted invariant
+(`PredictedNonZeros(0, 0) = 32` across every pass + channel);
+per-pass `qdc[3]` value propagation through the outer loop;
+mixed-transform (`DCT16×8 + 2 DCT8×8`) layout consistency across
+passes; pass-1 channel routing read from pass-1 histogram;
+`count_decoded_blocks` helper; DCT16×16 single-block single-pass
+pass-through; integration coverage of pass-index threading
+through both `read_non_zeros` and `decode_symbol` closures; mid-
+varblock inner-driver error (pass 1, X-channel decode_symbol
+failure) propagating through the outer loop. Lib tests 675 →
+689 (+14). Pure-control-flow primitive in the same shape as
+round-89 `dct_quant_weights`, round-95 `hf_dequant`, round-121
+`llf_from_lf`, round-138 `chroma_from_luma`, round-141
+`gaborish`, round-144 `epf`, round-147 `afv_idct`, round-159 /
+164 `pass_group_hf`, round-177 `non_zeros_grid`, round-183
+`per_channel_non_zeros`, round-190 `per_pass_non_zeros`,
+round-208 `varblock_walk`, round-214 `block_context_resolver`,
+and round-221's inner three-channel driver — no bit reads, no
+spec re-derivation, no histogram materialisation. A future
+round wiring §C.7.2 entropy histograms (#799 DOCS-GAP) +
+per-pass `hfp` selection from the [`hf_pass::HfPass`] array +
+per-channel quantised-LF buffers can drop this driver in as the
+per-LfGroup multi-pass control-flow layer without re-deriving
+any §C.8.3 raster-walk or per-pass loop geometry.
+
 **Round 221 (2026-06-03)** lands the three-channel per-LfGroup
 varblock decode driver
 `decode_varblocks_three_channels_with_resolver` — the canonical
