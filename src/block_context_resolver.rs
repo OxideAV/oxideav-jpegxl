@@ -16,6 +16,34 @@
 //! [`decode_varblocks_with_resolver`] convenience saves callers from
 //! writing the closure boilerplate every time.
 //!
+//! ## Scope (round 221)
+//!
+//! Round 221 layers the three-channel raster driver
+//! [`decode_varblocks_three_channels_with_resolver`] on top of the
+//! round-214 single-channel walker. §C.8.3 prose orders the
+//! per-pass decode as
+//!
+//! > for each varblock in raster order, decode the X, Y, B channels
+//! > (in that order) once
+//!
+//! — a single grid walk that emits 3 per-channel block-context reads
+//! per varblock. The naive composition of calling
+//! [`decode_varblocks_with_resolver`] three times (one per channel)
+//! visits the grid three times and (critically) cannot share the
+//! per-varblock `qdc[3]` derivation across channels. The round-221
+//! driver walks the grid once, computes `qdc[3]` once per varblock,
+//! invokes [`BlockContextResolver::resolve`] three times (X / Y / B)
+//! against that shared `qdc`, and threads each `(p, c)` call through
+//! [`PerPassNonZerosGrids::decode_block_at_for_pass_channel`]. The
+//! return is one `(Varblock, [DecodedHfBlock; 3], [u32; 3])` triple
+//! per varblock — three per-channel decoded blocks + three raw
+//! `non_zeros` counters indexed by channel.
+//!
+//! This matches §C.8.3 prose ordering precisely (the spec text
+//! orders the inner channel loop inside the outer varblock loop, not
+//! the other way around) and gives callers a deterministic raster
+//! layout that doesn't require post-walk per-channel zipping.
+//!
 //! No bit reads, no spec re-derivation, no histogram materialisation
 //! — same pure-control-flow primitive shape as round-89
 //! [`crate::dct_quant_weights`], round-95 [`crate::hf_dequant`],
@@ -172,6 +200,142 @@ where
             &mut decode_symbol,
         )?;
         out.push((vb, decoded, raw_non_zeros));
+    }
+    Ok(out)
+}
+
+/// Channel-routed payload used by the per-channel ANS-closure pair
+/// passed to [`decode_varblocks_three_channels_with_resolver`]. The
+/// inner driver invokes the caller's `read_non_zeros` and
+/// `decode_symbol` closures with the channel index as the first
+/// argument, so the caller can route each call to the matching
+/// per-pass per-channel histogram. This keeps the round-221 driver
+/// histogram-blind: it owns the channel iteration order (Listing
+/// C.13's X / Y / B canonical sweep) but defers the per-channel
+/// histogram selection to the caller, exactly as round 208 / 214
+/// defer the single-channel histograms.
+///
+/// `channel` ∈ {0, 1, 2} for X / Y / B respectively.
+pub type ChannelReadNonZeros<'a> = dyn FnMut(u32, u32) -> Result<u32> + 'a;
+/// See [`ChannelReadNonZeros`]. Caller routes per-channel histogram
+/// reads; the `(channel, coeff_ctx)` pair lets the closure pick the
+/// matching per-channel ANS distribution.
+pub type ChannelDecodeSymbol<'a> = dyn FnMut(u32, u32) -> Result<u32> + 'a;
+
+/// Per-varblock output triple returned by
+/// [`decode_varblocks_three_channels_with_resolver`]. Per-channel
+/// arrays are indexed 0 = X, 1 = Y, 2 = B (canonical FDIS §C.8.3
+/// channel order).
+pub type ThreeChannelVarblock = (Varblock, [DecodedHfBlock; 3], [u32; 3]);
+
+/// Per-LfGroup three-channel varblock decode driver — round 221's
+/// upgrade over [`decode_varblocks_with_resolver`].
+///
+/// Walks the [`DctSelectGrid`] in raster order; for each varblock
+/// the driver:
+///
+/// 1. invokes the caller's `qdc_at` closure exactly once to read
+///    the shared `qdc[3]` triple,
+/// 2. invokes [`BlockContextResolver::resolve`] three times — once
+///    per channel — against that shared `qdc`, and
+/// 3. invokes [`PerPassNonZerosGrids::decode_block_at_for_pass_channel`]
+///    three times (channel order: X = 0, Y = 1, B = 2) on the
+///    `p`-th pass with the matching `block_ctx`.
+///
+/// The `read_non_zeros` / `decode_symbol` closures take the channel
+/// index as their first argument so the caller can route each call
+/// to the matching per-pass per-channel histogram without binding
+/// three separate closure pairs.
+///
+/// Returns the in-raster-order
+/// `Vec<(Varblock, [DecodedHfBlock; 3], [u32; 3])>` triple. The
+/// per-channel `DecodedHfBlock` and `raw_non_zeros` arrays are
+/// indexed by channel — `out[i].1[0]` is the X-channel decoded
+/// block, `out[i].2[2]` is the B-channel `raw_non_zeros`, etc.
+///
+/// On any per-channel error the driver propagates the error
+/// immediately and discards any in-flight partial output. The walk
+/// always proceeds X → Y → B per varblock; an error on Y aborts
+/// before B reads (so the B-channel ANS state is **not** advanced).
+#[allow(clippy::too_many_arguments)]
+pub fn decode_varblocks_three_channels_with_resolver<Q, F, G>(
+    grid: &DctSelectGrid,
+    nz: &mut PerPassNonZerosGrids,
+    p: u32,
+    resolver: &BlockContextResolver<'_>,
+    mut qdc_at: Q,
+    mut read_non_zeros: F,
+    mut decode_symbol: G,
+) -> Result<Vec<ThreeChannelVarblock>>
+where
+    Q: FnMut(&Varblock) -> Result<[i32; 3]>,
+    F: FnMut(u32, u32) -> Result<u32>,
+    G: FnMut(u32, u32) -> Result<u32>,
+{
+    let nb_block_ctx = resolver.nb_block_ctx();
+    let mut out = Vec::with_capacity(count_varblocks(grid) as usize);
+    let mut walk = VarblockWalk::new(grid);
+    while let Some(vb) = walk.next()? {
+        let qdc = qdc_at(&vb)?;
+        // Channel order: X = 0, Y = 1, B = 2 (FDIS §C.8.3 listing
+        // sequence). The per-channel ANS state advance happens in
+        // this fixed order so caller-side closures can rely on the
+        // channel-major progression.
+        let decoded0;
+        let raw0;
+        {
+            let ctx0 = resolver.resolve(0, &vb, qdc)?;
+            let r = nz.decode_block_at_for_pass_channel(
+                p,
+                0,
+                vb.x,
+                vb.y,
+                vb.transform,
+                ctx0,
+                nb_block_ctx,
+                |pred| read_non_zeros(0, pred),
+                |coeff_ctx| decode_symbol(0, coeff_ctx),
+            )?;
+            decoded0 = r.0;
+            raw0 = r.1;
+        }
+        let decoded1;
+        let raw1;
+        {
+            let ctx1 = resolver.resolve(1, &vb, qdc)?;
+            let r = nz.decode_block_at_for_pass_channel(
+                p,
+                1,
+                vb.x,
+                vb.y,
+                vb.transform,
+                ctx1,
+                nb_block_ctx,
+                |pred| read_non_zeros(1, pred),
+                |coeff_ctx| decode_symbol(1, coeff_ctx),
+            )?;
+            decoded1 = r.0;
+            raw1 = r.1;
+        }
+        let decoded2;
+        let raw2;
+        {
+            let ctx2 = resolver.resolve(2, &vb, qdc)?;
+            let r = nz.decode_block_at_for_pass_channel(
+                p,
+                2,
+                vb.x,
+                vb.y,
+                vb.transform,
+                ctx2,
+                nb_block_ctx,
+                |pred| read_non_zeros(2, pred),
+                |coeff_ctx| decode_symbol(2, coeff_ctx),
+            )?;
+            decoded2 = r.0;
+            raw2 = r.1;
+        }
+        out.push((vb, [decoded0, decoded1, decoded2], [raw0, raw1, raw2]));
     }
     Ok(out)
 }
@@ -513,5 +677,356 @@ mod tests {
         .unwrap();
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].0.transform, TransformType::Dct16x16);
+    }
+
+    // -----------------------------------------------------------------
+    // Round 221 — three-channel driver tests
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn r221_three_channel_single_dct8x8_yields_three_decodes_per_varblock() {
+        let hbc = default_hbc();
+        let resolver = BlockContextResolver::new(&hbc);
+        let hf = make_hf(vec![0, 0], 1, 1);
+        let grid = derive_dct_select(&hf, 8, 8).unwrap();
+        let mut nz = PerPassNonZerosGrids::new_uniform(1, 3, 1, 1).unwrap();
+        let mut qdc_calls = 0u32;
+        let mut nz_calls: Vec<u32> = Vec::new();
+        let out = decode_varblocks_three_channels_with_resolver(
+            &grid,
+            &mut nz,
+            0,
+            &resolver,
+            |_vb| {
+                qdc_calls += 1;
+                Ok([1, 2, 3])
+            },
+            |channel, _pred| {
+                nz_calls.push(channel);
+                Ok(0)
+            },
+            |_channel, _coeff_ctx| Ok(0),
+        )
+        .unwrap();
+        assert_eq!(out.len(), 1);
+        // qdc closure should be called exactly once per varblock —
+        // shared across the three per-channel decodes.
+        assert_eq!(qdc_calls, 1);
+        // read_non_zeros should be called once per channel (3 total),
+        // in canonical X / Y / B order.
+        assert_eq!(nz_calls, vec![0, 1, 2]);
+        // All three raw_non_zeros are 0.
+        assert_eq!(out[0].2, [0, 0, 0]);
+    }
+
+    #[test]
+    fn r221_three_channel_raster_order_2x2_dct8x8() {
+        let hbc = default_hbc();
+        let resolver = BlockContextResolver::new(&hbc);
+        let hf = make_hf(vec![0, 0, 0, 0, 0, 0, 0, 0], 4, 4);
+        let grid = derive_dct_select(&hf, 16, 16).unwrap();
+        let mut nz = PerPassNonZerosGrids::new_uniform(1, 3, 2, 2).unwrap();
+        let out = decode_varblocks_three_channels_with_resolver(
+            &grid,
+            &mut nz,
+            0,
+            &resolver,
+            |_| Ok([0, 0, 0]),
+            |_, _| Ok(0),
+            |_, _| Ok(0),
+        )
+        .unwrap();
+        assert_eq!(out.len(), 4);
+        // Raster order (matches single-channel driver).
+        assert_eq!((out[0].0.x, out[0].0.y), (0, 0));
+        assert_eq!((out[1].0.x, out[1].0.y), (1, 0));
+        assert_eq!((out[2].0.x, out[2].0.y), (0, 1));
+        assert_eq!((out[3].0.x, out[3].0.y), (1, 1));
+        // Per-varblock outputs are length-3 arrays.
+        for entry in &out {
+            assert_eq!(entry.2, [0, 0, 0]);
+        }
+    }
+
+    #[test]
+    fn r221_three_channel_qdc_shared_across_channels() {
+        // The qdc closure must be called exactly once per varblock,
+        // and the same qdc must feed all three channels' resolve()
+        // calls. Test: a custom HfBlockContext where the LF threshold
+        // on channel 2 would discriminate between qdc values, and
+        // verify all three channels see the same qdc.
+        let hbc = default_hbc();
+        let resolver = BlockContextResolver::new(&hbc);
+        let hf = make_hf(vec![0, 0, 0, 0, 0, 0, 0, 0], 4, 4);
+        let grid = derive_dct_select(&hf, 16, 16).unwrap();
+        let mut nz = PerPassNonZerosGrids::new_uniform(1, 3, 2, 2).unwrap();
+        let mut qdc_call_count = 0u32;
+        let _ = decode_varblocks_three_channels_with_resolver(
+            &grid,
+            &mut nz,
+            0,
+            &resolver,
+            |_vb| {
+                qdc_call_count += 1;
+                Ok([7, 7, 7])
+            },
+            |_, _| Ok(0),
+            |_, _| Ok(0),
+        )
+        .unwrap();
+        // 4 varblocks × 1 qdc call each = 4 (not 12 — qdc is shared).
+        assert_eq!(qdc_call_count, 4);
+    }
+
+    #[test]
+    fn r221_three_channel_routes_each_channel_through_resolver_and_decoder() {
+        // Verify the per-channel ANS closure routing: each channel
+        // sees its own `read_non_zeros` + `decode_symbol` invocations.
+        // Each channel's `read_non_zeros` returns 2 (non-zero count)
+        // and `decode_symbol` returns a non-zero ucoeff so the loop
+        // counts 2 reads down to 0 (and stops). DCT8×8 has size = 64,
+        // num_blocks = 1, so the loop iterates k = 1..size while
+        // non_zeros > 0 — exactly 2 decode_symbol calls per channel
+        // when each symbol decrements non_zeros.
+        let hbc = default_hbc();
+        let resolver = BlockContextResolver::new(&hbc);
+        let hf = make_hf(vec![0, 0], 1, 1);
+        let grid = derive_dct_select(&hf, 8, 8).unwrap();
+        let mut nz = PerPassNonZerosGrids::new_uniform(1, 3, 1, 1).unwrap();
+        let mut per_channel_nz_calls = [0u32; 3];
+        let mut per_channel_decode_calls = [0u32; 3];
+        let _ = decode_varblocks_three_channels_with_resolver(
+            &grid,
+            &mut nz,
+            0,
+            &resolver,
+            |_vb| Ok([0, 0, 0]),
+            |channel, _pred| {
+                per_channel_nz_calls[channel as usize] += 1;
+                Ok(2) // 2 non-zeros per channel
+            },
+            |channel, _coeff_ctx| {
+                per_channel_decode_calls[channel as usize] += 1;
+                // Non-zero ucoeff (5) → decrements non_zeros.
+                Ok(5)
+            },
+        )
+        .unwrap();
+        // Each channel's read_non_zeros called exactly once.
+        assert_eq!(per_channel_nz_calls, [1, 1, 1]);
+        // Each channel's decode_symbol called exactly 2 times — the
+        // loop runs until non_zeros decrements to 0.
+        assert_eq!(per_channel_decode_calls, [2, 2, 2]);
+    }
+
+    #[test]
+    fn r221_three_channel_qdc_error_propagates_before_any_channel_read() {
+        let hbc = default_hbc();
+        let resolver = BlockContextResolver::new(&hbc);
+        let hf = make_hf(vec![0, 0], 1, 1);
+        let grid = derive_dct_select(&hf, 8, 8).unwrap();
+        let mut nz = PerPassNonZerosGrids::new_uniform(1, 3, 1, 1).unwrap();
+        let mut nz_call_count = 0u32;
+        let r = decode_varblocks_three_channels_with_resolver(
+            &grid,
+            &mut nz,
+            0,
+            &resolver,
+            |_| Err(oxideav_core::Error::InvalidData("qdc failure".into())),
+            |_, _| {
+                nz_call_count += 1;
+                Ok(0)
+            },
+            |_, _| Ok(0),
+        );
+        assert!(r.is_err());
+        // qdc failure aborts before any per-channel reads happen.
+        assert_eq!(nz_call_count, 0);
+    }
+
+    #[test]
+    fn r221_three_channel_y_error_does_not_advance_b() {
+        // Inject an error on channel = 1 (Y) and verify channel = 2 (B)
+        // sees no read_non_zeros call.
+        let hbc = default_hbc();
+        let resolver = BlockContextResolver::new(&hbc);
+        let hf = make_hf(vec![0, 0], 1, 1);
+        let grid = derive_dct_select(&hf, 8, 8).unwrap();
+        let mut nz = PerPassNonZerosGrids::new_uniform(1, 3, 1, 1).unwrap();
+        let mut per_channel_calls = [0u32; 3];
+        let r = decode_varblocks_three_channels_with_resolver(
+            &grid,
+            &mut nz,
+            0,
+            &resolver,
+            |_| Ok([0, 0, 0]),
+            |channel, _pred| {
+                per_channel_calls[channel as usize] += 1;
+                if channel == 1 {
+                    Err(oxideav_core::Error::InvalidData("y fail".into()))
+                } else {
+                    Ok(0)
+                }
+            },
+            |_, _| Ok(0),
+        );
+        assert!(r.is_err());
+        assert_eq!(per_channel_calls[0], 1); // X read
+        assert_eq!(per_channel_calls[1], 1); // Y read (fails)
+        assert_eq!(per_channel_calls[2], 0); // B not reached
+    }
+
+    #[test]
+    fn r221_three_channel_dct16x16_single_varblock_per_channel_dispatch() {
+        // 16×16 covered by one DCT16×16 → 1 varblock × 3 channels = 3
+        // resolver.resolve() calls. The transform OrderId for DCT16×16
+        // is 2; per-channel idx values are:
+        //   c=0 → 13 + 2 = 15 → map[15] = 9
+        //   c=1 → 0  + 2 = 2  → map[2]  = 2
+        //   c=2 → 26 + 2 = 28 → map[28] = 9
+        let hbc = default_hbc();
+        let resolver = BlockContextResolver::new(&hbc);
+        let hf = make_hf(vec![4, 0], 1, 1);
+        let grid = derive_dct_select(&hf, 16, 16).unwrap();
+        let mut nz = PerPassNonZerosGrids::new_uniform(1, 3, 2, 2).unwrap();
+        let out = decode_varblocks_three_channels_with_resolver(
+            &grid,
+            &mut nz,
+            0,
+            &resolver,
+            |_| Ok([0, 0, 0]),
+            |_, _| Ok(0),
+            |_, _| Ok(0),
+        )
+        .unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].0.transform, TransformType::Dct16x16);
+        assert_eq!(out[0].2, [0, 0, 0]);
+    }
+
+    #[test]
+    fn r221_three_channel_pass_index_routes_to_correct_pass() {
+        // Two-pass container; the driver writes to pass = 1 only;
+        // pass = 0 should remain pristine afterwards.
+        let hbc = default_hbc();
+        let resolver = BlockContextResolver::new(&hbc);
+        let hf = make_hf(vec![0, 0], 1, 1);
+        let grid = derive_dct_select(&hf, 8, 8).unwrap();
+        let mut nz = PerPassNonZerosGrids::new_uniform(2, 3, 1, 1).unwrap();
+        // pass = 1: write a per-block non_zeros of 6 on each channel.
+        let _ = decode_varblocks_three_channels_with_resolver(
+            &grid,
+            &mut nz,
+            1,
+            &resolver,
+            |_| Ok([0, 0, 0]),
+            |_, _| Ok(6),
+            |_, _| Ok(0),
+        )
+        .unwrap();
+        // pass 0 untouched.
+        for c in 0..3 {
+            assert_eq!(nz.get(0, c, 0, 0).unwrap(), 0);
+        }
+        // pass 1: each channel ran update_after_block for DCT8×8
+        // (num_blocks = 1) → stored non_zeros = 6.
+        for c in 0..3 {
+            assert_eq!(nz.get(1, c, 0, 0).unwrap(), 6);
+        }
+    }
+
+    #[test]
+    fn r221_three_channel_count_matches_walker() {
+        // Mixed transforms: DCT16×8 (covers (0,0)+(0,1)) + 2 DCT8×8.
+        let hbc = default_hbc();
+        let resolver = BlockContextResolver::new(&hbc);
+        let hf = make_hf(vec![6, 0, 0, 0, 0, 0], 3, 3);
+        let grid = derive_dct_select(&hf, 16, 16).unwrap();
+        let mut nz = PerPassNonZerosGrids::new_uniform(1, 3, 2, 2).unwrap();
+        let out = decode_varblocks_three_channels_with_resolver(
+            &grid,
+            &mut nz,
+            0,
+            &resolver,
+            |_| Ok([0, 0, 0]),
+            |_, _| Ok(0),
+            |_, _| Ok(0),
+        )
+        .unwrap();
+        assert_eq!(out.len(), 3);
+        // Layout (matches single-channel walker):
+        assert_eq!(out[0].0.transform, TransformType::Dct16x8);
+        assert_eq!((out[0].0.x, out[0].0.y), (0, 0));
+        assert_eq!(out[1].0.transform, TransformType::Dct8x8);
+        assert_eq!((out[1].0.x, out[1].0.y), (1, 0));
+        assert_eq!(out[2].0.transform, TransformType::Dct8x8);
+        assert_eq!((out[2].0.x, out[2].0.y), (1, 1));
+    }
+
+    #[test]
+    fn r221_three_channel_visits_grid_once_not_three_times() {
+        // The driver MUST walk the grid once — calling
+        // decode_varblocks_with_resolver three times would visit every
+        // varblock three times. Verify by counting unique qdc closure
+        // invocations: 4 varblocks → 4 qdc calls, NOT 12.
+        let hbc = default_hbc();
+        let resolver = BlockContextResolver::new(&hbc);
+        let hf = make_hf(vec![0, 0, 0, 0, 0, 0, 0, 0], 4, 4);
+        let grid = derive_dct_select(&hf, 16, 16).unwrap();
+        let mut nz = PerPassNonZerosGrids::new_uniform(1, 3, 2, 2).unwrap();
+        let mut qdc_calls = 0u32;
+        let mut varblocks_seen: Vec<(u32, u32)> = Vec::new();
+        let _ = decode_varblocks_three_channels_with_resolver(
+            &grid,
+            &mut nz,
+            0,
+            &resolver,
+            |vb| {
+                qdc_calls += 1;
+                varblocks_seen.push((vb.x, vb.y));
+                Ok([0, 0, 0])
+            },
+            |_, _| Ok(0),
+            |_, _| Ok(0),
+        )
+        .unwrap();
+        assert_eq!(qdc_calls, 4);
+        // Each varblock visited exactly once (no duplicates).
+        assert_eq!(varblocks_seen, vec![(0, 0), (1, 0), (0, 1), (1, 1)]);
+    }
+
+    #[test]
+    fn r221_three_channel_decoded_blocks_indexed_by_channel() {
+        // The returned [DecodedHfBlock; 3] array is indexed
+        // 0 = X, 1 = Y, 2 = B. Verify by giving each channel a
+        // distinct non_zeros value and inspecting the per-channel
+        // decoded result.
+        let hbc = default_hbc();
+        let resolver = BlockContextResolver::new(&hbc);
+        let hf = make_hf(vec![0, 0], 1, 1);
+        let grid = derive_dct_select(&hf, 8, 8).unwrap();
+        let mut nz = PerPassNonZerosGrids::new_uniform(1, 3, 1, 1).unwrap();
+        let out = decode_varblocks_three_channels_with_resolver(
+            &grid,
+            &mut nz,
+            0,
+            &resolver,
+            |_| Ok([0, 0, 0]),
+            |channel, _pred| match channel {
+                0 => Ok(3),
+                1 => Ok(5),
+                2 => Ok(7),
+                _ => unreachable!(),
+            },
+            |_, _| Ok(0),
+        )
+        .unwrap();
+        assert_eq!(out.len(), 1);
+        // raw_non_zeros indexed by channel.
+        assert_eq!(out[0].2, [3, 5, 7]);
+        // After the writeback: per-channel NonZeros(0, 0) values.
+        assert_eq!(nz.get(0, 0, 0, 0).unwrap(), 3);
+        assert_eq!(nz.get(0, 1, 0, 0).unwrap(), 5);
+        assert_eq!(nz.get(0, 2, 0, 0).unwrap(), 7);
     }
 }

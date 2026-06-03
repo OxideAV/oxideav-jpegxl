@@ -5,6 +5,52 @@ Pure-Rust **JPEG XL** (ISO/IEC 18181-1:2024) decoder. Resumed
 trace-doc-driven rounds 7-11 + encoder rounds 1-6 were retired
 (see "Why retired (history)" below).
 
+**Round 221 (2026-06-03)** lands the three-channel per-LfGroup
+varblock decode driver
+`decode_varblocks_three_channels_with_resolver` — the canonical
+§C.8.3 prose ordering (outer varblock-raster loop, inner X / Y / B
+channel sweep) wired directly above the round-214
+[`BlockContextResolver`]. The new driver walks the
+[`dct_select::DctSelectGrid`] once, computes the shared `qdc[3]`
+triple once per varblock (via the caller's `qdc_at` closure), then
+invokes [`BlockContextResolver::resolve`] three times against that
+shared `qdc` (channel order 0 = X → 1 = Y → 2 = B) and routes each
+`(p, c)` call through
+[`per_pass_non_zeros::PerPassNonZerosGrids::decode_block_at_for_pass_channel`].
+Return shape is the typed
+[`ThreeChannelVarblock = (Varblock, [DecodedHfBlock; 3], [u32; 3])`]
+in raster order — per-channel decoded blocks + per-channel raw
+`non_zeros` indexed 0 = X / 1 = Y / 2 = B. The per-channel ANS
+closures `read_non_zeros(channel, predicted)` /
+`decode_symbol(channel, coeff_ctx)` take the channel as their first
+argument so the caller routes per-channel histograms inside one
+closure pair instead of binding three. Eliminates the three
+separate grid walks (and the three independent `qdc[3]`
+derivations) that the naive composition of three round-214
+single-channel walks would incur. 11 unit + 12 integration
+(`round221_three_channel_resolver`) tests pin: single-DCT8×8
+yielding 3 per-channel decodes per varblock; 4×4 DCT8×8 grid (16
+varblocks) preserving raster order; single DCT16×16 (1 varblock);
+qdc closure invoked exactly once per varblock (= 4 calls for 4
+varblocks, NOT 12) — shared across all three channels; channel
+order strictly X / Y / B at every read_non_zeros + decode_symbol
+call site; per-channel non_zeros writeback at `(0, c, 0, 0)` with
+distinct per-channel raw counts (10 / 20 / 30); per-pass routing
+(pass = 1 isolated from pass = 0); qdc error aborts before any
+per-channel reads; X-channel error aborts before Y + B reads;
+mixed-transform `DCT16×8 + 2 DCT8×8` placement preserved; custom
+[`HfBlockContext`] (qf_threshold = 5) round-trip; DCT16×16
+`num_blocks = 4` per-channel non_zeros = 4 → 4 decode_symbol calls
++ `(4 + 3) / 4 = 1` stored. Lib tests 664 → 675 (+11). Pure
+control-flow primitive in the same shape as round-89
+`dct_quant_weights`, round-95 `hf_dequant`, round-121
+`llf_from_lf`, round-138 `chroma_from_luma`, round-141 `gaborish`,
+round-144 `epf`, round-147 `afv_idct`, round-159 / 164
+`pass_group_hf`, round-177 `non_zeros_grid`, round-183
+`per_channel_non_zeros`, round-190 `per_pass_non_zeros`, round-208
+`varblock_walk`, and round-214 `block_context_resolver` — no bit
+reads, no spec re-derivation, no histogram materialisation.
+
 **Round 214 (2026-06-03)** lands the typed per-LfGroup
 `BlockContext()` resolver — the "per-LfGroup `HfBlockContext`
 parameter sweep" the round-208 module notes explicitly named as
