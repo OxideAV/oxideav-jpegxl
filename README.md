@@ -5,6 +5,52 @@ Pure-Rust **JPEG XL** (ISO/IEC 18181-1:2024) decoder. Resumed
 trace-doc-driven rounds 7-11 + encoder rounds 1-6 were retired
 (see "Why retired (history)" below).
 
+**Round 214 (2026-06-03)** lands the typed per-LfGroup
+`BlockContext()` resolver — the "per-LfGroup `HfBlockContext`
+parameter sweep" the round-208 module notes explicitly named as
+follow-up. New `block_context_resolver` module exposes the
+borrow-based [`BlockContextResolver`] (wraps a
+`&lf_global::HfBlockContext` and offers a per-varblock
+`resolve(channel, &Varblock, qdc) -> Result<u32>` lookup matching
+the §C.8.3 / Listing C.13 `BlockContext()` signature) plus the
+convenience driver [`decode_varblocks_with_resolver`] that walks
+a [`dct_select::DctSelectGrid`] via the round-208
+[`varblock_walk::VarblockWalk`] iterator and threads each
+varblock through
+[`per_pass_non_zeros::PerPassNonZerosGrids::decode_block_at_for_pass_channel`]
+with the resolver-supplied `block_ctx`. The resolver eliminates
+the four-argument `(qf_thresholds, lf_thresholds, block_ctx_map,
+nb_block_ctx)` boilerplate at every per-varblock callsite — the
+LfGlobal §I.2.2 bundle is captured once and the
+`order_id_for_transform` mapping for `s` (Table I.1 OrderId) is
+applied internally so callers thread only `(channel, Varblock,
+qdc)`. 14 unit + 12 integration (`round214_block_context_resolver`)
+tests pin: borrow accessor + `nb_block_ctx` pass-through (default
+15); default-branch `(c=0, s=0)` → `map[13] = 7`, `(c=1, s=0)` →
+`map[0] = 0`, `(c=2, s=0)` → `map[26] = 7`; DCT16×16 → OrderId 2
+→ `map[15] = 9`; DCT32×32 → OrderId 3 → `map[16] = 9`; DCT16×8 +
+DCT8×16 share OrderId 4 → both `map[17] = 10`; Hornuss → OrderId
+1 → `map[14] = 8`; default-branch invariance to `qdc` and
+`hf_mul` (empty thresholds collapse those knobs);
+custom-branch `qf_threshold` perturbation grows `idx` exactly as
+the underlying `block_context` formula does; driver pass-through
+on single-DCT8×8 / raster-order 2×2 DCT8×8 / single-DCT16×16
+grids; `qdc_at` closure called once per varblock in walk order;
+closure-error propagation through the driver. Lib tests 650 →
+664 (+14). Pure-control-flow primitive in the same shape as
+round-89 `dct_quant_weights`, round-95 `hf_dequant`, round-121
+`llf_from_lf`, round-138 `chroma_from_luma`, round-141
+`gaborish`, round-144 `epf`, round-147 `afv_idct`, round-159 /
+164 `pass_group_hf`, round-177 `non_zeros_grid`, round-183
+`per_channel_non_zeros`, round-190 `per_pass_non_zeros`, and
+round-208 `varblock_walk` — no bit reads, no spec re-derivation,
+no histogram materialisation. A future round wiring §C.7.2
+entropy histograms (#799 DOCS-GAP) + per-channel quantised-LF
+buffers (so the `qdc_at` closure can read off a per-LfGroup
+buffer instead of returning a synthetic `[0; 3]`) can drop this
+resolver in as the per-varblock `block_ctx` source without
+re-deriving any §C.8.3 lookup geometry.
+
 **Round 208 (2026-06-02)** lands the per-LfGroup varblock-walk
 driver — the "varblock-shape grid" the round-177 / 183 / 190
 module notes repeatedly deferred to. New `varblock_walk` module

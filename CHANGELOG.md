@@ -9,6 +9,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Round 214 — `block_context_resolver` module (per-LfGroup
+  `BlockContext()` resolver, FDIS §C.8.3 Listing C.13 + §I.2.2
+  `HfBlockContext` bundle). Exposes the borrow-based
+  `BlockContextResolver::new(&HfBlockContext)` wrapper with a
+  per-varblock `resolve(channel, &Varblock, qdc) -> Result<u32>`
+  lookup (applies `order_id_for_transform` for `s`, threads
+  `hf_mul` as `qf`, forwards `qdc[3]` + the LfGlobal
+  `qf_thresholds` / `lf_thresholds` / `block_ctx_map` to the
+  round-159 `pass_group_hf::block_context` formula) plus
+  `decode_varblocks_with_resolver(grid, nz, p, c, &resolver,
+  qdc_at, read_non_zeros, decode_symbol)` driver that pairs the
+  round-208 `VarblockWalk` raster-order iterator with the
+  round-190 `PerPassNonZerosGrids::decode_block_at_for_pass_channel`
+  per-block primitive. The resolver eliminates the four-argument
+  `(qf_thresholds, lf_thresholds, block_ctx_map, nb_block_ctx)`
+  boilerplate at every per-varblock callsite. 14 unit + 12
+  integration (`round214_block_context_resolver`) tests pin:
+  borrow accessor + `nb_block_ctx` default-15 pass-through;
+  default-branch `(c=0, s=0)` / `(c=1, s=0)` / `(c=2, s=0)`
+  DCT8×8 → `block_ctx_map[{13, 0, 26}]` = `{7, 0, 7}`; DCT16×16 /
+  DCT32×32 / DCT16×8 / DCT8×16 / Hornuss order-id mapping;
+  default-branch invariance to `qdc` and `hf_mul` (empty
+  thresholds collapse those knobs); custom-branch
+  `qf_threshold` perturbation; driver pass-through on
+  single-DCT8×8 / raster-order 2×2 DCT8×8 / single-DCT16×16
+  grids; `qdc_at` closure called once per varblock in walk
+  order; closure-error propagation. Lib tests 650 → 664 (+14).
+  Pure-control-flow primitive in the round-89 / 95 / 121 / 138 /
+  141 / 144 / 147 / 159 / 164 / 177 / 183 / 190 / 208 family; no
+  bit reads, no spec re-derivation, no histogram materialisation.
+
 - Round 208 — `varblock_walk` module (per-LfGroup varblock-walk
   driver, FDIS §C.5.4 + §C.8.3). Exposes the `Varblock` descriptor
   (`{x, y, transform, hf_mul}`), the borrow-based `VarblockWalk`
