@@ -5,6 +5,66 @@ Pure-Rust **JPEG XL** (ISO/IEC 18181-1:2024) decoder. Resumed
 trace-doc-driven rounds 7-11 + encoder rounds 1-6 were retired
 (see "Why retired (history)" below).
 
+**Round 232 (2026-06-04)** lands the per-LfGroup multi-pass HF-header
++ per-pass `histogram_offset` routing driver
+`decode_multi_pass_with_hf_headers` — the §C.8.3 first-paragraph
+`hfp = u(ceil(log2(num_hf_presets)))` + derived
+`histogram_offset = 495 × nb_block_ctx × hfp` wiring above the
+round-228 per-LfGroup multi-pass three-channel driver. New
+`multi_pass_hf_header` module exposes the typed `PerPassHfHeaders`
+container (one [`pass_group_hf::PassGroupHfHeader`] per pass) with
+`PerPassHfHeaders::read(br, num_passes, num_hf_presets,
+nb_block_ctx)` consuming the per-pass header sequence from a
+[`bitreader::BitReader`] and `PerPassHfHeaders::from_headers(vec)`
+constructing from a pre-built `Vec`. Accessors expose per-pass
+`hfp` + `histogram_offset` + a `PassHfDigest` snapshot for callers
+performing the per-pass [`hf_pass::HfPass`] coefficient-order lookup
+or routing the offset into a per-pass entropy stream. The driver
+itself wraps
+[`multi_pass_decode::decode_multi_pass_three_channels_with_resolver`]
+with two augmented closure shapes
+`read_non_zeros(p, channel, predicted, histogram_offset)` /
+`decode_symbol(p, channel, coeff_ctx, histogram_offset)`. The
+per-pass offset is pre-resolved once per pass before the inner walk
+so the closure body sees a constant offset across each pass's
+per-channel calls. The companion
+`read_and_decode_multi_pass_with_hf_headers(br, ...)` reads the
+per-pass header sequence inline from a `BitReader` and invokes the
+driver in one call — the entry-point a future round wiring §C.7.2
+entropy histograms (#799 DOCS-GAP) into per-pass `EntropyStream`s
+will use. 16 unit + 12 integration
+(`round232_multi_pass_hf_header`) tests pin: per-pass header read
+with `num_hf_presets ∈ {1, 2, 4, 8}` (single-preset zero-bit fast
+path, two-preset one-bit-per-pass, four-preset two-bits-per-pass,
+eight-preset three-bits-per-pass with 15 bits across 5 passes);
+digest round-trip through bits LSB-first; `hfp = 0` always yielding
+`histogram_offset = 0` regardless of `nb_block_ctx`; offset scaling
+with `nb_block_ctx`; out-of-range errors; zero-passes degenerate
+empty container; `num_hf_presets == 0` rejection propagating
+through `PerPassHfHeaders::read`; per-pass offset uniformly routed
+across the three channels (X / Y / B) within a pass; both
+`read_non_zeros` and `decode_symbol` closures receiving the
+matching per-pass offset (378 = 2 × 3 × 63 decode_symbol calls
+covering the full DCT8×8 `k ∈ [num_blocks, size)` sweep); per-pass
+error propagation; `num_passes` mismatch rejected pre-walk;
+pass-distinct `qdc_at` invocation preserving the round-228 per-pass
+`qdc[3]` propagation; mixed transform `DCT16×8 + 2 DCT8×8` layout
+consistency across passes with distinct per-pass offsets; inline
+read+decode end-to-end (header bits consumed exactly, decode walk
+runs, output shape matches); inline-read error path (empty
+`BitReader` yields a proper `Error::InvalidData` from `read_bit`).
+Lib tests 689 → 705 (+16). Pure-control-flow primitive in the same
+shape as round-89 [`dct_quant_weights`], round-95 [`hf_dequant`],
+round-121 [`llf_from_lf`], round-138 [`chroma_from_luma`],
+round-141 [`gaborish`], round-144 [`epf`], round-147
+[`afv::afv_idct`], round-159 / 164 [`pass_group_hf`], round-177
+[`non_zeros_grid`], round-183 [`per_channel_non_zeros`], round-190
+[`per_pass_non_zeros`], round-208 [`varblock_walk`], round-214
+[`block_context_resolver`], round-221's three-channel driver, and
+round-228's multi-pass driver — no bit reads beyond the spec-line
+`hfp` u-read, no spec re-derivation, no histogram materialisation,
+no ANS state setup.
+
 **Round 228 (2026-06-04)** lands the per-LfGroup **multi-pass**
 three-channel varblock decode driver
 `decode_multi_pass_three_channels_with_resolver` — the outer
