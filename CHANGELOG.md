@@ -9,6 +9,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Round 238 — `hf_coeff_histogram_size::HfCoefficientHistogramSize`
+  typed sizing primitive for the §C.7.2 HF coefficient histogram
+  block. Encapsulates the spec line "Let `nb_block_ctx` be equal to
+  `max(block_ctx_map)+1`. The decoder reads a histogram with
+  `495 × num_hf_presets × nb_block_ctx` clustered distributions D
+  from the codestream as specified in D.3." behind a single typed
+  constructor pair (`new(num_hf_presets, nb_block_ctx)` and
+  `from_block_ctx_map(map, num_hf_presets)`), plus accessors
+  `per_preset()` (`495 × nb_block_ctx`), `num_distributions()`
+  (`495 × num_hf_presets × nb_block_ctx` — the §C.7.2 total),
+  and `offset_for_hfp(hfp)` (`495 × nb_block_ctx × hfp` — the
+  §C.8.3 per-pass routing offset, with `hfp < num_hf_presets`
+  range check). Spec constant published as
+  `PER_PRESET_PER_BLOCK_CTX = 495`. Defensive zero-input guards
+  reject `num_hf_presets == 0`, `nb_block_ctx == 0`, and empty
+  `block_ctx_map`. The duplicated `495u64 * num_hf_presets *
+  nb_block_ctx` and `495u64 * nb_block_ctx * hfp` arithmetic in
+  `hf_pass::HfPass::read` and `pass_group_hf::PassGroupHfHeader::read`
+  is now routed through the primitive so the spec constant has one
+  home and the per-pass offset shares its `nb_block_ctx` factor
+  with the §C.7.2 read-size derivation. Sizing-only — the actual
+  §C.7.2 `EntropyStream::read(br, num_distributions)` call against
+  the clustered-distributions block remains the deferred next step.
+  Adds 5 unit tests + 6 integration tests
+  (`tests/round238_hf_coeff_histogram_size.rs`). Lib test count
+  705 → 710 (+5). Pure refactor; no wire-format change. (§C.7.2
+  entropy-stream read itself remains a deferred next step.)
+
 - Round 232 — `multi_pass_hf_header::PerPassHfHeaders` +
   `decode_multi_pass_with_hf_headers` per-LfGroup multi-pass driver
   with per-pass `hfp` reads + per-pass `histogram_offset` routing

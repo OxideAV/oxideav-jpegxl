@@ -142,8 +142,16 @@ impl HfPass {
             build_natural_orders()
         };
 
-        // §C.7.2: number of clustered distributions.
-        let num_histogram_distributions = 495u64 * num_hf_presets as u64 * nb_block_ctx as u64;
+        // §C.7.2: number of clustered distributions, routed through
+        // the typed sizing primitive so the spec constant has one
+        // home and the zero-input guards run consistently across
+        // every call site that needs the §C.7.2 read size.
+        let num_histogram_distributions =
+            crate::hf_coeff_histogram_size::HfCoefficientHistogramSize::new(
+                num_hf_presets,
+                nb_block_ctx,
+            )?
+            .num_distributions();
 
         Ok(Self {
             used_orders,

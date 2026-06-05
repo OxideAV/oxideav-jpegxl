@@ -498,6 +498,7 @@ pub mod extensions;
 pub mod frame_header;
 pub mod gaborish;
 pub mod global_modular;
+pub mod hf_coeff_histogram_size;
 pub mod hf_dequant;
 pub mod hf_global;
 pub mod hf_pass;

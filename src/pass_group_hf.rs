@@ -124,7 +124,14 @@ impl PassGroupHfHeader {
                 "JXL PassGroup HF: hfp {hfp} ≥ num_hf_presets {num_hf_presets}"
             )));
         }
-        let histogram_offset = 495u64 * nb_block_ctx as u64 * hfp as u64;
+        // §C.8.3: `offset = 495 × nb_block_ctx × hfp`, routed through
+        // the typed sizing primitive so the spec constant has one
+        // home shared with the §C.7.2 read-size derivation.
+        let histogram_offset = crate::hf_coeff_histogram_size::HfCoefficientHistogramSize::new(
+            num_hf_presets,
+            nb_block_ctx,
+        )?
+        .offset_for_hfp(hfp)?;
         Ok(Self {
             hfp,
             histogram_offset,

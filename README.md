@@ -5,6 +5,45 @@ Pure-Rust **JPEG XL** (ISO/IEC 18181-1:2024) decoder. Resumed
 trace-doc-driven rounds 7-11 + encoder rounds 1-6 were retired
 (see "Why retired (history)" below).
 
+**Round 238 (2026-06-05)** lands the
+`hf_coeff_histogram_size::HfCoefficientHistogramSize` typed sizing
+primitive for the §C.7.2 HF coefficient histogram block. The spec
+line "Let `nb_block_ctx` be equal to `max(block_ctx_map)+1`. The
+decoder reads a histogram with `495 × num_hf_presets × nb_block_ctx`
+clustered distributions D from the codestream as specified in D.3"
+now has a single typed home: `HfCoefficientHistogramSize::new(
+num_hf_presets, nb_block_ctx)` direct constructor + `from_block_ctx_map(
+map, num_hf_presets)` deriving `nb_block_ctx` from the §C.7.2 line-1
+`max(block_ctx_map) + 1` rule. Accessors: `per_preset()`
+(`495 × nb_block_ctx` — single-preset distributions),
+`num_distributions()` (`495 × num_hf_presets × nb_block_ctx` — the
+§C.7.2 total), and `offset_for_hfp(hfp)` (`495 × nb_block_ctx × hfp`
+— the §C.8.3 per-pass routing offset, range-checked on `hfp <
+num_hf_presets`). Spec constant published as
+`pub const PER_PRESET_PER_BLOCK_CTX: u64 = 495`. The duplicated
+`495u64 * num_hf_presets * nb_block_ctx` and
+`495u64 * nb_block_ctx * hfp` arithmetic in `hf_pass::HfPass::read`
+and `pass_group_hf::PassGroupHfHeader::read` is now routed through
+the primitive so the spec constant has one home and the per-pass
+offset derivation shares its `nb_block_ctx` factor with the §C.7.2
+read-size. Defensive zero-input guards reject `num_hf_presets == 0`,
+`nb_block_ctx == 0`, and an empty `block_ctx_map`. 5 unit + 6
+integration (`round238_hf_coeff_histogram_size`) tests pin:
+default-shape 39-entry `block_ctx_map` deriving `nb_block_ctx = 15`
+and `num_distributions == 7425`; multi-preset multi-context
+arithmetic (`num_hf_presets ∈ {1, 2, 4, 8}` × `nb_block_ctx ∈ {1, 7,
+15}`); `offset_for_hfp(hfp)` stepping uniformly by `per_preset()`
+across `hfp ∈ [0, num_hf_presets)`; out-of-range `hfp` rejected;
+zero-input rejection on every constructor; `HfPass::read` and
+`PassGroupHfHeader::read` post-refactor producing bit-identical
+sizes/offsets to the primitive's direct computation across the
+worked-example matrix. Lib tests 705 → 710 (+5). Pure-control-flow
+sizing primitive — no bit reads, no spec re-derivation, no
+histogram materialisation, no ANS state setup. The actual §C.7.2
+read of the clustered-distributions block (the
+`EntropyStream::read(br, num_distributions)` call against the
+read-size the primitive now computes) remains a deferred next step.
+
 **Round 232 (2026-06-04)** lands the per-LfGroup multi-pass HF-header
 + per-pass `histogram_offset` routing driver
 `decode_multi_pass_with_hf_headers` — the §C.8.3 first-paragraph
