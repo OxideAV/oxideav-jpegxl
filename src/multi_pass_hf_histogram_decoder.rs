@@ -2,6 +2,33 @@
 //! §C.7.2 (entropy histograms) + §C.8.3 (per-pass `histogram_offset`
 //! routing) bridge.
 //!
+//! ## Scope (round 255)
+//!
+//! Round 255 closes the round-252 deferred next-step "per-block raster
+//! walk remain caller-side concerns above this primitive" with a new
+//! bundled per-varblock decode method:
+//!
+//! * [`HfHistogramDecodeContext::decode_block_for_pass_transform`] —
+//!   one [`crate::dct_select::TransformType`]-driven call that wires
+//!   the Listing C.13 + C.14 per-block walk against the round-252
+//!   per-pass histogram routing. Composes the existing
+//!   [`HfHistogramDecodeContext::non_zeros_at`] +
+//!   [`HfHistogramDecodeContext::coefficient_at`] entry points (which
+//!   each individually take `&mut self`, so cannot both be wrapped
+//!   into the round-90 `read_non_zeros_and_decode_block_for_transform`
+//!   closure pair) into a single sequential `&mut self` walk that
+//!   mirrors [`crate::pass_group_hf::decode_block_coefficients`]'s
+//!   state machine — `prev_nonzero[]` tracking, the `non_zeros == 0`
+//!   early-stop, and the `non_zeros > size - num_blocks` defensive
+//!   cap — without re-deriving any of it. Returns the round-90
+//!   [`DecodedHfBlock`] coefficient bundle plus the un-divided
+//!   `raw_non_zeros` so the caller can drive the NonZeros-grid
+//!   `(raw + num_blocks - 1) Idiv num_blocks` bookkeeping unchanged.
+//!
+//! Round 252 (the immediate prior round) landed the
+//! `HfHistogramDecodeContext` primitive itself — see the §C.7.2 →
+//! §C.8.3 routing summary below.
+//!
 //! ## Scope (round 252)
 //!
 //! Round 247 landed the typed [`HfCoefficientHistograms`] wrapper that
@@ -76,10 +103,14 @@
 //! before the first [`HfHistogramDecodeContext::decode_symbol_for_pass`]
 //! call. Prefix-coded streams short-circuit that to a no-op.
 //!
-//! Per-channel `BlockContext()` history threading, per-channel
-//! coefficient-order lookup against [`crate::hf_pass::HfPass`], and
-//! the per-block raster walk all remain caller-side concerns above
-//! this primitive.
+//! Per-channel `BlockContext()` history threading and per-channel
+//! coefficient-order lookup against [`crate::hf_pass::HfPass`] remain
+//! caller-side concerns above this primitive. The single-varblock
+//! Listing C.14 per-block walk is now bundled by round 255 (see
+//! [`HfHistogramDecodeContext::decode_block_for_pass_transform`]
+//! above) — the raster walk across multiple varblocks is still a
+//! caller-side concern (driven by [`crate::varblock_walk`] +
+//! [`crate::multi_pass_decode`]).
 //!
 //! Same pure-control-flow primitive shape as round-89
 //! [`crate::dct_quant_weights`], round-95 [`crate::hf_dequant`],
@@ -111,10 +142,15 @@
 
 use oxideav_core::{Error, Result};
 
-use crate::bitreader::BitReader;
+use crate::bitreader::{unpack_signed, BitReader};
+use crate::coeff_order::{natural_coeff_order, order_id_for_transform};
+use crate::dct_select::TransformType;
 use crate::hf_coefficient_histograms::HfCoefficientHistograms;
 use crate::multi_pass_hf_header::PerPassHfHeaders;
-use crate::pass_group_hf::{coefficient_context, non_zeros_context};
+use crate::pass_group_hf::{
+    coefficient_context, non_zeros_context, prev_for_context, transform_block_params,
+    DecodedHfBlock,
+};
 
 /// Per-pass HF histogram decode context — owns the §C.7.2 entropy
 /// stream + the per-pass §C.8.3 `histogram_offset` array.
@@ -290,6 +326,181 @@ impl<'a> HfHistogramDecodeContext<'a> {
             nb_block_ctx,
         )?;
         self.decode_symbol_for_pass(br, p, ctx)
+    }
+
+    /// Decode a single varblock's HF coefficients for pass `p`, driven
+    /// by a [`TransformType`] — round 255's bundled composition of the
+    /// round-90 §C.8.3 / Listing C.14 per-block loop with the round-252
+    /// per-pass histogram routing.
+    ///
+    /// One typed method replaces the round-90 caller pattern of
+    ///
+    /// ```text
+    /// read_non_zeros_and_decode_block_for_transform(
+    ///     t, predicted, block_ctx, nb_block_ctx,
+    ///     |ctx| ctx.non_zeros_at(br, p, predicted, block_ctx, nb_block_ctx),
+    ///     |ctx| ctx.coefficient_at(br, p, k, non_zeros, num_blocks, size,
+    ///                              prev, block_ctx, nb_block_ctx),
+    /// )
+    /// ```
+    ///
+    /// — which doesn't actually compile because both closures need
+    /// `&mut self` on the histogram-decode context concurrently. The
+    /// method body drives the same Listing C.14 state machine but with
+    /// sequential `&mut self` calls (one per symbol read), so the
+    /// borrow checker is happy.
+    ///
+    /// Spec walk per Listing C.13 + C.14:
+    ///
+    /// 1. `nz_ctx = NonZerosContext(predicted, block_ctx,
+    ///    nb_block_ctx)`,
+    /// 2. `non_zeros = D[nz_ctx + histogram_offset(p)]` (a single
+    ///    [`Self::non_zeros_at`] call),
+    /// 3. defensive `non_zeros ≤ size - num_blocks` cap (round-90
+    ///    invariant carried over verbatim — the spec's `(non_zeros +
+    ///    num_blocks - 1) Idiv num_blocks` bound says a varblock with
+    ///    `num_blocks` LLF cells can carry at most `size - num_blocks`
+    ///    HF coefficients, so any reported `non_zeros` exceeding that
+    ///    is an encoder bug or corrupted stream),
+    /// 4. walk `k` from `num_blocks` to `size`:
+    ///    a. break early when `non_zeros` reaches 0,
+    ///    b. compute `prev = prev_for_context(k, num_blocks, size,
+    ///    non_zeros, prev_nonzero[k-1])`,
+    ///    c. `ucoeff = D[CoefficientContext(k, non_zeros, num_blocks,
+    ///    size, prev, block_ctx, nb_block_ctx) + histogram_offset(
+    ///    p)]` (a single [`Self::coefficient_at`] call),
+    ///    d. `coeffs[natural_order[k]] = unpack_signed(ucoeff)`,
+    ///    e. when `ucoeff != 0`, record `prev_nonzero[k] = true` and
+    ///    decrement `non_zeros`.
+    ///
+    /// `predicted` is the [`crate::pass_group_hf::predicted_non_zeros`]
+    /// value for the current varblock's top-left position; `block_ctx`
+    /// is the [`crate::pass_group_hf::block_context`] result;
+    /// `nb_block_ctx` is the LfGlobal `HfBlockContext` invariant
+    /// (§I.2.2); `t` is the [`TransformType`] (§I.2.4 + Table C.16)
+    /// driving the `(num_blocks, size)` + natural-order derivation.
+    ///
+    /// Returns `(decoded, raw_non_zeros)` where `decoded` is the
+    /// [`DecodedHfBlock`] coefficient bundle (in natural-order index
+    /// space) and `raw_non_zeros` is the **un-divided** `non_zeros`
+    /// value the caller threads into the NonZeros-grid bookkeeping via
+    /// `(raw_non_zeros + num_blocks - 1) Idiv num_blocks` (the spec
+    /// line right after Listing C.14).
+    ///
+    /// Errors:
+    /// * Propagates any [`Self::non_zeros_at`] /
+    ///   [`Self::coefficient_at`] error verbatim (out-of-range pass
+    ///   index, `u32`-overflow `ctx + offset`, downstream
+    ///   `EntropyStream` error).
+    /// * Rejects `non_zeros > size - num_blocks` with
+    ///   [`Error::InvalidData`] before any HF-coefficient symbol read.
+    /// * Rejects `num_blocks == 0` / mismatched natural-order length
+    ///   via [`crate::pass_group_hf::transform_block_params`] +
+    ///   internal sanity checks (defence in depth — the spec table
+    ///   guarantees `num_blocks ≥ 1` for every [`TransformType`]).
+    #[allow(clippy::too_many_arguments)]
+    pub fn decode_block_for_pass_transform(
+        &mut self,
+        br: &mut BitReader<'_>,
+        p: u32,
+        t: TransformType,
+        predicted: u32,
+        block_ctx: u32,
+        nb_block_ctx: u32,
+    ) -> Result<(DecodedHfBlock, u32)> {
+        let (num_blocks, size) = transform_block_params(t);
+        // Defensive — every spec-listed TransformType has num_blocks ≥
+        // 1 and size > 0, but we propagate a clean error instead of
+        // panicking in `decode_block_coefficients_for_transform` if a
+        // future table change introduces a zero-sized entry.
+        if num_blocks == 0 {
+            return Err(Error::InvalidData(
+                "JXL HfHistogramDecodeContext::decode_block_for_pass_transform: \
+                 num_blocks must be ≥ 1"
+                    .into(),
+            ));
+        }
+        if size == 0 || num_blocks > size {
+            return Err(Error::InvalidData(format!(
+                "JXL HfHistogramDecodeContext::decode_block_for_pass_transform: \
+                 invalid (num_blocks={num_blocks}, size={size}) for {t:?}"
+            )));
+        }
+        let oid = order_id_for_transform(t);
+        let natural_order = natural_coeff_order(oid);
+        if natural_order.len() != size as usize {
+            return Err(Error::InvalidData(format!(
+                "JXL HfHistogramDecodeContext::decode_block_for_pass_transform: \
+                 natural_order len {} != size {size} for {t:?}",
+                natural_order.len()
+            )));
+        }
+
+        // (1) NonZerosContext read (round-252 routing).
+        let raw_non_zeros = self.non_zeros_at(br, p, predicted, block_ctx, nb_block_ctx)?;
+
+        // (2) Cap check — round-90 invariant.
+        if raw_non_zeros > size - num_blocks {
+            return Err(Error::InvalidData(format!(
+                "JXL HfHistogramDecodeContext::decode_block_for_pass_transform: \
+                 non_zeros {raw_non_zeros} > size - num_blocks ({}) at predicted={predicted}",
+                size - num_blocks
+            )));
+        }
+
+        // (3) Listing C.14 per-block loop — sequential &mut self calls.
+        let mut coeffs = vec![0i32; size as usize];
+        let mut prev_nonzero = vec![false; size as usize];
+        let mut non_zeros = raw_non_zeros;
+        let mut coeffs_read: u32 = 0;
+        let mut k = num_blocks;
+        while k < size {
+            if non_zeros == 0 {
+                break;
+            }
+            let prev = prev_for_context(k, num_blocks, size, non_zeros, |kk| {
+                prev_nonzero[kk as usize]
+            });
+            let ucoeff = self.coefficient_at(
+                br,
+                p,
+                k,
+                non_zeros,
+                num_blocks,
+                size,
+                prev,
+                block_ctx,
+                nb_block_ctx,
+            )?;
+            coeffs_read += 1;
+            let signed = unpack_signed(ucoeff);
+            let pos = natural_order[k as usize] as usize;
+            // natural_order entries are guaranteed in [0, size) by
+            // construction of natural_coeff_order; we still defensively
+            // guard for the (impossible-by-spec) out-of-range case to
+            // mirror round-90's belt-and-braces shape.
+            if pos >= size as usize {
+                return Err(Error::InvalidData(format!(
+                    "JXL HfHistogramDecodeContext::decode_block_for_pass_transform: \
+                     natural_order entry {pos} >= size {size} for {t:?}"
+                )));
+            }
+            coeffs[pos] = signed;
+            if ucoeff != 0 {
+                prev_nonzero[k as usize] = true;
+                non_zeros = non_zeros.saturating_sub(1);
+            }
+            k += 1;
+        }
+
+        Ok((
+            DecodedHfBlock {
+                coeffs,
+                remaining_non_zeros: non_zeros,
+                coeffs_read,
+            },
+            raw_non_zeros,
+        ))
     }
 
     /// Per-pass `histogram_offset(p)` lookup. Range-checked on `p`.
@@ -571,5 +782,188 @@ mod tests {
         assert_eq!(ctx.num_passes(), 2);
         // Pass-0 offset = 495 × 15 × 0 = 0; pass-1 offset = 7425.
         assert_eq!(ctx.per_pass_offsets(), &[0u64, 7425u64]);
+    }
+
+    // -----------------------------------------------------------------
+    // Round 255 — `decode_block_for_pass_transform` unit tests. The
+    // bundled per-varblock decode method composes round-252's per-pass
+    // `non_zeros_at` + `coefficient_at` into the round-90 Listing C.14
+    // state machine for one varblock at a time. All tests use the
+    // single-symbol-prefix `make_minimal_histograms` shape so every
+    // `D[ctx + offset]` read returns 0 — which means the C.14 inner
+    // loop short-circuits immediately on the very first symbol since
+    // `non_zeros` arrives as 0 (predicted = 0 → NonZerosContext = 5,
+    // single-symbol prefix → 0).
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn r255_decode_block_for_pass_transform_dct8x8_short_circuits_on_zero_non_zeros() {
+        // DCT8x8: num_blocks = 1, size = 64. With single-symbol prefix
+        // → non_zeros = 0 → C.14 loop never enters the body, no
+        // coefficient symbols read.
+        let mut h = make_minimal_histograms(1, 15);
+        let headers = PerPassHfHeaders::from_headers(vec![PassGroupHfHeader {
+            hfp: 0,
+            histogram_offset: 0,
+        }]);
+        let mut ctx_dec = HfHistogramDecodeContext::new(&mut h, &headers).unwrap();
+        let bytes = [0u8; 4];
+        let mut br = BitReader::new(&bytes);
+        let bits_before = br.bits_read();
+        let (decoded, raw_non_zeros) = ctx_dec
+            .decode_block_for_pass_transform(
+                &mut br,
+                /*p*/ 0,
+                TransformType::Dct8x8,
+                /*predicted*/ 0,
+                /*block_ctx*/ 0,
+                /*nb_block_ctx*/ 15,
+            )
+            .unwrap();
+        assert_eq!(raw_non_zeros, 0);
+        assert_eq!(decoded.remaining_non_zeros, 0);
+        assert_eq!(decoded.coeffs_read, 0);
+        assert_eq!(decoded.coeffs.len(), 64);
+        assert!(decoded.coeffs.iter().all(|&c| c == 0));
+        // Single-symbol prefix → zero bits consumed.
+        assert_eq!(br.bits_read(), bits_before);
+    }
+
+    #[test]
+    fn r255_decode_block_for_pass_transform_rejects_out_of_range_pass() {
+        let mut h = make_minimal_histograms(1, 15);
+        let headers = PerPassHfHeaders::from_headers(vec![PassGroupHfHeader {
+            hfp: 0,
+            histogram_offset: 0,
+        }]);
+        let mut ctx_dec = HfHistogramDecodeContext::new(&mut h, &headers).unwrap();
+        let bytes = [0u8; 4];
+        let mut br = BitReader::new(&bytes);
+        let r = ctx_dec.decode_block_for_pass_transform(
+            &mut br,
+            /*p*/ 5, // > num_passes (= 1)
+            TransformType::Dct8x8,
+            /*predicted*/ 0,
+            /*block_ctx*/ 0,
+            /*nb_block_ctx*/ 15,
+        );
+        assert!(matches!(r, Err(Error::InvalidData(_))));
+    }
+
+    #[test]
+    fn r255_decode_block_for_pass_transform_dct16x16_short_circuits() {
+        // DCT16x16: num_blocks = 4, size = 256. With single-symbol
+        // prefix → non_zeros = 0 → no coefficient symbols read.
+        let mut h = make_minimal_histograms(1, 15);
+        let headers = PerPassHfHeaders::from_headers(vec![PassGroupHfHeader {
+            hfp: 0,
+            histogram_offset: 0,
+        }]);
+        let mut ctx_dec = HfHistogramDecodeContext::new(&mut h, &headers).unwrap();
+        let bytes = [0u8; 4];
+        let mut br = BitReader::new(&bytes);
+        let (decoded, raw_non_zeros) = ctx_dec
+            .decode_block_for_pass_transform(
+                &mut br,
+                0,
+                TransformType::Dct16x16,
+                /*predicted*/ 32, // top-left → predicted_non_zeros = 32
+                /*block_ctx*/ 0,
+                /*nb_block_ctx*/ 15,
+            )
+            .unwrap();
+        assert_eq!(raw_non_zeros, 0);
+        assert_eq!(decoded.coeffs.len(), 256);
+        assert_eq!(decoded.coeffs_read, 0);
+        assert!(decoded.coeffs.iter().all(|&c| c == 0));
+    }
+
+    #[test]
+    fn r255_decode_block_for_pass_transform_routes_through_per_pass_offset() {
+        // num_hf_presets = 2, nb_block_ctx = 1; per-pass offset =
+        // 495 × 1 × hfp. We invoke for pass 1 → routes via cluster_map[
+        // nz_ctx + 495]; single-symbol prefix → 0.
+        let mut h = make_minimal_histograms(2, 1);
+        let headers = PerPassHfHeaders::from_headers(vec![
+            PassGroupHfHeader {
+                hfp: 0,
+                histogram_offset: 0,
+            },
+            PassGroupHfHeader {
+                hfp: 1,
+                histogram_offset: 495,
+            },
+        ]);
+        let mut ctx_dec = HfHistogramDecodeContext::new(&mut h, &headers).unwrap();
+        let bytes = [0u8; 4];
+        let mut br = BitReader::new(&bytes);
+        let (decoded, raw_non_zeros) = ctx_dec
+            .decode_block_for_pass_transform(
+                &mut br,
+                /*p*/ 1,
+                TransformType::Dct8x8,
+                /*predicted*/ 0,
+                /*block_ctx*/ 0,
+                /*nb_block_ctx*/ 1,
+            )
+            .unwrap();
+        assert_eq!(raw_non_zeros, 0);
+        assert_eq!(decoded.coeffs_read, 0);
+    }
+
+    #[test]
+    fn r255_decode_block_for_pass_transform_propagates_u32_overflow() {
+        // Synthetic header with histogram_offset > u32::MAX → the
+        // first non_zeros_at call hits the u32 overflow guard.
+        let mut h = make_minimal_histograms(1, 1);
+        let headers = PerPassHfHeaders::from_headers(vec![PassGroupHfHeader {
+            hfp: 0,
+            histogram_offset: u64::from(u32::MAX) + 10,
+        }]);
+        let mut ctx_dec = HfHistogramDecodeContext::new(&mut h, &headers).unwrap();
+        let bytes = [0u8; 4];
+        let mut br = BitReader::new(&bytes);
+        let r = ctx_dec.decode_block_for_pass_transform(&mut br, 0, TransformType::Dct8x8, 0, 0, 1);
+        assert!(matches!(r, Err(Error::InvalidData(_))));
+    }
+
+    #[test]
+    fn r255_decode_block_for_pass_transform_dct8x16_short_circuits() {
+        // DCT8x16: num_blocks = 2, size = 128. Confirms the transform-
+        // type dispatch picks the rectangular-output table cleanly.
+        let mut h = make_minimal_histograms(1, 15);
+        let headers = PerPassHfHeaders::from_headers(vec![PassGroupHfHeader {
+            hfp: 0,
+            histogram_offset: 0,
+        }]);
+        let mut ctx_dec = HfHistogramDecodeContext::new(&mut h, &headers).unwrap();
+        let bytes = [0u8; 4];
+        let mut br = BitReader::new(&bytes);
+        let (decoded, raw_non_zeros) = ctx_dec
+            .decode_block_for_pass_transform(&mut br, 0, TransformType::Dct8x16, 0, 0, 15)
+            .unwrap();
+        assert_eq!(raw_non_zeros, 0);
+        assert_eq!(decoded.coeffs.len(), 128);
+        assert_eq!(decoded.coeffs_read, 0);
+    }
+
+    #[test]
+    fn r255_decode_block_for_pass_transform_does_not_advance_br_when_short_circuited() {
+        // Single-symbol prefix: every D[...] read consumes 0 bits.
+        // The non_zeros_at call returns 0, the C.14 loop never enters,
+        // so the BitReader cursor must not advance.
+        let mut h = make_minimal_histograms(1, 15);
+        let headers = PerPassHfHeaders::from_headers(vec![PassGroupHfHeader {
+            hfp: 0,
+            histogram_offset: 0,
+        }]);
+        let mut ctx_dec = HfHistogramDecodeContext::new(&mut h, &headers).unwrap();
+        let bytes = [0xFFu8; 16];
+        let mut br = BitReader::new(&bytes);
+        let bits_before = br.bits_read();
+        let _ = ctx_dec
+            .decode_block_for_pass_transform(&mut br, 0, TransformType::Dct8x8, 0, 0, 15)
+            .unwrap();
+        assert_eq!(br.bits_read(), bits_before);
     }
 }

@@ -9,6 +9,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Round 255 —
+  `multi_pass_hf_histogram_decoder::HfHistogramDecodeContext::decode_block_for_pass_transform`
+  bundled per-varblock decode method closing the round-252 deferred
+  next-step "per-block raster walk remain caller-side concerns above
+  this primitive" against ISO/IEC FDIS 18181-1:2021 §C.8.3 + Listing
+  C.13 + Listing C.14. One `(p, t, predicted, block_ctx,
+  nb_block_ctx)` call now wires the round-90 Listing C.14 state
+  machine (`prev_nonzero[]` tracking, `non_zeros == 0` early-stop,
+  `non_zeros > size - num_blocks` defensive cap) against the
+  round-252 per-pass histogram routing for one varblock, returning
+  the round-90 `DecodedHfBlock` coefficient bundle plus the un-
+  divided `raw_non_zeros` for downstream `(raw + num_blocks - 1)
+  Idiv num_blocks` NonZeros-grid bookkeeping. The internal walk is a
+  single sequential `&mut self` loop because the two underlying
+  entry points (`non_zeros_at`, `coefficient_at`) each need `&mut
+  self` and therefore can't be wrapped into the round-90
+  `read_non_zeros_and_decode_block_for_transform` closure pair —
+  this method is the typed bridge. Defensive shape: rejects `p >=
+  num_passes`, `ctx + offset > u32::MAX`, and `num_blocks == 0` /
+  mismatched natural-order length, all without panicking. 7 unit +
+  10 integration (`round255_decode_block_for_pass_transform`) tests
+  pin: DCT8×8 / DCT16×16 / DCT16×8 / DCT8×16 / DCT4×4 short-circuit
+  to `raw_non_zeros == 0 → coeffs_read == 0 → all-zero coeffs vector
+  of the right length`; per-pass offset routing matches round-252
+  cluster_map indexing; out-of-range pass index rejected; `u32`
+  overflow on `ctx + offset` rejected; BitReader cursor unchanged on
+  a short-circuited block; round-trip with `PerPassHfHeaders::read`
+  driven off a real bitstream preserves the per-pass histogram
+  offsets. Lib tests 727 → 734 (+7).
+
 - Round 252 —
   `multi_pass_hf_histogram_decoder::HfHistogramDecodeContext` typed
   bridge that wires the round-247 `HfCoefficientHistograms` §C.7.2

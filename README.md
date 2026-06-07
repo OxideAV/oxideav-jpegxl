@@ -5,6 +5,42 @@ Pure-Rust **JPEG XL** (ISO/IEC 18181-1:2024) decoder. Resumed
 trace-doc-driven rounds 7-11 + encoder rounds 1-6 were retired
 (see "Why retired (history)" below).
 
+**Round 255 (2026-06-08)** closes the round-252 deferred next-step
+"per-block raster walk remain caller-side concerns above this
+primitive": the new
+`multi_pass_hf_histogram_decoder::HfHistogramDecodeContext::decode_block_for_pass_transform`
+method bundles the Listing C.14 per-varblock state machine against
+the round-252 per-pass histogram routing into a single
+[`TransformType`]-driven call. One
+`(p, t, predicted, block_ctx, nb_block_ctx)` invocation now wires
+the round-90 §C.8.3 / Listing C.14 walk (`prev_nonzero[]` tracking,
+the `non_zeros == 0` early-stop, and the `non_zeros > size -
+num_blocks` defensive cap) against the round-252 per-pass
+histogram routing, returning the round-90 `DecodedHfBlock`
+coefficient bundle plus the un-divided `raw_non_zeros` so the
+caller threads the §C.8.3 prose's `(raw + num_blocks - 1) Idiv
+num_blocks` NonZeros-grid bookkeeping unchanged. The internal walk
+is a single sequential `&mut self` loop because the round-252
+`non_zeros_at` and `coefficient_at` entry points each take `&mut
+self` individually and therefore cannot both be fed into the
+round-90 closure-pair shape — round 255's method is the typed
+bridge. Defensive shape: rejects `p >= num_passes`, `ctx + offset
+> u32::MAX`, `num_blocks == 0`, and mismatched natural-order
+length, all without panicking. 7 unit + 10 integration
+(`round255_decode_block_for_pass_transform`) tests pin: DCT8×8 /
+DCT16×16 / DCT16×8 / DCT8×16 / DCT4×4 short-circuit to
+`raw_non_zeros == 0 → coeffs_read == 0 → all-zero coeffs vector of
+the right length`; per-pass offset routing matches round-252
+cluster_map indexing; out-of-range pass index rejected;
+`u32`-overflow on `ctx + offset` rejected; BitReader cursor
+unchanged on a short-circuited block; round-trip with
+`PerPassHfHeaders::read` driven off a real bitstream preserves the
+per-pass histogram offsets end-to-end. Lib tests 727 → 734 (+7).
+Pure-control-flow bridge — the per-channel `BlockContext()` history
+threading, per-channel coefficient-order lookup against
+`HfPass`, and the per-varblock raster walk across the LfGroup all
+remain caller-side concerns above this primitive.
+
 **Round 252 (2026-06-08)** closes the round-247 deferred next-step:
 the `multi_pass_hf_histogram_decoder::HfHistogramDecodeContext` typed
 bridge wires the round-247 [`HfCoefficientHistograms`] §C.7.2 entropy
