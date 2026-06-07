@@ -5,6 +5,46 @@ Pure-Rust **JPEG XL** (ISO/IEC 18181-1:2024) decoder. Resumed
 trace-doc-driven rounds 7-11 + encoder rounds 1-6 were retired
 (see "Why retired (history)" below).
 
+**Round 247 (2026-06-07)** closes the round-238 deferred next-step:
+the `hf_coefficient_histograms::HfCoefficientHistograms` typed
+wrapper performs the actual §C.7.2 codestream read of the
+`495 × num_hf_presets × nb_block_ctx` clustered-distributions block.
+`HfCoefficientHistograms::read(br, size)` routes the
+`HfCoefficientHistogramSize::num_distributions()` total into
+[`modular_fdis::EntropyStream::read`] as `num_dist`, returning the
+sizing descriptor + the resulting `EntropyStream`. The §C.7.1 →
+§C.7.2 transition convenience `read_after_hf_pass_sequence(br,
+num_hf_presets, nb_block_ctx)` constructs the sizing descriptor
+inline so a caller that has just walked `hf_pass::read_hf_pass_sequence`
+can drive the §C.7.2 step against the same `BitReader` without a
+separate constructor call. ANS state initialisation is deferred to
+`HfCoefficientHistograms::read_ans_state_init` per the 2024-spec
+round-3 correction (the `u(32)` initialiser is read between the
+prelude and the first symbol decode, not eagerly inside the prelude
+itself), forwarded straight through to
+`EntropyStream::read_ans_state_init`. Defensive `usize`-cap guard on
+`num_distributions()` rejects 32-bit overflow before the
+`EntropyStream::read` call. Sizing accessors (`num_distributions`,
+`offset_for_hfp`, `num_hf_presets`, `nb_block_ctx`) forward through
+the underlying `HfCoefficientHistogramSize`. 7 unit + 6 integration
+(`round247_hf_coefficient_histograms`) tests pin: minimal §D.3
+prelude bit-layout (lz77=0, simple-clustering with `nbits=0`, prefix
+path, `split_exponent=0`, single-symbol prefix count) reading
+cleanly for `num_distributions ∈ {495, 990, 29 700}`; `helper` and
+`direct` constructors consume the exact same bit budget; sizing
+accessors match the primitive 1:1; zero-input rejection on
+`num_hf_presets == 0` and `nb_block_ctx == 0` does NOT advance the
+`BitReader`; truncated bitstream propagates an error without panic;
+`read_ans_state_init` is a no-op + idempotent on a prefix-coded
+stream; `entropy_mut()` returns a usable `&mut EntropyStream` for
+the downstream §C.8.3 per-block decode loop. Lib tests 710 → 717
+(+7). Pure wiring primitive — the histogram block is now read at
+the right place in the §C.7 walk, but the per-block decode against
+the histograms (Listing C.13 `BlockContext()` /
+`NonZerosContext()` / `CoefficientContext()` plumbing already
+landed by rounds 90 / 214 / 221 / 228 / 232) wiring through this
+new stream remains the next deferred step.
+
 **Round 238 (2026-06-05)** lands the
 `hf_coeff_histogram_size::HfCoefficientHistogramSize` typed sizing
 primitive for the §C.7.2 HF coefficient histogram block. The spec

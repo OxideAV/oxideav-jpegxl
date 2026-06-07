@@ -9,6 +9,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Round 247 — `hf_coefficient_histograms::HfCoefficientHistograms`
+  typed wrapper closing the round-238 deferred next-step. Performs
+  the actual ISO/IEC FDIS 18181-1:2021 §C.7.2 codestream read of the
+  `495 × num_hf_presets × nb_block_ctx` clustered-distributions block
+  by routing `HfCoefficientHistogramSize::num_distributions()` into
+  `modular_fdis::EntropyStream::read` as `num_dist`. Two entry-points:
+  `read(br, size)` for a caller-built sizing descriptor, and
+  `read_after_hf_pass_sequence(br, num_hf_presets, nb_block_ctx)`
+  for the §C.7.1 → §C.7.2 transition convenience (constructs the
+  sizing descriptor inline so a caller that has just walked
+  `hf_pass::read_hf_pass_sequence` can drive the §C.7.2 step against
+  the same `BitReader` without a separate constructor call). ANS
+  state initialisation is deferred to `read_ans_state_init` per the
+  round-3 2024-spec correction (the `u(32)` initialiser is read
+  between the prelude and the first symbol decode); forwarded
+  straight through to `EntropyStream::read_ans_state_init`. Defensive
+  `usize`-cap guard on `num_distributions()` rejects 32-bit overflow
+  before the `EntropyStream::read` call. Sizing accessors
+  (`num_distributions`, `offset_for_hfp`, `num_hf_presets`,
+  `nb_block_ctx`) forward through the underlying
+  `HfCoefficientHistogramSize`. `entropy_mut()` exposes the
+  underlying stream for the downstream §C.8.3 per-block decode loop.
+  Adds 7 unit tests + 6 integration tests
+  (`tests/round247_hf_coefficient_histograms.rs`). Lib test count
+  710 → 717 (+7). Pure wiring primitive — the per-block decode walk
+  through the freshly-read histograms (Listing C.13 contexts already
+  landed by rounds 90 / 214 / 221 / 228 / 232) remains the next
+  deferred step.
+
 - Round 238 — `hf_coeff_histogram_size::HfCoefficientHistogramSize`
   typed sizing primitive for the §C.7.2 HF coefficient histogram
   block. Encapsulates the spec line "Let `nb_block_ctx` be equal to
