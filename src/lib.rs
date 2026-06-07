@@ -516,6 +516,7 @@ pub mod modular;
 pub mod modular_fdis;
 pub mod multi_pass_decode;
 pub mod multi_pass_hf_header;
+pub mod multi_pass_hf_histogram_decoder;
 pub mod non_zeros_grid;
 pub mod pass_group;
 pub mod pass_group_hf;

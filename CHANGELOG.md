@@ -9,6 +9,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Round 252 —
+  `multi_pass_hf_histogram_decoder::HfHistogramDecodeContext` typed
+  bridge that wires the round-247 `HfCoefficientHistograms` §C.7.2
+  entropy stream to the round-232 `PerPassHfHeaders` per-pass
+  `(hfp, histogram_offset)` array, closing the round-247 deferred
+  next-step (the §C.8.3 per-block decode walk through the freshly-
+  read histograms). Public surface against ISO/IEC FDIS 18181-1:2021:
+  `HfHistogramDecodeContext::new(histograms, headers)` validates
+  per-pass `hfp < histograms.num_hf_presets()` (defensive cross-
+  container invariant) + `headers.num_passes() ≥ 1`, then caches the
+  per-pass `histogram_offset` array for a single-array-index per-
+  symbol path. Three decode entry-points expose the §C.8.3 prose
+  shape: (1) `decode_symbol_for_pass(br, p, ctx)` performs the raw
+  `D[ctx + histogram_offset(p)]` routing through
+  `EntropyStream::decode_symbol`; (2) `non_zeros_at(br, p,
+  predicted, block_ctx, nb_block_ctx)` composes
+  `pass_group_hf::non_zeros_context` + the per-pass offset routing,
+  matching the spec's `D[NonZerosContext(predicted) + offset]` line
+  exactly; (3) `coefficient_at(br, p, k, non_zeros, num_blocks,
+  size, prev, block_ctx, nb_block_ctx)` composes
+  `pass_group_hf::coefficient_context` + the per-pass offset
+  routing, matching the spec's `D[CoefficientContext(...) +
+  offset]` line, and propagates the `num_blocks == 0` rejection
+  without touching the `BitReader`. The `(ctx + offset)` sum is
+  computed in `u64` with a defensive `u32` overflow check so the
+  spec-permitted parameter maxima (`nb_block_ctx ≤ 256` ×
+  `hfp < num_hf_presets ≤ 2^28`) cannot silently truncate. Accessor
+  surface: `num_passes()`, `histogram_offset(p)`,
+  `per_pass_offsets()` slice. Adds 10 unit tests + 9 integration
+  tests (`tests/round252_multi_pass_hf_histogram_decoder.rs`)
+  pinning: zero-pass rejection (no decode without passes); per-pass
+  `hfp ≥ num_hf_presets` cross-container rejection; per-pass offset
+  caching matches `PerPassHfHeaders::histogram_offset` independent
+  read; single-symbol prefix decode for `(p, ctx)` matrix consumes
+  zero bits and returns 0; out-of-range pass index rejection;
+  `u32`-overflow synthetic `histogram_offset` rejection;
+  `non_zeros_at` composes cleanly with `non_zeros_context` (cross-
+  checked against the standalone helper); `coefficient_at` composes
+  cleanly with `coefficient_context` (cross-checked against the
+  standalone helper); `num_blocks == 0` rejection propagation does
+  not advance the `BitReader`; round-trip with
+  `PerPassHfHeaders::read` against a real bitstream (round-232
+  derivation) preserves the per-pass offsets. Lib test count
+  717 → 727 (+10). Pure-control-flow wiring primitive — no spec
+  re-derivation, no ANS state initialisation, no per-block raster
+  walk. The per-channel `BlockContext()` history threading, per-
+  channel coefficient-order lookup against `hf_pass::HfPass`, and
+  the per-block raster walk remain caller-side concerns above this
+  primitive.
+
 - Round 247 — `hf_coefficient_histograms::HfCoefficientHistograms`
   typed wrapper closing the round-238 deferred next-step. Performs
   the actual ISO/IEC FDIS 18181-1:2021 §C.7.2 codestream read of the
