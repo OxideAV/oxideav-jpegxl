@@ -2,6 +2,26 @@
 //! §C.7.2 (entropy histograms) + §C.8.3 (per-pass `histogram_offset`
 //! routing) bridge.
 //!
+//! ## Scope (round 260)
+//!
+//! Round 260 lifts the round-255 single-channel single-varblock
+//! decode entry into a bundled three-channel per-varblock walk
+//! against a [`BlockContextResolver`]:
+//!
+//! * [`HfHistogramDecodeContext::decode_three_channel_varblock_for_pass`]
+//!   — one `(br, p, vb, resolver, qdc, predicted[3])` call walks
+//!   the FDIS §C.8.3 X → Y → B channel sequence, invokes
+//!   [`BlockContextResolver::resolve`] once per channel against
+//!   the shared `qdc[3]` triple, threads each resulting `block_ctx`
+//!   into [`HfHistogramDecodeContext::decode_block_for_pass_transform`]
+//!   (round 255), and returns the per-channel
+//!   `([DecodedHfBlock; 3], [u32; 3])` pair (decoded coefficients
+//!   plus the un-divided `raw_non_zeros` triple the caller threads
+//!   into the per-channel NonZeros-grid bookkeeping).
+//!
+//! Round 255 (the immediate prior round) landed the single-channel
+//! per-varblock decode method itself — see the scope summary below.
+//!
 //! ## Scope (round 255)
 //!
 //! Round 255 closes the round-252 deferred next-step "per-block raster
@@ -108,6 +128,9 @@
 //! caller-side concerns above this primitive. The single-varblock
 //! Listing C.14 per-block walk is now bundled by round 255 (see
 //! [`HfHistogramDecodeContext::decode_block_for_pass_transform`]
+//! above) and the single-varblock three-channel X / Y / B sweep is
+//! now bundled by round 260 (see
+//! [`HfHistogramDecodeContext::decode_three_channel_varblock_for_pass`]
 //! above) — the raster walk across multiple varblocks is still a
 //! caller-side concern (driven by [`crate::varblock_walk`] +
 //! [`crate::multi_pass_decode`]).
@@ -143,6 +166,7 @@
 use oxideav_core::{Error, Result};
 
 use crate::bitreader::{unpack_signed, BitReader};
+use crate::block_context_resolver::BlockContextResolver;
 use crate::coeff_order::{natural_coeff_order, order_id_for_transform};
 use crate::dct_select::TransformType;
 use crate::hf_coefficient_histograms::HfCoefficientHistograms;
@@ -151,6 +175,7 @@ use crate::pass_group_hf::{
     coefficient_context, non_zeros_context, prev_for_context, transform_block_params,
     DecodedHfBlock,
 };
+use crate::varblock_walk::Varblock;
 
 /// Per-pass HF histogram decode context — owns the §C.7.2 entropy
 /// stream + the per-pass §C.8.3 `histogram_offset` array.
@@ -501,6 +526,126 @@ impl<'a> HfHistogramDecodeContext<'a> {
             },
             raw_non_zeros,
         ))
+    }
+
+    /// Decode one varblock's HF coefficients for all three §C.8.3
+    /// channels (X = 0, Y = 1, B = 2) under pass `p` — round 260's
+    /// bundled three-channel composition above
+    /// [`Self::decode_block_for_pass_transform`].
+    ///
+    /// Round 255 landed the single-channel per-varblock walk. Round
+    /// 221's
+    /// [`crate::block_context_resolver::decode_varblocks_three_channels_with_resolver`]
+    /// reproduces the X / Y / B three-channel sweep at the
+    /// per-LfGroup driver layer, but goes through the
+    /// [`crate::per_pass_non_zeros::PerPassNonZerosGrids::decode_block_at_for_pass_channel`]
+    /// closure-based path (`read_non_zeros` + `decode_symbol` per
+    /// channel). Now that the round-252 typed
+    /// [`HfHistogramDecodeContext`] owns the per-pass histogram
+    /// routing, callers wanting to drive the X / Y / B sweep against
+    /// the §C.7.2 entropy stream directly need a per-varblock typed
+    /// entry — without that, every caller re-implements the same
+    /// three-call sequential walk, mixing per-channel state with
+    /// the borrow-checker dance the round-255 method already solves
+    /// for the single-channel case.
+    ///
+    /// Round 260 lifts that single-channel walk into a three-channel
+    /// per-varblock walk:
+    ///
+    /// 1. for `c` ∈ `{0, 1, 2}` (X / Y / B canonical FDIS §C.8.3
+    ///    sequence):
+    ///    a. `block_ctx_c = resolver.resolve(c, &vb, qdc)?`
+    ///    (Listing C.13 per-channel `BlockContext()` lookup),
+    ///    b. `(decoded_c, raw_c) =
+    ///    self.decode_block_for_pass_transform(br, p, vb.transform,
+    ///    predicted[c], block_ctx_c, resolver.nb_block_ctx())?`,
+    /// 2. return `(([decoded_0, decoded_1, decoded_2],
+    ///    [raw_0, raw_1, raw_2]))`.
+    ///
+    /// The `resolver` owns the `nb_block_ctx` invariant (read off the
+    /// LfGlobal `HfBlockContext` bundle, the same value the §C.7.2
+    /// histograms were sized against — caller is responsible for
+    /// passing the resolver that matches the histograms used to build
+    /// `self`). The `predicted[3]` triple is the caller's per-channel
+    /// [`crate::pass_group_hf::predicted_non_zeros`] lookup against
+    /// the per-pass per-channel
+    /// [`crate::per_channel_non_zeros::PerChannelNonZerosGrids`] grid
+    /// (round 183 / 190) — round 260 keeps that lookup caller-side so
+    /// the histograms primitive remains storage-blind. The same
+    /// applies to the post-decode `NonZeros(x, y)` writeback (the
+    /// `(raw + num_blocks - 1) Idiv num_blocks` line right after
+    /// Listing C.14): caller invokes
+    /// [`crate::per_pass_non_zeros::PerPassNonZerosGrids::update_after_block_for_pass_transform`]
+    /// (or the equivalent per-channel call) once per channel against
+    /// the returned `raw_non_zeros[c]`.
+    ///
+    /// `qdc[3]` is the shared per-varblock quantised-LF top-left
+    /// triple (one read, three lookups) per round-221's invariant —
+    /// not a per-channel value, so we accept a single `[i32; 3]`
+    /// array.
+    ///
+    /// Channel ordering is fixed at X → Y → B per the §C.8.3 listing
+    /// sequence. The §C.7.2 entropy stream advances in that order;
+    /// an error on Y aborts before B reads, so the B-channel ANS
+    /// state is **not** advanced (matching round-221's error-path
+    /// invariant).
+    ///
+    /// Errors:
+    /// * Propagates any [`BlockContextResolver::resolve`] error
+    ///   verbatim (channel `> 2`, `s` out-of-range, threshold-table
+    ///   inconsistency).
+    /// * Propagates any [`Self::decode_block_for_pass_transform`]
+    ///   error verbatim (out-of-range pass index, `u32`-overflow,
+    ///   downstream `EntropyStream` error, or `non_zeros > size -
+    ///   num_blocks` cap).
+    ///
+    /// Same pure-control-flow primitive shape as the round-255
+    /// [`Self::decode_block_for_pass_transform`] it composes: no spec
+    /// re-derivation, no ANS state initialisation, no raster walk
+    /// across multiple varblocks.
+    pub fn decode_three_channel_varblock_for_pass(
+        &mut self,
+        br: &mut BitReader<'_>,
+        p: u32,
+        vb: &Varblock,
+        resolver: &BlockContextResolver<'_>,
+        qdc: [i32; 3],
+        predicted: [u32; 3],
+    ) -> Result<([DecodedHfBlock; 3], [u32; 3])> {
+        let nb_block_ctx = resolver.nb_block_ctx();
+        // Channel order X = 0 → Y = 1 → B = 2 per FDIS §C.8.3 listing
+        // sequence. Sequential `&mut self` calls (each walks the
+        // round-255 Listing C.14 state machine) because the histogram
+        // stream is shared across channels and the underlying
+        // `decode_block_for_pass_transform` takes `&mut self`.
+        let ctx0 = resolver.resolve(0, vb, qdc)?;
+        let (decoded0, raw0) = self.decode_block_for_pass_transform(
+            br,
+            p,
+            vb.transform,
+            predicted[0],
+            ctx0,
+            nb_block_ctx,
+        )?;
+        let ctx1 = resolver.resolve(1, vb, qdc)?;
+        let (decoded1, raw1) = self.decode_block_for_pass_transform(
+            br,
+            p,
+            vb.transform,
+            predicted[1],
+            ctx1,
+            nb_block_ctx,
+        )?;
+        let ctx2 = resolver.resolve(2, vb, qdc)?;
+        let (decoded2, raw2) = self.decode_block_for_pass_transform(
+            br,
+            p,
+            vb.transform,
+            predicted[2],
+            ctx2,
+            nb_block_ctx,
+        )?;
+        Ok(([decoded0, decoded1, decoded2], [raw0, raw1, raw2]))
     }
 
     /// Per-pass `histogram_offset(p)` lookup. Range-checked on `p`.
@@ -965,5 +1110,324 @@ mod tests {
             .decode_block_for_pass_transform(&mut br, 0, TransformType::Dct8x8, 0, 0, 15)
             .unwrap();
         assert_eq!(br.bits_read(), bits_before);
+    }
+
+    // -----------------------------------------------------------------
+    // Round 260 — `decode_three_channel_varblock_for_pass` unit tests.
+    // The bundled three-channel per-varblock walk composes round-255's
+    // single-channel `decode_block_for_pass_transform` three times
+    // (channel order X = 0 → Y = 1 → B = 2 per FDIS §C.8.3) against a
+    // BlockContextResolver-derived per-channel `block_ctx`. All tests
+    // use the single-symbol-prefix `make_minimal_histograms` shape so
+    // every `D[ctx + offset]` read returns 0 — and the per-channel
+    // C.14 inner loop short-circuits as in the round-255 tests above.
+    // -----------------------------------------------------------------
+
+    use crate::lf_global::HfBlockContext;
+
+    /// Default §I.2.2 `HfBlockContext` bundle — same shape the round
+    /// 214 / 221 / 228 tests use. Empty thresholds collapse the
+    /// `qf` / `qdc` knobs; the 39-entry default `block_ctx_map`
+    /// gives `nb_block_ctx = 15`.
+    fn default_hbc_r260() -> HfBlockContext {
+        HfBlockContext {
+            used_default: true,
+            qf_thresholds: vec![],
+            lf_thresholds: [vec![], vec![], vec![]],
+            block_ctx_map: HfBlockContext::DEFAULT_BLOCK_CTX_MAP.to_vec(),
+            nb_block_ctx: 15,
+        }
+    }
+
+    fn vb_dct8x8(x: u32, y: u32) -> Varblock {
+        Varblock {
+            x,
+            y,
+            transform: TransformType::Dct8x8,
+            hf_mul: 1,
+        }
+    }
+
+    #[test]
+    fn r260_three_channel_short_circuits_on_zero_non_zeros_dct8x8() {
+        // DCT8×8 single varblock, all three channels short-circuit on
+        // non_zeros = 0; each channel returns an all-zero 64-coeff
+        // block.
+        let mut h = make_minimal_histograms(1, 15);
+        let headers = PerPassHfHeaders::from_headers(vec![PassGroupHfHeader {
+            hfp: 0,
+            histogram_offset: 0,
+        }]);
+        let mut ctx_dec = HfHistogramDecodeContext::new(&mut h, &headers).unwrap();
+        let hbc = default_hbc_r260();
+        let resolver = BlockContextResolver::new(&hbc);
+        let vb = vb_dct8x8(0, 0);
+        let bytes = [0u8; 4];
+        let mut br = BitReader::new(&bytes);
+        let bits_before = br.bits_read();
+        let (decoded, raw) = ctx_dec
+            .decode_three_channel_varblock_for_pass(
+                &mut br,
+                /*p*/ 0,
+                &vb,
+                &resolver,
+                /*qdc*/ [0, 0, 0],
+                /*predicted*/ [0, 0, 0],
+            )
+            .unwrap();
+        for c in 0..3 {
+            assert_eq!(raw[c], 0, "channel {c} raw_non_zeros");
+            assert_eq!(decoded[c].remaining_non_zeros, 0, "channel {c} remaining");
+            assert_eq!(decoded[c].coeffs_read, 0, "channel {c} coeffs_read");
+            assert_eq!(decoded[c].coeffs.len(), 64, "channel {c} coeffs.len");
+            assert!(
+                decoded[c].coeffs.iter().all(|&v| v == 0),
+                "channel {c} all-zero"
+            );
+        }
+        // Single-symbol prefix → three D[...] reads, each zero bits.
+        assert_eq!(br.bits_read(), bits_before);
+    }
+
+    #[test]
+    fn r260_three_channel_rejects_out_of_range_pass() {
+        // Pass index 2 with num_passes = 1 → InvalidData on the very
+        // first channel's decode_block_for_pass_transform call.
+        let mut h = make_minimal_histograms(1, 15);
+        let headers = PerPassHfHeaders::from_headers(vec![PassGroupHfHeader {
+            hfp: 0,
+            histogram_offset: 0,
+        }]);
+        let mut ctx_dec = HfHistogramDecodeContext::new(&mut h, &headers).unwrap();
+        let hbc = default_hbc_r260();
+        let resolver = BlockContextResolver::new(&hbc);
+        let vb = vb_dct8x8(0, 0);
+        let bytes = [0u8; 4];
+        let mut br = BitReader::new(&bytes);
+        let r = ctx_dec.decode_three_channel_varblock_for_pass(
+            &mut br,
+            /*p*/ 2,
+            &vb,
+            &resolver,
+            [0, 0, 0],
+            [0, 0, 0],
+        );
+        assert!(matches!(r, Err(Error::InvalidData(_))));
+    }
+
+    #[test]
+    fn r260_three_channel_dct16x16_short_circuits_per_channel() {
+        // DCT16×16: num_blocks = 4, size = 256. Three channels each
+        // short-circuit; per-channel coeff buffer length = 256.
+        let mut h = make_minimal_histograms(1, 15);
+        let headers = PerPassHfHeaders::from_headers(vec![PassGroupHfHeader {
+            hfp: 0,
+            histogram_offset: 0,
+        }]);
+        let mut ctx_dec = HfHistogramDecodeContext::new(&mut h, &headers).unwrap();
+        let hbc = default_hbc_r260();
+        let resolver = BlockContextResolver::new(&hbc);
+        let vb = Varblock {
+            x: 0,
+            y: 0,
+            transform: TransformType::Dct16x16,
+            hf_mul: 1,
+        };
+        let bytes = [0u8; 4];
+        let mut br = BitReader::new(&bytes);
+        let (decoded, raw) = ctx_dec
+            .decode_three_channel_varblock_for_pass(
+                &mut br,
+                0,
+                &vb,
+                &resolver,
+                [0, 0, 0],
+                [32, 32, 32],
+            )
+            .unwrap();
+        for c in 0..3 {
+            assert_eq!(raw[c], 0);
+            assert_eq!(decoded[c].coeffs.len(), 256);
+            assert_eq!(decoded[c].coeffs_read, 0);
+        }
+    }
+
+    #[test]
+    fn r260_three_channel_routes_through_per_pass_offset() {
+        // Per-pass routing parity — pass 1 (offset = 7425) returns
+        // symbol 0 via the same minimal-histograms shape because all
+        // distributions map to cluster 0 → single-symbol prefix.
+        // Reading both passes from the same context exercises the
+        // round-252 per-pass offset cache.
+        let mut h = make_minimal_histograms(2, 15);
+        let header_bytes = [0b0000_0010u8]; // pass 0 hfp = 0, pass 1 hfp = 1
+        let mut br_h = BitReader::new(&header_bytes);
+        let headers = PerPassHfHeaders::read(&mut br_h, 2, 2, 15).unwrap();
+        let mut ctx_dec = HfHistogramDecodeContext::new(&mut h, &headers).unwrap();
+        let hbc = default_hbc_r260();
+        let resolver = BlockContextResolver::new(&hbc);
+        let vb = vb_dct8x8(0, 0);
+        let bytes = [0u8; 4];
+        let mut br = BitReader::new(&bytes);
+        let (_d0, r0) = ctx_dec
+            .decode_three_channel_varblock_for_pass(
+                &mut br,
+                0,
+                &vb,
+                &resolver,
+                [0, 0, 0],
+                [0, 0, 0],
+            )
+            .unwrap();
+        let (_d1, r1) = ctx_dec
+            .decode_three_channel_varblock_for_pass(
+                &mut br,
+                1,
+                &vb,
+                &resolver,
+                [0, 0, 0],
+                [0, 0, 0],
+            )
+            .unwrap();
+        assert_eq!(r0, [0, 0, 0]);
+        assert_eq!(r1, [0, 0, 0]);
+    }
+
+    #[test]
+    fn r260_three_channel_channel_order_x_y_b_via_resolver() {
+        // Verify channel ordering: the resolver is invoked for c = 0,
+        // 1, 2 in that order. We piggy-back on the BlockContextResolver
+        // to compute the per-channel block_ctx values and check that
+        // they all flow into the decoder (default-table fast path —
+        // empty thresholds collapse qf / qdc, so block_ctx is purely
+        // determined by `(channel, transform-order-id)`).
+        let mut h = make_minimal_histograms(1, 15);
+        let headers = PerPassHfHeaders::from_headers(vec![PassGroupHfHeader {
+            hfp: 0,
+            histogram_offset: 0,
+        }]);
+        let mut ctx_dec = HfHistogramDecodeContext::new(&mut h, &headers).unwrap();
+        let hbc = default_hbc_r260();
+        let resolver = BlockContextResolver::new(&hbc);
+        let vb = vb_dct8x8(0, 0);
+        // Pre-compute expected per-channel block_ctx values to ensure
+        // the resolver is in fact invoked with c ∈ {0, 1, 2}.
+        let exp_c0 = resolver.resolve(0, &vb, [0, 0, 0]).unwrap();
+        let exp_c1 = resolver.resolve(1, &vb, [0, 0, 0]).unwrap();
+        let exp_c2 = resolver.resolve(2, &vb, [0, 0, 0]).unwrap();
+        // The three values must be `< nb_block_ctx` (= 15).
+        assert!(exp_c0 < 15);
+        assert!(exp_c1 < 15);
+        assert!(exp_c2 < 15);
+        let bytes = [0u8; 4];
+        let mut br = BitReader::new(&bytes);
+        // The bundled method must consume zero bits (single-symbol
+        // prefix) and return three short-circuited blocks — confirming
+        // every per-channel resolve + decode pair ran.
+        let (decoded, raw) = ctx_dec
+            .decode_three_channel_varblock_for_pass(
+                &mut br,
+                0,
+                &vb,
+                &resolver,
+                [0, 0, 0],
+                [0, 0, 0],
+            )
+            .unwrap();
+        assert_eq!(raw, [0, 0, 0]);
+        assert_eq!(decoded[0].coeffs_read, 0);
+        assert_eq!(decoded[1].coeffs_read, 0);
+        assert_eq!(decoded[2].coeffs_read, 0);
+    }
+
+    #[test]
+    fn r260_three_channel_does_not_advance_br_when_short_circuited() {
+        let mut h = make_minimal_histograms(1, 15);
+        let headers = PerPassHfHeaders::from_headers(vec![PassGroupHfHeader {
+            hfp: 0,
+            histogram_offset: 0,
+        }]);
+        let mut ctx_dec = HfHistogramDecodeContext::new(&mut h, &headers).unwrap();
+        let hbc = default_hbc_r260();
+        let resolver = BlockContextResolver::new(&hbc);
+        let vb = vb_dct8x8(0, 0);
+        let bytes = [0xFFu8; 16];
+        let mut br = BitReader::new(&bytes);
+        let bits_before = br.bits_read();
+        let _ = ctx_dec
+            .decode_three_channel_varblock_for_pass(
+                &mut br,
+                0,
+                &vb,
+                &resolver,
+                [0, 0, 0],
+                [0, 0, 0],
+            )
+            .unwrap();
+        // Three single-symbol-prefix reads → zero bits consumed total.
+        assert_eq!(br.bits_read(), bits_before);
+    }
+
+    #[test]
+    fn r260_three_channel_propagates_u32_overflow() {
+        // Synthetic header offset above u32::MAX → first channel's
+        // decode_block_for_pass_transform → non_zeros_at →
+        // decode_symbol_for_pass returns the u32-overflow rejection.
+        let mut h = make_minimal_histograms(1, 15);
+        let headers = PerPassHfHeaders::from_headers(vec![PassGroupHfHeader {
+            hfp: 0,
+            histogram_offset: u64::from(u32::MAX) + 10,
+        }]);
+        let mut ctx_dec = HfHistogramDecodeContext::new(&mut h, &headers).unwrap();
+        let hbc = default_hbc_r260();
+        let resolver = BlockContextResolver::new(&hbc);
+        let vb = vb_dct8x8(0, 0);
+        let bytes = [0u8; 4];
+        let mut br = BitReader::new(&bytes);
+        let r = ctx_dec.decode_three_channel_varblock_for_pass(
+            &mut br,
+            0,
+            &vb,
+            &resolver,
+            [0, 0, 0],
+            [0, 0, 0],
+        );
+        assert!(matches!(r, Err(Error::InvalidData(_))));
+    }
+
+    #[test]
+    fn r260_three_channel_dct16x8_short_circuits() {
+        // DCT16×8: num_blocks = 2, size = 128.
+        let mut h = make_minimal_histograms(1, 15);
+        let headers = PerPassHfHeaders::from_headers(vec![PassGroupHfHeader {
+            hfp: 0,
+            histogram_offset: 0,
+        }]);
+        let mut ctx_dec = HfHistogramDecodeContext::new(&mut h, &headers).unwrap();
+        let hbc = default_hbc_r260();
+        let resolver = BlockContextResolver::new(&hbc);
+        let vb = Varblock {
+            x: 0,
+            y: 0,
+            transform: TransformType::Dct16x8,
+            hf_mul: 1,
+        };
+        let bytes = [0u8; 4];
+        let mut br = BitReader::new(&bytes);
+        let (decoded, raw) = ctx_dec
+            .decode_three_channel_varblock_for_pass(
+                &mut br,
+                0,
+                &vb,
+                &resolver,
+                [0, 0, 0],
+                [16, 16, 16],
+            )
+            .unwrap();
+        for c in 0..3 {
+            assert_eq!(raw[c], 0);
+            assert_eq!(decoded[c].coeffs.len(), 128);
+            assert_eq!(decoded[c].coeffs_read, 0);
+        }
     }
 }

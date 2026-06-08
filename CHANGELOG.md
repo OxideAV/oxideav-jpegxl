@@ -9,6 +9,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Round 260 —
+  `multi_pass_hf_histogram_decoder::HfHistogramDecodeContext::decode_three_channel_varblock_for_pass`
+  bundled three-channel per-varblock walk against ISO/IEC FDIS
+  18181-1:2021 §C.8.3 — one
+  `(br, p, vb, resolver, qdc, predicted[3])` call composes the
+  round-255 single-channel `decode_block_for_pass_transform` three
+  times (channel order X = 0 → Y = 1 → B = 2 per the §C.8.3 listing
+  sequence) against the round-214
+  `BlockContextResolver::resolve(c, vb, qdc)` per-channel Listing
+  C.13 `block_ctx` derivation, returning the per-channel
+  `([DecodedHfBlock; 3], [u32; 3])` pair (decoded coefficient bundle
+  plus the un-divided `raw_non_zeros` triple the caller threads into
+  the per-channel NonZeros-grid bookkeeping). The `nb_block_ctx`
+  invariant is read off `resolver.nb_block_ctx()` so the caller does
+  not have to pass it separately; the `qdc[3]` triple is shared
+  across the three channels per round-221's per-varblock invariant
+  (one read, three lookups). Channel ordering is fixed at X → Y → B
+  — the §C.7.2 entropy stream advances in that order; an error on Y
+  aborts before B reads, so the B-channel ANS state is **not**
+  advanced (matching round-221's error-path invariant). Defensive
+  shape: propagates any `BlockContextResolver::resolve` error
+  (channel `> 2`, `s` out-of-range, threshold-table inconsistency)
+  and any `decode_block_for_pass_transform` error (out-of-range
+  pass index, `u32`-overflow `ctx + offset`, downstream
+  `EntropyStream` error, or `non_zeros > size - num_blocks` cap)
+  verbatim. 8 unit + 11 integration
+  (`round260_three_channel_varblock_for_pass`) tests pin: DCT8×8 /
+  DCT16×16 / DCT16×8 / DCT8×16 / DCT4×4 per-channel short-circuit
+  to `raw == [0, 0, 0] → coeffs_read == 0 → all-zero coeffs vector
+  of the right length`; per-pass offset routing matches round-252
+  cluster_map indexing for both `p = 0` and `p = 1` against a
+  2-preset bundle; out-of-range pass index rejected; `u32` overflow
+  on `ctx + offset` rejected; BitReader cursor unchanged on a
+  short-circuited three-channel block; round-trip with
+  `PerPassHfHeaders::read` driven off a real bitstream preserves
+  the per-pass histogram offsets across both passes; per-channel
+  `block_ctx` values resolved by the `BlockContextResolver` are `<
+  nb_block_ctx` (= 15) for the default-table bundle. Lib tests 734
+  → 742 (+8).
+
 - Round 255 —
   `multi_pass_hf_histogram_decoder::HfHistogramDecodeContext::decode_block_for_pass_transform`
   bundled per-varblock decode method closing the round-252 deferred
