@@ -5,6 +5,47 @@ Pure-Rust **JPEG XL** (ISO/IEC 18181-1:2024) decoder. Resumed
 trace-doc-driven rounds 7-11 + encoder rounds 1-6 were retired
 (see "Why retired (history)" below).
 
+**Round 264 (2026-06-09)** lifts the round-260 single-varblock
+three-channel walk into a per-LfGroup raster-walk three-channel
+decode driver for one pass: the new
+`multi_pass_hf_histogram_decoder::HfHistogramDecodeContext::decode_lf_group_three_channels_for_pass`
+method takes `(br, p, grid, resolver, qdc_at, predicted_at)` and
+walks the `DctSelectGrid` in raster order via `VarblockWalk`, invoking
+the caller's per-varblock `qdc_at` + `predicted_at` closures once
+each per top-left cell and composing the round-260
+`decode_three_channel_varblock_for_pass` bundled three-channel walk
+to yield one `ThreeChannelVarblock` per varblock. The driver owns
+both the raster walk and the §C.7.2 entropy-stream routing through
+the round-252 typed decode context — no `read_non_zeros` /
+`decode_symbol` closures cross the boundary, only the storage-only
+`qdc_at` + `predicted_at` lookups do. Per-varblock invariant:
+`qdc_at` fires before `predicted_at`; per-LfGroup invariant:
+row-major DctSelectGrid raster (continuation cells skipped, residual
+`Empty` cells rejected). Defensive shape: propagates
+`VarblockWalk::next` errors, closure errors (qdc_at aborts before
+predicted_at runs for that varblock; predicted_at error aborts
+before the inner method runs), and any inner method error
+verbatim without advancing the BitReader past the failing call.
+Empty grid (`width × height == 0`) yields an empty output vector;
+the per-varblock output count is precisely `count_varblocks(grid)`
+on success. 11 unit + 10 integration
+(`round264_lf_group_three_channels_for_pass`) tests pin: 1×1
+DCT8×8 short-circuit; 2×2 / 3×3 uniform raster ordering
+((0,0), (1,0), (0,1), (1,1) — row-major); per-varblock
+`qdc → predicted → decode` ordering; per-pass offset routing matches
+round-260 cluster_map indexing for both `p = 0` and `p = 1`;
+mixed-transform grid (DCT16×16 single varblock covering 2×2
+cells) emits one varblock with `coeffs.len() == 256` per channel;
+out-of-range pass index rejected; residual `Empty` cell rejected;
+closure errors propagated without advancing the BitReader;
+round-trip with `PerPassHfHeaders::read` end-to-end against a real
+bitstream preserves per-pass histogram offsets; empty grid yields
+empty vector. Lib tests 742 → 753 (+11). Pure-control-flow raster
+walk — the per-pass outer loop (round 228's layer above) and the
+per-channel `NonZeros(x, y)` writeback bookkeeping (`(raw +
+num_blocks - 1) Idiv num_blocks` per Listing C.14) remain
+caller-side concerns above this primitive.
+
 **Round 255 (2026-06-08)** closes the round-252 deferred next-step
 "per-block raster walk remain caller-side concerns above this
 primitive": the new

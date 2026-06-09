@@ -2,6 +2,38 @@
 //! §C.7.2 (entropy histograms) + §C.8.3 (per-pass `histogram_offset`
 //! routing) bridge.
 //!
+//! ## Scope (round 264)
+//!
+//! Round 264 lifts the round-260 single-varblock three-channel decode
+//! method into a per-LfGroup raster walk for one pass:
+//!
+//! * [`HfHistogramDecodeContext::decode_lf_group_three_channels_for_pass`]
+//!   — one `(br, p, grid, resolver, qdc_at, predicted_at)` call walks
+//!   the [`crate::dct_select::DctSelectGrid`] in raster order via
+//!   [`crate::varblock_walk::VarblockWalk`], invokes the caller's
+//!   per-varblock `qdc_at` + `predicted_at` closures once per varblock
+//!   to read the shared `qdc[3]` triple and the per-channel
+//!   `predicted[3]` triple, then composes the round-260
+//!   [`HfHistogramDecodeContext::decode_three_channel_varblock_for_pass`]
+//!   bundled three-channel walk to yield one
+//!   [`crate::block_context_resolver::ThreeChannelVarblock`] per
+//!   top-left cell. Returns the in-raster-order
+//!   `Vec<ThreeChannelVarblock>` per the round-221 / 228 driver
+//!   convention.
+//!
+//! This is the per-pass per-LfGroup raster-walk driver layered above
+//! the round-260 bundled per-varblock method, mirroring the round-221
+//! [`crate::block_context_resolver::decode_varblocks_three_channels_with_resolver`]
+//! shape — except that this driver owns the §C.7.2 entropy-stream
+//! routing through the round-252 typed decode context (no caller-side
+//! `read_non_zeros` / `decode_symbol` closures), so the per-channel
+//! per-pass histogram selection happens inside the driver. The
+//! per-LfGroup multi-pass outer loop (round 228) layers above this
+//! by repeating the call for `p ∈ [0, num_passes)`.
+//!
+//! Round 260 (the immediate prior round) landed the single-varblock
+//! three-channel walk — see the scope summary below.
+//!
 //! ## Scope (round 260)
 //!
 //! Round 260 lifts the round-255 single-channel single-varblock
@@ -128,12 +160,14 @@
 //! caller-side concerns above this primitive. The single-varblock
 //! Listing C.14 per-block walk is now bundled by round 255 (see
 //! [`HfHistogramDecodeContext::decode_block_for_pass_transform`]
-//! above) and the single-varblock three-channel X / Y / B sweep is
+//! above), the single-varblock three-channel X / Y / B sweep is
 //! now bundled by round 260 (see
 //! [`HfHistogramDecodeContext::decode_three_channel_varblock_for_pass`]
-//! above) — the raster walk across multiple varblocks is still a
-//! caller-side concern (driven by [`crate::varblock_walk`] +
-//! [`crate::multi_pass_decode`]).
+//! above), and the per-LfGroup raster walk for one pass is now
+//! bundled by round 264 (see
+//! [`HfHistogramDecodeContext::decode_lf_group_three_channels_for_pass`]
+//! above) — the per-LfGroup multi-pass outer loop is still a
+//! caller-side concern (driven by [`crate::multi_pass_decode`]).
 //!
 //! Same pure-control-flow primitive shape as round-89
 //! [`crate::dct_quant_weights`], round-95 [`crate::hf_dequant`],
@@ -166,16 +200,16 @@
 use oxideav_core::{Error, Result};
 
 use crate::bitreader::{unpack_signed, BitReader};
-use crate::block_context_resolver::BlockContextResolver;
+use crate::block_context_resolver::{BlockContextResolver, ThreeChannelVarblock};
 use crate::coeff_order::{natural_coeff_order, order_id_for_transform};
-use crate::dct_select::TransformType;
+use crate::dct_select::{DctSelectGrid, TransformType};
 use crate::hf_coefficient_histograms::HfCoefficientHistograms;
 use crate::multi_pass_hf_header::PerPassHfHeaders;
 use crate::pass_group_hf::{
     coefficient_context, non_zeros_context, prev_for_context, transform_block_params,
     DecodedHfBlock,
 };
-use crate::varblock_walk::Varblock;
+use crate::varblock_walk::{count_varblocks, Varblock, VarblockWalk};
 
 /// Per-pass HF histogram decode context — owns the §C.7.2 entropy
 /// stream + the per-pass §C.8.3 `histogram_offset` array.
@@ -646,6 +680,130 @@ impl<'a> HfHistogramDecodeContext<'a> {
             nb_block_ctx,
         )?;
         Ok(([decoded0, decoded1, decoded2], [raw0, raw1, raw2]))
+    }
+
+    /// Per-LfGroup raster-walk three-channel decode driver for one
+    /// pass — round 264's bundled composition above
+    /// [`Self::decode_three_channel_varblock_for_pass`].
+    ///
+    /// Round 260 landed the single-varblock three-channel walk. The
+    /// canonical §C.8.3 caller pattern, however, is a raster walk of
+    /// the [`DctSelectGrid`] in row-major order with that bundled
+    /// method called once per top-left cell. Round 221's
+    /// [`crate::block_context_resolver::decode_varblocks_three_channels_with_resolver`]
+    /// reproduces that raster sweep at the per-LfGroup driver layer
+    /// but routes through the [`crate::per_pass_non_zeros::PerPassNonZerosGrids`]
+    /// closure-based path (caller-side `read_non_zeros` /
+    /// `decode_symbol` closures wired to the per-pass per-channel
+    /// histogram).
+    ///
+    /// Round 264 lifts that into a typed primitive that owns both the
+    /// raster walk **and** the §C.7.2 entropy-stream routing: the
+    /// driver invokes the round-260 single-varblock bundled method
+    /// once per top-left cell, threading the per-pass `histogram_offset`
+    /// internally via [`Self::decode_block_for_pass_transform`]. No
+    /// `read_non_zeros` / `decode_symbol` closures cross the boundary
+    /// — the caller hands in only the (storage-only) `qdc_at` +
+    /// `predicted_at` lookups.
+    ///
+    /// Spec walk per FDIS §C.8.3 (per-LfGroup raster):
+    ///
+    /// 1. for every top-left cell yielded by
+    ///    [`VarblockWalk::next`] in row-major order:
+    ///    a. `qdc = qdc_at(&vb)` — caller's per-varblock shared
+    ///    quantised-LF top-left triple,
+    ///    b. `predicted = predicted_at(&vb)` — caller's per-varblock
+    ///    per-channel
+    ///    [`crate::pass_group_hf::predicted_non_zeros`] triple,
+    ///    c. `(decoded[3], raw[3]) =
+    ///    self.decode_three_channel_varblock_for_pass(br, p, &vb,
+    ///    resolver, qdc, predicted)` — round-260 bundled
+    ///    three-channel walk,
+    ///    d. push
+    ///    `(vb, [decoded_0, decoded_1, decoded_2], [raw_0, raw_1, raw_2])`
+    ///    onto the output vector.
+    /// 2. return the in-raster-order
+    ///    `Vec<ThreeChannelVarblock>` (matching the round-221 /
+    ///    228 / 260 type alias).
+    ///
+    /// The `resolver` owns the `nb_block_ctx` invariant (read off the
+    /// LfGlobal `HfBlockContext` bundle, the same value the §C.7.2
+    /// histograms were sized against — caller is responsible for
+    /// passing the resolver that matches the histograms used to build
+    /// `self`). The `qdc_at` closure may be a per-LfGroup
+    /// quantised-LF lookup
+    /// ([`crate::lf_dequant`] output sampled at the varblock's
+    /// top-left LF cell) or a static per-varblock cache — the driver
+    /// is storage-blind. Same for `predicted_at`: typically a lookup
+    /// against the per-pass per-channel
+    /// [`crate::per_channel_non_zeros::PerChannelNonZerosGrids`]
+    /// grid the caller maintains.
+    ///
+    /// `predicted_at` is invoked **after** `qdc_at` so the caller
+    /// closure may consult any state observed during `qdc_at` if
+    /// that simplifies the predictor lookup; the driver keeps the
+    /// `qdc → predicted → decode` ordering invariant.
+    ///
+    /// The driver writes back per-channel `NonZeros(x, y)` state
+    /// **not** automatically — the caller is responsible for
+    /// invoking
+    /// [`crate::per_pass_non_zeros::PerPassNonZerosGrids::update_after_block_for_pass_transform`]
+    /// (or the equivalent per-channel call) once per channel
+    /// against the returned `raw[c]` value per varblock per pass,
+    /// matching the round-260 invariant.
+    ///
+    /// On any error (per-varblock `qdc_at` / `predicted_at` /
+    /// resolver / `decode_three_channel_varblock_for_pass`) the
+    /// driver propagates the error immediately and discards any
+    /// in-flight partial output. The walk always proceeds in
+    /// raster order; an error on varblock `i` aborts before
+    /// varblock `i + 1`'s `qdc_at` is invoked (so the §C.7.2
+    /// entropy stream is not advanced past the failing call).
+    ///
+    /// Returns an empty vector for an empty grid (`width_blocks ==
+    /// 0` or `height_blocks == 0`); the per-varblock output count
+    /// is precisely [`count_varblocks(grid)`] on success.
+    ///
+    /// Errors:
+    /// * Propagates any [`VarblockWalk::next`] error verbatim
+    ///   (residual `DctSelectCell::Empty` cell — caller-side grid
+    ///   mutation),
+    /// * Propagates any `qdc_at` / `predicted_at` closure error
+    ///   verbatim,
+    /// * Propagates any
+    ///   [`Self::decode_three_channel_varblock_for_pass`] error
+    ///   verbatim (per-channel resolver error, out-of-range pass
+    ///   index, `u32`-overflow `ctx + offset`, downstream
+    ///   `EntropyStream` error, `non_zeros > size - num_blocks`
+    ///   cap, transform-table inconsistency).
+    ///
+    /// Same pure-control-flow primitive shape as the round-260
+    /// [`Self::decode_three_channel_varblock_for_pass`] it composes:
+    /// no spec re-derivation, no ANS state initialisation, no
+    /// per-pass outer loop (that's round 228's layer above).
+    pub fn decode_lf_group_three_channels_for_pass<Q, P>(
+        &mut self,
+        br: &mut BitReader<'_>,
+        p: u32,
+        grid: &DctSelectGrid,
+        resolver: &BlockContextResolver<'_>,
+        mut qdc_at: Q,
+        mut predicted_at: P,
+    ) -> Result<Vec<ThreeChannelVarblock>>
+    where
+        Q: FnMut(&Varblock) -> Result<[i32; 3]>,
+        P: FnMut(&Varblock) -> Result<[u32; 3]>,
+    {
+        let mut out: Vec<ThreeChannelVarblock> = Vec::with_capacity(count_varblocks(grid) as usize);
+        let mut walk = VarblockWalk::new(grid);
+        while let Some(vb) = walk.next()? {
+            let qdc = qdc_at(&vb)?;
+            let predicted = predicted_at(&vb)?;
+            let (decoded, raw) =
+                self.decode_three_channel_varblock_for_pass(br, p, &vb, resolver, qdc, predicted)?;
+            out.push((vb, decoded, raw));
+        }
+        Ok(out)
     }
 
     /// Per-pass `histogram_offset(p)` lookup. Range-checked on `p`.
@@ -1428,6 +1586,473 @@ mod tests {
             assert_eq!(raw[c], 0);
             assert_eq!(decoded[c].coeffs.len(), 128);
             assert_eq!(decoded[c].coeffs_read, 0);
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Round 264 — `decode_lf_group_three_channels_for_pass` unit tests.
+    // The bundled per-LfGroup raster-walk driver for one pass composes
+    // the round-260 single-varblock three-channel method across the
+    // DctSelectGrid raster, threading per-varblock `qdc_at` +
+    // `predicted_at` closures into the inner method. All tests use the
+    // single-symbol-prefix `make_minimal_histograms` shape so every
+    // `D[ctx + offset]` read returns 0 — every per-channel C.14 loop
+    // short-circuits on `non_zeros = 0`, no coefficient symbols are
+    // read, and the BitReader cursor is invariant across the entire
+    // raster walk.
+    // -----------------------------------------------------------------
+
+    use crate::dct_select::{DctSelectCell, DctSelectGrid};
+
+    /// Build a synthetic [`DctSelectGrid`] whose every cell is a
+    /// [`DctSelectCell::TopLeft`] of the given `TransformType` (a
+    /// `width × height` raster of single-block varblocks). The
+    /// `hf_mul` array is all-`1` per the §C.5.4 default. Used by the
+    /// round-264 unit tests to exercise the raster walk without
+    /// re-deriving a `BlockInfo` fixture.
+    fn make_uniform_grid_r264(
+        width_blocks: u32,
+        height_blocks: u32,
+        t: TransformType,
+    ) -> DctSelectGrid {
+        let total = (width_blocks as usize) * (height_blocks as usize);
+        DctSelectGrid {
+            cells: vec![DctSelectCell::TopLeft(t); total],
+            hf_mul: vec![1i32; total],
+            width_blocks,
+            height_blocks,
+        }
+    }
+
+    #[test]
+    fn r264_lf_group_empty_grid_returns_empty_vec() {
+        // 0×0 grid → no top-left cells → empty output.
+        let mut h = make_minimal_histograms(1, 15);
+        let headers = PerPassHfHeaders::from_headers(vec![PassGroupHfHeader {
+            hfp: 0,
+            histogram_offset: 0,
+        }]);
+        let mut ctx_dec = HfHistogramDecodeContext::new(&mut h, &headers).unwrap();
+        let hbc = default_hbc_r260();
+        let resolver = BlockContextResolver::new(&hbc);
+        let grid = DctSelectGrid {
+            cells: vec![],
+            hf_mul: vec![],
+            width_blocks: 0,
+            height_blocks: 0,
+        };
+        let bytes = [0u8; 4];
+        let mut br = BitReader::new(&bytes);
+        let out = ctx_dec
+            .decode_lf_group_three_channels_for_pass(
+                &mut br,
+                0,
+                &grid,
+                &resolver,
+                |_vb| Ok([0, 0, 0]),
+                |_vb| Ok([0, 0, 0]),
+            )
+            .unwrap();
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn r264_lf_group_1x1_dct8x8_short_circuits_three_channels() {
+        // 1×1 DCT8×8 grid → one varblock × three channels, all
+        // short-circuited on non_zeros = 0.
+        let mut h = make_minimal_histograms(1, 15);
+        let headers = PerPassHfHeaders::from_headers(vec![PassGroupHfHeader {
+            hfp: 0,
+            histogram_offset: 0,
+        }]);
+        let mut ctx_dec = HfHistogramDecodeContext::new(&mut h, &headers).unwrap();
+        let hbc = default_hbc_r260();
+        let resolver = BlockContextResolver::new(&hbc);
+        let grid = make_uniform_grid_r264(1, 1, TransformType::Dct8x8);
+        let bytes = [0u8; 4];
+        let mut br = BitReader::new(&bytes);
+        let bits_before = br.bits_read();
+        let out = ctx_dec
+            .decode_lf_group_three_channels_for_pass(
+                &mut br,
+                0,
+                &grid,
+                &resolver,
+                |_vb| Ok([0, 0, 0]),
+                |_vb| Ok([0, 0, 0]),
+            )
+            .unwrap();
+        assert_eq!(out.len(), 1);
+        let (vb, decoded, raw) = &out[0];
+        assert_eq!(vb.x, 0);
+        assert_eq!(vb.y, 0);
+        for c in 0..3 {
+            assert_eq!(decoded[c].coeffs.len(), 64);
+            assert_eq!(decoded[c].coeffs_read, 0);
+            assert_eq!(raw[c], 0);
+        }
+        // Single-symbol prefix × three channels = zero bits consumed.
+        assert_eq!(br.bits_read(), bits_before);
+    }
+
+    #[test]
+    fn r264_lf_group_2x2_uniform_dct8x8_yields_four_varblocks_in_raster_order() {
+        // 2×2 DCT8×8 grid → four varblocks in row-major (0,0), (1,0),
+        // (0,1), (1,1). Per-varblock closures observed in the same
+        // order via a side-channel counter.
+        use std::cell::RefCell;
+        let mut h = make_minimal_histograms(1, 15);
+        let headers = PerPassHfHeaders::from_headers(vec![PassGroupHfHeader {
+            hfp: 0,
+            histogram_offset: 0,
+        }]);
+        let mut ctx_dec = HfHistogramDecodeContext::new(&mut h, &headers).unwrap();
+        let hbc = default_hbc_r260();
+        let resolver = BlockContextResolver::new(&hbc);
+        let grid = make_uniform_grid_r264(2, 2, TransformType::Dct8x8);
+        let bytes = [0u8; 4];
+        let mut br = BitReader::new(&bytes);
+        let qdc_calls: RefCell<Vec<(u32, u32)>> = RefCell::new(vec![]);
+        let pred_calls: RefCell<Vec<(u32, u32)>> = RefCell::new(vec![]);
+        let out = ctx_dec
+            .decode_lf_group_three_channels_for_pass(
+                &mut br,
+                0,
+                &grid,
+                &resolver,
+                |vb| {
+                    qdc_calls.borrow_mut().push((vb.x, vb.y));
+                    Ok([0, 0, 0])
+                },
+                |vb| {
+                    pred_calls.borrow_mut().push((vb.x, vb.y));
+                    Ok([0, 0, 0])
+                },
+            )
+            .unwrap();
+        assert_eq!(out.len(), 4);
+        // Raster order: (0,0), (1,0), (0,1), (1,1).
+        let exp = vec![(0u32, 0u32), (1, 0), (0, 1), (1, 1)];
+        assert_eq!(*qdc_calls.borrow(), exp);
+        assert_eq!(*pred_calls.borrow(), exp);
+        for i in 0..4 {
+            assert_eq!(out[i].0.x, exp[i].0);
+            assert_eq!(out[i].0.y, exp[i].1);
+        }
+    }
+
+    #[test]
+    fn r264_lf_group_qdc_at_invoked_before_predicted_at_per_varblock() {
+        // Per-varblock ordering: qdc_at fires before predicted_at, but
+        // the per-varblock pair is followed by the next varblock's
+        // qdc_at. We pin this by appending a tag to a shared log.
+        use std::cell::RefCell;
+        let mut h = make_minimal_histograms(1, 15);
+        let headers = PerPassHfHeaders::from_headers(vec![PassGroupHfHeader {
+            hfp: 0,
+            histogram_offset: 0,
+        }]);
+        let mut ctx_dec = HfHistogramDecodeContext::new(&mut h, &headers).unwrap();
+        let hbc = default_hbc_r260();
+        let resolver = BlockContextResolver::new(&hbc);
+        let grid = make_uniform_grid_r264(2, 1, TransformType::Dct8x8);
+        let bytes = [0u8; 4];
+        let mut br = BitReader::new(&bytes);
+        let log: RefCell<Vec<(char, u32)>> = RefCell::new(vec![]);
+        let _ = ctx_dec
+            .decode_lf_group_three_channels_for_pass(
+                &mut br,
+                0,
+                &grid,
+                &resolver,
+                |vb| {
+                    log.borrow_mut().push(('q', vb.x));
+                    Ok([0, 0, 0])
+                },
+                |vb| {
+                    log.borrow_mut().push(('p', vb.x));
+                    Ok([0, 0, 0])
+                },
+            )
+            .unwrap();
+        assert_eq!(*log.borrow(), vec![('q', 0), ('p', 0), ('q', 1), ('p', 1)]);
+    }
+
+    #[test]
+    fn r264_lf_group_rejects_out_of_range_pass_no_per_varblock_calls() {
+        // Pass 5 with num_passes = 1 → first varblock's
+        // decode_three_channel_varblock_for_pass returns InvalidData
+        // on the first channel. qdc_at / predicted_at still fire
+        // for that first varblock (they're invoked before the inner
+        // method); confirm the error propagates and no second-varblock
+        // closure invocation occurs.
+        let mut h = make_minimal_histograms(1, 15);
+        let headers = PerPassHfHeaders::from_headers(vec![PassGroupHfHeader {
+            hfp: 0,
+            histogram_offset: 0,
+        }]);
+        let mut ctx_dec = HfHistogramDecodeContext::new(&mut h, &headers).unwrap();
+        let hbc = default_hbc_r260();
+        let resolver = BlockContextResolver::new(&hbc);
+        let grid = make_uniform_grid_r264(3, 1, TransformType::Dct8x8);
+        let bytes = [0u8; 4];
+        let mut br = BitReader::new(&bytes);
+        use std::cell::Cell;
+        let q_calls: Cell<u32> = Cell::new(0);
+        let p_calls: Cell<u32> = Cell::new(0);
+        let r = ctx_dec.decode_lf_group_three_channels_for_pass(
+            &mut br,
+            5, // > num_passes (= 1)
+            &grid,
+            &resolver,
+            |_| {
+                q_calls.set(q_calls.get() + 1);
+                Ok([0, 0, 0])
+            },
+            |_| {
+                p_calls.set(p_calls.get() + 1);
+                Ok([0, 0, 0])
+            },
+        );
+        assert!(matches!(r, Err(Error::InvalidData(_))));
+        // First varblock invoked both closures before the inner method
+        // hit the pass-index rejection; subsequent varblocks never ran.
+        assert_eq!(q_calls.get(), 1);
+        assert_eq!(p_calls.get(), 1);
+    }
+
+    #[test]
+    fn r264_lf_group_propagates_qdc_at_error() {
+        // qdc_at returns an error → driver propagates it immediately;
+        // predicted_at is not invoked for that varblock, and no
+        // subsequent varblock's closures run.
+        use std::cell::Cell;
+        let mut h = make_minimal_histograms(1, 15);
+        let headers = PerPassHfHeaders::from_headers(vec![PassGroupHfHeader {
+            hfp: 0,
+            histogram_offset: 0,
+        }]);
+        let mut ctx_dec = HfHistogramDecodeContext::new(&mut h, &headers).unwrap();
+        let hbc = default_hbc_r260();
+        let resolver = BlockContextResolver::new(&hbc);
+        let grid = make_uniform_grid_r264(2, 1, TransformType::Dct8x8);
+        let bytes = [0u8; 4];
+        let mut br = BitReader::new(&bytes);
+        let p_calls: Cell<u32> = Cell::new(0);
+        let r = ctx_dec.decode_lf_group_three_channels_for_pass(
+            &mut br,
+            0,
+            &grid,
+            &resolver,
+            |_vb| Err(Error::InvalidData("synthetic qdc_at error".into())),
+            |_vb| {
+                p_calls.set(p_calls.get() + 1);
+                Ok([0, 0, 0])
+            },
+        );
+        assert!(matches!(r, Err(Error::InvalidData(_))));
+        assert_eq!(p_calls.get(), 0);
+    }
+
+    #[test]
+    fn r264_lf_group_propagates_predicted_at_error() {
+        // predicted_at returns an error → driver propagates it; the
+        // inner decode method is not invoked for that varblock.
+        let mut h = make_minimal_histograms(1, 15);
+        let headers = PerPassHfHeaders::from_headers(vec![PassGroupHfHeader {
+            hfp: 0,
+            histogram_offset: 0,
+        }]);
+        let mut ctx_dec = HfHistogramDecodeContext::new(&mut h, &headers).unwrap();
+        let hbc = default_hbc_r260();
+        let resolver = BlockContextResolver::new(&hbc);
+        let grid = make_uniform_grid_r264(2, 1, TransformType::Dct8x8);
+        let bytes = [0u8; 4];
+        let mut br = BitReader::new(&bytes);
+        let bits_before = br.bits_read();
+        let r = ctx_dec.decode_lf_group_three_channels_for_pass(
+            &mut br,
+            0,
+            &grid,
+            &resolver,
+            |_vb| Ok([0, 0, 0]),
+            |_vb| Err(Error::InvalidData("synthetic predicted_at error".into())),
+        );
+        assert!(matches!(r, Err(Error::InvalidData(_))));
+        // No symbol reads happened past the closure error.
+        assert_eq!(br.bits_read(), bits_before);
+    }
+
+    #[test]
+    fn r264_lf_group_skips_continuation_cells() {
+        // Synthetic grid: row 0 = [TopLeft(DCT16x16), Continuation,
+        // TopLeft(DCT8x8)]; row 1 = [Continuation, Continuation,
+        // TopLeft(DCT8x8)]. Two top-left cells should yield two
+        // varblocks in raster order.
+        let mut h = make_minimal_histograms(1, 15);
+        let headers = PerPassHfHeaders::from_headers(vec![PassGroupHfHeader {
+            hfp: 0,
+            histogram_offset: 0,
+        }]);
+        let mut ctx_dec = HfHistogramDecodeContext::new(&mut h, &headers).unwrap();
+        let hbc = default_hbc_r260();
+        let resolver = BlockContextResolver::new(&hbc);
+        // 3×2 grid (3 cols × 2 rows). Row-major order: (0,0)=TopLeft,
+        // (1,0)=Cont, (2,0)=TopLeft, (0,1)=Cont, (1,1)=Cont,
+        // (2,1)=TopLeft.
+        let grid = DctSelectGrid {
+            cells: vec![
+                DctSelectCell::TopLeft(TransformType::Dct16x16),
+                DctSelectCell::Continuation,
+                DctSelectCell::TopLeft(TransformType::Dct8x8),
+                DctSelectCell::Continuation,
+                DctSelectCell::Continuation,
+                DctSelectCell::TopLeft(TransformType::Dct8x8),
+            ],
+            hf_mul: vec![1, 0, 1, 0, 0, 1],
+            width_blocks: 3,
+            height_blocks: 2,
+        };
+        let bytes = [0u8; 4];
+        let mut br = BitReader::new(&bytes);
+        let out = ctx_dec
+            .decode_lf_group_three_channels_for_pass(
+                &mut br,
+                0,
+                &grid,
+                &resolver,
+                |_vb| Ok([0, 0, 0]),
+                |_vb| Ok([0, 0, 0]),
+            )
+            .unwrap();
+        assert_eq!(out.len(), 3);
+        // Top-lefts in raster order: (0,0) DCT16x16, (2,0) DCT8x8,
+        // (2,1) DCT8x8.
+        assert_eq!(out[0].0.x, 0);
+        assert_eq!(out[0].0.y, 0);
+        assert_eq!(out[0].0.transform, TransformType::Dct16x16);
+        assert_eq!(out[0].1[0].coeffs.len(), 256);
+        assert_eq!(out[1].0.x, 2);
+        assert_eq!(out[1].0.y, 0);
+        assert_eq!(out[1].0.transform, TransformType::Dct8x8);
+        assert_eq!(out[1].1[0].coeffs.len(), 64);
+        assert_eq!(out[2].0.x, 2);
+        assert_eq!(out[2].0.y, 1);
+        assert_eq!(out[2].0.transform, TransformType::Dct8x8);
+        assert_eq!(out[2].1[0].coeffs.len(), 64);
+    }
+
+    #[test]
+    fn r264_lf_group_does_not_advance_br_when_short_circuited() {
+        // 2×2 uniform DCT8x8 → 4 varblocks × 3 channels = 12
+        // single-symbol-prefix reads, all zero-bit. BitReader cursor
+        // invariant.
+        let mut h = make_minimal_histograms(1, 15);
+        let headers = PerPassHfHeaders::from_headers(vec![PassGroupHfHeader {
+            hfp: 0,
+            histogram_offset: 0,
+        }]);
+        let mut ctx_dec = HfHistogramDecodeContext::new(&mut h, &headers).unwrap();
+        let hbc = default_hbc_r260();
+        let resolver = BlockContextResolver::new(&hbc);
+        let grid = make_uniform_grid_r264(2, 2, TransformType::Dct8x8);
+        let bytes = [0xFFu8; 16];
+        let mut br = BitReader::new(&bytes);
+        let bits_before = br.bits_read();
+        let _ = ctx_dec
+            .decode_lf_group_three_channels_for_pass(
+                &mut br,
+                0,
+                &grid,
+                &resolver,
+                |_vb| Ok([0, 0, 0]),
+                |_vb| Ok([0, 0, 0]),
+            )
+            .unwrap();
+        assert_eq!(br.bits_read(), bits_before);
+    }
+
+    #[test]
+    fn r264_lf_group_rejects_residual_empty_cell() {
+        // A DctSelectGrid with a residual `Empty` cell must trigger
+        // the VarblockWalk::next rejection before any closure fires.
+        let mut h = make_minimal_histograms(1, 15);
+        let headers = PerPassHfHeaders::from_headers(vec![PassGroupHfHeader {
+            hfp: 0,
+            histogram_offset: 0,
+        }]);
+        let mut ctx_dec = HfHistogramDecodeContext::new(&mut h, &headers).unwrap();
+        let hbc = default_hbc_r260();
+        let resolver = BlockContextResolver::new(&hbc);
+        let grid = DctSelectGrid {
+            cells: vec![DctSelectCell::Empty],
+            hf_mul: vec![0],
+            width_blocks: 1,
+            height_blocks: 1,
+        };
+        let bytes = [0u8; 4];
+        let mut br = BitReader::new(&bytes);
+        use std::cell::Cell;
+        let q_calls: Cell<u32> = Cell::new(0);
+        let r = ctx_dec.decode_lf_group_three_channels_for_pass(
+            &mut br,
+            0,
+            &grid,
+            &resolver,
+            |_vb| {
+                q_calls.set(q_calls.get() + 1);
+                Ok([0, 0, 0])
+            },
+            |_vb| Ok([0, 0, 0]),
+        );
+        assert!(matches!(r, Err(Error::InvalidData(_))));
+        assert_eq!(q_calls.get(), 0);
+    }
+
+    #[test]
+    fn r264_lf_group_routes_through_per_pass_offset() {
+        // Per-pass offset routing: pass 1 uses offset = 495 (num_hf_presets
+        // = 2, nb_block_ctx = 1, hfp = 1). All distributions remain
+        // single-cluster single-symbol → every read returns 0.
+        let mut h = make_minimal_histograms(2, 1);
+        let headers = PerPassHfHeaders::from_headers(vec![
+            PassGroupHfHeader {
+                hfp: 0,
+                histogram_offset: 0,
+            },
+            PassGroupHfHeader {
+                hfp: 1,
+                histogram_offset: 495,
+            },
+        ]);
+        let mut ctx_dec = HfHistogramDecodeContext::new(&mut h, &headers).unwrap();
+        // Custom hbc with nb_block_ctx = 1 matches the histogram shape.
+        let hbc = HfBlockContext {
+            used_default: false,
+            qf_thresholds: vec![],
+            lf_thresholds: [vec![], vec![], vec![]],
+            block_ctx_map: vec![0u8; 39],
+            nb_block_ctx: 1,
+        };
+        let resolver = BlockContextResolver::new(&hbc);
+        let grid = make_uniform_grid_r264(2, 1, TransformType::Dct8x8);
+        let bytes = [0u8; 4];
+        let mut br = BitReader::new(&bytes);
+        // Drive pass 1 (offset 495) → each varblock's three channels all
+        // return raw = 0 via cluster_map[ctx + 495] → cluster 0 → symbol 0.
+        let out = ctx_dec
+            .decode_lf_group_three_channels_for_pass(
+                &mut br,
+                1,
+                &grid,
+                &resolver,
+                |_vb| Ok([0, 0, 0]),
+                |_vb| Ok([0, 0, 0]),
+            )
+            .unwrap();
+        assert_eq!(out.len(), 2);
+        for vbo in &out {
+            assert_eq!(vbo.2, [0u32, 0u32, 0u32]);
         }
     }
 }

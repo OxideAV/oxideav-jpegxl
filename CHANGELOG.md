@@ -9,6 +9,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Round 264 —
+  `multi_pass_hf_histogram_decoder::HfHistogramDecodeContext::decode_lf_group_three_channels_for_pass`
+  bundled per-LfGroup raster-walk three-channel decode driver for one
+  pass against ISO/IEC FDIS 18181-1:2021 §C.8.3 — one
+  `(br, p, grid, resolver, qdc_at, predicted_at)` call walks the
+  `DctSelectGrid` in raster order via `VarblockWalk`, invokes the
+  caller's per-varblock `qdc_at` + `predicted_at` closures once per
+  varblock to read the shared `qdc[3]` triple and the per-channel
+  `predicted[3]` triple, then composes the round-260
+  `decode_three_channel_varblock_for_pass` bundled three-channel walk
+  to yield one `ThreeChannelVarblock` per top-left cell. Returns the
+  in-raster-order `Vec<ThreeChannelVarblock>` per the round-221 / 228
+  / 260 type alias. The driver owns both the raster walk **and** the
+  §C.7.2 entropy-stream routing through the round-252 typed decode
+  context — no `read_non_zeros` / `decode_symbol` closures cross the
+  boundary, only the storage-only `qdc_at` + `predicted_at` lookups
+  do. Per-varblock ordering: `qdc_at` fires before `predicted_at`;
+  per-LfGroup ordering: row-major (DctSelectGrid raster). Defensive
+  shape: propagates `VarblockWalk::next` errors (residual `Empty`
+  cell), closure errors (`qdc_at` aborts before `predicted_at`;
+  `predicted_at` error aborts before the inner method runs), and any
+  inner `decode_three_channel_varblock_for_pass` error verbatim. On
+  closure error the per-varblock cursor halts without advancing the
+  BitReader past the failing call. Empty grid (`width × height ==
+  0`) yields an empty output vector. 11 unit + 10 integration
+  (`round264_lf_group_three_channels_for_pass`) tests pin: 1×1 DCT8×8
+  short-circuit; 2×2 / 3×3 uniform raster ordering ((0,0), (1,0),
+  (0,1), (1,1) — row-major); per-varblock `qdc → predicted → decode`
+  ordering; per-pass offset routing matches round-260 cluster_map
+  indexing for both `p = 0` and `p = 1`; mixed-transform grid
+  (DCT16×16 single varblock covering 2×2 cells) emits one
+  varblock with `coeffs.len() == 256` per channel; out-of-range pass
+  index rejected; residual `Empty` cell rejected (VarblockWalk error
+  propagated); closure errors (qdc_at / predicted_at) propagated
+  without advancing the BitReader past the failing call; round-trip
+  with `PerPassHfHeaders::read` driven off a real bitstream
+  preserves per-pass histogram offsets across both passes; empty
+  grid yields empty vector. Lib tests 742 → 753 (+11).
 - Round 260 —
   `multi_pass_hf_histogram_decoder::HfHistogramDecodeContext::decode_three_channel_varblock_for_pass`
   bundled three-channel per-varblock walk against ISO/IEC FDIS
