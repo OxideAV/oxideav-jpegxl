@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Round 272 — extracted the Weighted-Predictor post-decode
+  `sub_err_i` computation (FDIS Annex E.1 / §H.5.2) into the named
+  `modular_fdis::sub_err_for` (8x-domain magnitude-then-round reading,
+  used on the decode path) plus a `modular_fdis::sub_err_fdis_literal`
+  reference oracle for the literal FDIS-2021 listing reading
+  `abs(((prediction_i + 3) >> 3) - true_value)`. New
+  `tests/r272_sub_err_reading.rs` (4 tests) pins the reading choice as
+  a regression guard: the two readings coincide for every non-negative
+  sub-prediction (so both reproduce the `noise-64x64-lossless`
+  sample-194 trace value `sub_err = [122, 59, 18, 36]`) but diverge for
+  negative sub-predictions; and the production decode path must keep
+  `synth_320`'s round-10 drift anchor at PG[0][0] `(y=24, x=14)` — the
+  literal reading moves it EARLIER to `(y=11, x=104)` (decodes the
+  fixture less far), confirming the 8x-domain reading is the
+  bisect-validated one. Round 272 also ruled the `sub_err` reading OUT
+  as the cause of the residual `noise-64x64-lossless` sample-129
+  `Δ = -21` WP state-evolution divergence (switching readings leaves
+  that fixture's divergence profile unchanged).
+
 - Round 264 —
   `multi_pass_hf_histogram_decoder::HfHistogramDecodeContext::decode_lf_group_three_channels_for_pass`
   bundled per-LfGroup raster-walk three-channel decode driver for one

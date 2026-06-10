@@ -1150,6 +1150,57 @@ impl WpState {
     }
 }
 
+/// Post-decode per-sub-predictor error `sub_err_i` stored into the
+/// [`WpState`] history (Annex E.1 / §H.5.2).
+///
+/// `pred_i_8x` is the sub-prediction in the left-shifted-by-3 (8x)
+/// domain; `v` is the **un-shifted** decoded sample value.
+///
+/// ## Two readings — and why this one
+///
+/// The FDIS-2021 listing text states
+/// `sub_err_i = abs(((prediction_i + 3) >> 3) - true_value)`
+/// (round the 8x prediction down to 1x FIRST, then subtract the
+/// un-shifted value, then take the magnitude). That is
+/// [`sub_err_fdis_literal`].
+///
+/// The production decoder instead computes the magnitude of the
+/// difference in the 8x domain and rounds afterwards:
+/// `(abs(prediction_i - v*8) + 3) >> 3`. The two readings COINCIDE
+/// whenever `prediction_i >= 0` (e.g. every sub-predictor at the
+/// `noise-64x64-lossless` sample-194 trace point), but DIVERGE when a
+/// sub-predictor goes negative, because the FDIS-literal `(p+3) >> 3`
+/// floors toward negative infinity before the `abs`, whereas the
+/// production reading takes the `abs` first.
+///
+/// The production reading is the one validated by the round-10
+/// `synth_320` drift bisect: substituting [`sub_err_fdis_literal`]
+/// moves `synth_320`'s first PG[0][0] mismatch EARLIER, from the
+/// bisect-anchored `(y=24, x=14)` to `(y=11, x=104)` — i.e. the
+/// literal reading decodes that real fixture LESS far. This mirrors
+/// the documented FDIS-literal-vs-production `error2weight` reading
+/// discrepancy already noted in `wp_predict` / `r191_wp_trace_oracle`.
+/// Do not "correct" this to the literal listing without a clean-room
+/// trace that proves the literal reading on a fixture where the two
+/// diverge.
+#[inline]
+pub fn sub_err_for(pred_i_8x: i32, v: i32) -> i32 {
+    let tv8 = v.wrapping_shl(3);
+    let diff_i = pred_i_8x.wrapping_sub(tv8);
+    ((diff_i.unsigned_abs().wrapping_add(3)) >> 3) as i32
+}
+
+/// The literal FDIS-2021 Annex E.1 reading of `sub_err_i`
+/// (`abs(((prediction_i + 3) >> 3) - true_value)`), retained as a
+/// reference oracle for tests. NOT used on the decode path — see
+/// [`sub_err_for`] for why the production reading differs and which
+/// real fixture pins the choice.
+#[inline]
+pub fn sub_err_fdis_literal(pred_i_8x: i32, v: i32) -> i32 {
+    let pi_rounded = pred_i_8x.wrapping_add(3) >> 3;
+    pi_rounded.wrapping_sub(v).unsigned_abs() as i32
+}
+
 /// Annex H.5.2 sub-predictor + final-prediction computation.
 ///
 /// Returns `(prediction_in_8x_scale, [predictioni_in_8x_scale; 4],
@@ -1977,11 +2028,11 @@ pub fn decode_channels_at_stream(
                     let te = wp_pred8.wrapping_sub(v.wrapping_shl(3));
                     state.set_true_err(x, y, te);
                     // err[i] = (abs(subpred[i] - (true_value << 3)) + 3) >> 3
-                    let tv8 = v.wrapping_shl(3);
+                    // — the bisect-validated 8x-domain reading; see
+                    // `sub_err_for` for why this differs from the literal
+                    // FDIS-2021 listing on negative sub-predictions.
                     for (k, p_i) in wp_subpreds.iter().enumerate() {
-                        let diff_i = p_i.wrapping_sub(tv8);
-                        let se = (diff_i.unsigned_abs().wrapping_add(3)) >> 3;
-                        state.set_sub_err(k, x, y, se as i32);
+                        state.set_sub_err(k, x, y, sub_err_for(*p_i, v));
                     }
                 }
 
