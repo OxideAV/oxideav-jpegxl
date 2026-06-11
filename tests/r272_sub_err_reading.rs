@@ -33,14 +33,19 @@
 //! divergence on `noise-64x64-lossless` (the sample-129 `Δ = -21`
 //! smoking gun, `wp-trace-sample-194.md`) was caused by the production
 //! `sub_err` reading. It is NOT: switching the decode path to the
-//! literal-FDIS reading leaves that fixture's divergence profile
+//! literal-FDIS reading left that fixture's divergence profile
 //! unchanged, while moving the round-10 `synth_320` drift bisect's first
-//! PG[0][0] mismatch EARLIER — from the anchored `(y=24, x=14)` to
+//! PG[0][0] mismatch EARLIER — from the then-anchored `(y=24, x=14)` to
 //! `(y=11, x=104)`. In other words the literal reading decodes a real
 //! fixture LESS far, so the production 8x-domain reading is the
-//! bisect-validated one. This is the same shape as the documented
-//! FDIS-literal-vs-production `error2weight` discrepancy in
-//! `r191_wp_trace_oracle`.
+//! bisect-validated one.
+//!
+//! Round 278 then fixed the actual sample-129 root cause (Listing E.2
+//! `error2weight` inner-Idiv-first operand order + `true_errNW →
+//! true_errN` fallback at x == 0; see `r32_noise_bisect.rs`), which
+//! also eliminated the synth_320 drift entirely — with the production
+//! 8x-domain `sub_err` reading still in place, confirming round 272's
+//! conclusion.
 //!
 //! This test locks:
 //!  1. the two readings agree for every non-negative sub-prediction
@@ -48,8 +53,8 @@
 //!  2. they diverge for negative sub-predictions (so the choice is
 //!     load-bearing);
 //!  3. the production decode path uses the 8x-domain reading
-//!     ([`sub_err_for`]), validated by `synth_320` still drifting at the
-//!     round-10 anchor `(y=24, x=14)`.
+//!     ([`sub_err_for`]), validated by `synth_320` decoding pixel-exact
+//!     (from round 278 onward).
 //!
 //! ## Spec citations
 //!
@@ -151,19 +156,20 @@ fn readings_diverge_for_negative_predictions() {
 }
 
 /// End-to-end anchor: the production decode path uses the 8x-domain
-/// reading ([`sub_err_for`]), so `synth_320` must still drift at the
-/// round-10 bisect anchor `(y=24, x=14)` inside PG[0][0]. (The
-/// literal-FDIS reading would move this to `(y=11, x=104)` — strictly
-/// worse.) This guards against a future agent swapping the decode path
-/// to the literal listing.
+/// reading ([`sub_err_for`]), and from round 278 onward `synth_320`
+/// decodes pixel-exact with that reading in place. A mismatch
+/// appearing here means a WP reading was changed — if the first
+/// mismatch lands at `(y=11, x=104)` the decode path was switched to
+/// the literal-FDIS sub_err reading (the round-272 finding), which
+/// decodes synth_320 LESS far — revert to `sub_err_for`.
 #[test]
-fn synth_320_drift_anchor_unchanged_by_reading_choice() {
+fn synth_320_pixel_exact_with_production_reading() {
     let vf = oxideav_jpegxl::decode_one_frame(SYNTH_320_JXL, None).unwrap();
     let plane = &vf.planes[0];
 
     let mut first: Option<(usize, usize)> = None;
-    'outer: for y in 0..128usize {
-        for x in 0..128usize {
+    'outer: for y in 0..320usize {
+        for x in 0..320usize {
             let want = ((y as u32 + x as u32) & 0xFF) as u8;
             if plane.data[y * 320 + x] != want {
                 first = Some((y, x));
@@ -171,13 +177,12 @@ fn synth_320_drift_anchor_unchanged_by_reading_choice() {
             }
         }
     }
-    let (y, x) = first.expect("PG[0][0] should still have at least one mismatch");
     assert_eq!(
-        (y, x),
-        (24, 14),
-        "PG[0][0] first mismatch must stay at the round-10 bisect anchor \
-         (y=24, x=14); got ({y}, {x}). If this is (11, 104) the decode \
-         path was switched to the literal-FDIS sub_err reading, which \
-         decodes synth_320 LESS far — revert to `sub_err_for`.",
+        first, None,
+        "synth_320 must decode pixel-exact with the production \
+         8x-domain sub_err reading (round-278 baseline); first \
+         mismatch at {first:?}. If this is (11, 104) the decode path \
+         was switched to the literal-FDIS sub_err reading — revert to \
+         `sub_err_for`.",
     );
 }

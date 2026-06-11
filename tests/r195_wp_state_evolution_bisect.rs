@@ -1,5 +1,16 @@
 //! Round 195 — WP state-evolution bisect at sample 193
 //!
+//! ## Round-278 resolution (read this first)
+//!
+//! The upstream state-evolution defect chased below was fixed in
+//! round 278 (`modular_fdis::wp_predict`: Listing E.2 `error2weight`
+//! inner-Idiv-first operand order + `true_errNW → true_errN` fallback
+//! at x == 0 — see `r32_noise_bisect.rs`). The assertions in this
+//! file are re-pinned to the spec-conformant values: the shared
+//! sample-129 stored true_err is now 737 (Δ = 0) and sample 193's
+//! prediction is the trace's 896. The historical bisect narrative is
+//! kept below because it documents HOW the defect was localised.
+//!
 //! ## Background (r191 finding)
 //!
 //! Round 191 established that the WP predictor itself is spec-conformant:
@@ -132,18 +143,19 @@ fn r195_sample_193_te_n_equals_sample_194_te_nw() {
         te_n_at_193, te_nw_at_194
     );
 
-    // Both should be 716 (production) vs 737 (spec), Δ = -21
+    // Round-278: the stored true_err at sample 129 is spec-exact
+    // (737). Pre-fix production stored 716 (the Δ = -21 smoking gun).
     let spec_te_at_129 = 737;
-    let delta = te_n_at_193 - spec_te_at_129;
     assert_eq!(
-        delta, -21,
-        "te at sample 129 should be -21 from spec (716 vs 737). Got delta = {}",
-        delta
+        te_n_at_193, spec_te_at_129,
+        "te at sample 129 must match spec (737) from round 278 onward \
+         (pre-fix production stored 716, Δ = -21). Got {}",
+        te_n_at_193
     );
 
     eprintln!(
-        "    ✓ te_n@193 == te_nw@194 == {} (spec: 737, Δ = {})",
-        te_n_at_193, delta
+        "    ✓ te_n@193 == te_nw@194 == {} (spec: 737, Δ = 0)",
+        te_n_at_193
     );
 }
 
@@ -179,7 +191,7 @@ fn r195_sample_193_prediction_propagation() {
         wp_pred8, PREDICTION_EXPECTED
     );
     eprintln!(
-        "    delta    = {} (should be +21 to cause te storage delta)",
+        "    delta    = {} (0 from round 278 onward)",
         wp_pred8 - PREDICTION_EXPECTED
     );
 
@@ -191,9 +203,7 @@ fn r195_sample_193_prediction_propagation() {
         eprintln!("    expected = {:?}", SUBPRED_EXPECTED);
     }
 
-    // The stored true_err at sample 193 = wp_pred8 - true_value_8x
-    // Production: 317 - 600 = -283?? No wait, te = pred - tv, so
-    // if wp_pred8 = 917 and tv8 = 600, then te = 317
+    // The stored true_err at sample 193 = wp_pred8 - true_value_8x.
     let production_te = wp_pred8 - TRUE_VALUE_8X;
     let spec_te = TRUE_ERR_EXPECTED; // 296
 
@@ -201,24 +211,21 @@ fn r195_sample_193_prediction_propagation() {
         "    production true_err = {} (spec: {})",
         production_te, spec_te
     );
-    eprintln!("    delta = {} (should be +21)", production_te - spec_te);
 
-    // The +21 delta in true_err comes from +21 delta in prediction
-    // (since true_err = pred - tv, and tv is the same)
+    // Round-278: sample 193's prediction and stored true_err are
+    // spec-exact (pre-fix they carried the +21 delta propagated from
+    // the -21 te_n error at sample 129).
     assert_eq!(
-        production_te - spec_te,
-        21,
-        "Sample 193's true_err delta should be +21 (propagated from the -21 \
-         te_n error at sample 129 through the prediction formula). Got {}",
-        production_te - spec_te
+        production_te, spec_te,
+        "Sample 193's stored true_err must match spec ({}) from round \
+         278 onward. Got {}",
+        spec_te, production_te
     );
-
-    // Verify the prediction delta matches
     assert_eq!(
-        wp_pred8 - PREDICTION_EXPECTED,
-        21,
-        "Sample 193's prediction delta should be +21. Got {}",
-        wp_pred8 - PREDICTION_EXPECTED
+        wp_pred8, PREDICTION_EXPECTED,
+        "Sample 193's prediction must match the trace's {} from round \
+         278 onward. Got {}",
+        PREDICTION_EXPECTED, wp_pred8
     );
 }
 

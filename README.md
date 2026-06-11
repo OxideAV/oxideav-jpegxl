@@ -5,6 +5,48 @@ Pure-Rust **JPEG XL** (ISO/IEC 18181-1:2024) decoder. Resumed
 trace-doc-driven rounds 7-11 + encoder rounds 1-6 were retired
 (see "Why retired (history)" below).
 
+**Round 278 (2026-06-11)** FIXES the long-standing
+`noise-64x64-lossless` WP pixel divergence (rounds 31..272) — the
+fixture now decodes **byte-exact on all three planes**, and the
+round-10 `synth_320` drift is gone too (**102400/102400 pixels
+correct**, up from ~21k). Root cause was two Annex E readings in
+`modular_fdis::wp_predict`, both pinned by the staged behavioural
+trace (`docs/image/jpegxl/fixtures/noise-64x64-lossless/
+wp-trace-sample-194.md`): (1) Listing E.2 `error2weight` computes
+the inner `(1 << 24) Idiv ((err_sum >> shift) + 1)` division FIRST
+and multiplies the truncated quotient by `maxweight` — the
+FDIS-2021 parenthesisation; production had multiplied `maxweight`
+into the numerator before dividing. The trace's 52 full-precision
+`(err_sum, weight)` cells (samples 188..200) discriminate the two
+readings: Idiv-first matches all 52, multiply-first mismatches 18
+(sharpest: s=192 `err_sum=51` → 4194298 vs 4194308). (2) The
+`true_errNW` read falls back to `true_errN` when NW does not exist
+(x = 0) — the same H.5.2 NW/NE→N edge rule the err_sum accumulator
+reads already used; the previous zero fallback corrupted every
+column-0 prediction and produced the sample-129 `Δ = -21` smoking
+gun. Method: a from-scratch Annex E state-evolution simulation over
+the fixture's known-correct decoded values, swept across every
+contested reading knob (te border fallbacks, `>> 5` semantics,
+`s_init`, final-division rounding, sub_err reading, err_sum border
+policies, first-row/column handling) against the trace's 13-sample
+window + the three known row-2 stored true_err cells — exactly one
+knob combination reproduces every traced cell, and it differs from
+production only in the two fixes above (the trace's s=191
+`prediction=502` vs stored `true_err=528` confirms the doc reports
+the pre-clamp weighted sum while storage uses the post-clamp value).
+The production 8x-domain `sub_err` reading (r272) is CONFIRMED:
+with it both fixtures decode pixel-exact; substituting the literal
+reading breaks `noise-64x64-lossless` at plane[0] sample 68. New
+`error2weight_pub` oracle + `tests/r278_error2weight_trace.rs`
+(3 tests) pin all 52 trace cells and the operand order directly;
+12 historical divergence-pin tests across 6 files promoted to
+spec/pixel-exact assertions (`r32` full three-plane equality,
+`round10` whole-image equality, `r126` spec intermediates
+(709 / te (296, -456, 737, -165) / err_sum (438, 330, 416, 240) /
+shifted weights (3, 4, 3, 6)), `r195` Δ=0 pins, `r202` spec
+cross-row reads + sample-194 = 34, `r272` pixel-exact guard).
+Tests 1153 → 1156.
+
 **Round 264 (2026-06-09)** lifts the round-260 single-varblock
 three-channel walk into a per-LfGroup raster-walk three-channel
 decode driver for one pass: the new

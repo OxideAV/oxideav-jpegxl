@@ -1173,16 +1173,20 @@ impl WpState {
 /// floors toward negative infinity before the `abs`, whereas the
 /// production reading takes the `abs` first.
 ///
-/// The production reading is the one validated by the round-10
-/// `synth_320` drift bisect: substituting [`sub_err_fdis_literal`]
-/// moves `synth_320`'s first PG[0][0] mismatch EARLIER, from the
-/// bisect-anchored `(y=24, x=14)` to `(y=11, x=104)` — i.e. the
-/// literal reading decodes that real fixture LESS far. This mirrors
-/// the documented FDIS-literal-vs-production `error2weight` reading
-/// discrepancy already noted in `wp_predict` / `r191_wp_trace_oracle`.
-/// Do not "correct" this to the literal listing without a clean-room
-/// trace that proves the literal reading on a fixture where the two
-/// diverge.
+/// The production reading is fixture-pinned. Pre-round-278 the
+/// round-10 `synth_320` drift bisect validated it (substituting
+/// [`sub_err_fdis_literal`] moved `synth_320`'s first PG[0][0]
+/// mismatch EARLIER, from the bisect-anchored `(y=24, x=14)` to
+/// `(y=11, x=104)`). From round 278 onward the pin is stronger:
+/// with the production reading both `synth_320` (102400 px) and
+/// `noise-64x64-lossless` (3 × 4096 px) decode pixel-exact, while
+/// substituting the literal reading breaks `noise-64x64-lossless`
+/// at plane[0] sample 68 (y=1, x=4). NOTE this is a different
+/// outcome from the `error2weight` operand-order question inside
+/// `wp_predict`, which round 278 resolved IN FAVOUR OF the
+/// FDIS-2021-literal parenthesisation — the two readings are
+/// independent choices, each pinned by fixtures/trace. Do not
+/// "correct" this to the literal listing.
 #[inline]
 pub fn sub_err_for(pred_i_8x: i32, v: i32) -> i32 {
     let tv8 = v.wrapping_shl(3);
@@ -1199,6 +1203,56 @@ pub fn sub_err_for(pred_i_8x: i32, v: i32) -> i32 {
 pub fn sub_err_fdis_literal(pred_i_8x: i32, v: i32) -> i32 {
     let pi_rounded = pred_i_8x.wrapping_add(3) >> 3;
     pi_rounded.wrapping_sub(v).unsigned_abs() as i32
+}
+
+/// FDIS-2021 Listing E.2 `error2weight`:
+///
+/// ```text
+/// shift = floor(log2(err_sum + 1)) - 5; if shift < 0 shift = 0;
+/// return 4 + (maxweight × ((1 << 24) Idiv ((err_sum >> shift) + 1)));
+/// ```
+///
+/// plus the outer `>> shift` on the `maxweight × quotient` product
+/// added by the 2024 published edition, which keeps the weight bounded
+/// for very large err_sum (pure FDIS-2021 yields weights up to 2^32
+/// for err_sum near 2^32 — those overflow u32 in the subsequent
+/// Listing E.3 `(weight >> sh)` step; round-19 audit pick, present
+/// since round 3).
+///
+/// ## Operand order (round 278)
+///
+/// The `(1 << 24) Idiv denom` inner division happens FIRST and its
+/// truncated quotient is then multiplied by `maxweight`, exactly as
+/// the FDIS-2021 listing parenthesises it. The pre-278 production
+/// code multiplied `maxweight` into the numerator BEFORE dividing
+/// (`maxweight * (1 << 24) / denom`), which yields a slightly larger
+/// product whenever the inner division truncates. The staged
+/// behavioural trace (docs/image/jpegxl/fixtures/noise-64x64-lossless/
+/// wp-trace-sample-194.md, samples 188..200) discriminates the two
+/// readings: all 52 traced (err_sum, weight) cells match the
+/// Idiv-first reading exactly, while the multiply-first reading
+/// mismatches 18 of them (e.g. s=192 err_sum=51 maxweight=13:
+/// Idiv-first 4194298 == trace, multiply-first 4194308). The mismatch
+/// propagates through the Listing E.3 `>> (log_weight - 5)` rounding
+/// at some samples and was, together with the `true_errNW` column-0
+/// fallback in [`wp_predict`], the root cause of the long-standing
+/// `noise-64x64-lossless` sample-129/-194 WP state-evolution
+/// divergence (rounds 31..272).
+#[inline]
+fn error2weight(err_sum: u32, maxweight: u32) -> u64 {
+    let bits = 32u32 - (err_sum + 1).leading_zeros();
+    let shift = (bits.saturating_sub(1)).saturating_sub(5);
+    let denom = ((err_sum >> shift) as u64) + 1;
+    4u64 + ((maxweight as u64 * ((1u64 << 24) / denom)) >> shift)
+}
+
+/// Round-278 public oracle wrapper for [`error2weight`], so an
+/// integration test can pin the full-precision weights against the
+/// clean-room behavioural trace's 52 (err_sum, weight) cells (the
+/// Listing E.3 `>> (log_weight - 5)` step usually masks the operand-
+/// order distinction end-to-end).
+pub fn error2weight_pub(err_sum: u32, maxweight: u32) -> u64 {
+    error2weight(err_sum, maxweight)
 }
 
 /// Annex H.5.2 sub-predictor + final-prediction computation.
@@ -1223,9 +1277,30 @@ fn wp_predict(
     let ww8 = nb.ww.wrapping_shl(3);
 
     // true_err neighbours (already in 8x scale, stored that way).
+    //
+    // Edge rule (round 278): when NW does not exist (x == 0), the
+    // true_errNW read falls back to true_errN — the SAME "if NW or NE
+    // does not exist, the value of N is used instead" H.5.2 edge rule
+    // this function already applies to the sub_err accumulator reads
+    // below. The pre-278 code zeroed true_errNW at x == 0, which
+    // corrupted every column-0 prediction (and, via the stored
+    // true_err/sub_err history, the whole WP state evolution). Pinned
+    // by the staged behavioural trace (docs/image/jpegxl/fixtures/
+    // noise-64x64-lossless/wp-trace-sample-194.md): with this fallback
+    // (plus the Idiv-first error2weight below) a from-scratch Annex E
+    // state-evolution walk over the fixture's decoded values
+    // reproduces all 13 traced samples (188..200) — err_sum, weight,
+    // prediction_i, prediction, true_err — and the three known row-2
+    // stored true_err cells (sample 129 = 737, 130 = -456,
+    // 131 = -165) exactly; the zero fallback yields the long-standing
+    // sample-129 Δ = -21 divergence (rounds 31..272).
     let te_w = state.true_err_at(x - 1, y);
     let te_n = state.true_err_at(x, y - 1);
-    let te_nw = state.true_err_at(x - 1, y - 1);
+    let te_nw = if x > 0 && y > 0 {
+        state.true_err_at(x - 1, y - 1)
+    } else {
+        te_n
+    };
     let te_ne_raw = if (x + 1) < state.width as i32 && y > 0 {
         state.true_err_at(x + 1, y - 1)
     } else {
@@ -1295,24 +1370,9 @@ fn wp_predict(
             if x == (state.width as i32 - 1) {
                 err_sum = (err_sum + w_se as u64) & 0xFFFF_FFFF;
             }
-            // FDIS 2021 Listing E.2 — error2weight:
-            //   shift = floor(log2(err_sum + 1)) - 5; if shift < 0 shift = 0;
-            //   return 4 + maxweight * ((1 << 24) Idiv ((err_sum >> shift) + 1));
-            // NOTE: the 2024 published edition adds an outer `>> shift`
-            // on the result, which keeps the weight bounded for very
-            // large err_sum. Round-19 audit picks the 2024 reading
-            // because pure FDIS-2021 yields weights up to 2^32 for
-            // err_sum near 2^32 — those overflow u32 in the subsequent
-            // `(weight >> sh)` step. The outer shift was already in
-            // round-3.
             let err_sum32 = err_sum as u32;
             err_sums_capture[k] = err_sum;
-            let bits = 32u32 - (err_sum32 + 1).leading_zeros();
-            let shift = (bits.saturating_sub(1)).saturating_sub(5);
-            let denom = ((err_sum32 >> shift) as u64) + 1;
-            let inner = (weights_cfg[k] as u64 * (1u64 << 24) / denom) >> shift;
-            let weight = 4u64 + inner;
-            weights[k] = weight;
+            weights[k] = error2weight(err_sum32, weights_cfg[k]);
         }
         weights
     };

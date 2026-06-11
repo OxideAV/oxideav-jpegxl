@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Round 278 — the long-standing `noise-64x64-lossless` Weighted-
+  Predictor pixel divergence (rounds 31..272) is FIXED; the fixture
+  decodes byte-exact on all three planes and the round-10 `synth_320`
+  drift is gone (102400/102400 pixels correct). Two FDIS Annex E
+  readings in `modular_fdis::wp_predict`, both pinned by the staged
+  behavioural trace
+  (`docs/image/jpegxl/fixtures/noise-64x64-lossless/wp-trace-sample-194.md`):
+  (1) Listing E.2 `error2weight` performs the inner
+  `(1 << 24) Idiv ((err_sum >> shift) + 1)` division FIRST and
+  multiplies the truncated quotient by `maxweight` (the FDIS-2021
+  parenthesisation) — the trace's 52 full-precision
+  `(err_sum, weight)` cells (samples 188..200) all match this
+  reading while the previous multiply-first form mismatches 18 of
+  them; (2) the `true_errNW` read falls back to `true_errN` when NW
+  does not exist (x = 0), matching the H.5.2 NW/NE→N edge rule the
+  err_sum accumulator reads already applied — the previous zero
+  fallback corrupted every column-0 prediction and produced the
+  sample-129 `Δ = -21` state-evolution divergence. Root-caused via a
+  from-scratch Annex E state-evolution sweep over the fixture's
+  known-correct decoded values across every contested reading knob:
+  exactly one combination reproduces all 13 traced samples plus the
+  three known row-2 stored true_err cells (737 / -456 / -165), and
+  it differs from production only in these two readings. The
+  production 8x-domain `sub_err` reading (round 272) is confirmed —
+  the literal reading now breaks the fixture at plane[0] sample 68.
+  New `error2weight_pub` oracle + `tests/r278_error2weight_trace.rs`
+  (3 tests) pin the 52 trace cells and the operand order; 12
+  historical divergence-pin tests across 6 files
+  (`r32`/`round10`/`r126`/`r195`/`r202`/`r272`) promoted to
+  spec/pixel-exact assertions. Tests 1153 → 1156.
+
 ### Added
 
 - Round 272 — extracted the Weighted-Predictor post-decode

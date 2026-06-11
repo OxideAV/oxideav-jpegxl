@@ -4,7 +4,22 @@
 //! has enough state to identify which FDIS Annex E.3 step is producing
 //! the off-by-1 in the rounded prediction.
 //!
-//! ## Round-126 captured numbers (pinned)
+//! ## Round-278 resolution (read this first)
+//!
+//! The divergence was fixed in round 278 by two Annex E reading
+//! corrections in `modular_fdis::wp_predict` (Listing E.2
+//! `error2weight` inner-Idiv-first operand order + `true_errNW →
+//! true_errN` fallback at x == 0; see `r32_noise_bisect.rs` for the
+//! full derivation). The intermediates below are the HISTORICAL
+//! round-126 production capture kept for context; the assertions in
+//! this file now pin the spec-conformant values from the staged
+//! behavioural trace (`docs/image/jpegxl/fixtures/
+//! noise-64x64-lossless/wp-trace-sample-194.md`): `wp_pred8 = 709`,
+//! `te = (296, -456, 737, -165)`, `err_sum = (438, 330, 416, 240)`,
+//! shifted weights `(3, 4, 3, 6)`, and a byte-exact three-plane
+//! decode.
+//!
+//! ## Round-126 captured numbers (historical, pre-fix)
 //!
 //! ```text
 //! te_w       =  317     w8       =  600    nn8 =  416
@@ -148,20 +163,33 @@ fn r126_wp_intermediates_at_sample_194_pinned() {
         wp
     );
 
-    // The wp_pred8 value the round-32 docstring identifies as
-    // off-by-1 from the spec-correct 712. Anything in [709..716]
-    // would round to 89 and produce the correct `v = 89 + (-55) =
-    // 34` matching `expected.png[194*3]`.
     let wp_pred8 = wp[8];
     let max_error = wp[9];
 
+    // Round-278 spec pin: the trace doc's Listing E.3 weighted-sum
+    // prediction at sample 194 is 709 (rounds to (709+3)>>3 = 89,
+    // producing v = 89 + (-55) = 34 = expected.png[194*3]).
     assert_eq!(
-        wp_pred8, 717,
-        "round-32 baseline: wp_pred8 at sample 194 must remain 717 \
-         until the WP-correctness fix lands. If this changes, either \
-         (a) the WP formula changed (good — promote the test to \
-         assert pixel-correctness against expected.png[194*3] = 34), \
-         or (b) the WP state machine regressed (bad — bisect)."
+        wp_pred8, 709,
+        "wp_pred8 at sample 194 must equal the trace doc's \
+         spec-conformant 709 (historical pre-round-278 production \
+         value was 717)"
+    );
+
+    // The four true_err reads at sample 194, per the trace doc's
+    // explicit table (wp-trace-sample-194.md lines 64-71).
+    assert_eq!(
+        (wp[0], wp[1], wp[2], wp[3]),
+        (296, -456, 737, -165),
+        "(te_w, te_n, te_nw, te_ne) at sample 194 must match the \
+         trace doc (true_errW, true_errN, true_errNW, true_errNE)"
+    );
+
+    // max_error per Listing E.4 = the te with the largest magnitude.
+    assert_eq!(
+        max_error, 737,
+        "max_error at sample 194 must be 737 (the trace-conformant \
+         te_nw, largest in magnitude of the four reads)"
     );
 
     // The other intermediates are pinned so a future agent comparing
@@ -230,6 +258,26 @@ fn r126_wp_intermediates_at_sample_194_pinned() {
     eprintln!("    pred_pre_cl = {}", deep[18]);
     eprintln!("    clamped     = {}", deep[19]);
 
+    // Round-278 spec pins from the trace doc's sample-194 tables:
+    // sub-predictions (Listing E.1), err_sum_i (Listing E.2), and the
+    // post-`>> sh` weights (Listing E.3).
+    assert_eq!(
+        (deep[0], deep[1], deep[2], deep[3]),
+        (1248, 747, 420, 559),
+        "sub-predictions at sample 194 must match the trace doc"
+    );
+    assert_eq!(
+        (deep[4], deep[5], deep[6], deep[7]),
+        (438, 330, 416, 240),
+        "err_sum_i at sample 194 must match the trace doc"
+    );
+    assert_eq!(
+        (deep[8], deep[9], deep[10], deep[11]),
+        (3, 4, 3, 6),
+        "post-shift weights at sample 194 must match the trace doc's \
+         error2weight values (495694, 599189, 474830, 825112) >> 17"
+    );
+
     // The pre-clamp prediction must equal the captured wp_pred8 unless
     // the clamp kicked in. (If clamp == 1, wp_pred8 == clamped value
     // which is in [lo, hi]; if clamp == 0, wp_pred8 == pred_pre_clamp.)
@@ -242,13 +290,10 @@ fn r126_wp_intermediates_at_sample_194_pinned() {
 }
 
 /// Scan for the first plane-byte divergence vs `expected.png` across
-/// all 3 planes. Round-32 has the divergence anchored at plane[0]
-/// linear index 194; round-126 confirms that fix-up work to the
-/// sub_err FDIS-literal formula did NOT shift the divergence boundary
-/// in any of the three planes. (If a later round genuinely fixes
-/// sample 194 in plane 0, the divergence either moves later or to a
-/// different plane — both call for re-pinning, never for an unexplained
-/// silent improvement.)
+/// all 3 planes. Round-32 had the divergence anchored at plane[0]
+/// linear index 194; from round 278 onward (WP error2weight
+/// Idiv-first + true_errNW column-0 fallback) all three planes must
+/// be byte-exact.
 #[test]
 fn r126_first_divergence_scan() {
     use std::io::Cursor;
@@ -289,12 +334,16 @@ fn r126_first_divergence_scan() {
         }
     }
 
-    // Plane 0 first mismatch is at 194 per round 32.
-    assert_eq!(
-        first_div[0].0, 194,
-        "round-32 baseline: plane[0] first mismatch must remain at \
-         linear index 194 (y=3, x=2). A shift downward = a different \
-         WP state-evolution bug fired earlier; a shift upward = good \
-         news (the round-32 WP bug is partially or fully fixed)."
-    );
+    // Round-278: every plane must be byte-exact.
+    for (c, slot) in first_div.iter().enumerate() {
+        assert_eq!(
+            slot.0,
+            usize::MAX,
+            "plane[{c}] must be byte-exact vs expected.png from round \
+             278 onward; first mismatch at i={} (dec={}, exp={})",
+            slot.0,
+            slot.1,
+            slot.2
+        );
+    }
 }

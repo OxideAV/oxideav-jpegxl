@@ -34,9 +34,12 @@
 //! (stride == width, no error). This nails down the §F.3 single-section
 //! fast-path behaviour as a regression baseline.
 //!
-//! ## What this test does NOT yet assert (deferred)
+//! ## What this test does NOT assert (deferred at round 31 — RESOLVED
+//! in round 278: the WP `error2weight` operand order + `true_errNW`
+//! column-0 fallback fixes made the decode byte-exact; the full
+//! pixel-equality regression lives in `r32_noise_bisect.rs`)
 //!
-//! The decoded pixels are not yet byte-identical to `expected.png`.
+//! As of round 31 the decoded pixels were not byte-identical to `expected.png`.
 //! Round-31 traced the first divergence to plane[0] (R) at (2, 3) —
 //! i.e. after 194 of 4096 samples in plane 0 decode correctly. From
 //! that sample on, ~98 % of samples diverge. The divergence point is
