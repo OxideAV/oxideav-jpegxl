@@ -120,14 +120,21 @@ fn round177_grid_dct16x16_ceil_div_4_through_typed_driver() {
 fn round177_grid_dct32x32_ceil_div_16_through_typed_driver() {
     // DCT32×32 has num_blocks = 16, size = 1024. The per-block loop
     // (round 159) caps initial_non_zeros at size - num_blocks = 1008,
-    // so we test at the boundary: ceil(1008 / 16) = 63.
-    let mut g = NonZerosGrid::new(1, 1).unwrap();
+    // so we test at the boundary: ceil(1008 / 16) = 63. The grid is
+    // sized 4×4 for the DCT32×32 footprint; per the §C.8.3 "for each
+    // block in the current varblock" prose every covered cell stores
+    // the value.
+    let mut g = NonZerosGrid::new(4, 4).unwrap();
     let read_nz = |_ctx: u32| -> Result<u32> { Ok(1008u32) };
     let dec = |_ctx: u32| -> Result<u32> { Ok(0u32) };
     let (_block, raw) =
         decode_block_at(&mut g, 0, 0, TransformType::Dct32x32, 0, 1, read_nz, dec).unwrap();
     assert_eq!(raw, 1008);
-    assert_eq!(g.get(0, 0).unwrap(), 63);
+    for y in 0..4 {
+        for x in 0..4 {
+            assert_eq!(g.get(x, y).unwrap(), 63, "footprint cell ({x},{y})");
+        }
+    }
 }
 
 #[test]

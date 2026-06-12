@@ -464,8 +464,11 @@ mod tests {
     fn update_after_block_for_transform_per_pass() {
         // DCT8×8 / DCT16×16 / DCT32×32 → num_blocks {1, 4, 16}.
         // raw_non_zeros = 17 reduces to {17, 5, 2}. Verify per-pass
-        // routing applies the requested TransformType.
-        let mut p = PerPassNonZerosGrids::new_uniform(3, 3, 2, 2).unwrap();
+        // routing applies the requested TransformType, writing the
+        // value to every covered cell per the §C.8.3 "for each block
+        // in the current varblock" prose (grids sized for the
+        // largest 4×4-cell footprint).
+        let mut p = PerPassNonZerosGrids::new_uniform(3, 3, 4, 4).unwrap();
         let v0 = p
             .update_after_block_for_transform(0, 0, 0, 0, 17, TransformType::Dct8x8)
             .unwrap();
@@ -478,6 +481,13 @@ mod tests {
         assert_eq!(v0, 17, "ceil(17/1) = 17");
         assert_eq!(v1, 5, "ceil(17/4) = 5");
         assert_eq!(v2, 2, "ceil(17/16) = 2");
+        // Footprint writeback per (pass, channel): DCT16x16 wrote the
+        // 2×2 footprint on (pass 1, channel 1); DCT32x32 the full 4×4
+        // footprint on (pass 2, channel 2); cross-pass isolation
+        // intact.
+        assert_eq!(p.get(1, 1, 1, 1).unwrap(), 5, "DCT16x16 2×2 footprint");
+        assert_eq!(p.get(2, 2, 3, 3).unwrap(), 2, "DCT32x32 4×4 footprint");
+        assert_eq!(p.get(0, 0, 1, 1).unwrap(), 0, "pass 0 only wrote (0,0)");
     }
 
     #[test]
@@ -551,8 +561,9 @@ mod tests {
     fn decode_block_at_for_pass_channel_dct16x16_ceil_divides() {
         // Per-pass routing must propagate the TransformType through
         // to the post-update step: raw_non_zeros = 17 with DCT16×16
-        // (num_blocks = 4) stores ceil(17/4) = 5.
-        let mut p = PerPassNonZerosGrids::new_uniform(2, 3, 1, 1).unwrap();
+        // (num_blocks = 4) stores ceil(17/4) = 5 on every cell of
+        // the 2×2 footprint (§C.8.3 prose).
+        let mut p = PerPassNonZerosGrids::new_uniform(2, 3, 2, 2).unwrap();
         let read_non_zeros = |_ctx: u32| -> Result<u32> { Ok(17u32) };
         let decode_symbol = |_ctx: u32| -> Result<u32> { Ok(0u32) };
         let (_decoded, raw_non_zeros) = p
@@ -569,7 +580,10 @@ mod tests {
             )
             .unwrap();
         assert_eq!(raw_non_zeros, 17);
-        assert_eq!(p.get(0, 1, 0, 0).unwrap(), 5);
+        for (x, y) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+            assert_eq!(p.get(0, 1, x, y).unwrap(), 5, "footprint cell ({x},{y})");
+        }
+        assert_eq!(p.get(1, 1, 0, 0).unwrap(), 0, "pass 1 untouched");
     }
 
     #[test]

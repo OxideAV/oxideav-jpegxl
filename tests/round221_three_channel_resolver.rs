@@ -226,7 +226,10 @@ fn r221_three_channel_qdc_error_aborts_before_any_channel_read() {
 }
 
 #[test]
-fn r221_three_channel_x_error_aborts_before_y_and_b() {
+fn r221_three_channel_y_error_aborts_before_x_and_b() {
+    // Y (channel 1) is decoded FIRST per the §C.8.3 prose ("for
+    // each varblock it reads channels Y, X, then B"); a Y error
+    // aborts before the X and B reads.
     let hbc = default_hbc();
     let resolver = BlockContextResolver::new(&hbc);
     let hf = make_hf(vec![0, 0], 1, 1);
@@ -241,8 +244,8 @@ fn r221_three_channel_x_error_aborts_before_y_and_b() {
         |_| Ok([0, 0, 0]),
         |channel, _pred| {
             per_channel[channel as usize] += 1;
-            if channel == 0 {
-                Err(oxideav_core::Error::InvalidData("x fail".into()))
+            if channel == 1 {
+                Err(oxideav_core::Error::InvalidData("y fail".into()))
             } else {
                 Ok(0)
             }
@@ -250,9 +253,9 @@ fn r221_three_channel_x_error_aborts_before_y_and_b() {
         |_, _| Ok(0),
     );
     assert!(r.is_err());
-    assert_eq!(per_channel[0], 1);
-    assert_eq!(per_channel[1], 0);
-    assert_eq!(per_channel[2], 0);
+    assert_eq!(per_channel[1], 1, "Y read first (fails)");
+    assert_eq!(per_channel[0], 0, "X not reached");
+    assert_eq!(per_channel[2], 0, "B not reached");
 }
 
 #[test]
@@ -283,9 +286,11 @@ fn r221_three_channel_mixed_transforms() {
 }
 
 #[test]
-fn r221_three_channel_channel_order_x_y_b() {
-    // Verify channel order matches §C.8.3 prose (X = 0 first,
-    // Y = 1 second, B = 2 last). Capture the channel arg sequence.
+fn r221_three_channel_channel_order_y_x_b() {
+    // Verify channel decode order matches the §C.8.3 prose ("for
+    // each varblock it reads channels Y, X, then B") — channel
+    // indices 1, 0, 2 per Listing C.13's 0=X / 1=Y / 2=B mapping.
+    // Capture the channel arg sequence.
     let hbc = default_hbc();
     let resolver = BlockContextResolver::new(&hbc);
     let hf = make_hf(vec![0, 0], 1, 1);
@@ -305,7 +310,7 @@ fn r221_three_channel_channel_order_x_y_b() {
         |_, _| Ok(0),
     )
     .unwrap();
-    assert_eq!(seen, vec![0, 1, 2]);
+    assert_eq!(seen, vec![1, 0, 2]);
 }
 
 #[test]

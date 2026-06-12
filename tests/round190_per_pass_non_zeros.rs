@@ -75,7 +75,10 @@ fn r190_update_after_block_per_pass_dct16x16_ceil() {
 
 #[test]
 fn r190_update_after_block_for_transform_dispatches_per_pass() {
-    let mut p = PerPassNonZerosGrids::new_uniform(3, 3, 2, 2).unwrap();
+    // Grids sized 4×4 for the largest (DCT32×32) footprint — per the
+    // §C.8.3 "for each block in the current varblock" prose every
+    // covered cell stores the ceiling-divided value.
+    let mut p = PerPassNonZerosGrids::new_uniform(3, 3, 4, 4).unwrap();
     let v0 = p
         .update_after_block_for_transform(0, 0, 0, 0, 17, TransformType::Dct8x8)
         .unwrap();
@@ -88,6 +91,12 @@ fn r190_update_after_block_for_transform_dispatches_per_pass() {
     assert_eq!(v0, 17);
     assert_eq!(v1, 5);
     assert_eq!(v2, 2);
+    // Footprint writeback: (pass 1, channel 1) DCT16×16 filled the
+    // 2×2 footprint; (pass 2, channel 2) DCT32×32 the full 4×4;
+    // (pass 0, channel 0) DCT8×8 only (0, 0).
+    assert_eq!(p.get(0, 0, 1, 1).unwrap(), 0);
+    assert_eq!(p.get(1, 1, 1, 1).unwrap(), 5);
+    assert_eq!(p.get(2, 2, 3, 3).unwrap(), 2);
 }
 
 #[test]
@@ -178,8 +187,10 @@ fn r190_per_pass_decode_chain_two_step_raster_walk() {
 fn r190_per_pass_independent_dct16x16_evolution() {
     // Pass 0 uses DCT16×16 (ceil-divide by 4); pass 1 uses DCT8×8
     // (identity). After raw_non_zeros = 17 on (channel 0, (0, 0)) of
-    // each pass, the stored cell is 5 on pass 0 and 17 on pass 1.
-    let mut p = PerPassNonZerosGrids::new_uniform(2, 3, 1, 1).unwrap();
+    // each pass, the stored cells are 5 on pass 0 (full 2×2
+    // footprint per the §C.8.3 prose) and 17 on pass 1 (top-left
+    // only — DCT8×8's footprint is a single cell).
+    let mut p = PerPassNonZerosGrids::new_uniform(2, 3, 2, 2).unwrap();
     // Pass 0 DCT16×16.
     let read_a = |_ctx: u32| -> Result<u32> { Ok(17u32) };
     let decode_a = |_ctx: u32| -> Result<u32> { Ok(0u32) };
@@ -202,8 +213,15 @@ fn r190_per_pass_independent_dct16x16_evolution() {
     let _ = p
         .decode_block_at_for_pass_channel(1, 0, 0, 0, TransformType::Dct8x8, 0, 1, read_b, decode_b)
         .unwrap();
-    assert_eq!(p.get(0, 0, 0, 0).unwrap(), 5, "DCT16×16: ceil(17/4) = 5");
+    for (x, y) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+        assert_eq!(
+            p.get(0, 0, x, y).unwrap(),
+            5,
+            "DCT16×16: ceil(17/4) = 5 on footprint cell ({x},{y})"
+        );
+    }
     assert_eq!(p.get(1, 0, 0, 0).unwrap(), 17, "DCT8×8: identity");
+    assert_eq!(p.get(1, 0, 1, 0).unwrap(), 0, "DCT8×8 footprint is 1×1");
 }
 
 #[test]

@@ -47,6 +47,38 @@ shifted weights (3, 4, 3, 6)), `r195` Δ=0 pins, `r202` spec
 cross-row reads + sample-194 = 34, `r272` pixel-exact guard).
 Tests 1153 → 1156.
 
+**Round 281 (2026-06-12)** lands two §C.8.3 decode-walk
+prose-conformance fixes, both latent in the VarDCT HF coefficient
+path since the drivers landed. (1) **Per-varblock channel decode
+order is Y, X, then B**: the FDIS §C.8.3 prose reads "The decoder
+proceeds by decoding varblocks in raster order; for each varblock
+it reads channels Y, X, then B" — rounds 221..264 advanced the
+entropy stream X-first (a misreading recorded in-source as a
+"§C.8.3 listing sequence" that does not exist). Fixed in the
+round-221 closure-path driver (feeding the round-228 / 232 layers)
+and the round-260 typed `decode_three_channel_varblock_for_pass`
+(feeding the round-264 per-LfGroup driver). Channel *indices* stay
+0 = X / 1 = Y / 2 = B per Listing C.13 (whose
+`(c < 2 ? c ^ 1 : 2)` mapping — Y → 0, X → 1, B → 2 —
+independently corroborates Y-first decode); only the
+stream-advance order changed, so output arrays remain
+channel-indexed. (2) **`NonZeros(x, y)` writeback covers every
+block of the varblock**: the prose computes "the NonZeros(x, y)
+field for each block in the current varblock" — rounds 177..264
+wrote only the top-left cell, so a neighbour's
+`PredictedNonZeros(x, y)` reading a continuation cell of a
+multi-cell transform (second row/column of a DCT16×16, anything
+inside a DCT32×32) saw the zero-init sentinel instead of the
+ceiling-divided value.
+`NonZerosGrid::update_after_block_for_transform` now fills the
+full `TransformType::block_dims()` footprint (cols × rows per
+Table C.16, spill past the grid rejected); the per-channel /
+per-pass containers and every typed driver inherit the fix.
+Ordering + footprint pins rewritten across the round-177 / 183 /
+190 / 221 / 228 suites; new rectangular-footprint (DCT16×8 =
+1×2 cells vs DCT8×16 = 2×1) and spill-rejection tests. Tests
+1156 → 1159.
+
 **Round 264 (2026-06-09)** lifts the round-260 single-varblock
 three-channel walk into a per-LfGroup raster-walk three-channel
 decode driver for one pass: the new

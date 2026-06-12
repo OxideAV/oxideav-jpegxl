@@ -108,7 +108,8 @@ pub type MultiPassThreeChannelOutput = Vec<Vec<ThreeChannelVarblock>>;
 ///    varblock to read the (potentially pass-dependent) `qdc[3]`
 ///    triple,
 /// 2. invokes [`BlockContextResolver::resolve`] three times per
-///    varblock (channel order X = 0 → Y = 1 → B = 2),
+///    varblock (channel decode order Y = 1 → X = 0 → B = 2 per
+///    the §C.8.3 prose),
 /// 3. invokes
 ///    [`PerPassNonZerosGrids::decode_block_at_for_pass_channel`]
 ///    three times per varblock with the matching pass + channel

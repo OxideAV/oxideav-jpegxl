@@ -188,10 +188,12 @@ fn r228_pass_index_threaded_to_read_non_zeros_closure() {
         |_p, _c, _coef| Ok(0),
     )
     .unwrap();
-    // 4 passes × 3 channels = 12 calls. (pass=0, c=0,1,2) then
-    // (pass=1, c=0,1,2) etc.
+    // 4 passes × 3 channels = 12 calls. Within each pass the
+    // per-varblock channel decode order is Y, X, then B per the
+    // §C.8.3 prose (channel indices 1, 0, 2): (pass=0, c=1,0,2)
+    // then (pass=1, c=1,0,2) etc.
     assert_eq!(observed.len(), 12);
-    assert_eq!(observed, vec![0, 1, 2, 10, 11, 12, 20, 21, 22, 30, 31, 32]);
+    assert_eq!(observed, vec![1, 0, 2, 11, 10, 12, 21, 20, 22, 31, 30, 32]);
 }
 
 #[test]

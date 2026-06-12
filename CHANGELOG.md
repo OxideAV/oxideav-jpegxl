@@ -9,6 +9,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Round 281 — two §C.8.3 decode-walk prose-conformance fixes against
+  ISO/IEC FDIS 18181-1:2021, both affecting the (not-yet-wired)
+  VarDCT HF coefficient path. (1) **Per-varblock channel decode
+  order is Y, X, then B** — the §C.8.3 prose reads "for each
+  varblock it reads channels Y, X, then B"; rounds 221..264 advanced
+  the entropy stream X-first. Fixed in
+  `block_context_resolver::decode_varblocks_three_channels_with_resolver`
+  (round 221; also feeds the round-228 multi-pass and round-232
+  HF-header drivers) and
+  `HfHistogramDecodeContext::decode_three_channel_varblock_for_pass`
+  (round 260; also feeds the round-264 per-LfGroup driver). Output
+  arrays stay indexed 0 = X / 1 = Y / 2 = B per Listing C.13's
+  "c is the current channel (with 0=X, 1=Y, 2=B)" — only the
+  stream-advance order changed. The Listing C.13 `BlockContext()`
+  channel mapping `(c < 2 ? c ^ 1 : 2)` (Y → 0, X → 1, B → 2)
+  independently corroborates Y-first decode order. (2)
+  **`NonZeros(x, y)` writeback covers every block of the varblock**
+  — the prose reads "The decoder then computes the NonZeros(x, y)
+  field for each block in the current varblock"; rounds 177..264
+  wrote only the top-left cell, so a neighbouring varblock's
+  `PredictedNonZeros(x, y)` reading a continuation cell of a
+  multi-cell transform (e.g. the second row/column of a DCT16×16)
+  saw the zero-init sentinel instead of the varblock's
+  ceiling-divided value. `NonZerosGrid::update_after_block_for_transform`
+  now fills the full `TransformType::block_dims()` footprint
+  (rejecting footprints that spill outside the grid); the
+  per-channel / per-pass wrappers and every typed driver above them
+  inherit the fix. Ordering + footprint tests rewritten to the
+  prose readings across `round177` / `round183` / `round190` /
+  `round221` / `round228` suites plus the in-module unit tests; new
+  rectangular-footprint (DCT16×8 1×2-cell vs DCT8×16 2×1-cell) and
+  footprint-spill rejection pins. Tests 1156 → 1159.
+
 - Round 278 — the long-standing `noise-64x64-lossless` Weighted-
   Predictor pixel divergence (rounds 31..272) is FIXED; the fixture
   decodes byte-exact on all three planes and the round-10 `synth_320`

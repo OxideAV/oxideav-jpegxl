@@ -76,8 +76,10 @@ fn r183_per_channel_predicted_horizontal_chain() {
 fn r183_update_after_block_for_transform_dispatch() {
     // Per-channel TransformType dispatch. DCT8×8 / DCT16×16 / DCT32×32
     // num_blocks = 1 / 4 / 16; raw_non_zeros = 17 reduces to
-    // 17 / 5 / 2 respectively.
-    let mut p = PerChannelNonZerosGrids::new_uniform(3, 1, 1).unwrap();
+    // 17 / 5 / 2 respectively. Grids sized 4×4 for the largest
+    // footprint — per the §C.8.3 "for each block in the current
+    // varblock" prose every covered cell stores the value.
+    let mut p = PerChannelNonZerosGrids::new_uniform(3, 4, 4).unwrap();
     let v0 = p
         .update_after_block_for_transform(0, 0, 0, 17, TransformType::Dct8x8)
         .unwrap();
@@ -90,6 +92,12 @@ fn r183_update_after_block_for_transform_dispatch() {
     assert_eq!(v0, 17);
     assert_eq!(v1, 5);
     assert_eq!(v2, 2);
+    // Footprint writeback: channel 1's DCT16×16 filled its 2×2
+    // footprint; channel 2's DCT32×32 the full 4×4; channel 0's
+    // DCT8×8 only (0, 0).
+    assert_eq!(p.get(0, 1, 1).unwrap(), 0);
+    assert_eq!(p.get(1, 1, 1).unwrap(), 5);
+    assert_eq!(p.get(2, 3, 3).unwrap(), 2);
 }
 
 #[test]

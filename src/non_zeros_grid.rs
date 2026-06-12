@@ -42,13 +42,18 @@
 //!
 //! ## §C.8.3 prose — `NonZeros(x, y)` grid
 //!
-//! From the FDIS prose right after Listing C.14:
+//! From the FDIS §C.8.3 prose right after the per-varblock
+//! `non_zeros` read:
 //!
-//! > After the coefficients of a varblock have been decoded, the
-//! > NonZeros(x, y) value used as a context for the next varblock at
-//! > the same channel is set to `(non_zeros + num_blocks − 1) Idiv
-//! > num_blocks` (i.e. the non_zeros count rounded up to the nearest
-//! > multiple of num_blocks and divided by num_blocks).
+//! > The decoder then computes the NonZeros(x, y) field for each
+//! > block in the current varblock as follows. [...] NonZeros(x, y)
+//! > is then (non_zeros + num_blocks - 1) Idiv num_blocks.
+//!
+//! Note "for **each block** in the current varblock" — every 8×8
+//! block covered by the varblock's footprint receives the same
+//! ceiling-divided value (see
+//! [`NonZerosGrid::update_after_block_for_transform`]; round-281
+//! prose-conformance fix).
 //!
 //! `PredictedNonZeros(x, y)` from the prose right before Listing
 //! C.14:
@@ -206,10 +211,19 @@ impl NonZerosGrid {
         }))
     }
 
-    /// Update the grid cell after a per-block decode, per the FDIS
-    /// prose right after Listing C.14:
+    /// Update a **single** grid cell after a per-block decode, per the
+    /// FDIS §C.8.3 prose formula:
     ///
     /// > NonZeros(x, y) = (non_zeros + num_blocks − 1) Idiv num_blocks.
+    ///
+    /// This is the per-cell assignment primitive. The spec prose
+    /// applies the formula to *each block* of the varblock's
+    /// footprint — callers decoding a varblock should use
+    /// [`Self::update_after_block_for_transform`], which derives the
+    /// footprint from the [`TransformType`] and writes every covered
+    /// cell. `update_after_block` remains useful when the caller
+    /// addresses cells individually (or for `num_blocks` values with
+    /// no transform attached, as in tests).
     ///
     /// `non_zeros` here is the **raw** value read from the
     /// `NonZerosContext(predicted)` ANS stream (i.e. the value the
@@ -244,8 +258,31 @@ impl NonZerosGrid {
         Ok(updated)
     }
 
-    /// `update_after_block` with `num_blocks` derived from a
-    /// [`TransformType`] via [`transform_block_params`].
+    /// Full-varblock-footprint writeback with `num_blocks` derived
+    /// from a [`TransformType`] via [`transform_block_params`].
+    ///
+    /// Per the FDIS §C.8.3 prose right after the `non_zeros` read:
+    ///
+    /// > The decoder then computes the NonZeros(x, y) field for
+    /// > **each block** in the current varblock [...] NonZeros(x, y)
+    /// > is then (non_zeros + num_blocks - 1) Idiv num_blocks.
+    ///
+    /// i.e. *every* 8×8 block covered by the varblock receives the
+    /// same ceiling-divided value — not just the top-left cell.
+    /// This matters whenever a neighbouring varblock's
+    /// `PredictedNonZeros(x, y)` reads an `(x − 1, y)` / `(x, y − 1)`
+    /// cell that is a non-top-left (continuation) cell of a larger
+    /// transform: the cell must hold the varblock's value, not the
+    /// zero-init sentinel. (Round 281 prose-conformance fix: rounds
+    /// 177..264 wrote only the top-left cell.)
+    ///
+    /// `(x, y)` is the varblock's **top-left** cell; the footprint
+    /// `(bcols, brows) = t.block_dims()` cells to the right/below
+    /// are all written. Returns [`Error::InvalidData`] when any
+    /// covered cell falls outside the grid (the placement-validated
+    /// [`crate::dct_select::DctSelectGrid`] guarantees in-grid
+    /// footprints, so an out-of-range write indicates caller-side
+    /// grid mismatch).
     pub fn update_after_block_for_transform(
         &mut self,
         x: u32,
@@ -254,7 +291,22 @@ impl NonZerosGrid {
         t: TransformType,
     ) -> Result<u32> {
         let (num_blocks, _size) = transform_block_params(t);
-        self.update_after_block(x, y, non_zeros, num_blocks)
+        if num_blocks == 0 {
+            return Err(Error::InvalidData(
+                "JXL NonZerosGrid::update_after_block_for_transform: num_blocks must be ≥ 1".into(),
+            ));
+        }
+        let updated = non_zeros
+            .saturating_add(num_blocks - 1)
+            .checked_div(num_blocks)
+            .unwrap_or(0);
+        let (bcols, brows) = t.block_dims();
+        for j in 0..brows {
+            for i in 0..bcols {
+                self.set(x + i, y + j, updated)?;
+            }
+        }
+        Ok(updated)
     }
 
     /// Read-only view onto the raw cell buffer (row-major, `y *
@@ -507,21 +559,69 @@ mod tests {
         // DCT8×8 → num_blocks = 1, DCT16×16 → num_blocks = 4,
         // DCT32×32 → num_blocks = 16. Verify via the
         // TransformType-driven entry point that all three reduce to
-        // the same ceil-division formula.
-        let mut g = NonZerosGrid::new(1, 1).unwrap();
+        // the same ceil-division formula, and that the value is
+        // written to *every* covered cell per the §C.8.3 "for each
+        // block in the current varblock" prose (grid sized for the
+        // largest 4×4-cell footprint).
+        let mut g = NonZerosGrid::new(4, 4).unwrap();
         let nz = 17;
         let v = g
             .update_after_block_for_transform(0, 0, nz, TransformType::Dct8x8)
             .unwrap();
         assert_eq!(v, 17, "DCT8x8 num_blocks=1: ceil(17/1)=17");
+        assert_eq!(g.get(0, 0).unwrap(), 17);
+        assert_eq!(g.get(1, 0).unwrap(), 0, "DCT8x8 footprint is 1×1");
         let v = g
             .update_after_block_for_transform(0, 0, nz, TransformType::Dct16x16)
             .unwrap();
         assert_eq!(v, 5, "DCT16x16 num_blocks=4: ceil(17/4)=5");
+        for (x, y) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+            assert_eq!(g.get(x, y).unwrap(), 5, "DCT16x16 cell ({x},{y})");
+        }
+        assert_eq!(g.get(2, 0).unwrap(), 0, "outside the 2×2 footprint");
         let v = g
             .update_after_block_for_transform(0, 0, nz, TransformType::Dct32x32)
             .unwrap();
         assert_eq!(v, 2, "DCT32x32 num_blocks=16: ceil(17/16)=2");
+        for y in 0..4 {
+            for x in 0..4 {
+                assert_eq!(g.get(x, y).unwrap(), 2, "DCT32x32 cell ({x},{y})");
+            }
+        }
+    }
+
+    #[test]
+    fn update_after_block_for_transform_footprint_spilling_grid_errors() {
+        // A DCT16×16 footprint (2×2 cells) anchored at the last
+        // column of a 2×2 grid spills outside → clean error, no
+        // panic.
+        let mut g = NonZerosGrid::new(2, 2).unwrap();
+        let r = g.update_after_block_for_transform(1, 0, 4, TransformType::Dct16x16);
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn update_after_block_for_transform_rectangular_footprint() {
+        // Per Table C.16 / `TransformType::block_dims()` (cols, rows):
+        // DCT16×8 (16 rows × 8 cols) covers 1 col × 2 rows; DCT8×16
+        // (8 rows × 16 cols) covers 2 cols × 1 row. Verify the
+        // rectangular footprints land on the right cells.
+        let mut g = NonZerosGrid::new(2, 2).unwrap();
+        g.update_after_block_for_transform(0, 0, 3, TransformType::Dct16x8)
+            .unwrap();
+        assert_eq!(g.get(0, 0).unwrap(), 2, "ceil(3/2) = 2");
+        assert_eq!(g.get(0, 1).unwrap(), 2, "second row of 1×2-cell footprint");
+        assert_eq!(g.get(1, 0).unwrap(), 0, "column 1 untouched by DCT16x8");
+        let mut g = NonZerosGrid::new(2, 2).unwrap();
+        g.update_after_block_for_transform(0, 1, 3, TransformType::Dct8x16)
+            .unwrap();
+        assert_eq!(g.get(0, 1).unwrap(), 2);
+        assert_eq!(
+            g.get(1, 1).unwrap(),
+            2,
+            "second column of 2×1-cell footprint"
+        );
+        assert_eq!(g.get(0, 0).unwrap(), 0, "row 0 untouched by DCT8x16");
     }
 
     #[test]
@@ -611,11 +711,13 @@ mod tests {
     #[test]
     fn decode_block_at_dct16x16_ceil_divides_num_blocks() {
         // DCT16×16 has num_blocks = 4. After decoding with raw
-        // non_zeros = 17, the post-Listing-C.14 grid cell must store
-        // ceil(17 / 4) = 5, not 17. Verifies the typed driver routes
-        // the TransformType-derived num_blocks through the grid
-        // update — not the identity-by-default DCT8×8 path.
-        let mut g = NonZerosGrid::new(1, 1).unwrap();
+        // non_zeros = 17, the post-Listing-C.14 grid cells must store
+        // ceil(17 / 4) = 5, not 17 — on every cell of the 2×2
+        // footprint per the §C.8.3 "for each block in the current
+        // varblock" prose. Verifies the typed driver routes the
+        // TransformType-derived num_blocks through the grid update —
+        // not the identity-by-default DCT8×8 path.
+        let mut g = NonZerosGrid::new(2, 2).unwrap();
         let read_non_zeros = |_ctx: u32| -> Result<u32> { Ok(17u32) };
         let decode_symbol = |_ctx: u32| -> Result<u32> { Ok(0u32) };
         let (_decoded, raw_non_zeros) = decode_block_at(
@@ -630,7 +732,9 @@ mod tests {
         )
         .unwrap();
         assert_eq!(raw_non_zeros, 17);
-        assert_eq!(g.get(0, 0).unwrap(), 5, "ceil(17/4) = 5");
+        for (x, y) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+            assert_eq!(g.get(x, y).unwrap(), 5, "ceil(17/4) = 5 at ({x},{y})");
+        }
     }
 
     #[test]

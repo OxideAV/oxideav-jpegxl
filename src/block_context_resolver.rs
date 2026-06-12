@@ -23,16 +23,17 @@
 //! round-214 single-channel walker. §C.8.3 prose orders the
 //! per-pass decode as
 //!
-//! > for each varblock in raster order, decode the X, Y, B channels
-//! > (in that order) once
+//! > The decoder proceeds by decoding varblocks in raster order; for
+//! > each varblock it reads channels Y, X, then B
 //!
 //! — a single grid walk that emits 3 per-channel block-context reads
-//! per varblock. The naive composition of calling
-//! [`decode_varblocks_with_resolver`] three times (one per channel)
-//! visits the grid three times and (critically) cannot share the
-//! per-varblock `qdc[3]` derivation across channels. The round-221
+//! per varblock, in Y → X → B decode order (channel *indices* stay
+//! 0 = X, 1 = Y, 2 = B per Listing C.13). The naive composition of
+//! calling [`decode_varblocks_with_resolver`] three times (one per
+//! channel) visits the grid three times and (critically) cannot share
+//! the per-varblock `qdc[3]` derivation across channels. The round-221
 //! driver walks the grid once, computes `qdc[3]` once per varblock,
-//! invokes [`BlockContextResolver::resolve`] three times (X / Y / B)
+//! invokes [`BlockContextResolver::resolve`] three times (Y → X → B)
 //! against that shared `qdc`, and threads each `(p, c)` call through
 //! [`PerPassNonZerosGrids::decode_block_at_for_pass_channel`]. The
 //! return is one `(Varblock, [DecodedHfBlock; 3], [u32; 3])` triple
@@ -210,10 +211,12 @@ where
 /// `decode_symbol` closures with the channel index as the first
 /// argument, so the caller can route each call to the matching
 /// per-pass per-channel histogram. This keeps the round-221 driver
-/// histogram-blind: it owns the channel iteration order (Listing
-/// C.13's X / Y / B canonical sweep) but defers the per-channel
+/// histogram-blind: it owns the channel iteration order (the
+/// §C.8.3 prose's Y, X, then B decode sweep) but defers the per-channel
 /// histogram selection to the caller, exactly as round 208 / 214
-/// defer the single-channel histograms.
+/// defer the single-channel histograms. The iteration order is the
+/// §C.8.3 prose's Y, X, then B decode sweep (channel indices 1, 0,
+/// 2).
 ///
 /// `channel` ∈ {0, 1, 2} for X / Y / B respectively.
 pub type ChannelReadNonZeros<'a> = dyn FnMut(u32, u32) -> Result<u32> + 'a;
@@ -224,8 +227,11 @@ pub type ChannelDecodeSymbol<'a> = dyn FnMut(u32, u32) -> Result<u32> + 'a;
 
 /// Per-varblock output triple returned by
 /// [`decode_varblocks_three_channels_with_resolver`]. Per-channel
-/// arrays are indexed 0 = X, 1 = Y, 2 = B (canonical FDIS §C.8.3
-/// channel order).
+/// arrays are indexed 0 = X, 1 = Y, 2 = B (the Listing C.13 channel
+/// *indices* — "c is the current channel (with 0=X, 1=Y, 2=B)").
+/// Note the per-varblock entropy-stream *decode order* is Y, X,
+/// then B per the §C.8.3 prose; indexing is by channel, not by
+/// decode position.
 pub type ThreeChannelVarblock = (Varblock, [DecodedHfBlock; 3], [u32; 3]);
 
 /// Per-LfGroup three-channel varblock decode driver — round 221's
@@ -239,8 +245,9 @@ pub type ThreeChannelVarblock = (Varblock, [DecodedHfBlock; 3], [u32; 3]);
 /// 2. invokes [`BlockContextResolver::resolve`] three times — once
 ///    per channel — against that shared `qdc`, and
 /// 3. invokes [`PerPassNonZerosGrids::decode_block_at_for_pass_channel`]
-///    three times (channel order: X = 0, Y = 1, B = 2) on the
-///    `p`-th pass with the matching `block_ctx`.
+///    three times (channel decode order: Y = 1, X = 0, B = 2 per the
+///    §C.8.3 prose "for each varblock it reads channels Y, X, then
+///    B") on the `p`-th pass with the matching `block_ctx`.
 ///
 /// The `read_non_zeros` / `decode_symbol` closures take the channel
 /// index as their first argument so the caller can route each call
@@ -255,7 +262,7 @@ pub type ThreeChannelVarblock = (Varblock, [DecodedHfBlock; 3], [u32; 3]);
 ///
 /// On any per-channel error the driver propagates the error
 /// immediately and discards any in-flight partial output. The walk
-/// always proceeds X → Y → B per varblock; an error on Y aborts
+/// always proceeds Y → X → B per varblock; an error on X aborts
 /// before B reads (so the B-channel ANS state is **not** advanced).
 #[allow(clippy::too_many_arguments)]
 pub fn decode_varblocks_three_channels_with_resolver<Q, F, G>(
@@ -277,65 +284,43 @@ where
     let mut walk = VarblockWalk::new(grid);
     while let Some(vb) = walk.next()? {
         let qdc = qdc_at(&vb)?;
-        // Channel order: X = 0, Y = 1, B = 2 (FDIS §C.8.3 listing
-        // sequence). The per-channel ANS state advance happens in
-        // this fixed order so caller-side closures can rely on the
-        // channel-major progression.
-        let decoded0;
-        let raw0;
-        {
-            let ctx0 = resolver.resolve(0, &vb, qdc)?;
+        // Channel decode order: Y = 1, X = 0, B = 2 per the FDIS
+        // §C.8.3 prose ("for each varblock it reads channels Y, X,
+        // then B"). The §C.8.3 channel *indices* stay 0 = X, 1 = Y,
+        // 2 = B (Listing C.13: "c is the current channel (with 0=X,
+        // 1=Y, 2=B)") — only the entropy-stream advance order is
+        // Y-first, so the output arrays remain indexed by channel
+        // while the per-channel ANS reads happen in Y → X → B
+        // sequence. (Round 281 prose-conformance fix: rounds
+        // 221..264 advanced the stream X-first.)
+        let mut decoded: [Option<DecodedHfBlock>; 3] = [None, None, None];
+        let mut raw: [u32; 3] = [0; 3];
+        for c in [1u32, 0, 2] {
+            let ctx = resolver.resolve(c, &vb, qdc)?;
             let r = nz.decode_block_at_for_pass_channel(
                 p,
-                0,
+                c,
                 vb.x,
                 vb.y,
                 vb.transform,
-                ctx0,
+                ctx,
                 nb_block_ctx,
-                |pred| read_non_zeros(0, pred),
-                |coeff_ctx| decode_symbol(0, coeff_ctx),
+                |pred| read_non_zeros(c, pred),
+                |coeff_ctx| decode_symbol(c, coeff_ctx),
             )?;
-            decoded0 = r.0;
-            raw0 = r.1;
+            decoded[c as usize] = Some(r.0);
+            raw[c as usize] = r.1;
         }
-        let decoded1;
-        let raw1;
-        {
-            let ctx1 = resolver.resolve(1, &vb, qdc)?;
-            let r = nz.decode_block_at_for_pass_channel(
-                p,
-                1,
-                vb.x,
-                vb.y,
-                vb.transform,
-                ctx1,
-                nb_block_ctx,
-                |pred| read_non_zeros(1, pred),
-                |coeff_ctx| decode_symbol(1, coeff_ctx),
-            )?;
-            decoded1 = r.0;
-            raw1 = r.1;
-        }
-        let decoded2;
-        let raw2;
-        {
-            let ctx2 = resolver.resolve(2, &vb, qdc)?;
-            let r = nz.decode_block_at_for_pass_channel(
-                p,
-                2,
-                vb.x,
-                vb.y,
-                vb.transform,
-                ctx2,
-                nb_block_ctx,
-                |pred| read_non_zeros(2, pred),
-                |coeff_ctx| decode_symbol(2, coeff_ctx),
-            )?;
-            decoded2 = r.0;
-            raw2 = r.1;
-        }
-        out.push((vb, [decoded0, decoded1, decoded2], [raw0, raw1, raw2]));
+        let [d0, d1, d2] = decoded;
+        out.push((
+            vb,
+            [
+                d0.expect("channel 0 decoded"),
+                d1.expect("channel 1 decoded"),
+                d2.expect("channel 2 decoded"),
+            ],
+            raw,
+        ));
     }
     Ok(out)
 }
@@ -713,8 +698,9 @@ mod tests {
         // shared across the three per-channel decodes.
         assert_eq!(qdc_calls, 1);
         // read_non_zeros should be called once per channel (3 total),
-        // in canonical X / Y / B order.
-        assert_eq!(nz_calls, vec![0, 1, 2]);
+        // in the §C.8.3 prose decode order Y, X, then B (channel
+        // indices 1, 0, 2 per Listing C.13).
+        assert_eq!(nz_calls, vec![1, 0, 2]);
         // All three raw_non_zeros are 0.
         assert_eq!(out[0].2, [0, 0, 0]);
     }
@@ -845,9 +831,44 @@ mod tests {
     }
 
     #[test]
-    fn r221_three_channel_y_error_does_not_advance_b() {
-        // Inject an error on channel = 1 (Y) and verify channel = 2 (B)
-        // sees no read_non_zeros call.
+    fn r221_three_channel_x_error_does_not_advance_b() {
+        // Decode order is Y, X, then B (§C.8.3 prose). Inject an
+        // error on channel = 0 (X, decoded second) and verify
+        // channel = 2 (B, decoded last) sees no read_non_zeros call
+        // while channel = 1 (Y, decoded first) was already read.
+        let hbc = default_hbc();
+        let resolver = BlockContextResolver::new(&hbc);
+        let hf = make_hf(vec![0, 0], 1, 1);
+        let grid = derive_dct_select(&hf, 8, 8).unwrap();
+        let mut nz = PerPassNonZerosGrids::new_uniform(1, 3, 1, 1).unwrap();
+        let mut per_channel_calls = [0u32; 3];
+        let r = decode_varblocks_three_channels_with_resolver(
+            &grid,
+            &mut nz,
+            0,
+            &resolver,
+            |_| Ok([0, 0, 0]),
+            |channel, _pred| {
+                per_channel_calls[channel as usize] += 1;
+                if channel == 0 {
+                    Err(oxideav_core::Error::InvalidData("x fail".into()))
+                } else {
+                    Ok(0)
+                }
+            },
+            |_, _| Ok(0),
+        );
+        assert!(r.is_err());
+        assert_eq!(per_channel_calls[1], 1); // Y read first
+        assert_eq!(per_channel_calls[0], 1); // X read second (fails)
+        assert_eq!(per_channel_calls[2], 0); // B not reached
+    }
+
+    #[test]
+    fn r221_three_channel_y_error_does_not_advance_x_or_b() {
+        // Y is decoded FIRST per the §C.8.3 prose; an error on Y
+        // must abort before X and B reads — neither's ANS state is
+        // advanced.
         let hbc = default_hbc();
         let resolver = BlockContextResolver::new(&hbc);
         let hf = make_hf(vec![0, 0], 1, 1);
@@ -871,8 +892,8 @@ mod tests {
             |_, _| Ok(0),
         );
         assert!(r.is_err());
-        assert_eq!(per_channel_calls[0], 1); // X read
         assert_eq!(per_channel_calls[1], 1); // Y read (fails)
+        assert_eq!(per_channel_calls[0], 0); // X not reached
         assert_eq!(per_channel_calls[2], 0); // B not reached
     }
 

@@ -4,7 +4,9 @@
 //! ISO/IEC FDIS 18181-1:2021 §C.8.3 — the bundled three-channel
 //! per-varblock walk that composes the round-255 single-channel
 //! [`HfHistogramDecodeContext::decode_block_for_pass_transform`] three
-//! times (channel order X = 0 → Y = 1 → B = 2) against the round-214
+//! times (channel decode order Y = 1 → X = 0 → B = 2 per the §C.8.3
+//! prose "for each varblock it reads channels Y, X, then B"; output
+//! arrays stay indexed 0 = X, 1 = Y, 2 = B) against the round-214
 //! [`BlockContextResolver`] per-channel `block_ctx` derivation
 //! (Listing C.13).
 //!
@@ -24,9 +26,9 @@
 //!   against a 2-preset histogram bundle routes through
 //!   `cluster_map[ctx + 495 × nb_block_ctx]` rather than
 //!   `cluster_map[ctx]`.
-//! * Channel ordering is exactly X → Y → B; an error on Y aborts
-//!   before B reads (so the B-channel ANS state is **not**
-//!   advanced).
+//! * Channel decode ordering is exactly Y → X → B (§C.8.3 prose);
+//!   an error mid-walk aborts before the remaining channels' reads
+//!   (so their ANS state is **not** advanced).
 //! * The defensive rejections (`p >= num_passes`, `u32` overflow on
 //!   `ctx + offset`) bubble out as [`oxideav_core::Error`] without
 //!   panicking.

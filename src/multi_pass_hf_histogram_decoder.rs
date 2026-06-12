@@ -42,7 +42,7 @@
 //!
 //! * [`HfHistogramDecodeContext::decode_three_channel_varblock_for_pass`]
 //!   — one `(br, p, vb, resolver, qdc, predicted[3])` call walks
-//!   the FDIS §C.8.3 X → Y → B channel sequence, invokes
+//!   the FDIS §C.8.3 prose Y → X → B channel decode sequence, invokes
 //!   [`BlockContextResolver::resolve`] once per channel against
 //!   the shared `qdc[3]` triple, threads each resulting `block_ctx`
 //!   into [`HfHistogramDecodeContext::decode_block_for_pass_transform`]
@@ -160,7 +160,7 @@
 //! caller-side concerns above this primitive. The single-varblock
 //! Listing C.14 per-block walk is now bundled by round 255 (see
 //! [`HfHistogramDecodeContext::decode_block_for_pass_transform`]
-//! above), the single-varblock three-channel X / Y / B sweep is
+//! above), the single-varblock three-channel Y → X → B sweep is
 //! now bundled by round 260 (see
 //! [`HfHistogramDecodeContext::decode_three_channel_varblock_for_pass`]
 //! above), and the per-LfGroup raster walk for one pass is now
@@ -570,13 +570,13 @@ impl<'a> HfHistogramDecodeContext<'a> {
     /// Round 255 landed the single-channel per-varblock walk. Round
     /// 221's
     /// [`crate::block_context_resolver::decode_varblocks_three_channels_with_resolver`]
-    /// reproduces the X / Y / B three-channel sweep at the
+    /// reproduces the three-channel sweep at the
     /// per-LfGroup driver layer, but goes through the
     /// [`crate::per_pass_non_zeros::PerPassNonZerosGrids::decode_block_at_for_pass_channel`]
     /// closure-based path (`read_non_zeros` + `decode_symbol` per
     /// channel). Now that the round-252 typed
     /// [`HfHistogramDecodeContext`] owns the per-pass histogram
-    /// routing, callers wanting to drive the X / Y / B sweep against
+    /// routing, callers wanting to drive the three-channel sweep against
     /// the §C.7.2 entropy stream directly need a per-varblock typed
     /// entry — without that, every caller re-implements the same
     /// three-call sequential walk, mixing per-channel state with
@@ -586,15 +586,18 @@ impl<'a> HfHistogramDecodeContext<'a> {
     /// Round 260 lifts that single-channel walk into a three-channel
     /// per-varblock walk:
     ///
-    /// 1. for `c` ∈ `{0, 1, 2}` (X / Y / B canonical FDIS §C.8.3
-    ///    sequence):
+    /// 1. for `c` ∈ `{1, 0, 2}` (the §C.8.3 prose decode order —
+    ///    "for each varblock it reads channels Y, X, then B" —
+    ///    against the Listing C.13 channel indices 0 = X, 1 = Y,
+    ///    2 = B):
     ///    a. `block_ctx_c = resolver.resolve(c, &vb, qdc)?`
     ///    (Listing C.13 per-channel `BlockContext()` lookup),
     ///    b. `(decoded_c, raw_c) =
     ///    self.decode_block_for_pass_transform(br, p, vb.transform,
     ///    predicted[c], block_ctx_c, resolver.nb_block_ctx())?`,
     /// 2. return `(([decoded_0, decoded_1, decoded_2],
-    ///    [raw_0, raw_1, raw_2]))`.
+    ///    [raw_0, raw_1, raw_2]))` — indexed by channel, not by
+    ///    decode position.
     ///
     /// The `resolver` owns the `nb_block_ctx` invariant (read off the
     /// LfGlobal `HfBlockContext` bundle, the same value the §C.7.2
@@ -618,11 +621,11 @@ impl<'a> HfHistogramDecodeContext<'a> {
     /// not a per-channel value, so we accept a single `[i32; 3]`
     /// array.
     ///
-    /// Channel ordering is fixed at X → Y → B per the §C.8.3 listing
-    /// sequence. The §C.7.2 entropy stream advances in that order;
-    /// an error on Y aborts before B reads, so the B-channel ANS
-    /// state is **not** advanced (matching round-221's error-path
-    /// invariant).
+    /// Channel decode ordering is fixed at Y → X → B per the §C.8.3
+    /// prose ("for each varblock it reads channels Y, X, then B").
+    /// The §C.7.2 entropy stream advances in that order; an error on
+    /// X aborts before B reads, so the B-channel ANS state is **not**
+    /// advanced (matching round-221's error-path invariant).
     ///
     /// Errors:
     /// * Propagates any [`BlockContextResolver::resolve`] error
@@ -647,39 +650,41 @@ impl<'a> HfHistogramDecodeContext<'a> {
         predicted: [u32; 3],
     ) -> Result<([DecodedHfBlock; 3], [u32; 3])> {
         let nb_block_ctx = resolver.nb_block_ctx();
-        // Channel order X = 0 → Y = 1 → B = 2 per FDIS §C.8.3 listing
-        // sequence. Sequential `&mut self` calls (each walks the
-        // round-255 Listing C.14 state machine) because the histogram
-        // stream is shared across channels and the underlying
-        // `decode_block_for_pass_transform` takes `&mut self`.
-        let ctx0 = resolver.resolve(0, vb, qdc)?;
-        let (decoded0, raw0) = self.decode_block_for_pass_transform(
-            br,
-            p,
-            vb.transform,
-            predicted[0],
-            ctx0,
-            nb_block_ctx,
-        )?;
-        let ctx1 = resolver.resolve(1, vb, qdc)?;
-        let (decoded1, raw1) = self.decode_block_for_pass_transform(
-            br,
-            p,
-            vb.transform,
-            predicted[1],
-            ctx1,
-            nb_block_ctx,
-        )?;
-        let ctx2 = resolver.resolve(2, vb, qdc)?;
-        let (decoded2, raw2) = self.decode_block_for_pass_transform(
-            br,
-            p,
-            vb.transform,
-            predicted[2],
-            ctx2,
-            nb_block_ctx,
-        )?;
-        Ok(([decoded0, decoded1, decoded2], [raw0, raw1, raw2]))
+        // Channel decode order Y = 1 → X = 0 → B = 2 per the FDIS
+        // §C.8.3 prose ("for each varblock it reads channels Y, X,
+        // then B"); the channel *indices* stay 0 = X, 1 = Y, 2 = B
+        // per Listing C.13, so the output arrays remain indexed by
+        // channel while the entropy stream advances Y-first.
+        // (Round 281 prose-conformance fix: rounds 260..264 advanced
+        // the stream X-first.) Sequential `&mut self` calls (each
+        // walks the round-255 Listing C.14 state machine) because the
+        // histogram stream is shared across channels and the
+        // underlying `decode_block_for_pass_transform` takes
+        // `&mut self`.
+        let mut decoded: [Option<DecodedHfBlock>; 3] = [None, None, None];
+        let mut raw: [u32; 3] = [0; 3];
+        for c in [1u32, 0, 2] {
+            let ctx = resolver.resolve(c, vb, qdc)?;
+            let (d, r) = self.decode_block_for_pass_transform(
+                br,
+                p,
+                vb.transform,
+                predicted[c as usize],
+                ctx,
+                nb_block_ctx,
+            )?;
+            decoded[c as usize] = Some(d);
+            raw[c as usize] = r;
+        }
+        let [d0, d1, d2] = decoded;
+        Ok((
+            [
+                d0.expect("channel 0 decoded"),
+                d1.expect("channel 1 decoded"),
+                d2.expect("channel 2 decoded"),
+            ],
+            raw,
+        ))
     }
 
     /// Per-LfGroup raster-walk three-channel decode driver for one
@@ -1274,7 +1279,8 @@ mod tests {
     // Round 260 — `decode_three_channel_varblock_for_pass` unit tests.
     // The bundled three-channel per-varblock walk composes round-255's
     // single-channel `decode_block_for_pass_transform` three times
-    // (channel order X = 0 → Y = 1 → B = 2 per FDIS §C.8.3) against a
+    // (channel decode order Y = 1 → X = 0 → B = 2 per the §C.8.3
+    // prose; round-281 conformance fix) against a
     // BlockContextResolver-derived per-channel `block_ctx`. All tests
     // use the single-symbol-prefix `make_minimal_histograms` shape so
     // every `D[ctx + offset]` read returns 0 — and the per-channel
@@ -1452,13 +1458,19 @@ mod tests {
     }
 
     #[test]
-    fn r260_three_channel_channel_order_x_y_b_via_resolver() {
-        // Verify channel ordering: the resolver is invoked for c = 0,
-        // 1, 2 in that order. We piggy-back on the BlockContextResolver
-        // to compute the per-channel block_ctx values and check that
-        // they all flow into the decoder (default-table fast path —
-        // empty thresholds collapse qf / qdc, so block_ctx is purely
-        // determined by `(channel, transform-order-id)`).
+    fn r260_three_channel_all_channels_resolved_via_resolver() {
+        // Verify all three channels are resolved + decoded. (The
+        // decode *order* — Y, X, then B per the §C.8.3 prose — is not
+        // bit-observable here because the single-symbol prefix
+        // histograms consume zero bits; the ordering itself is pinned
+        // by the closure-path driver tests in
+        // `round221_three_channel_resolver` /
+        // `round228_multi_pass_decode`.) We piggy-back on the
+        // BlockContextResolver to compute the per-channel block_ctx
+        // values and check that they all flow into the decoder
+        // (default-table fast path — empty thresholds collapse
+        // qf / qdc, so block_ctx is purely determined by
+        // `(channel, transform-order-id)`).
         let mut h = make_minimal_histograms(1, 15);
         let headers = PerPassHfHeaders::from_headers(vec![PassGroupHfHeader {
             hfp: 0,
