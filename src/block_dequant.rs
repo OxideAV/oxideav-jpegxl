@@ -30,30 +30,51 @@
 //! raster), and run the inverse transform to obtain the block's
 //! spatial residual samples.
 //!
-//! ## Coordinate convention (square DCT transforms)
+//! ## Coordinate convention (all plain-DCT transforms)
 //!
-//! Round 286 covers the **square plain-DCT** transforms — `DCT8×8`,
-//! `DCT16×16`, `DCT32×32` — where the coefficient block, the
-//! dequantisation matrix, and the inverse-DCT input all share one
-//! unambiguous `dim × dim` row-major layout (`i = y * dim + x`):
+//! This module covers **every plain-separable-DCT** transform — the
+//! square `DCT8×8` / `DCT16×16` / `DCT32×32`, the rectangular
+//! `DCT16×8` / `DCT8×16` / `DCT32×8` / `DCT8×32` / `DCT32×16` /
+//! `DCT16×32`, and the larger `DCT64×64` … `DCT256×256` family —
+//! i.e. exactly the set for which
+//! [`crate::idct::dct_pixel_dims`] returns `Some`. For every one of
+//! these the **coefficient grid** and the **dequantisation matrix**
+//! share one unambiguous `bwidth × bheight` "wide" row-major layout
+//! (`i = y * bwidth + x`), and that layout is precisely the
+//! "spec coefficient layout" `(short × long)` row-major that
+//! [`crate::idct::idct_for_transform`] expects as input:
 //!
-//! * [`crate::coeff_order::varblock_size_for_order`] gives the
-//!   coefficient grid `(bwidth, bheight)`; for a square transform
-//!   `bwidth == bheight == dim`.
+//! * [`crate::coeff_order::varblock_size_for_order`] (keyed by
+//!   [`crate::coeff_order::order_id_for_transform`]) gives the
+//!   coefficient grid `(bwidth, bheight)` with
+//!   `bwidth = max(8, max(N, M))`, `bheight = max(8, min(N, M))` — so
+//!   `bwidth >= bheight` always ("wide"). The decoded block is stored
+//!   row-major as `coeffs[y * bwidth + x]`.
 //! * [`crate::dct_quant_weights::weights_matrix_dims_for_slot`] gives
-//!   the dequant-matrix dims; for the square slots (0 → 8×8, 4 →
-//!   16×16, 5 → 32×32) this is the same `dim × dim`.
-//! * [`crate::idct::dct_pixel_dims`] gives `(rows, cols) = (dim, dim)`.
+//!   the dequant-matrix dims as `(x_dim = cols, y_dim = rows)`; for
+//!   every DCT slot these equal `(bwidth, bheight)` and the matrix is
+//!   stored row-major as `matrix[y * x_dim + x]` — the **same** wide
+//!   layout as the coefficient grid.
+//! * [`crate::idct::dct_pixel_dims`] gives the pixel dims
+//!   `(R, C) = (N, M)`. For a rectangular transform `DCT16×8` and its
+//!   transpose `DCT8×16` the coefficient grid and dequant matrix are
+//!   *identical* (both slot 6, both `16 × 8` wide); only the pixel
+//!   orientation `(R, C)` passed to the IDCT differs. `idct_2d`
+//!   consumes the wide `(short × long)` block and emits the correctly
+//!   oriented `(R × C)` pixel block, so no per-cell transpose is
+//!   needed in this module.
 //!
-//! Because all three layouts coincide, the per-coefficient mapping is
-//! the identity: dequant-matrix entry for raster cell `i` multiplies
-//! decoded coefficient `coeffs[i]`, and the result feeds raster cell
-//! `i` of the inverse-DCT input. The rectangular and non-DCT
-//! transforms (whose coefficient grid is stored "wide" while their
-//! pixel block may be "tall", and whose IDCT path is the I.2.3
-//! dispatch rather than a plain separable IDCT) are deferred to a
-//! follow-up round so their orientation handling can be pinned
-//! independently.
+//! Because the coefficient grid and the dequant matrix share the wide
+//! layout, the per-coefficient dequant mapping is the identity:
+//! dequant-matrix entry for raster cell `i` multiplies decoded
+//! coefficient `coeffs[i]`, and the result feeds raster cell `i` of
+//! the inverse-DCT input. The **non-DCT** transforms (`Hornuss`,
+//! `DCT2×2`, `DCT4×4`, `DCT4×8`, `DCT8×4`, `AFV0..AFV3`) are deferred:
+//! their dequant matrix is canonicalised to `8 × 8` while their IDCT
+//! path is the §I.2.3 dispatch (`idct_dct2x2`, `idct_afv`, …) rather
+//! than a plain separable IDCT, and the AFV / DCT2×2 sub-block
+//! coefficient extraction does not reduce to a flat identity over an
+//! `8 × 8` grid. Those are pinned in a follow-up round.
 //!
 //! ## Pipeline order (Annex F.3, then Annex I.2.3.2)
 //!
@@ -69,6 +90,7 @@
 //! filters run *after* this stage on the assembled per-channel image;
 //! they remain caller-side concerns above this primitive.
 
+use crate::coeff_order::{order_id_for_transform, varblock_size_for_order};
 use crate::dct_quant_weights::{slot_for_transform, DequantMatrixSet};
 use crate::dct_select::TransformType;
 use crate::hf_dequant::{dequant_hf_coefficient, QmScaleFactors};
@@ -77,10 +99,30 @@ use crate::metadata_fdis::OpsinInverseMatrix;
 use crate::pass_group_hf::DecodedHfBlock;
 use oxideav_core::{Error, Result};
 
-/// The square plain-DCT transforms covered by the round-286 per-block
-/// decode walk. Returns the side `dim` (8, 16 or 32) for a covered
-/// transform, or `None` for any rectangular / non-DCT transform whose
-/// orientation handling is deferred to a follow-up round.
+/// The "wide" coefficient-grid dimensions `(bwidth, bheight)` of a
+/// plain-DCT transform `t` covered by this per-block decode walk, or
+/// `None` for any non-DCT transform (Hornuss / DCT2×2 / DCT4×4 /
+/// DCT4×8 / DCT8×4 / AFV0..AFV3) whose dequant-vs-IDCT layout is
+/// deferred to a follow-up round.
+///
+/// The covered set is exactly the transforms for which
+/// [`dct_pixel_dims`] is `Some` — the plain separable-IDCT family.
+/// For every covered transform the returned `(bwidth, bheight)` is the
+/// shared row-major layout of both the decoded coefficient block and
+/// the dequant matrix (`bwidth >= bheight`).
+pub fn covered_grid_dims(t: TransformType) -> Option<(usize, usize)> {
+    // The covered set is precisely "plain separable DCT", which is the
+    // domain of `dct_pixel_dims`. For those, the coefficient grid is
+    // the `varblock_size_for_order` of the transform's order id.
+    dct_pixel_dims(t)?;
+    let (bw, bh) = varblock_size_for_order(order_id_for_transform(t));
+    Some((bw as usize, bh as usize))
+}
+
+/// Side of a covered **square** plain-DCT transform (8, 16 or 32), or
+/// `None` otherwise. Retained for callers that only need the
+/// square-DCT subset; prefer [`covered_grid_dims`] for the full
+/// plain-DCT set.
 pub fn covered_square_dim(t: TransformType) -> Option<usize> {
     match t {
         TransformType::Dct8x8 => Some(8),
@@ -90,15 +132,16 @@ pub fn covered_square_dim(t: TransformType) -> Option<usize> {
     }
 }
 
-/// Reject any transform outside the round-286 covered set with a
-/// precise [`Error::Unsupported`].
-fn require_covered(t: TransformType) -> Result<usize> {
-    covered_square_dim(t).ok_or_else(|| {
+/// Reject any transform outside the covered plain-DCT set with a
+/// precise [`Error::Unsupported`], returning the wide coefficient-grid
+/// dimensions `(bwidth, bheight)` for a covered transform.
+fn require_covered(t: TransformType) -> Result<(usize, usize)> {
+    covered_grid_dims(t).ok_or_else(|| {
         Error::Unsupported(format!(
-            "JXL block_dequant: per-block decode walk covers the square \
-             plain-DCT transforms (DCT8×8, DCT16×16, DCT32×32) only; {t:?} \
-             is a rectangular / non-DCT transform whose orientation is \
-             deferred to a follow-up round"
+            "JXL block_dequant: per-block decode walk covers the plain \
+             separable-DCT transforms only; {t:?} is a non-DCT transform \
+             (Hornuss / DCT2×2 / DCT4×4 / DCT4×8 / DCT8×4 / AFV) whose \
+             dequant-vs-IDCT layout is deferred to a follow-up round"
         ))
     })
 }
@@ -138,17 +181,17 @@ pub fn dequant_block_for_transform(
     oim: &OpsinInverseMatrix,
     qm: &QmScaleFactors,
 ) -> Result<Vec<f32>> {
-    let dim = require_covered(t)?;
+    let (bwidth, bheight) = require_covered(t)?;
     if channel >= 3 {
         return Err(Error::InvalidData(format!(
             "JXL dequant_block_for_transform: channel {channel} must be < 3"
         )));
     }
-    let n = dim * dim;
+    let n = bwidth * bheight;
     if decoded.coeffs.len() != n {
         return Err(Error::InvalidData(format!(
             "JXL dequant_block_for_transform: decoded.coeffs length {} != \
-             dim * dim ({n}) for {t:?}",
+             bwidth * bheight ({bwidth} * {bheight} = {n}) for {t:?}",
             decoded.coeffs.len()
         )));
     }
@@ -164,7 +207,7 @@ pub fn dequant_block_for_transform(
     if matrix.len() != n {
         return Err(Error::InvalidData(format!(
             "JXL dequant_block_for_transform: dequant matrix length {} != \
-             dim * dim ({n}) for slot {slot} channel {channel}",
+             bwidth * bheight ({n}) for slot {slot} channel {channel}",
             matrix.len()
         )));
     }
@@ -172,9 +215,11 @@ pub fn dequant_block_for_transform(
     let mut out = vec![0.0f32; n];
     for i in 0..n {
         // Per the `DecodedHfBlock` documentation `coeffs[i]` is the
-        // raster cell `i`; the square-transform dequant matrix shares
-        // that same `i = y * dim + x` layout, so the per-cell mapping
-        // is the identity.
+        // wide-grid raster cell `i = y * bwidth + x`; the dequant
+        // matrix shares that same `bwidth × bheight` row-major layout
+        // (`matrix[y * x_dim + x]` with `x_dim == bwidth`), so the
+        // per-cell mapping is the identity for both square and
+        // rectangular plain-DCT transforms.
         out[i] = dequant_hf_coefficient(
             decoded.coeffs[i],
             channel,
@@ -209,14 +254,19 @@ pub fn decode_block_to_residual(
     qm: &QmScaleFactors,
 ) -> Result<Vec<f32>> {
     let dequantised = dequant_block_for_transform(decoded, t, channel, hf_mul, set, oim, qm)?;
-    // For the covered square transforms `dct_pixel_dims` returns
-    // `(dim, dim)`; we assert that invariant defensively so a future
-    // table edit cannot silently feed a mis-sized block to the IDCT.
-    let dim = require_covered(t)?;
+    // The dequantised block is `bwidth * bheight` cells in the wide
+    // `(short × long)` layout that `idct_for_transform` consumes; we
+    // assert defensively that the IDCT's pixel-cell count matches that
+    // coefficient count so a future table edit cannot silently feed a
+    // mis-sized block to the IDCT. (`bwidth * bheight == R * C` because
+    // `{bwidth, bheight} == {R, C}` as a set for every plain-DCT
+    // transform — they differ only by which side is "long".)
+    let (bwidth, bheight) = require_covered(t)?;
     debug_assert_eq!(
-        dct_pixel_dims(t),
-        Some((dim, dim)),
-        "JXL decode_block_to_residual: dct_pixel_dims({t:?}) must be ({dim}, {dim})"
+        dct_pixel_dims(t).map(|(r, c)| r * c),
+        Some(bwidth * bheight),
+        "JXL decode_block_to_residual: dct_pixel_dims({t:?}) pixel count must equal \
+         bwidth * bheight ({bwidth} * {bheight})"
     );
     idct_for_transform(t, &dequantised)
 }
@@ -248,24 +298,100 @@ mod tests {
     }
 
     #[test]
-    fn covered_set_is_the_three_square_dcts() {
+    fn covered_square_dim_is_the_three_square_dcts() {
         assert_eq!(covered_square_dim(TransformType::Dct8x8), Some(8));
         assert_eq!(covered_square_dim(TransformType::Dct16x16), Some(16));
         assert_eq!(covered_square_dim(TransformType::Dct32x32), Some(32));
-        // A representative rectangular + a non-DCT transform are not
-        // covered.
+        // Rectangular + non-DCT are not in the *square* subset.
         assert_eq!(covered_square_dim(TransformType::Dct16x8), None);
-        assert_eq!(covered_square_dim(TransformType::Dct8x16), None);
         assert_eq!(covered_square_dim(TransformType::Hornuss), None);
-        assert_eq!(covered_square_dim(TransformType::Afv0), None);
     }
 
     #[test]
-    fn dequant_rejects_uncovered_transform() {
+    fn covered_grid_dims_spans_every_plain_dct() {
+        use crate::dct_select::TransformType as T;
+        // The covered set is exactly the transforms with a plain-DCT
+        // pixel shape; for each the grid is the wide `(bwidth, bheight)`
+        // with `bwidth >= bheight`.
+        let cases = [
+            (T::Dct8x8, (8, 8)),
+            (T::Dct16x16, (16, 16)),
+            (T::Dct32x32, (32, 32)),
+            (T::Dct16x8, (16, 8)),
+            (T::Dct8x16, (16, 8)),
+            (T::Dct32x8, (32, 8)),
+            (T::Dct8x32, (32, 8)),
+            (T::Dct32x16, (32, 16)),
+            (T::Dct16x32, (32, 16)),
+            (T::Dct64x64, (64, 64)),
+            (T::Dct64x32, (64, 32)),
+            (T::Dct32x64, (64, 32)),
+            (T::Dct128x128, (128, 128)),
+            (T::Dct128x64, (128, 64)),
+            (T::Dct64x128, (128, 64)),
+            (T::Dct256x256, (256, 256)),
+            (T::Dct256x128, (256, 128)),
+            (T::Dct128x256, (256, 128)),
+        ];
+        for (t, (bw, bh)) in cases {
+            assert_eq!(covered_grid_dims(t), Some((bw, bh)), "{t:?}");
+            assert!(bw >= bh, "{t:?}: grid must be wide");
+            // A rectangular transform and its transpose share one grid.
+            assert!(dct_pixel_dims(t).is_some(), "{t:?} must be a plain DCT");
+        }
+        // Non-DCT transforms are NOT covered.
+        for t in [
+            T::Hornuss,
+            T::Dct2x2,
+            T::Dct4x4,
+            T::Dct4x8,
+            T::Dct8x4,
+            T::Afv0,
+            T::Afv1,
+            T::Afv2,
+            T::Afv3,
+        ] {
+            assert_eq!(covered_grid_dims(t), None, "{t:?}");
+        }
+    }
+
+    #[test]
+    fn rect_transform_and_its_transpose_share_one_grid_and_matrix() {
+        // DCT16×8 and DCT8×16 differ only in pixel orientation; the
+        // coefficient grid + dequant matrix are identical (slot 6).
         let set = materialise_default_dequant_set().unwrap();
-        let b = block(vec![0i32; 128]);
+        assert_eq!(
+            covered_grid_dims(TransformType::Dct16x8),
+            covered_grid_dims(TransformType::Dct8x16)
+        );
+        assert_eq!(
+            slot_for_transform(TransformType::Dct16x8),
+            slot_for_transform(TransformType::Dct8x16)
+        );
+        // Same coefficients dequantise identically for both names.
+        let mut coeffs = vec![0i32; 128];
+        coeffs[3] = 5;
+        coeffs[70] = -2;
+        let b = block(coeffs);
+        let a = dequant_block_for_transform(&b, TransformType::Dct16x8, 1, 3, &set, &oim(), &qm())
+            .unwrap();
+        let c = dequant_block_for_transform(&b, TransformType::Dct8x16, 1, 3, &set, &oim(), &qm())
+            .unwrap();
+        assert_eq!(a, c, "transpose pair must share the dequant result");
+        // But the IDCT pixel orientation differs.
+        assert_ne!(
+            dct_pixel_dims(TransformType::Dct16x8),
+            dct_pixel_dims(TransformType::Dct8x16)
+        );
+    }
+
+    #[test]
+    fn dequant_rejects_non_dct_transform() {
+        let set = materialise_default_dequant_set().unwrap();
+        // A non-DCT transform (8×8 grid) is rejected.
+        let b = block(vec![0i32; 64]);
         let err =
-            dequant_block_for_transform(&b, TransformType::Dct16x8, 1, 1, &set, &oim(), &qm())
+            dequant_block_for_transform(&b, TransformType::Hornuss, 1, 1, &set, &oim(), &qm())
                 .unwrap_err();
         assert!(matches!(err, Error::Unsupported(_)), "got {err:?}");
     }
@@ -393,6 +519,66 @@ mod tests {
                 out.iter().all(|&v| v.abs() < 1e-6),
                 "{t:?} residual not all zero"
             );
+        }
+    }
+
+    #[test]
+    fn residual_rect_all_zero_block_is_all_zero_samples() {
+        // Rectangular + large-DCT all-zero blocks inverse-transform to
+        // all-zero spatial samples (pixel-cell count == grid-cell
+        // count).
+        let set = materialise_default_dequant_set().unwrap();
+        for t in [
+            TransformType::Dct16x8,
+            TransformType::Dct8x16,
+            TransformType::Dct32x8,
+            TransformType::Dct8x32,
+            TransformType::Dct32x16,
+            TransformType::Dct16x32,
+            TransformType::Dct64x64,
+            TransformType::Dct64x32,
+            TransformType::Dct32x64,
+        ] {
+            let (bw, bh) = covered_grid_dims(t).unwrap();
+            let n = bw * bh;
+            let b = block(vec![0i32; n]);
+            let out = decode_block_to_residual(&b, t, 1, 4, &set, &oim(), &qm()).unwrap();
+            // Output pixel count equals the grid cell count.
+            assert_eq!(out.len(), n, "{t:?}");
+            assert!(
+                out.iter().all(|&v| v.abs() < 1e-6),
+                "{t:?} residual not all zero"
+            );
+        }
+    }
+
+    #[test]
+    fn residual_rect_dc_only_block_is_flat() {
+        // A pure-DC rectangular block inverse-transforms to a flat
+        // (constant) pixel block, just like the square case — this pins
+        // the wide-grid dequant → oriented-IDCT chain end-to-end for
+        // rectangular transforms.
+        let set = materialise_default_dequant_set().unwrap();
+        for t in [
+            TransformType::Dct16x8,
+            TransformType::Dct8x16,
+            TransformType::Dct32x16,
+        ] {
+            let (bw, bh) = covered_grid_dims(t).unwrap();
+            let n = bw * bh;
+            let mut coeffs = vec![0i32; n];
+            coeffs[0] = 10;
+            let b = block(coeffs);
+            let out = decode_block_to_residual(&b, t, 1, 3, &set, &oim(), &qm()).unwrap();
+            assert_eq!(out.len(), n, "{t:?}");
+            let first = out[0];
+            assert!(first.abs() > 1e-9, "{t:?} DC residual unexpectedly zero");
+            for (i, &v) in out.iter().enumerate() {
+                assert!(
+                    (v - first).abs() < 1e-2,
+                    "{t:?} cell {i} = {v} not flat (first = {first})"
+                );
+            }
         }
     }
 

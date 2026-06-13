@@ -9,6 +9,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Round 293 — extend the per-block VarDCT decode walk
+  (`src/block_dequant.rs`) from the three square plain-DCT transforms
+  to **every plain separable-DCT transform**: the rectangular
+  DCT16×8 / DCT8×16 / DCT32×8 / DCT8×32 / DCT32×16 / DCT16×32 family and
+  the larger DCT64×64 … DCT256×256 family. The round-286 orientation
+  deferral is lifted by pinning, against ISO/IEC FDIS 18181-1:2021
+  §I.2.4 + Table I.4 + Annex I.2.3.2, that the decoded coefficient grid
+  (`varblock_size_for_order` → `(bwidth, bheight)`, `bwidth >= bheight`)
+  and the dequant matrix (`weights_matrix_dims_for_slot` →
+  `(cols, rows) = (bwidth, bheight)`) share **one** "wide"
+  `bwidth × bheight` row-major layout, which is exactly the
+  `(short × long)` "spec coefficient layout" `idct_for_transform`
+  already consumes. A rectangular transform and its transpose
+  (e.g. DCT16×8 / DCT8×16) share one coefficient grid and one dequant
+  matrix; they differ only in the pixel orientation `(R, C)` the IDCT
+  emits, so the per-cell dequant is the identity and no transpose is
+  needed in this stage. New public API `covered_grid_dims(t) ->
+  Option<(bwidth, bheight)>` (the full plain-DCT covered set, keyed off
+  `dct_pixel_dims`); `covered_square_dim` retained for the square
+  subset; `dequant_block_for_transform` / `decode_block_to_residual`
+  now accept the whole plain-DCT set. The **non-DCT** transforms
+  (Hornuss / DCT2×2 / DCT4×4 / DCT4×8 / DCT8×4 / AFV0..AFV3) stay
+  `Error::Unsupported` — their dequant matrix is canonicalised to 8×8
+  while their IDCT path is the §I.2.3 dispatch, so the sub-block
+  coefficient extraction does not reduce to a flat 8×8 identity.
+  +4 unit tests (transpose-pair grid/matrix sharing, full plain-DCT
+  covered-set census, rectangular all-zero + pure-DC residuals);
+  lib tests 767 → 771.
 - Round 286 — first per-block VarDCT decode-walk stage that reaches
   spatial samples (`src/block_dequant.rs`). Chains the §C.8.3 decoded
   quantised-coefficient block through Annex F.3 HF dequantisation and

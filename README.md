@@ -78,6 +78,34 @@ block → flat spatial block; chained == manual dequant-then-IDCT.
 Lib tests 756 → 767. CfL (Annex G) + Gaborish/EPF remain
 caller-side concerns above this primitive.
 
+**Round 293 (2026-06-14)** lifts the round-286 orientation deferral:
+`block_dequant` now covers **every plain separable-DCT transform** —
+the rectangular DCT16×8 / DCT8×16 / DCT32×8 / DCT8×32 / DCT32×16 /
+DCT16×32 family and the larger DCT64×64 … DCT256×256 family — i.e.
+exactly the set for which `idct::dct_pixel_dims` is `Some`. The
+orientation question is resolved against §I.2.4 + Table I.4 +
+Annex I.2.3.2: the decoded coefficient grid
+(`varblock_size_for_order` → `(bwidth, bheight)` with
+`bwidth = max(8, max(N,M))`, `bheight = max(8, min(N,M))`, so always
+"wide") and the dequant matrix (`weights_matrix_dims_for_slot` →
+`(cols, rows) = (bwidth, bheight)`, row-major `y·x_dim + x`) share
+**one** `bwidth × bheight` row-major layout — which is precisely the
+`(short × long)` "spec coefficient layout" `idct_for_transform`
+already consumes. A rectangular transform and its transpose
+(DCT16×8 / DCT8×16, both slot 6, both `16 × 8` wide) share **one**
+coefficient grid and **one** dequant matrix; they differ only in the
+pixel orientation `(R, C)` the IDCT emits, so the per-cell dequant is
+the identity and no transpose belongs in this stage. New
+`covered_grid_dims(t) -> Option<(bwidth, bheight)>` exposes the full
+plain-DCT covered set; `covered_square_dim` is retained for the
+square subset. The **non-DCT** transforms (Hornuss / DCT2×2 / DCT4×4 /
+DCT4×8 / DCT8×4 / AFV0..AFV3) stay `Unsupported` — their dequant
+matrix is canonicalised to 8×8 while their IDCT path is the §I.2.3
+dispatch, so the sub-block coefficient extraction does not reduce to a
+flat 8×8 identity. +4 tests (transpose-pair grid/matrix sharing;
+full plain-DCT covered-set census; rectangular all-zero + pure-DC
+residuals). Lib tests 767 → 771.
+
 **Round 281 (2026-06-12)** lands two §C.8.3 decode-walk
 prose-conformance fixes, both latent in the VarDCT HF coefficient
 path since the drivers landed. (1) **Per-varblock channel decode
