@@ -47,6 +47,37 @@ shifted weights (3, 4, 3, 6)), `r195` Δ=0 pins, `r202` spec
 cross-row reads + sample-194 = 34, `r272` pixel-exact guard).
 Tests 1153 → 1156.
 
+**Round 286 (2026-06-13)** lands the first **per-block VarDCT
+decode-walk stage that reaches spatial samples** — the new
+`src/block_dequant.rs` chains the §C.8.3 decoded
+quantised-coefficient block through Annex F.3 HF dequantisation and
+the Annex I.2.3.2 inverse DCT for the **square plain-DCT**
+transforms (DCT8×8 / DCT16×16 / DCT32×32). Until now every
+constituent primitive existed only in isolation: the §C.8.3
+per-block loop produces a raster-index-space `DecodedHfBlock`,
+`hf_dequant::dequant_hf_coefficient` dequantises a *single*
+coefficient, `dct_quant_weights::DequantMatrixSet` materialises the
+per-slot matrices, and `idct::idct_for_transform` inverts a
+raster-order block — but nothing composed them into a block walk.
+Public API: `dequant_block_for_transform(decoded, t, channel,
+hf_mul, set, oim, qm)` applies F.3 across the whole raster (per-cell
+dequant-matrix entry from `slot_for_transform(t)`, the identity
+`i = y·dim + x` map that the square coefficient grid, matrix, and
+IDCT input all share); `decode_block_to_residual(...)` composes that
+with `idct_for_transform` to yield the block's `dim × dim` spatial
+residual samples; `covered_square_dim(t)` exposes the covered set.
+Rectangular / non-DCT transforms (whose coefficient grid is stored
+"wide" while the pixel block may be "tall", and whose IDCT path is
+the I.2.3 dispatch) return `Unsupported` and are deferred so their
+orientation can be pinned independently. 11 tests pin: the covered
+set; uncovered-transform / bad-channel / wrong-length rejection;
+all-zero block → all-zero coeffs and all-zero samples; single-coeff
+whole-block dequant == the per-sample formula at that cell; distinct
+matrix entries → distinct outputs (proves per-cell indexing); DC-only
+block → flat spatial block; chained == manual dequant-then-IDCT.
+Lib tests 756 → 767. CfL (Annex G) + Gaborish/EPF remain
+caller-side concerns above this primitive.
+
 **Round 281 (2026-06-12)** lands two §C.8.3 decode-walk
 prose-conformance fixes, both latent in the VarDCT HF coefficient
 path since the drivers landed. (1) **Per-varblock channel decode

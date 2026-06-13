@@ -488,6 +488,7 @@ pub mod ans;
 pub mod begabrac;
 pub mod bitreader;
 pub mod block_context_resolver;
+pub mod block_dequant;
 pub mod chroma_from_luma;
 pub mod coeff_order;
 pub mod container;

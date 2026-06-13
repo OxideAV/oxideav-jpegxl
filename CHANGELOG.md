@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Round 286 — first per-block VarDCT decode-walk stage that reaches
+  spatial samples (`src/block_dequant.rs`). Chains the §C.8.3 decoded
+  quantised-coefficient block through Annex F.3 HF dequantisation and
+  the Annex I.2.3.2 inverse DCT for the square plain-DCT transforms
+  (DCT8×8 / DCT16×16 / DCT32×32), where the coefficient grid, the
+  dequantisation matrix, and the inverse-DCT input all share one
+  unambiguous `dim × dim` row-major layout. New public API:
+  `dequant_block_for_transform` (Annex F.3 across the whole raster,
+  per-cell dequant-matrix entry via `slot_for_transform`),
+  `decode_block_to_residual` (dequant → `idct_for_transform`), and
+  `covered_square_dim`. Rectangular / non-DCT transforms return
+  `Error::Unsupported`, deferred to a follow-up round so their
+  coefficient-grid-vs-pixel-block orientation can be pinned
+  independently. 11 unit tests; lib tests 756 → 767.
+
 ### Fixed
 
 - Round 281 — two §C.8.3 decode-walk prose-conformance fixes against
