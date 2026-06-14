@@ -9,6 +9,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Round 306 — per-LfGroup VarDCT **residual-plane assembly**
+  (`src/residual_plane.rs`), the spatial-placement layer directly above
+  the round-286/293/300 `block_dequant` per-block decode walk. Walks a
+  `dct_select::DctSelectGrid` via `varblock_walk::VarblockWalk` and
+  writes each varblock's `R × C` row-major residual block (the
+  `block_dequant::decode_block_to_residual` output) into a single-channel
+  spatial plane at the varblock's pixel origin `(bx · 8, by · 8)`. New
+  public API: `ResidualPlane` (row-major `f32` plane sized to the padded
+  block grid `width_blocks·8 × height_blocks·8`, `for_grid` / `get`);
+  `block_pixel_dims(t)` (the `(R, C)` pixel shape from
+  `idct::dct_pixel_dims` ∪ `non_dct_pixel_dims`, covering every
+  `TransformType`); `place_block(plane, vb, block)` (verbatim copy with
+  length-mismatch + footprint-spill rejection); and
+  `assemble_channel_plane(grid, residual_at)` (raster-order grid walk
+  invoking the caller's per-varblock decode closure once per top-left
+  cell, continuation cells skipped, residual-`Empty` cell rejected). The
+  plane is the padded block grid (no per-edge clamping; caller crops to
+  `lf_w × lf_h`). The geometry invariant `C == block_dims().0 · 8` /
+  `R == block_dims().1 · 8` is pinned for every transform. The IDCT
+  output already carries the LLF/DC contribution (§I.2.5) so no separate
+  DC add at placement; chroma-from-luma / Gaborish / EPF run on the
+  assembled plane and remain caller-side concerns. 14 unit + 5
+  integration (`round306_residual_plane`, composing the real F.3-dequant
+  + I.2.3-IDCT walk end-to-end) tests. Lib tests 774 → 788 (+14).
+  Pure-control-flow geometry primitive — no bit reads, no spec
+  re-derivation, no histogram materialisation. Source of truth:
+  ISO/IEC FDIS 18181-1:2021 §C.5.4 (DctSelect placement) + §C.8.3 +
+  Table I.4 / §I.2.3 (pixel-dims).
+
 - Round 300 — extend the per-block VarDCT decode walk
   (`src/block_dequant.rs`) to the **non-DCT transforms**: Hornuss,
   DCT2×2, DCT4×4, DCT4×8, DCT8×4, and AFV0..AFV3 — i.e. exactly the set

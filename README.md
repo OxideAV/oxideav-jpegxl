@@ -47,6 +47,45 @@ shifted weights (3, 4, 3, 6)), `r195` Δ=0 pins, `r202` spec
 cross-row reads + sample-194 = 34, `r272` pixel-exact guard).
 Tests 1153 → 1156.
 
+**Round 306 (2026-06-15)** lands the per-LfGroup VarDCT
+**residual-plane assembly** stage — the spatial-placement layer
+directly above the round-286/293/300 `block_dequant` per-block decode
+walk. New `src/residual_plane.rs` walks a [`dct_select::DctSelectGrid`]
+via the round-208 [`varblock_walk::VarblockWalk`] and writes each
+varblock's `R × C` row-major residual block (the
+`block_dequant::decode_block_to_residual` output) into a single-channel
+spatial plane at the varblock's pixel origin `(bx · 8, by · 8)`. Public
+API: [`residual_plane::ResidualPlane`] (a row-major `f32` plane sized to
+the **padded block grid** `width_blocks·8 × height_blocks·8`, with
+`for_grid` / `get`); `block_pixel_dims(t)` (the transform's `(R, C)`
+pixel shape from `idct::dct_pixel_dims` ∪ `non_dct_pixel_dims`, covering
+**every** [`dct_select::TransformType`]); `place_block(plane, vb, block)`
+(verbatim copy `plane[(py+r)·W + (px+c)] = block[r·C + c]`, with
+length-mismatch + footprint-spill rejection); and the driver
+`assemble_channel_plane(grid, residual_at)` (raster-order grid walk
+invoking the caller's per-varblock decode closure once per top-left cell,
+continuation cells skipped, residual-`Empty` cell rejected). The plane is
+the padded block grid so placement is total and unconditional — no
+per-edge clamping; the caller crops to `lf_w × lf_h` afterwards. The
+geometry invariant `C == block_dims().0 · 8` / `R == block_dims().1 · 8`
+is pinned for every transform, so rectangular (DCT16×8 → 8px wide ×
+16px tall) and non-DCT (AFV → 8×8) blocks land in the correct region.
+The IDCT output already carries the LLF/DC contribution at its prefix
+cells (§I.2.5), so no separate DC add happens at placement; chroma-from-
+luma (Annex G), Gaborish (Annex J.2), and EPF (Annex J.3) run on the
+assembled plane and remain caller-side concerns above this primitive.
+14 unit + 5 integration (`round306_residual_plane`, composing the real
+F.3-dequant + I.2.3-IDCT walk end-to-end: DC-only block lands flat, 2×2
+raster-order quadrants, rectangular tall-region placement, cell-for-cell
+== manual IDCT, AFV 8×8) tests. Lib tests 774 → 788 (+14).
+Pure-control-flow geometry primitive in the same shape as the round-89…
+round-300 stack — no bit reads, no spec re-derivation, no histogram
+materialisation. A future round wiring §C.7.2 entropy histograms
+(#799 DOCS-GAP) + the per-LfGroup three-channel decode driver
+(round 264) can drop this assembler in as the per-channel
+spatial-reconstruction layer below chroma-from-luma without re-deriving
+any §C.5.4 placement geometry.
+
 **Round 300 (2026-06-14)** lifts the round-293 deferral and extends
 the per-block VarDCT decode walk (`src/block_dequant.rs`) to the
 **non-DCT transforms** — Hornuss / DCT2×2 / DCT4×4 / DCT4×8 / DCT8×4 /
