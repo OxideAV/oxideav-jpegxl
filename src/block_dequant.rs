@@ -68,13 +68,36 @@
 //! layout, the per-coefficient dequant mapping is the identity:
 //! dequant-matrix entry for raster cell `i` multiplies decoded
 //! coefficient `coeffs[i]`, and the result feeds raster cell `i` of
-//! the inverse-DCT input. The **non-DCT** transforms (`Hornuss`,
-//! `DCT2×2`, `DCT4×4`, `DCT4×8`, `DCT8×4`, `AFV0..AFV3`) are deferred:
-//! their dequant matrix is canonicalised to `8 × 8` while their IDCT
-//! path is the §I.2.3 dispatch (`idct_dct2x2`, `idct_afv`, …) rather
-//! than a plain separable IDCT, and the AFV / DCT2×2 sub-block
+//! the inverse-DCT input.
+//!
+//! ## Non-DCT transforms (round 300)
+//!
+//! Round 300 lifts the round-293 deferral and covers the **non-DCT**
+//! transforms too — `Hornuss`, `DCT2×2`, `DCT4×4`, `DCT4×8`, `DCT8×4`,
+//! and `AFV0..AFV3` — i.e. exactly the set for which
+//! [`crate::idct::non_dct_pixel_dims`] returns `Some` (all `8 × 8`).
+//! The round-293 deferral note worried that "the AFV / DCT2×2 sub-block
 //! coefficient extraction does not reduce to a flat identity over an
-//! `8 × 8` grid. Those are pinned in a follow-up round.
+//! `8 × 8` grid" — but that re-mapping happens **inside** the §I.2.3
+//! IDCT dispatch (`idct_dct2x2`, `idct_afv`, …), which the spec applies
+//! *after* dequantisation. The Annex F.3 dequant stage itself is
+//! uniform across all transform types: §F.3 multiplies each stored
+//! coefficient by "a multiplier defined by the channel, the transform
+//! type and the coefficient index inside the varblock". For every
+//! non-DCT transform that varblock is the `8 × 8` block (OrderId 1,
+//! [`crate::coeff_order::varblock_size_for_order`] → `(8, 8)`), the
+//! dequant matrix is the `8 × 8` slot matrix
+//! ([`crate::dct_quant_weights::weights_matrix_dims_for_slot`] → `(8,
+//! 8)` for slots 1 / 2 / 3 / 9 / 10), and the §I.2.3 IDCT helpers
+//! consume a row-major `8 × 8` block via `coef(x, y) = coeffs[y·8 + x]`.
+//! The decoded block is already in raster index space
+//! (`coeffs[natural_order[k]]` with `natural_order[k] = y·bwidth + x`,
+//! per [`crate::pass_group_hf::DecodedHfBlock`]), so the per-cell
+//! dequant is the identity raster map for the non-DCT family exactly as
+//! it is for the square / rectangular DCT family — the sub-block
+//! coefficient extraction is the IDCT's concern, downstream of this
+//! stage. No orientation subtlety arises because the non-DCT grid is
+//! always square `8 × 8` (`bwidth == bheight`).
 //!
 //! ## Pipeline order (Annex F.3, then Annex I.2.3.2)
 //!
@@ -94,27 +117,33 @@ use crate::coeff_order::{order_id_for_transform, varblock_size_for_order};
 use crate::dct_quant_weights::{slot_for_transform, DequantMatrixSet};
 use crate::dct_select::TransformType;
 use crate::hf_dequant::{dequant_hf_coefficient, QmScaleFactors};
-use crate::idct::{dct_pixel_dims, idct_for_transform};
+use crate::idct::{dct_pixel_dims, idct_for_transform, non_dct_pixel_dims};
 use crate::metadata_fdis::OpsinInverseMatrix;
 use crate::pass_group_hf::DecodedHfBlock;
 use oxideav_core::{Error, Result};
 
-/// The "wide" coefficient-grid dimensions `(bwidth, bheight)` of a
-/// plain-DCT transform `t` covered by this per-block decode walk, or
-/// `None` for any non-DCT transform (Hornuss / DCT2×2 / DCT4×4 /
-/// DCT4×8 / DCT8×4 / AFV0..AFV3) whose dequant-vs-IDCT layout is
-/// deferred to a follow-up round.
+/// The coefficient-grid dimensions `(bwidth, bheight)` of a transform
+/// `t` covered by this per-block decode walk.
 ///
-/// The covered set is exactly the transforms for which
-/// [`dct_pixel_dims`] is `Some` — the plain separable-IDCT family.
-/// For every covered transform the returned `(bwidth, bheight)` is the
-/// shared row-major layout of both the decoded coefficient block and
-/// the dequant matrix (`bwidth >= bheight`).
+/// As of round 300 this is **every** [`TransformType`]: the plain
+/// separable-DCT family (square / rectangular / large, for which the
+/// grid is "wide" with `bwidth >= bheight`) and the non-DCT family
+/// (Hornuss / DCT2×2 / DCT4×4 / DCT4×8 / DCT8×4 / AFV0..AFV3, for which
+/// the grid is the square `8 × 8` of OrderId 1). For every transform
+/// the returned `(bwidth, bheight)` is the shared row-major layout of
+/// both the decoded coefficient block and the dequant matrix.
+///
+/// Returns `None` only if a future [`TransformType`] is added without a
+/// pixel-dims mapping in either [`dct_pixel_dims`] or
+/// [`non_dct_pixel_dims`].
 pub fn covered_grid_dims(t: TransformType) -> Option<(usize, usize)> {
-    // The covered set is precisely "plain separable DCT", which is the
-    // domain of `dct_pixel_dims`. For those, the coefficient grid is
-    // the `varblock_size_for_order` of the transform's order id.
-    dct_pixel_dims(t)?;
+    // The grid for any transform is `varblock_size_for_order` of its
+    // order id; the covered set is "any transform that has a pixel-dims
+    // mapping" (the DCT family via `dct_pixel_dims`, the non-DCT family
+    // via `non_dct_pixel_dims` — together every variant).
+    if dct_pixel_dims(t).is_none() && non_dct_pixel_dims(t).is_none() {
+        return None;
+    }
     let (bw, bh) = varblock_size_for_order(order_id_for_transform(t));
     Some((bw as usize, bh as usize))
 }
@@ -132,16 +161,17 @@ pub fn covered_square_dim(t: TransformType) -> Option<usize> {
     }
 }
 
-/// Reject any transform outside the covered plain-DCT set with a
-/// precise [`Error::Unsupported`], returning the wide coefficient-grid
-/// dimensions `(bwidth, bheight)` for a covered transform.
+/// Return the coefficient-grid dimensions `(bwidth, bheight)` for a
+/// covered transform, or a precise [`Error::Unsupported`] for a
+/// [`TransformType`] that lacks a pixel-dims mapping (which, as of
+/// round 300, no current variant does — the guard defends a future
+/// table edit).
 fn require_covered(t: TransformType) -> Result<(usize, usize)> {
     covered_grid_dims(t).ok_or_else(|| {
         Error::Unsupported(format!(
-            "JXL block_dequant: per-block decode walk covers the plain \
-             separable-DCT transforms only; {t:?} is a non-DCT transform \
-             (Hornuss / DCT2×2 / DCT4×4 / DCT4×8 / DCT8×4 / AFV) whose \
-             dequant-vs-IDCT layout is deferred to a follow-up round"
+            "JXL block_dequant: {t:?} has no pixel-dims mapping in \
+             dct_pixel_dims/non_dct_pixel_dims; the per-block decode walk \
+             cannot determine its coefficient-grid layout"
         ))
     })
 }
@@ -254,18 +284,21 @@ pub fn decode_block_to_residual(
     qm: &QmScaleFactors,
 ) -> Result<Vec<f32>> {
     let dequantised = dequant_block_for_transform(decoded, t, channel, hf_mul, set, oim, qm)?;
-    // The dequantised block is `bwidth * bheight` cells in the wide
-    // `(short × long)` layout that `idct_for_transform` consumes; we
-    // assert defensively that the IDCT's pixel-cell count matches that
-    // coefficient count so a future table edit cannot silently feed a
-    // mis-sized block to the IDCT. (`bwidth * bheight == R * C` because
-    // `{bwidth, bheight} == {R, C}` as a set for every plain-DCT
-    // transform — they differ only by which side is "long".)
+    // The dequantised block is `bwidth * bheight` cells in the row-major
+    // layout that `idct_for_transform` consumes; we assert defensively
+    // that the IDCT's pixel-cell count matches that coefficient count so
+    // a future table edit cannot silently feed a mis-sized block to the
+    // IDCT. For the DCT family `bwidth * bheight == R * C` (the grid is
+    // the "wide" `{bwidth, bheight} == {R, C}` set); for the non-DCT
+    // family the grid and the IDCT pixel block are both `8 × 8`.
     let (bwidth, bheight) = require_covered(t)?;
+    let pixel_cells = dct_pixel_dims(t)
+        .or_else(|| non_dct_pixel_dims(t))
+        .map(|(r, c)| r * c);
     debug_assert_eq!(
-        dct_pixel_dims(t).map(|(r, c)| r * c),
+        pixel_cells,
         Some(bwidth * bheight),
-        "JXL decode_block_to_residual: dct_pixel_dims({t:?}) pixel count must equal \
+        "JXL decode_block_to_residual: pixel-dims({t:?}) cell count must equal \
          bwidth * bheight ({bwidth} * {bheight})"
     );
     idct_for_transform(t, &dequantised)
@@ -339,7 +372,8 @@ mod tests {
             // A rectangular transform and its transpose share one grid.
             assert!(dct_pixel_dims(t).is_some(), "{t:?} must be a plain DCT");
         }
-        // Non-DCT transforms are NOT covered.
+        // As of round 300 the non-DCT transforms are ALSO covered, with
+        // the square `8 × 8` grid of OrderId 1.
         for t in [
             T::Hornuss,
             T::Dct2x2,
@@ -351,7 +385,11 @@ mod tests {
             T::Afv2,
             T::Afv3,
         ] {
-            assert_eq!(covered_grid_dims(t), None, "{t:?}");
+            assert_eq!(covered_grid_dims(t), Some((8, 8)), "{t:?}");
+            // Non-DCT grids are square (no orientation subtlety).
+            let (bw, bh) = covered_grid_dims(t).unwrap();
+            assert_eq!(bw, bh, "{t:?}: non-DCT grid must be square");
+            assert!(non_dct_pixel_dims(t).is_some(), "{t:?} must be non-DCT");
         }
     }
 
@@ -386,14 +424,26 @@ mod tests {
     }
 
     #[test]
-    fn dequant_rejects_non_dct_transform() {
+    fn dequant_non_dct_transform_now_covered() {
+        // Round 300: the non-DCT transforms are no longer rejected; an
+        // 8×8 block dequantises through slot 1 / 2 / 3 / 9 / 10.
         let set = materialise_default_dequant_set().unwrap();
-        // A non-DCT transform (8×8 grid) is rejected.
-        let b = block(vec![0i32; 64]);
-        let err =
-            dequant_block_for_transform(&b, TransformType::Hornuss, 1, 1, &set, &oim(), &qm())
-                .unwrap_err();
-        assert!(matches!(err, Error::Unsupported(_)), "got {err:?}");
+        for t in [
+            TransformType::Hornuss,
+            TransformType::Dct2x2,
+            TransformType::Dct4x4,
+            TransformType::Dct4x8,
+            TransformType::Dct8x4,
+            TransformType::Afv0,
+            TransformType::Afv1,
+            TransformType::Afv2,
+            TransformType::Afv3,
+        ] {
+            let b = block(vec![0i32; 64]);
+            let out = dequant_block_for_transform(&b, t, 1, 1, &set, &oim(), &qm())
+                .unwrap_or_else(|e| panic!("{t:?} should be covered now, got {e:?}"));
+            assert_eq!(out.len(), 64, "{t:?}");
+        }
     }
 
     #[test]
@@ -634,11 +684,121 @@ mod tests {
     }
 
     #[test]
-    fn residual_rejects_uncovered_transform() {
+    fn residual_non_dct_all_zero_block_is_all_zero_samples() {
+        // An all-zero coefficient block inverse-transforms to all-zero
+        // spatial samples for every non-DCT transform (8×8 output).
         let set = materialise_default_dequant_set().unwrap();
-        let b = block(vec![0i32; 64]);
-        let err = decode_block_to_residual(&b, TransformType::Afv0, 1, 1, &set, &oim(), &qm())
-            .unwrap_err();
-        assert!(matches!(err, Error::Unsupported(_)), "got {err:?}");
+        for t in [
+            TransformType::Hornuss,
+            TransformType::Dct2x2,
+            TransformType::Dct4x4,
+            TransformType::Dct4x8,
+            TransformType::Dct8x4,
+            TransformType::Afv0,
+            TransformType::Afv1,
+            TransformType::Afv2,
+            TransformType::Afv3,
+        ] {
+            let b = block(vec![0i32; 64]);
+            let out = decode_block_to_residual(&b, t, 1, 4, &set, &oim(), &qm()).unwrap();
+            assert_eq!(out.len(), 64, "{t:?}");
+            assert!(
+                out.iter().all(|&v| v.abs() < 1e-6),
+                "{t:?} residual not all zero"
+            );
+        }
+    }
+
+    #[test]
+    fn dequant_non_dct_single_coefficient_matches_per_sample_formula() {
+        // Place one non-zero coefficient at raster cell 5 of a Hornuss
+        // Y-channel block and confirm the whole-block dequant matches
+        // the per-sample formula at that cell — proving the per-cell
+        // dequant is the identity raster map for the non-DCT family too.
+        let set = materialise_default_dequant_set().unwrap();
+        let channel = 1usize;
+        let hf_mul = 7;
+        for t in [
+            TransformType::Hornuss,
+            TransformType::Dct2x2,
+            TransformType::Dct4x4,
+            TransformType::Dct4x8,
+            TransformType::Dct8x4,
+            TransformType::Afv0,
+        ] {
+            let slot = slot_for_transform(t) as usize;
+            let mut coeffs = vec![0i32; 64];
+            coeffs[5] = 9;
+            let b = block(coeffs);
+            let out =
+                dequant_block_for_transform(&b, t, channel, hf_mul, &set, &oim(), &qm()).unwrap();
+            let entry = set.matrices[slot][channel][5] as f32;
+            let expected = dequant_hf_coefficient(9, channel, hf_mul, entry, &oim(), &qm());
+            assert_eq!(out[5], expected, "{t:?}");
+            for (i, &v) in out.iter().enumerate() {
+                if i != 5 {
+                    assert_eq!(v, 0.0, "{t:?} cell {i} should be zero");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn non_dct_residual_matches_manual_dequant_then_idct() {
+        // End-to-end equivalence for the non-DCT path: the chained
+        // decode equals dequant followed by the §I.2.3 IDCT dispatch.
+        // The AFV / DCT2×2 sub-block extraction lives inside the IDCT,
+        // downstream of this stage, so the composition is unchanged.
+        let set = materialise_default_dequant_set().unwrap();
+        for t in [
+            TransformType::Afv0,
+            TransformType::Afv3,
+            TransformType::Dct2x2,
+            TransformType::Hornuss,
+        ] {
+            let mut coeffs = vec![0i32; 64];
+            coeffs[0] = 6;
+            coeffs[1] = -3;
+            coeffs[9] = 2;
+            coeffs[8] = 4;
+            let b = block(coeffs);
+            let chained = decode_block_to_residual(&b, t, 1, 5, &set, &oim(), &qm()).unwrap();
+            let dq = dequant_block_for_transform(&b, t, 1, 5, &set, &oim(), &qm()).unwrap();
+            let manual = idct_for_transform(t, &dq).unwrap();
+            assert_eq!(chained.len(), manual.len(), "{t:?}");
+            for (i, (&a, &c)) in chained.iter().zip(manual.iter()).enumerate() {
+                assert_eq!(a, c, "{t:?} cell {i}");
+            }
+        }
+    }
+
+    #[test]
+    fn afv_transpose_pair_share_grid_and_matrix() {
+        // AFV0..AFV3 all map to slot 10 and the 8×8 OrderId-1 grid; they
+        // differ only in the IDCT flip orientation, so the dequant is
+        // identical across the four variants for identical coefficients.
+        let set = materialise_default_dequant_set().unwrap();
+        let mut coeffs = vec![0i32; 64];
+        coeffs[2] = 5;
+        coeffs[33] = -4;
+        let b = block(coeffs);
+        let base = dequant_block_for_transform(&b, TransformType::Afv0, 1, 3, &set, &oim(), &qm())
+            .unwrap();
+        for t in [
+            TransformType::Afv1,
+            TransformType::Afv2,
+            TransformType::Afv3,
+        ] {
+            assert_eq!(
+                slot_for_transform(t),
+                slot_for_transform(TransformType::Afv0)
+            );
+            assert_eq!(covered_grid_dims(t), Some((8, 8)));
+            let other = dequant_block_for_transform(&b, t, 1, 3, &set, &oim(), &qm()).unwrap();
+            assert_eq!(
+                base, other,
+                "{t:?} dequant must match AFV0 (shared slot/grid)"
+            );
+        }
     }
 }

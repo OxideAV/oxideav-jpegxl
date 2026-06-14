@@ -9,6 +9,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Round 300 — extend the per-block VarDCT decode walk
+  (`src/block_dequant.rs`) to the **non-DCT transforms**: Hornuss,
+  DCT2×2, DCT4×4, DCT4×8, DCT8×4, and AFV0..AFV3 — i.e. exactly the set
+  for which `idct::non_dct_pixel_dims` returns `Some` (all `8 × 8`).
+  This lifts the round-293 deferral. The deferral worried that the
+  AFV / DCT2×2 sub-block coefficient extraction "does not reduce to a
+  flat identity over an `8 × 8` grid", but per ISO/IEC FDIS 18181-1:2021
+  the §I.2.3 sub-block re-mapping happens *inside* the inverse-transform
+  dispatch (`idct_afv`, `idct_dct2x2`, …), which the spec applies
+  *after* the Annex F.3 dequant. The §F.3 dequant stage is uniform: it
+  multiplies each stored coefficient by a multiplier keyed on "the
+  channel, the transform type and the coefficient index inside the
+  varblock". For every non-DCT transform the varblock is the `8 × 8`
+  OrderId-1 grid (`coeff_order::varblock_size_for_order` → `(8, 8)`),
+  the dequant matrix is the `8 × 8` slot matrix
+  (`weights_matrix_dims_for_slot` → `(8, 8)` for slots 1 / 2 / 3 / 9 /
+  10), and the decoded block is already in raster index space
+  (`coeffs[natural_order[k]]`, `natural_order[k] = y·bwidth + x`), so
+  the per-cell dequant is the identity raster map — exactly as for the
+  square / rectangular DCT family, with no orientation subtlety
+  (`bwidth == bheight == 8`). `covered_grid_dims` now returns `Some` for
+  every `TransformType`; `require_covered`'s `Unsupported` path now only
+  guards a hypothetical future variant lacking a pixel-dims mapping.
+  +3 lib tests (non-DCT all-zero residual census; non-DCT single-coeff
+  per-sample-formula identity; AFV0..AFV3 shared-slot/grid dequant
+  equality; chained == manual dequant-then-IDCT for the non-DCT path).
+  Lib tests 771 → 774.
+
 - Round 293 — extend the per-block VarDCT decode walk
   (`src/block_dequant.rs`) from the three square plain-DCT transforms
   to **every plain separable-DCT transform**: the rectangular

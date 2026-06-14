@@ -47,6 +47,33 @@ shifted weights (3, 4, 3, 6)), `r195` Δ=0 pins, `r202` spec
 cross-row reads + sample-194 = 34, `r272` pixel-exact guard).
 Tests 1153 → 1156.
 
+**Round 300 (2026-06-14)** lifts the round-293 deferral and extends
+the per-block VarDCT decode walk (`src/block_dequant.rs`) to the
+**non-DCT transforms** — Hornuss / DCT2×2 / DCT4×4 / DCT4×8 / DCT8×4 /
+AFV0..AFV3 — so `covered_grid_dims` now returns `Some` for **every**
+`TransformType`. The round-293 note worried the AFV / DCT2×2 sub-block
+coefficient extraction "does not reduce to a flat identity over an
+8×8 grid"; the resolution (ISO/IEC FDIS 18181-1:2021 §F.3 + §I.2.3 +
+Table I.4 + OrderId 1) is that the §I.2.3 sub-block re-mapping lives
+*inside* the inverse-transform dispatch (`idct_afv`, `idct_dct2x2`, …),
+which the spec runs **after** the Annex F.3 dequant. The §F.3 dequant
+stage is uniform — it scales each stored coefficient by a multiplier
+keyed on "the channel, the transform type and the coefficient index
+inside the varblock". For every non-DCT transform the varblock is the
+8×8 OrderId-1 grid (`varblock_size_for_order` → `(8, 8)`), the dequant
+matrix is the 8×8 slot matrix (`weights_matrix_dims_for_slot` →
+`(8, 8)` for slots 1/2/3/9/10), and the decoded block is already in
+raster index space (`coeffs[natural_order[k]]`,
+`natural_order[k] = y·bwidth + x`) — so the per-cell dequant is the
+identity raster map, exactly as for the square/rectangular DCT family
+and with **no** orientation subtlety (`bwidth == bheight == 8`). The
+sub-block extraction is the IDCT's concern, downstream of this stage.
+`require_covered`'s `Unsupported` path now only guards a hypothetical
+future variant lacking a pixel-dims mapping. +3 tests (non-DCT
+all-zero residual census; non-DCT single-coeff per-sample-formula
+identity; AFV0..AFV3 shared-slot/grid dequant equality; chained ==
+manual dequant-then-IDCT for the non-DCT path). Lib tests 771 → 774.
+
 **Round 286 (2026-06-13)** lands the first **per-block VarDCT
 decode-walk stage that reaches spatial samples** — the new
 `src/block_dequant.rs` chains the §C.8.3 decoded
