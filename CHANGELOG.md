@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Other
+
+- round-316 (parent-dispatch r316) against ISO/IEC FDIS 18181-1:2021 — per-block VarDCT LLF-coefficient placement: `block_dequant::merge_llf_into_block` folds the LF-derived `cy × cx` LLF (DC) block into the §I.2.4 natural-order low-frequency prefix (top-left cells `(x < cx, y < cy)` of the wide `bwidth × bheight` dequant grid) and `block_dequant::decode_block_to_residual_with_llf` runs the LF-aware per-block decode walk (F.3 dequant → §I.2.4 LLF merge → §I.2.3.2 inverse DCT), the LF-aware counterpart of the round-286 HF-only `decode_block_to_residual`
+
 ## [0.0.11](https://github.com/OxideAV/oxideav-jpegxl/compare/v0.0.10...v0.0.11) - 2026-06-15
 
 ### Other

@@ -36,8 +36,11 @@ What is implemented and tested today:
   HfBlockContext, LfChannelCorrelation), the LfCoefficients
   sub-bitstream, the spec-conformant 1-D / 2-D IDCT dispatch across the
   plain-DCT block sizes and the non-DCT helpers, per-block dequant +
-  residual assembly, the per-LfGroup three-channel residual-plane
-  reconstruction, and the inverse XYB / YCbCr colour transforms.
+  residual assembly (including the §I.2.4 LLF-coefficient placement that
+  folds the LF-derived DC block into the natural-order low-frequency
+  prefix before the §I.2.3.2 inverse DCT), the per-LfGroup three-channel
+  residual-plane reconstruction, and the inverse XYB / YCbCr colour
+  transforms.
 
 ### Not yet implemented
 

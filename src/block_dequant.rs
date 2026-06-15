@@ -304,6 +304,131 @@ pub fn decode_block_to_residual(
     idct_for_transform(t, &dequantised)
 }
 
+/// Place the dequantised LLF (low-frequency) coefficient block into the
+/// top-left corner of a dequantised `bwidth × bheight` coefficient grid,
+/// in place.
+///
+/// Per FDIS §I.2.4 the natural coefficient order is the `LLF` prefix
+/// (cells `(x, y)` with `x < cx && y < cy`, where `cx = bwidth / 8` and
+/// `cy = bheight / 8`) followed by the `HF` tail. The §C.8.3 per-block
+/// decode loop only reads symbols for `k in [num_blocks, size)` —
+/// `num_blocks = cx × cy` — so a [`DecodedHfBlock`] carries **zero** in
+/// every LLF cell. The LLF coefficients themselves are produced
+/// separately from the dequantised LF image by Listing I.16
+/// ([`crate::llf_from_lf::llf_from_lf`], driven per varblock by
+/// [`crate::vardct::compose_lf_to_llf_block`]) and must be written into
+/// those `cy × cx` top-left cells before the §I.2.3.2 inverse DCT, which
+/// transforms the **complete** coefficient matrix
+/// (`samples = IDCT_2D(coefficients)`).
+///
+/// Layout contract:
+///
+/// * `block` is the dequantised `bwidth × bheight` row-major coefficient
+///   grid (`block[y · bwidth + x]`) — the output of
+///   [`dequant_block_for_transform`]. Its length must be
+///   `bwidth · bheight`.
+/// * `llf` is the `cy × cx` row-major LLF block (`llf[y · cx + x]`) — the
+///   output of [`crate::llf_from_lf::llf_from_lf`] /
+///   [`crate::vardct::compose_lf_to_llf_block`]. Its length must be
+///   `cx · cy`.
+///
+/// The write is an **overwrite** of the `cy × cx` top-left cells:
+/// `block[y · bwidth + x] = llf[y · cx + x]` for `x < cx`, `y < cy`. The
+/// overwrite is equivalent to an add because every LLF cell of `block` is
+/// zero by construction of [`DecodedHfBlock`], but the overwrite is the
+/// spec-literal placement and is robust against a future change that
+/// would let the HF stream touch an LLF cell.
+///
+/// For the non-DCT transforms (`cx = cy = 1`) only the single DC cell
+/// `(0, 0)` is written — matching §I.2.5's "the output is equal to the
+/// input" identity for that family.
+///
+/// Errors ([`Error::InvalidData`]):
+/// * `block.len() != bwidth · bheight`,
+/// * `llf.len() != cx · cy`.
+pub fn merge_llf_into_block(block: &mut [f32], t: TransformType, llf: &[f32]) -> Result<()> {
+    let (bwidth, bheight) = require_covered(t)?;
+    if block.len() != bwidth * bheight {
+        return Err(Error::InvalidData(format!(
+            "JXL merge_llf_into_block: dequant block length {} != bwidth · bheight \
+             ({bwidth} · {bheight} = {}) for {t:?}",
+            block.len(),
+            bwidth * bheight
+        )));
+    }
+    // cx = bwidth / 8, cy = bheight / 8 per FDIS §I.2.4. For every covered
+    // transform `bwidth` and `bheight` are multiples of 8 (the DCT family
+    // grids are 8·k; the non-DCT family is the square 8 × 8 grid), so the
+    // integer division is exact.
+    let cx = bwidth / 8;
+    let cy = bheight / 8;
+    if llf.len() != cx * cy {
+        return Err(Error::InvalidData(format!(
+            "JXL merge_llf_into_block: LLF block length {} != cx · cy \
+             ({cx} · {cy} = {}) for {t:?}",
+            llf.len(),
+            cx * cy
+        )));
+    }
+    for y in 0..cy {
+        for x in 0..cx {
+            block[y * bwidth + x] = llf[y * cx + x];
+        }
+    }
+    Ok(())
+}
+
+/// Per-block VarDCT decode walk **including** the LLF (DC) coefficients:
+/// dequantise the decoded HF coefficient block (Annex F.3), place the
+/// dequantised LLF block into its top-left `cy × cx` cells (§I.2.4
+/// natural-order placement), then apply the §I.2.3.2 inverse DCT to the
+/// complete coefficient matrix to obtain the block's spatial residual
+/// samples (row-major).
+///
+/// This is the LF-aware counterpart of [`decode_block_to_residual`]: that
+/// function transforms an HF-only coefficient block (every LLF cell
+/// zero), whereas this one folds in the separately-decoded LLF
+/// coefficients first, producing the complete per-channel spatial block —
+/// the §I.2.3.2 `samples = IDCT_2D(coefficients)` result with
+/// `coefficients` being the LLF-prefix-plus-HF-tail matrix the natural
+/// order describes.
+///
+/// `llf` is the `cy × cx` row-major LLF block from Listing I.16
+/// ([`crate::vardct::compose_lf_to_llf_block`]); the other arguments are
+/// exactly those of [`decode_block_to_residual`].
+///
+/// Errors propagate verbatim from [`dequant_block_for_transform`],
+/// [`merge_llf_into_block`], and [`idct_for_transform`].
+#[allow(clippy::too_many_arguments)]
+pub fn decode_block_to_residual_with_llf(
+    decoded: &DecodedHfBlock,
+    t: TransformType,
+    channel: usize,
+    hf_mul: i32,
+    set: &DequantMatrixSet,
+    oim: &OpsinInverseMatrix,
+    qm: &QmScaleFactors,
+    llf: &[f32],
+) -> Result<Vec<f32>> {
+    let mut dequantised = dequant_block_for_transform(decoded, t, channel, hf_mul, set, oim, qm)?;
+    merge_llf_into_block(&mut dequantised, t, llf)?;
+    // The same defensive pixel-cell-count assertion as
+    // `decode_block_to_residual` — a table edit that mis-sized the IDCT
+    // pixel block relative to the coefficient grid would be caught here
+    // before the IDCT consumes a mis-sized block.
+    let (bwidth, bheight) = require_covered(t)?;
+    let pixel_cells = dct_pixel_dims(t)
+        .or_else(|| non_dct_pixel_dims(t))
+        .map(|(r, c)| r * c);
+    debug_assert_eq!(
+        pixel_cells,
+        Some(bwidth * bheight),
+        "JXL decode_block_to_residual_with_llf: pixel-dims({t:?}) cell count must equal \
+         bwidth · bheight ({bwidth} · {bheight})"
+    );
+    idct_for_transform(t, &dequantised)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -799,6 +924,177 @@ mod tests {
                 base, other,
                 "{t:?} dequant must match AFV0 (shared slot/grid)"
             );
+        }
+    }
+
+    // -------- merge_llf_into_block tests ---------------------------------
+
+    #[test]
+    fn merge_llf_dct8x8_writes_single_dc_cell() {
+        // DCT8×8: cx = cy = 1 → only cell (0, 0) is an LLF cell.
+        let mut blk = vec![0.0f32; 64];
+        // Seed an HF cell to confirm it is untouched.
+        blk[5] = 7.0;
+        merge_llf_into_block(&mut blk, TransformType::Dct8x8, &[42.0]).unwrap();
+        assert_eq!(blk[0], 42.0, "DC cell must carry the LLF value");
+        assert_eq!(blk[5], 7.0, "HF cell must be untouched");
+        // All other cells stay zero.
+        for (i, &v) in blk.iter().enumerate() {
+            if i != 0 && i != 5 {
+                assert_eq!(v, 0.0, "cell {i} must stay zero");
+            }
+        }
+    }
+
+    #[test]
+    fn merge_llf_dct16x16_places_2x2_top_left_corner() {
+        // DCT16×16: bwidth = bheight = 16, cx = cy = 2 → LLF cells are the
+        // 2×2 top-left corner at raster (0,0),(1,0),(8,0),(9,0)?  No —
+        // raster index is y · bwidth + x with bwidth = 16, so the LLF
+        // cells (x<2, y<2) map to raster 0, 1, 16, 17.
+        let mut blk = vec![0.0f32; 256];
+        let llf = vec![1.0f32, 2.0, 3.0, 4.0]; // row-major cy×cx = 2×2
+        merge_llf_into_block(&mut blk, TransformType::Dct16x16, &llf).unwrap();
+        assert_eq!(blk[0], 1.0, "(0,0)");
+        assert_eq!(blk[1], 2.0, "(1,0)");
+        assert_eq!(blk[16], 3.0, "(0,1)");
+        assert_eq!(blk[17], 4.0, "(1,1)");
+        // No other cell is touched.
+        for (i, &v) in blk.iter().enumerate() {
+            if ![0usize, 1, 16, 17].contains(&i) {
+                assert_eq!(v, 0.0, "cell {i} must stay zero");
+            }
+        }
+    }
+
+    #[test]
+    fn merge_llf_rect_dct16x8_uses_wide_grid_stride() {
+        // DCT16×8 grid is wide (bwidth, bheight) = (16, 8); cx = 2, cy = 1.
+        // LLF cells (x<2, y<1) map to raster 0, 1 with stride bwidth = 16.
+        let mut blk = vec![0.0f32; 128];
+        merge_llf_into_block(&mut blk, TransformType::Dct16x8, &[9.0, 11.0]).unwrap();
+        assert_eq!(blk[0], 9.0);
+        assert_eq!(blk[1], 11.0);
+        for (i, &v) in blk.iter().enumerate() {
+            if i > 1 {
+                assert_eq!(v, 0.0, "cell {i} must stay zero");
+            }
+        }
+    }
+
+    #[test]
+    fn merge_llf_non_dct_writes_only_dc() {
+        // Non-DCT transforms have cx = cy = 1 (8×8 grid); only cell 0.
+        for t in [
+            TransformType::Hornuss,
+            TransformType::Dct2x2,
+            TransformType::Dct4x4,
+            TransformType::Dct4x8,
+            TransformType::Dct8x4,
+            TransformType::Afv0,
+            TransformType::Afv1,
+            TransformType::Afv2,
+            TransformType::Afv3,
+        ] {
+            let mut blk = vec![0.0f32; 64];
+            merge_llf_into_block(&mut blk, t, &[-3.5]).unwrap();
+            assert_eq!(blk[0], -3.5, "{t:?} DC cell");
+            assert!(blk[1..].iter().all(|&v| v == 0.0), "{t:?} HF cells zero");
+        }
+    }
+
+    #[test]
+    fn merge_llf_length_mismatches_error() {
+        let mut blk = vec![0.0f32; 256];
+        // Wrong LLF length for DCT16×16 (needs 4).
+        assert!(merge_llf_into_block(&mut blk, TransformType::Dct16x16, &[1.0]).is_err());
+        // Wrong block length.
+        let mut short = vec![0.0f32; 10];
+        assert!(
+            merge_llf_into_block(&mut short, TransformType::Dct16x16, &[1.0, 2.0, 3.0, 4.0])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn merge_llf_overwrites_rather_than_adds() {
+        // Defensive: even if an LLF cell were non-zero coming in (which the
+        // §C.8.3 loop never produces), the placement is an overwrite, so the
+        // post-merge value is exactly the LLF value, not a sum.
+        let mut blk = vec![0.0f32; 256];
+        blk[0] = 100.0;
+        blk[17] = 100.0;
+        merge_llf_into_block(&mut blk, TransformType::Dct16x16, &[1.0, 2.0, 3.0, 4.0]).unwrap();
+        assert_eq!(blk[0], 1.0);
+        assert_eq!(blk[17], 4.0);
+    }
+
+    // -------- decode_block_to_residual_with_llf tests --------------------
+
+    #[test]
+    fn residual_with_llf_dc_only_dct8x8_is_flat_block() {
+        // An HF-empty DCT8×8 block whose only coefficient is the DC term
+        // IDCTs to a flat (constant) 8×8 spatial block. Compare to the
+        // HF-only path (which has DC = 0 → flat zero block) to confirm the
+        // LLF injection moves the whole block by the DC contribution.
+        let set = materialise_default_dequant_set().unwrap();
+        let b = block(vec![0i32; 64]);
+        let hf_only =
+            decode_block_to_residual(&b, TransformType::Dct8x8, 1, 3, &set, &oim(), &qm()).unwrap();
+        assert!(
+            hf_only.iter().all(|&v| v == 0.0),
+            "HF-empty block IDCTs to all-zero"
+        );
+        let with_dc = decode_block_to_residual_with_llf(
+            &b,
+            TransformType::Dct8x8,
+            1,
+            3,
+            &set,
+            &oim(),
+            &qm(),
+            &[5.0],
+        )
+        .unwrap();
+        // A pure-DC DCT8×8 block IDCTs to a constant block; every sample is
+        // equal and non-zero.
+        assert_eq!(with_dc.len(), 64);
+        let s0 = with_dc[0];
+        assert!(s0 != 0.0, "DC contribution must be non-zero");
+        for (i, &v) in with_dc.iter().enumerate() {
+            assert!(
+                (v - s0).abs() < 1e-4,
+                "pure-DC block must be flat: cell {i} = {v} != {s0}"
+            );
+        }
+    }
+
+    #[test]
+    fn residual_with_llf_zero_llf_matches_hf_only_path() {
+        // When the LLF block is all-zero, the LF-aware path is identical to
+        // the HF-only path (the merge writes zeros into already-zero cells).
+        let set = materialise_default_dequant_set().unwrap();
+        let mut coeffs = vec![0i32; 256];
+        coeffs[40] = 6;
+        coeffs[100] = -3;
+        let b = block(coeffs);
+        let hf_only =
+            decode_block_to_residual(&b, TransformType::Dct16x16, 0, 5, &set, &oim(), &qm())
+                .unwrap();
+        let with_zero_llf = decode_block_to_residual_with_llf(
+            &b,
+            TransformType::Dct16x16,
+            0,
+            5,
+            &set,
+            &oim(),
+            &qm(),
+            &[0.0; 4],
+        )
+        .unwrap();
+        assert_eq!(hf_only.len(), with_zero_llf.len());
+        for (i, (&a, &c)) in hf_only.iter().zip(with_zero_llf.iter()).enumerate() {
+            assert!((a - c).abs() < 1e-5, "cell {i}: {a} != {c}");
         }
     }
 }
