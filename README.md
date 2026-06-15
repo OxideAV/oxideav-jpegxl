@@ -47,6 +47,41 @@ shifted weights (3, 4, 3, 6)), `r195` Δ=0 pins, `r202` spec
 cross-row reads + sample-194 = 34, `r272` pixel-exact guard).
 Tests 1153 → 1156.
 
+**Round 309 (2026-06-15)** lifts the round-306 single-channel
+`assemble_channel_plane` into the per-LfGroup **three-channel
+spatial-reconstruction layer** — the step the round-306 note named as a
+caller-side concern ("chroma-from-luma (Annex G) ... runs on the assembled
+plane"). New public API in `src/residual_plane.rs`:
+[`residual_plane::ChannelResidualPlanes`] (the three XYB residual planes of
+one LfGroup, all on the shared padded block grid, channel order 0 = X /
+1 = Y / 2 = B per Listing C.13, with `x()` / `y()` / `b()` / `dims()`
+accessors); `assemble_three_channel_planes(grid, residual_at)` (walks the
+**shared** [`dct_select::DctSelectGrid`] once per channel via the round-306
+`assemble_channel_plane`, invoking the caller's `residual_at(channel, &vb)`
+decode closure — in VarDCT mode all three channels share one DctSelect grid
+per §C.5.4, and Annex G CfL "is skipped if any channel is subsampled," so
+the three planes are geometrically identical); `apply_chroma_from_luma(
+planes, x_from_y, b_from_y, cfl)` (applies Annex G Listing G.1 in place via
+the round-138 `chroma_from_luma::apply_hf_plane_inplace` — `X = dX + kX·Y`,
+`B = dB + kB·Y`, with `(kX, kB)` looked up per the 64×64 tile containing the
+sample; after the call X-plane holds final `X`, B-plane final `B`, Y
+unchanged); and the one-call driver
+`reconstruct_three_channel_planes(grid, x_from_y, b_from_y, cfl,
+residual_at)` (= assemble + CfL). The CfL call splits the `[ResidualPlane;
+3]` array so X and B are written while Y is a shared borrow. 9 unit + 5
+integration (`round309_three_channel_residual_plane`, composing the real
+F.3-dequant + I.2.3-IDCT walk across all three channels then the real Annex
+G CfL end-to-end: per-channel flat DC residual placement; default-CfL
+`B = dB + dY` restore; nonzero-tile-factor `X = dX + dY` restore; one-call
+== two-step; DCT16×16-covers-2×2 mixed-transform layout) tests. Lib tests
+788 → 797 (+9). Pure-control-flow composition primitive in the same shape as
+the round-306 stack — no bit reads, no spec re-derivation, no histogram
+materialisation. A future round wiring §C.7.2 entropy histograms
+(#799 DOCS-GAP) + the per-LfGroup three-channel decode driver (round 264)
+can drop this reconstructor in as the per-LfGroup spatial-reconstruction
+layer; Gaborish (Annex J.2) + EPF (Annex J.3) run on the returned planes
+and remain caller-side concerns above this primitive.
+
 **Round 306 (2026-06-15)** lands the per-LfGroup VarDCT
 **residual-plane assembly** stage — the spatial-placement layer
 directly above the round-286/293/300 `block_dequant` per-block decode

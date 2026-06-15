@@ -76,8 +76,10 @@
 //! **no** histogram materialisation.
 
 use crate::block_dequant::covered_grid_dims;
+use crate::chroma_from_luma::apply_hf_plane_inplace;
 use crate::dct_select::{DctSelectGrid, TransformType};
 use crate::idct::{dct_pixel_dims, non_dct_pixel_dims};
+use crate::lf_global::LfChannelCorrelation;
 use crate::varblock_walk::{Varblock, VarblockWalk};
 use oxideav_core::{Error, Result};
 
@@ -224,6 +226,138 @@ where
         place_block(&mut plane, &vb, &block)?;
     }
     Ok(plane)
+}
+
+/// The three XYB residual planes of a single LfGroup, all sized to the
+/// same padded block grid: index `0 = X`, `1 = Y`, `2 = B` (the VarDCT
+/// channel ordering of Listing C.13).
+///
+/// Each plane is a [`ResidualPlane`] over the LfGroup's padded block
+/// grid (`width_blocks·8 × height_blocks·8`); the caller crops all three
+/// to `lf_w × lf_h` after restoration filtering.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChannelResidualPlanes {
+    /// The X / Y / B residual planes, in that channel order.
+    pub planes: [ResidualPlane; 3],
+}
+
+impl ChannelResidualPlanes {
+    /// Borrow the X plane (channel 0).
+    pub fn x(&self) -> &ResidualPlane {
+        &self.planes[0]
+    }
+    /// Borrow the Y plane (channel 1).
+    pub fn y(&self) -> &ResidualPlane {
+        &self.planes[1]
+    }
+    /// Borrow the B plane (channel 2).
+    pub fn b(&self) -> &ResidualPlane {
+        &self.planes[2]
+    }
+    /// The shared plane dimensions `(width, height)` in pixels.
+    pub fn dims(&self) -> (usize, usize) {
+        (self.planes[0].width, self.planes[0].height)
+    }
+}
+
+/// Assemble all three XYB residual planes of an LfGroup by walking the
+/// shared [`DctSelectGrid`] once per channel.
+///
+/// `residual_at(channel, &vb)` is invoked once per `(channel, varblock)`
+/// pair — three full raster walks of the grid, channel order `0 = X`,
+/// `1 = Y`, `2 = B` — and returns the channel's `R × C` row-major
+/// spatial residual block (the [`crate::block_dequant::decode_block_to_residual`]
+/// output) for that varblock.
+///
+/// In VarDCT mode all three channels share one `DctSelectGrid`: the
+/// transform choice is decoded once per varblock (§C.5.4) and applies to
+/// every channel, and Annex G CfL "is skipped if any channel is
+/// subsampled," so when CfL applies the three planes have identical
+/// geometry. This driver therefore reuses the single grid for all three
+/// channel walks and produces three planes of identical dimensions.
+///
+/// The per-varblock decode (coefficient lookup, F.3 dequant, IDCT) lives
+/// entirely in the closure; this driver owns only the per-channel grid
+/// walk and the spatial placement geometry (delegated to
+/// [`assemble_channel_plane`]). Closure errors propagate verbatim.
+pub fn assemble_three_channel_planes<F>(
+    grid: &DctSelectGrid,
+    mut residual_at: F,
+) -> Result<ChannelResidualPlanes>
+where
+    F: FnMut(usize, &Varblock) -> Result<Vec<f32>>,
+{
+    let x = assemble_channel_plane(grid, |vb| residual_at(0, vb))?;
+    let y = assemble_channel_plane(grid, |vb| residual_at(1, vb))?;
+    let b = assemble_channel_plane(grid, |vb| residual_at(2, vb))?;
+    Ok(ChannelResidualPlanes { planes: [x, y, b] })
+}
+
+/// Apply Annex G chroma-from-luma to three assembled XYB residual planes
+/// in place.
+///
+/// The X (channel 0) and B (channel 2) residual planes carry the
+/// `dX` / `dB` chroma-residual samples; the Y plane (channel 1) carries
+/// the luma `dY`. Per Listing G.1 each X / B sample is restored as
+/// `X = dX + kX·Y` / `B = dB + kB·Y`, with `(kX, kB)` looked up per the
+/// 64×64 tile containing the sample (the HF path of Annex G). After this
+/// call `planes[0]` holds the final `X` plane, `planes[2]` the final `B`
+/// plane, and `planes[1]` (`Y`) is unchanged.
+///
+/// `x_from_y` / `b_from_y` are the per-64×64-tile factor channels from
+/// [`crate::lf_group::HfMetadata`], each of length
+/// `ceil(width / 64) × ceil(height / 64)` over the shared plane
+/// dimensions (row-major).
+///
+/// Errors (via [`apply_hf_plane_inplace`]): factor-plane length mismatch,
+/// or `cfl.colour_factor == 0`.
+pub fn apply_chroma_from_luma(
+    planes: &mut ChannelResidualPlanes,
+    x_from_y: &[i32],
+    b_from_y: &[i32],
+    cfl: &LfChannelCorrelation,
+) -> Result<()> {
+    let (w, h) = planes.dims();
+    let width = u32::try_from(w)
+        .map_err(|_| Error::InvalidData("JXL CfL: plane width exceeds u32".into()))?;
+    let height = u32::try_from(h)
+        .map_err(|_| Error::InvalidData("JXL CfL: plane height exceeds u32".into()))?;
+    // Split the array so X and B are mutable while Y is a shared borrow.
+    let [x_plane, y_plane, b_plane] = &mut planes.planes;
+    apply_hf_plane_inplace(
+        &mut x_plane.samples,
+        &y_plane.samples,
+        &mut b_plane.samples,
+        width,
+        height,
+        x_from_y,
+        b_from_y,
+        cfl,
+    )
+}
+
+/// One-call per-LfGroup three-channel reconstruction: assemble the X / Y
+/// / B residual planes from the shared grid, then apply Annex G CfL,
+/// returning the final XYB planes (still on the padded block grid; the
+/// caller crops to `lf_w × lf_h`).
+///
+/// Equivalent to [`assemble_three_channel_planes`] followed by
+/// [`apply_chroma_from_luma`]. Gaborish (Annex J.2) and EPF (Annex J.3)
+/// run on the returned planes and remain caller-side concerns above this
+/// primitive.
+pub fn reconstruct_three_channel_planes<F>(
+    grid: &DctSelectGrid,
+    x_from_y: &[i32],
+    b_from_y: &[i32],
+    cfl: &LfChannelCorrelation,
+    residual_at: F,
+) -> Result<ChannelResidualPlanes>
+where
+    F: FnMut(usize, &Varblock) -> Result<Vec<f32>>,
+{
+    let mut planes = assemble_three_channel_planes(grid, residual_at)?;
+    apply_chroma_from_luma(&mut planes, x_from_y, b_from_y, cfl)?;
+    Ok(planes)
 }
 
 #[cfg(test)]
@@ -525,5 +659,189 @@ mod tests {
         assert_eq!(p.get(8, 0), None);
         assert_eq!(p.get(0, 8), None);
         assert!(p.get(7, 7).is_some());
+    }
+
+    #[test]
+    fn assemble_three_channels_visits_each_channel_in_order() {
+        // 1×1 DCT8×8 grid: the closure should be called once per channel,
+        // in order 0=X, 1=Y, 2=B, with the same varblock each time.
+        let g = single_dct8x8();
+        let mut calls: Vec<usize> = Vec::new();
+        let planes = assemble_three_channel_planes(&g, |c, v| {
+            assert_eq!((v.x, v.y), (0, 0));
+            calls.push(c);
+            // Tag each channel's plane with a distinct constant.
+            Ok(vec![(c as f32 + 1.0) * 10.0; 64])
+        })
+        .unwrap();
+        assert_eq!(calls, vec![0, 1, 2]);
+        assert_eq!(planes.dims(), (8, 8));
+        assert_eq!(planes.x().get(0, 0), Some(10.0));
+        assert_eq!(planes.y().get(0, 0), Some(20.0));
+        assert_eq!(planes.b().get(0, 0), Some(30.0));
+    }
+
+    #[test]
+    fn three_channel_planes_share_dims() {
+        // 2×2 DCT8×8 grid → all three planes are 16×16.
+        let cells = vec![DctSelectCell::TopLeft(TransformType::Dct8x8); 4];
+        let g = grid(cells, vec![1; 4], 2, 2);
+        let planes = assemble_three_channel_planes(&g, |_c, _v| Ok(vec![0.0f32; 64])).unwrap();
+        assert_eq!(planes.dims(), (16, 16));
+        for p in &planes.planes {
+            assert_eq!((p.width, p.height), (16, 16));
+        }
+    }
+
+    #[test]
+    fn assemble_three_channels_propagates_channel_error() {
+        // Fail only on the B channel (index 2); the X+Y walks must have
+        // run first, so the error surfaces from the third walk.
+        let g = single_dct8x8();
+        let err = assemble_three_channel_planes(&g, |c, _v| {
+            if c == 2 {
+                Err(Error::InvalidData("b boom".into()))
+            } else {
+                Ok(vec![0.0f32; 64])
+            }
+        })
+        .unwrap_err();
+        assert!(matches!(err, Error::InvalidData(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn cfl_default_correlation_restores_x_and_b() {
+        // Single 8×8 DCT block; default LfChannelCorrelation:
+        //   kX = base_correlation_x + x_factor/colour_factor
+        //      = 0.0 + 0/84 = 0.0
+        //   kB = base_correlation_b + b_factor/colour_factor
+        //      = 1.0 + 0/84 = 1.0
+        // (XFromY / BFromY tile factors are all 0 here.)
+        // So final X = dX + 0·Y = dX (unchanged); B = dB + 1·Y.
+        let g = single_dct8x8();
+        let mut planes = assemble_three_channel_planes(&g, |c, _v| {
+            // dX = 3, dY = 5, dB = 7 everywhere.
+            let v = match c {
+                0 => 3.0,
+                1 => 5.0,
+                _ => 7.0,
+            };
+            Ok(vec![v; 64])
+        })
+        .unwrap();
+        // One 8×8 plane → ceil(8/64) = 1 tile in each axis → 1 factor cell.
+        let x_from_y = vec![0i32; 1];
+        let b_from_y = vec![0i32; 1];
+        let cfl = LfChannelCorrelation::default();
+        apply_chroma_from_luma(&mut planes, &x_from_y, &b_from_y, &cfl).unwrap();
+        // X unchanged (kX = 0), Y unchanged, B = 7 + 1·5 = 12.
+        assert_eq!(planes.x().get(0, 0), Some(3.0));
+        assert_eq!(planes.y().get(0, 0), Some(5.0));
+        assert_eq!(planes.b().get(0, 0), Some(12.0));
+    }
+
+    #[test]
+    fn cfl_nonzero_tile_factor_changes_kx() {
+        // x_factor = 84 → kX = 0 + 84/84 = 1.0; X = dX + 1·Y.
+        // b_factor = -84 → kB = 1 + (-84)/84 = 0.0; B = dB + 0·Y = dB.
+        let g = single_dct8x8();
+        let mut planes = assemble_three_channel_planes(&g, |c, _v| {
+            let v = match c {
+                0 => 2.0,
+                1 => 10.0,
+                _ => 4.0,
+            };
+            Ok(vec![v; 64])
+        })
+        .unwrap();
+        let x_from_y = vec![84i32; 1];
+        let b_from_y = vec![-84i32; 1];
+        let cfl = LfChannelCorrelation::default();
+        apply_chroma_from_luma(&mut planes, &x_from_y, &b_from_y, &cfl).unwrap();
+        // X = 2 + 1·10 = 12; Y = 10; B = 4 + 0·10 = 4.
+        assert_eq!(planes.x().get(0, 0), Some(12.0));
+        assert_eq!(planes.y().get(0, 0), Some(10.0));
+        assert_eq!(planes.b().get(0, 0), Some(4.0));
+    }
+
+    #[test]
+    fn cfl_rejects_wrong_factor_plane_length() {
+        let g = single_dct8x8();
+        let mut planes = assemble_three_channel_planes(&g, |_c, _v| Ok(vec![0.0f32; 64])).unwrap();
+        // 8×8 plane needs exactly 1 factor cell; supply 2.
+        let err = apply_chroma_from_luma(
+            &mut planes,
+            &[0i32; 2],
+            &[0i32; 1],
+            &LfChannelCorrelation::default(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::InvalidData(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn cfl_rejects_zero_colour_factor() {
+        let g = single_dct8x8();
+        let mut planes = assemble_three_channel_planes(&g, |_c, _v| Ok(vec![0.0f32; 64])).unwrap();
+        let cfl = LfChannelCorrelation {
+            colour_factor: 0,
+            ..LfChannelCorrelation::default()
+        };
+        let err = apply_chroma_from_luma(&mut planes, &[0i32; 1], &[0i32; 1], &cfl).unwrap_err();
+        assert!(matches!(err, Error::InvalidData(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn reconstruct_equals_assemble_then_cfl() {
+        // The one-call driver must equal the two-step composition.
+        let cells = vec![DctSelectCell::TopLeft(TransformType::Dct8x8); 4];
+        let g = grid(cells, vec![1; 4], 2, 2);
+        let resid = |c: usize, v: &Varblock| -> Result<Vec<f32>> {
+            // A value that varies by channel and varblock position.
+            let base = (c as f32) * 100.0 + (v.y * 2 + v.x) as f32;
+            Ok(vec![base; 64])
+        };
+        // 16×16 plane → ceil(16/64) = 1 tile.
+        let x_from_y = vec![42i32; 1];
+        let b_from_y = vec![-21i32; 1];
+        let cfl = LfChannelCorrelation::default();
+
+        let mut step = assemble_three_channel_planes(&g, resid).unwrap();
+        apply_chroma_from_luma(&mut step, &x_from_y, &b_from_y, &cfl).unwrap();
+
+        let one = reconstruct_three_channel_planes(&g, &x_from_y, &b_from_y, &cfl, resid).unwrap();
+        assert_eq!(one, step);
+    }
+
+    #[test]
+    fn reconstruct_multi_tile_uses_per_tile_factor() {
+        // A 9×9 cell grid → 72×72 px plane → ceil(72/64) = 2 tiles per
+        // axis = 4 factor cells. Tile (0,0) covers pixels [0,64); tile
+        // (1,1) covers [64,72). Use distinct x_factor per tile and check
+        // a sample in each tile picks up the matching kX.
+        let cells = vec![DctSelectCell::TopLeft(TransformType::Dct8x8); 81];
+        let g = grid(cells, vec![1; 81], 9, 9);
+        // dX = 0, dY = 84 everywhere → X = 0 + kX·84 = x_factor (since
+        // kX = x_factor/84 with default base 0 and colour_factor 84).
+        let planes = reconstruct_three_channel_planes(
+            &g,
+            // tiles row-major: (0,0)=1, (1,0)=2, (0,1)=3, (1,1)=4.
+            &[1i32, 2, 3, 4],
+            &[0i32; 4],
+            &LfChannelCorrelation::default(),
+            |c, _v| Ok(vec![if c == 1 { 84.0 } else { 0.0 }; 64]),
+        )
+        .unwrap();
+        // X = x_factor/84·84 = x_factor (within f32 rounding). Each
+        // sampled pixel falls in a distinct tile, so it must pick up the
+        // matching tile's x_factor.
+        let close = |got: Option<f32>, want: f32| {
+            let v = got.unwrap();
+            assert!((v - want).abs() < 1e-3, "got {v}, want {want}");
+        };
+        close(planes.x().get(0, 0), 1.0); // tile (0,0)
+        close(planes.x().get(64, 0), 2.0); // tile (1,0)
+        close(planes.x().get(0, 64), 3.0); // tile (0,1)
+        close(planes.x().get(64, 64), 4.0); // tile (1,1)
     }
 }

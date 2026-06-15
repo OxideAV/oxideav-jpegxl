@@ -9,6 +9,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Round 309 — per-LfGroup VarDCT **three-channel spatial-reconstruction
+  layer** (`src/residual_plane.rs`), lifting the round-306 single-channel
+  `assemble_channel_plane` to the X / Y / B level and applying Annex G
+  chroma-from-luma. New public API: `ChannelResidualPlanes` (the three XYB
+  residual planes of one LfGroup, all on the shared padded block grid,
+  channel order 0 = X / 1 = Y / 2 = B per Listing C.13, with `x()` / `y()`
+  / `b()` / `dims()` accessors); `assemble_three_channel_planes(grid,
+  residual_at)` (walks the shared `dct_select::DctSelectGrid` once per
+  channel via `assemble_channel_plane`, invoking the caller's
+  `residual_at(channel, &vb)` decode closure — in VarDCT mode all three
+  channels share one DctSelect grid per §C.5.4, and Annex G CfL "is skipped
+  if any channel is subsampled," so the three planes are geometrically
+  identical); `apply_chroma_from_luma(planes, x_from_y, b_from_y, cfl)`
+  (applies Annex G Listing G.1 in place via the round-138
+  `chroma_from_luma::apply_hf_plane_inplace`: `X = dX + kX·Y`,
+  `B = dB + kB·Y`, with `(kX, kB)` looked up per the 64×64 tile containing
+  the sample; after the call X-plane holds final `X`, B-plane final `B`, Y
+  unchanged); and the one-call driver `reconstruct_three_channel_planes(
+  grid, x_from_y, b_from_y, cfl, residual_at)` (= assemble + CfL). 9 unit +
+  5 integration (`round309_three_channel_residual_plane`, composing the
+  real F.3-dequant + I.2.3-IDCT walk across all three channels then the
+  real Annex G CfL end-to-end) tests. Lib tests 788 → 797 (+9).
+  Pure-control-flow composition primitive — no bit reads, no spec
+  re-derivation, no histogram materialisation. Gaborish (Annex J.2) + EPF
+  (Annex J.3) run on the returned planes and remain caller-side concerns.
+  Source of truth: ISO/IEC FDIS 18181-1:2021 §C.5.4 (DctSelect placement) +
+  Annex G (chroma-from-luma, Listing G.1) + §F.3 / §I.2.3 (dequant + IDCT).
+
 - Round 306 — per-LfGroup VarDCT **residual-plane assembly**
   (`src/residual_plane.rs`), the spatial-placement layer directly above
   the round-286/293/300 `block_dequant` per-block decode walk. Walks a
