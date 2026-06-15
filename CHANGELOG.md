@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.11](https://github.com/OxideAV/oxideav-jpegxl/compare/v0.0.10...v0.0.11) - 2026-06-15
+
+### Other
+
+- round-309 (parent-dispatch r309) against ISO/IEC FDIS 18181-1:2021 — per-LfGroup VarDCT three-channel residual-plane assembly + Annex G chroma-from-luma
+- round-306 (parent-dispatch r306) against ISO/IEC FDIS 18181-1:2021 — per-LfGroup VarDCT residual-plane assembly (§C.5.4 placement + §C.8.3 + Table I.4/§I.2.3 pixel-dims)
+- cover non-DCT transforms (Hornuss/DCT2x2/DCT4x4/DCT4x8/DCT8x4/AFV) — round 300
+- round-293 (parent-dispatch r293) against ISO/IEC FDIS 18181-1:2021 — extend the per-block VarDCT decode walk to every plain separable-DCT transform (rectangular + DCT64..256 family), lifting the round-286 square-only orientation deferral
+- Round 286 — per-block VarDCT decode walk to spatial samples (square DCTs)
+- round-281 (parent-dispatch r281) against ISO/IEC FDIS 18181-1:2021 — two §C.8.3 decode-walk prose-conformance fixes: per-varblock channel decode order is Y, X, then B (rounds 221..264 advanced the entropy stream X-first; Listing C.13's (c < 2 ? c ^ 1 : 2) mapping independently corroborates Y-first) + NonZeros(x, y) writeback covers every block of the varblock footprint per the 'for each block in the current varblock' prose (rounds 177..264 wrote only the top-left cell, corrupting PredictedNonZeros reads against continuation cells of multi-cell transforms)
+- round-278 (parent-dispatch r278) against ISO/IEC FDIS 18181-1:2021 — FIX the rounds-31..272 noise-64x64-lossless WP pixel divergence: Listing E.2 error2weight Idiv-first operand order + true_errNW column-0 N-fallback, both pinned by the staged wp-trace-sample-194.md; noise-64x64-lossless now byte-exact on all three planes and synth_320 pixel-exact (102400/102400)
+- name + pin the WP sub_err reading choice (Annex E.1)
+- round-264 (parent-dispatch r264) against ISO/IEC FDIS 18181-1:2021 — HfHistogramDecodeContext::decode_lf_group_three_channels_for_pass bundled per-LfGroup raster-walk three-channel decode driver for one pass
+- round-260 (parent-dispatch r260) against ISO/IEC FDIS 18181-1:2021 — HfHistogramDecodeContext::decode_three_channel_varblock_for_pass bundled three-channel per-varblock walk composing the round-255 single-channel decode method three times against the round-214 BlockContextResolver per-channel block_ctx derivation
+- round-255 (parent-dispatch r255) against ISO/IEC FDIS 18181-1:2021 — HfHistogramDecodeContext::decode_block_for_pass_transform bundled per-varblock decode method composing the round-90 Listing C.14 state machine with the round-252 per-pass histogram routing
+- round-252 (parent-dispatch r252) against ISO/IEC FDIS 18181-1:2021 — multi_pass_hf_histogram_decoder::HfHistogramDecodeContext typed bridge wiring the §C.7.2 entropy stream to the §C.8.3 per-pass histogram_offset routing
+- drop release-plz.toml — use release-plz defaults across the workspace
+- round-247 (parent-dispatch r247) against ISO/IEC FDIS 18181-1:2021 — §C.7.2 HfCoefficientHistograms wrapper performing the actual EntropyStream::read of the 495 × num_hf_presets × nb_block_ctx clustered-distributions block
+- round-238 (parent-dispatch r238) against ISO/IEC FDIS 18181-1:2021 — hf_coeff_histogram_size typed sizing primitive for §C.7.2 + §C.8.3 routing offset
+- round-232 (parent-dispatch r232) against ISO/IEC FDIS 18181-1:2021 — per-LfGroup multi-pass HF-header + per-pass histogram_offset routing driver (§C.8.3 first paragraph)
+- round-228 (parent-dispatch r228) against ISO/IEC FDIS 18181-1:2021 — per-LfGroup multi-pass three-channel varblock decode driver (§C.8.3 + Table C.6 Passes outer pass loop)
+- round-221 (parent-dispatch r221) against ISO/IEC FDIS 18181-1:2021 — three-channel per-LfGroup varblock decode driver (§C.8.3 outer-varblock × inner-X/Y/B sweep)
+- round-214 (parent-dispatch r214) against ISO/IEC FDIS 18181-1:2021 — per-LfGroup BlockContext() resolver (§C.8.3 Listing C.13 + §I.2.2 HfBlockContext bundle)
+- round-208 (parent-dispatch r208) against ISO/IEC FDIS 18181-1:2021 — per-LfGroup varblock-walk driver (§C.5.4 + §C.8.3)
+- round-202 (parent-dispatch r202) against ISO/IEC FDIS 18181-1:2021 — full-row WP state-evolution chain validation across noise-64x64-lossless samples 192..=200
+- Hat-2 scrub: replace 'libjxl' decorative-attribution lines with neutral terms
+- r195 fix — add serial_test for r195 WP trace tests
+
 ### Added
 
 - Round 309 — per-LfGroup VarDCT **three-channel spatial-reconstruction
