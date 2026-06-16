@@ -79,8 +79,10 @@ use crate::block_dequant::covered_grid_dims;
 use crate::chroma_from_luma::apply_hf_plane_inplace;
 use crate::dct_select::{DctSelectGrid, TransformType};
 use crate::idct::{dct_pixel_dims, non_dct_pixel_dims};
+use crate::lf_dequant::LfDequantOutput;
 use crate::lf_global::LfChannelCorrelation;
 use crate::varblock_walk::{Varblock, VarblockWalk};
+use crate::vardct::compose_lf_to_llf_block;
 use oxideav_core::{Error, Result};
 
 /// A single-channel spatial residual plane sized to the padded block
@@ -356,6 +358,108 @@ where
     F: FnMut(usize, &Varblock) -> Result<Vec<f32>>,
 {
     let mut planes = assemble_three_channel_planes(grid, residual_at)?;
+    apply_chroma_from_luma(&mut planes, x_from_y, b_from_y, cfl)?;
+    Ok(planes)
+}
+
+/// LF-aware counterpart of [`assemble_three_channel_planes`]: assemble
+/// the X / Y / B residual planes from the shared grid, threading each
+/// varblock's separately-decoded **LLF** (DC subband) coefficients into
+/// the per-block decode.
+///
+/// For every varblock walked (per channel `c ∈ [0..3]`) this driver
+/// extracts that channel's `cy × cx` row-major LLF block from `lf` at the
+/// varblock's `(vb.x, vb.y)` 8×8-block grid origin — via
+/// [`crate::vardct::compose_lf_to_llf_block`] (`extract_lf_subblock` then
+/// Listing I.16 `llf_from_lf`) — and hands it to the caller's
+/// `decode_with_llf(channel, vb, &llf)` closure, which owns the F.3
+/// dequant → §I.2.4 LLF merge → §I.2.3.2 IDCT walk (i.e.
+/// [`crate::block_dequant::decode_block_to_residual_with_llf`]). The
+/// returned residual block is the **complete** per-channel spatial
+/// block, not the HF-only residual of
+/// [`assemble_three_channel_planes`].
+///
+/// `lf` carries the dequantised LF samples of this LfGroup for all three
+/// channels ([`crate::lf_dequant::dequant_lf`] output). The three LF
+/// channels must share identical dims — the non-subsampled case §F.2
+/// applies to; a per-channel-dims subsampled LfGroup must drive the
+/// per-channel `compose_lf_to_llf_block` path directly. Mismatched LF
+/// dims surface as [`Error::InvalidData`] before any decode work.
+///
+/// The grid walk, plane geometry, and placement are exactly those of
+/// [`assemble_channel_plane`]; only the per-block residual source folds
+/// in the LLF. Closure errors and `compose_lf_to_llf_block` errors
+/// (varblock origin overflow, varblock spilling past the LF grid)
+/// propagate verbatim without writing a partial plane.
+pub fn assemble_three_channel_planes_with_lf<F>(
+    grid: &DctSelectGrid,
+    lf: &LfDequantOutput,
+    mut decode_with_llf: F,
+) -> Result<ChannelResidualPlanes>
+where
+    F: FnMut(usize, &Varblock, &[f32]) -> Result<Vec<f32>>,
+{
+    // The three LF channels must agree on dims (non-subsampled case);
+    // reject up front so a mismatch can't silently mis-address one
+    // channel's LLF extraction mid-walk.
+    if lf.widths[0] != lf.widths[1]
+        || lf.widths[0] != lf.widths[2]
+        || lf.heights[0] != lf.heights[1]
+        || lf.heights[0] != lf.heights[2]
+    {
+        return Err(Error::InvalidData(format!(
+            "JXL reconstruct_with_lf: LF channels have different dims \
+             (widths = {:?}, heights = {:?}); the subsampled case must \
+             drive compose_lf_to_llf_block per channel",
+            lf.widths, lf.heights,
+        )));
+    }
+    let lf_w = lf.widths[0];
+    let lf_h = lf.heights[0];
+
+    let assemble_one = |c: usize, decode: &mut F| -> Result<ResidualPlane> {
+        assemble_channel_plane(grid, |vb| {
+            let llf =
+                compose_lf_to_llf_block(&lf.samples[c], lf_w, lf_h, vb.x, vb.y, vb.transform)?;
+            decode(c, vb, &llf)
+        })
+    };
+
+    let x = assemble_one(0, &mut decode_with_llf)?;
+    let y = assemble_one(1, &mut decode_with_llf)?;
+    let b = assemble_one(2, &mut decode_with_llf)?;
+    Ok(ChannelResidualPlanes { planes: [x, y, b] })
+}
+
+/// One-call LF-aware per-LfGroup three-channel reconstruction: the
+/// LF-aware counterpart of [`reconstruct_three_channel_planes`].
+///
+/// Assembles the X / Y / B residual planes from the shared grid with
+/// each varblock's LLF (DC subband) coefficients folded in
+/// ([`assemble_three_channel_planes_with_lf`]), then applies Annex G
+/// chroma-from-luma ([`apply_chroma_from_luma`]). The returned XYB
+/// planes are the final per-LfGroup residual planes on the padded block
+/// grid; the caller crops to `lf_w × lf_h` and runs Gaborish (Annex J.2)
+/// + EPF (Annex J.3) above this primitive.
+///
+/// `lf` supplies the LfGroup's dequantised LF samples and
+/// `decode_with_llf(channel, vb, &llf)` owns the per-block F.3 dequant →
+/// §I.2.4 LLF merge → §I.2.3.2 IDCT walk
+/// ([`crate::block_dequant::decode_block_to_residual_with_llf`]); see
+/// [`assemble_three_channel_planes_with_lf`] for the LLF-extraction and
+/// LF-dims contract.
+pub fn reconstruct_three_channel_planes_with_lf<F>(
+    grid: &DctSelectGrid,
+    lf: &LfDequantOutput,
+    x_from_y: &[i32],
+    b_from_y: &[i32],
+    cfl: &LfChannelCorrelation,
+    decode_with_llf: F,
+) -> Result<ChannelResidualPlanes>
+where
+    F: FnMut(usize, &Varblock, &[f32]) -> Result<Vec<f32>>,
+{
+    let mut planes = assemble_three_channel_planes_with_lf(grid, lf, decode_with_llf)?;
     apply_chroma_from_luma(&mut planes, x_from_y, b_from_y, cfl)?;
     Ok(planes)
 }
@@ -843,5 +947,104 @@ mod tests {
         close(planes.x().get(64, 0), 2.0); // tile (1,0)
         close(planes.x().get(0, 64), 3.0); // tile (0,1)
         close(planes.x().get(64, 64), 4.0); // tile (1,1)
+    }
+
+    #[test]
+    fn with_lf_threads_per_channel_llf_block() {
+        // Single DCT8×8 varblock (cx=cy=1 → LLF is the LF sample). Feed a
+        // distinct LF sample per channel and a decode closure that simply
+        // returns a flat block of the LLF value; the assembled plane must
+        // carry each channel's own LLF across its 8×8 footprint.
+        let g = single_dct8x8();
+        let lf = LfDequantOutput {
+            samples: [vec![10.0], vec![20.0], vec![30.0]],
+            widths: [1, 1, 1],
+            heights: [1, 1, 1],
+        };
+        let planes = assemble_three_channel_planes_with_lf(&g, &lf, |_c, _vb, llf| {
+            assert_eq!(llf.len(), 1);
+            Ok(vec![llf[0]; 64])
+        })
+        .unwrap();
+        // DCT8×8 LLF = LF sample within f32 rounding (ScaleF(1,8,0) ≈ 1).
+        for (c, &want) in [10.0f32, 20.0, 30.0].iter().enumerate() {
+            for r in 0..8 {
+                for x in 0..8 {
+                    let v = planes.planes[c].get(x, r).unwrap();
+                    assert!((v - want).abs() < 1e-3, "channel {c} cell ({x},{r}) = {v}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn with_lf_passes_correct_block_coords_to_llf_extraction() {
+        // A 2×1 grid: two side-by-side DCT8×8 varblocks. The 2×1 LF image
+        // gives the left varblock LF cell 0 and the right varblock LF cell
+        // 1, so the per-varblock block-grid origin must thread through
+        // `compose_lf_to_llf_block` into the closure's LLF.
+        let g = grid(
+            vec![
+                DctSelectCell::TopLeft(TransformType::Dct8x8),
+                DctSelectCell::TopLeft(TransformType::Dct8x8),
+            ],
+            vec![1, 1],
+            2,
+            1,
+        );
+        let lf = LfDequantOutput {
+            samples: [vec![3.0, 7.0], vec![3.0, 7.0], vec![3.0, 7.0]],
+            widths: [2, 2, 2],
+            heights: [1, 1, 1],
+        };
+        let planes =
+            assemble_three_channel_planes_with_lf(&g, &lf, |_c, _vb, llf| Ok(vec![llf[0]; 64]))
+                .unwrap();
+        // Left block (pixels x<8) carries LF 3; right block (x>=8) LF 7.
+        assert!((planes.planes[1].get(0, 0).unwrap() - 3.0).abs() < 1e-3);
+        assert!((planes.planes[1].get(8, 0).unwrap() - 7.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn with_lf_rejects_mismatched_channel_dims() {
+        let g = single_dct8x8();
+        let lf = LfDequantOutput {
+            samples: [vec![1.0], vec![1.0, 2.0], vec![1.0]],
+            widths: [1, 2, 1],
+            heights: [1, 1, 1],
+        };
+        let err = assemble_three_channel_planes_with_lf(&g, &lf, |_, _, _| Ok(vec![0.0; 64]))
+            .unwrap_err();
+        assert!(matches!(err, Error::InvalidData(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn reconstruct_with_lf_equals_assemble_with_lf_then_cfl() {
+        // The one-call LF-aware driver equals the two-step composition
+        // (assemble_with_lf then apply_chroma_from_luma), mirroring the
+        // non-LF `reconstruct_equals_assemble_then_cfl` invariant.
+        let cells = vec![DctSelectCell::TopLeft(TransformType::Dct8x8); 4];
+        let g = grid(cells, vec![1; 4], 2, 2);
+        let lf = LfDequantOutput {
+            samples: [
+                vec![1.0, 2.0, 3.0, 4.0],
+                vec![5.0, 6.0, 7.0, 8.0],
+                vec![9.0, 10.0, 11.0, 12.0],
+            ],
+            widths: [2, 2, 2],
+            heights: [2, 2, 2],
+        };
+        let decode = |_c: usize, _vb: &Varblock, llf: &[f32]| Ok(vec![llf[0]; 64]);
+        let x_from_y = vec![42i32; 1];
+        let b_from_y = vec![-21i32; 1];
+        let cfl = LfChannelCorrelation::default();
+
+        let mut step = assemble_three_channel_planes_with_lf(&g, &lf, decode).unwrap();
+        apply_chroma_from_luma(&mut step, &x_from_y, &b_from_y, &cfl).unwrap();
+
+        let one =
+            reconstruct_three_channel_planes_with_lf(&g, &lf, &x_from_y, &b_from_y, &cfl, decode)
+                .unwrap();
+        assert_eq!(one, step);
     }
 }
