@@ -131,6 +131,58 @@ impl ResidualPlane {
         }
         Some(self.samples[y * self.width + x])
     }
+
+    /// Crop this plane to a `target_width × target_height` extent by
+    /// keeping the top-left rectangle and discarding the right and bottom
+    /// padding — the §6.2 "cropping at the right and bottom as necessary"
+    /// step that turns the padded block-grid reconstruction into the
+    /// logical channel extent.
+    ///
+    /// The padded plane has dimensions `width_blocks·8 × height_blocks·8`
+    /// where `width_blocks = ceil(target_width / 8)` and
+    /// `height_blocks = ceil(target_height / 8)` (§C.5.4), so a valid
+    /// target is at most this plane's dimensions and at most 7 pixels
+    /// smaller along each axis. Both bounds are enforced.
+    ///
+    /// Per §6.2 the decoder "ensures the decoded image has the dimensions
+    /// specified in SizeHeader by cropping at the right and bottom" — the
+    /// retained samples are exactly `self.get(x, y)` for `x < target_width`
+    /// and `y < target_height`; no resampling, averaging, or edge handling
+    /// is performed.
+    ///
+    /// Errors with [`Error::InvalidData`] if either target dimension is
+    /// zero or exceeds this plane's corresponding dimension (a crop can
+    /// only shrink — never grow — a padded reconstruction).
+    pub fn crop_to(&self, target_width: usize, target_height: usize) -> Result<ResidualPlane> {
+        if target_width == 0 || target_height == 0 {
+            return Err(Error::InvalidData(format!(
+                "JXL residual plane crop: zero target dimension \
+                 ({target_width}×{target_height})"
+            )));
+        }
+        if target_width > self.width || target_height > self.height {
+            return Err(Error::InvalidData(format!(
+                "JXL residual plane crop: target {target_width}×{target_height} \
+                 exceeds padded plane {}×{} (crop only shrinks)",
+                self.width, self.height
+            )));
+        }
+        // Common case: target already matches the plane (LfGroup whose
+        // logical extent is an exact multiple of 8). Avoid the copy.
+        if target_width == self.width && target_height == self.height {
+            return Ok(self.clone());
+        }
+        let mut out = Vec::with_capacity(target_width * target_height);
+        for y in 0..target_height {
+            let row_start = y * self.width;
+            out.extend_from_slice(&self.samples[row_start..row_start + target_width]);
+        }
+        Ok(ResidualPlane {
+            width: target_width,
+            height: target_height,
+            samples: out,
+        })
+    }
 }
 
 /// Pixel shape `(R, C) = (rows, cols)` of a transform's residual block,
@@ -259,6 +311,29 @@ impl ChannelResidualPlanes {
     /// The shared plane dimensions `(width, height)` in pixels.
     pub fn dims(&self) -> (usize, usize) {
         (self.planes[0].width, self.planes[0].height)
+    }
+
+    /// Crop all three XYB planes to a `target_width × target_height`
+    /// extent, dropping the right/bottom padding of the block grid
+    /// (§6.2). This is the post-restoration step that turns the padded
+    /// per-LfGroup reconstruction into the logical channel extent
+    /// (`lf_w × lf_h`, or the §6.2.1 cropped frame extent for the whole
+    /// image).
+    ///
+    /// All three planes share the padded grid geometry (the non-subsampled
+    /// VarDCT case these planes are produced for), so a single target pair
+    /// crops every channel identically via [`ResidualPlane::crop_to`];
+    /// see that method for the shrink-only contract and the §6.2 cropping
+    /// semantics. Any per-channel error propagates verbatim.
+    pub fn crop_to(
+        &self,
+        target_width: usize,
+        target_height: usize,
+    ) -> Result<ChannelResidualPlanes> {
+        let x = self.planes[0].crop_to(target_width, target_height)?;
+        let y = self.planes[1].crop_to(target_width, target_height)?;
+        let b = self.planes[2].crop_to(target_width, target_height)?;
+        Ok(ChannelResidualPlanes { planes: [x, y, b] })
     }
 }
 
@@ -1046,5 +1121,79 @@ mod tests {
             reconstruct_three_channel_planes_with_lf(&g, &lf, &x_from_y, &b_from_y, &cfl, decode)
                 .unwrap();
         assert_eq!(one, step);
+    }
+
+    // ---- §6.2 crop (right/bottom padding removal) ----
+
+    /// Build a padded plane whose sample at `(x, y)` equals `y*width+x`,
+    /// so a crop's retained samples are trivially checkable.
+    fn ramp_plane(width: usize, height: usize) -> ResidualPlane {
+        ResidualPlane {
+            width,
+            height,
+            samples: (0..width * height).map(|i| i as f32).collect(),
+        }
+    }
+
+    #[test]
+    fn crop_keeps_top_left_rectangle() {
+        // 24×16 padded plane (3×2 blocks) cropped to a 17×9 logical extent
+        // (ceil/8 = 3×2 blocks, the §C.5.4 padding relationship).
+        let p = ramp_plane(24, 16);
+        let c = p.crop_to(17, 9).unwrap();
+        assert_eq!(c.width, 17);
+        assert_eq!(c.height, 9);
+        assert_eq!(c.samples.len(), 17 * 9);
+        // Every retained sample equals the original at the same (x, y):
+        // §6.2 crops at the right and bottom, top-left rectangle kept.
+        for y in 0..9 {
+            for x in 0..17 {
+                assert_eq!(c.get(x, y), p.get(x, y), "({x},{y})");
+            }
+        }
+    }
+
+    #[test]
+    fn crop_to_full_dims_is_identity() {
+        let p = ramp_plane(16, 8);
+        let c = p.crop_to(16, 8).unwrap();
+        assert_eq!(c, p);
+    }
+
+    #[test]
+    fn crop_one_pixel_drops_last_row_and_column() {
+        // 8×8 → 7×7 keeps columns 0..7 of rows 0..7, discarding the last
+        // row and the last column of every kept row.
+        let p = ramp_plane(8, 8);
+        let c = p.crop_to(7, 7).unwrap();
+        assert_eq!((c.width, c.height), (7, 7));
+        assert_eq!(c.get(6, 0), Some(6.0)); // last kept column of row 0
+        assert_eq!(c.get(0, 6), Some(48.0)); // (0,6) = 6*8+0
+        assert_eq!(c.get(7, 0), None); // dropped column
+        assert_eq!(c.get(0, 7), None); // dropped row
+    }
+
+    #[test]
+    fn crop_rejects_growth_and_zero() {
+        let p = ramp_plane(16, 8);
+        assert!(p.crop_to(17, 8).is_err()); // wider than padded plane
+        assert!(p.crop_to(16, 9).is_err()); // taller than padded plane
+        assert!(p.crop_to(0, 8).is_err()); // zero width
+        assert!(p.crop_to(16, 0).is_err()); // zero height
+    }
+
+    #[test]
+    fn channel_crop_applies_to_all_three_planes() {
+        // Distinct ramps per channel so a mis-wired channel would show.
+        let planes = ChannelResidualPlanes {
+            planes: [ramp_plane(16, 16), ramp_plane(16, 16), ramp_plane(16, 16)],
+        };
+        let c = planes.crop_to(13, 11).unwrap();
+        assert_eq!(c.dims(), (13, 11));
+        for ch in 0..3 {
+            assert_eq!((c.planes[ch].width, c.planes[ch].height), (13, 11));
+            // Spot-check a retained interior sample matches the source.
+            assert_eq!(c.planes[ch].get(12, 10), planes.planes[ch].get(12, 10));
+        }
     }
 }

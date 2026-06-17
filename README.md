@@ -39,8 +39,10 @@ What is implemented and tested today:
   residual assembly (including the §I.2.4 LLF-coefficient placement that
   folds the LF-derived DC block into the natural-order low-frequency
   prefix before the §I.2.3.2 inverse DCT), the per-LfGroup three-channel
-  residual-plane reconstruction, and the inverse XYB / YCbCr colour
-  transforms.
+  residual-plane reconstruction, the §6.2 right/bottom crop that turns
+  the padded block-grid reconstruction into the logical channel extent
+  (`ResidualPlane::crop_to` / `ChannelResidualPlanes::crop_to`), and the
+  inverse XYB / YCbCr colour transforms.
 
 ### Not yet implemented
 
