@@ -193,18 +193,22 @@
 //!   leaves the precision choice to f32 (the rest of the pipeline
 //!   is f32).
 //!
+//! ## VarDCT per-block-sigma path (§J.3.3)
+//!
+//! [`apply_epf_iterations_per_block_sigma`] is the VarDCT counterpart
+//! to the constant-sigma [`apply_epf_iterations`].  The caller packs
+//! the Listing J.3 per-8×8-block sigma values (built from
+//! `HfMul`/`Sharpness` via [`vardct_sigma_from_listing_j3`]) into a
+//! [`SigmaGrid`]; the driver looks up each reference pixel's block
+//! sigma, applies the **`sigma < 0.3` block-skip** ([`EPF_SKIP_SIGMA`],
+//! Listing J.3 tail — output == input for the whole block), and
+//! otherwise filters with `inv_sigma` derived from that block's sigma.
+//!
 //! ## What this module does NOT do
 //!
-//! * It does not implement the per-frame loop calling each pass on
-//!   each varblock.
-//! * It does not implement the `sigma < 0.3` skip-the-block path
-//!   (Listing J.3 tail).  The skip is a wiring-round responsibility
-//!   — the pure-math primitive surfaces `sigma` from
-//!   `vardct_sigma_from_listing_j3` and the caller decides whether
-//!   the block falls under the skip rule.
-//! * It does not consult [`crate::frame_header::RestorationFilter`]
-//!   `epf_iters` to decide which passes to skip; the caller does
-//!   the dispatch.
+//! * It does not derive the `HfMul`/`Sharpness` grids — that comes
+//!   from the §C.5.4 HF pipeline; the caller supplies the resulting
+//!   per-block sigma via [`SigmaGrid`].
 
 use crate::frame_header::RestorationFilter;
 use crate::gaborish::mirror1d;
@@ -224,6 +228,89 @@ pub enum Pass {
     /// Third step — 5-tap cross kernel.  Distance metric:
     /// `DistanceStep2`.  Run when `rf.epf_iters >= 2`.
     Pass2,
+}
+
+/// §J.3.3 block-skip threshold: "If `sigma < 0.3` for a given
+/// varblock, the decoder skips all steps on the pixels of that block:
+/// for each step, the output samples are the same as the input sample
+/// in the given block."
+///
+/// The comparison is on the per-block `sigma` (Listing J.3 value), not
+/// the per-pass `inv_sigma`.
+pub const EPF_SKIP_SIGMA: f32 = 0.3;
+
+/// A per-8×8-block sigma table for the VarDCT EPF path (§J.3.3).
+///
+/// `sigma[by * blocks_w + bx]` is the Listing J.3 `sigma` value for
+/// the 8×8 rectangle at block coordinate `(bx, by)` — i.e. the value
+/// "at the coordinates of the 8 × 8 rectangle containing the reference
+/// pixel" used by [`weight`]/[`inv_sigma_for_pass`].  The grid covers
+/// `blocks_w × blocks_h` blocks, where `blocks_w = ceil(width / 8)` and
+/// `blocks_h = ceil(height / 8)` for the filtered plane.
+///
+/// Pixel `(x, y)` maps to block `(x / 8, y / 8)`; the lookup clamps to
+/// the last block when a partial trailing block exists (the §6.2 crop
+/// guarantees `x < blocks_w * 8`, so the clamp is defensive).
+#[derive(Debug, Clone)]
+pub struct SigmaGrid {
+    sigma: Vec<f32>,
+    blocks_w: usize,
+    blocks_h: usize,
+}
+
+impl SigmaGrid {
+    /// Build a sigma grid from a row-major `blocks_w × blocks_h` slice
+    /// of per-block sigma values.
+    ///
+    /// `Err(InvalidData)` if `sigma.len() != blocks_w * blocks_h`, if
+    /// either block dimension is zero while the other is not, or if any
+    /// value is non-finite or `<= 0` (Listing J.3 clamps the value to
+    /// `>= 1e-4`, so a zero/negative entry is malformed input).
+    pub fn new(sigma: Vec<f32>, blocks_w: usize, blocks_h: usize) -> Result<Self> {
+        if sigma.len() != blocks_w * blocks_h {
+            return Err(Error::InvalidData(format!(
+                "JXL EPF: sigma grid length {} != {blocks_w}*{blocks_h} = {}",
+                sigma.len(),
+                blocks_w * blocks_h
+            )));
+        }
+        for (i, &s) in sigma.iter().enumerate() {
+            if !s.is_finite() || s <= 0.0 {
+                return Err(Error::InvalidData(format!(
+                    "JXL EPF: sigma grid entry {i} = {s} must be finite and > 0 \
+                     (Listing J.3 clamps sigma >= 1e-4)"
+                )));
+            }
+        }
+        Ok(Self {
+            sigma,
+            blocks_w,
+            blocks_h,
+        })
+    }
+
+    /// Number of 8×8 blocks across.
+    pub fn blocks_w(&self) -> usize {
+        self.blocks_w
+    }
+
+    /// Number of 8×8 blocks down.
+    pub fn blocks_h(&self) -> usize {
+        self.blocks_h
+    }
+
+    /// Sigma for the 8×8 block containing pixel `(x, y)` (§J.3.3:
+    /// "the values in HfMul and Sharpness … at the coordinates of the
+    /// 8 × 8 rectangle containing the reference pixel").
+    ///
+    /// The block index is `(x / 8, y / 8)`, clamped to the last block
+    /// so a trailing partial block reuses its block's sigma.
+    #[inline]
+    pub fn at_pixel(&self, x: usize, y: usize) -> f32 {
+        let bx = (x / 8).min(self.blocks_w.saturating_sub(1));
+        let by = (y / 8).min(self.blocks_h.saturating_sub(1));
+        self.sigma[by * self.blocks_w + bx]
+    }
 }
 
 /// Listing J.1 — `DistanceStep0and1(x, y, cx, cy)`.
@@ -653,6 +740,135 @@ pub fn apply_step_13tap(
     Ok(())
 }
 
+/// Apply one §J.3 pass with a **per-block sigma** (§J.3.3 VarDCT
+/// path) to all three channel planes.
+///
+/// Unlike [`apply_step_5tap`] / [`apply_step_13tap`], which take one
+/// scalar sigma for the whole call, this looks up each reference
+/// pixel's block sigma from `sigma_grid` and:
+///
+/// * **Block-skip (§J.3.3):** if the pixel's block sigma is
+///   `< EPF_SKIP_SIGMA` (0.3), the output sample is the input sample
+///   unchanged (no kernel applied).
+/// * Otherwise the kernel runs with `inv_sigma` derived from that
+///   pixel's block sigma via [`inv_sigma_for_pass`].
+///
+/// `pass` selects the kernel (Pass0 → 13-tap, Pass1/Pass2 → 5-tap)
+/// and the distance metric (Pass2 → `DistanceStep2`, else
+/// `DistanceStep0and1`), matching the constant-sigma appliers.
+///
+/// All six channel buffers must have length `width * height`;
+/// `Err(InvalidData)` otherwise.  Zero-area planes are a no-op.
+#[allow(clippy::too_many_arguments)]
+pub fn apply_step_per_block_sigma(
+    pass: Pass,
+    x_in: &[f32],
+    y_in: &[f32],
+    b_in: &[f32],
+    x_out: &mut [f32],
+    y_out: &mut [f32],
+    b_out: &mut [f32],
+    width: usize,
+    height: usize,
+    sigma_grid: &SigmaGrid,
+    step_multiplier: f32,
+    zeroflush: f32,
+    position_multiplier_border: f32,
+    channel_scale: [f32; 3],
+) -> Result<()> {
+    check_plane(x_in, width, height, "x_in")?;
+    check_plane(y_in, width, height, "y_in")?;
+    check_plane(b_in, width, height, "b_in")?;
+    check_plane(x_out, width, height, "x_out")?;
+    check_plane(y_out, width, height, "y_out")?;
+    check_plane(b_out, width, height, "b_out")?;
+    if width == 0 || height == 0 {
+        return Ok(());
+    }
+
+    // Kernel + metric per pass, mirroring the constant-sigma appliers.
+    let (kernel, use_step_2): (&[(i64, i64)], bool) = match pass {
+        Pass::Pass0 => (&KERNEL_13TAP, false),
+        Pass::Pass1 => (&KERNEL_5TAP, false),
+        Pass::Pass2 => (&KERNEL_5TAP, true),
+    };
+
+    for y in 0..height {
+        for x in 0..width {
+            let idx = y * width + x;
+            let block_sigma = sigma_grid.at_pixel(x, y);
+
+            // §J.3.3 block-skip: sigma < 0.3 → output == input for
+            // every step on this block's pixels.
+            if block_sigma < EPF_SKIP_SIGMA {
+                x_out[idx] = x_in[idx];
+                y_out[idx] = y_in[idx];
+                b_out[idx] = b_in[idx];
+                continue;
+            }
+
+            let inv_sigma = inv_sigma_for_pass(step_multiplier, block_sigma)?;
+            let pm = if is_border_position(x, y) {
+                position_multiplier_border
+            } else {
+                1.0_f32
+            };
+            let (xi, yi) = (x as i64, y as i64);
+
+            let mut sum_w = 0.0_f32;
+            let mut acc = [0.0_f32; 3];
+            for (ix, iy) in kernel.iter() {
+                let distance = if use_step_2 {
+                    distance_step_2(
+                        x_in,
+                        y_in,
+                        b_in,
+                        width,
+                        height,
+                        xi,
+                        yi,
+                        *ix,
+                        *iy,
+                        channel_scale,
+                    )?
+                } else {
+                    distance_step_0_and_1(
+                        x_in,
+                        y_in,
+                        b_in,
+                        width,
+                        height,
+                        xi,
+                        yi,
+                        *ix,
+                        *iy,
+                        channel_scale,
+                    )?
+                };
+                let w = weight(distance, inv_sigma, pm, zeroflush);
+                sum_w += w;
+                let sx = fetch_mirror(x_in, width, height, xi + ix, yi + iy)?;
+                let sy = fetch_mirror(y_in, width, height, xi + ix, yi + iy)?;
+                let sb = fetch_mirror(b_in, width, height, xi + ix, yi + iy)?;
+                acc[0] += sx * w;
+                acc[1] += sy * w;
+                acc[2] += sb * w;
+            }
+            if !sum_w.is_finite() || sum_w <= 0.0 {
+                return Err(Error::InvalidData(format!(
+                    "JXL EPF: sum_weights non-positive ({sum_w}) at ({x},{y}) \
+                     in per-block-sigma pass; block_sigma={block_sigma}"
+                )));
+            }
+            let inv = 1.0_f32 / sum_w;
+            x_out[idx] = acc[0] * inv;
+            y_out[idx] = acc[1] * inv;
+            b_out[idx] = acc[2] * inv;
+        }
+    }
+    Ok(())
+}
+
 /// §J.3.1 three-step EPF iteration driver — composes the up-to-three
 /// passes (`apply_step_13tap` for Step 0, `apply_step_5tap` for Steps
 /// 1 and 2) sequentially, with the **output of each step feeding the
@@ -812,6 +1028,129 @@ pub fn apply_epf_iterations(
 
     // If the live samples ended up in scratch (odd pass count), copy
     // them back so the caller's buffers carry the final result.
+    if into_scratch {
+        x_plane.copy_from_slice(&sx);
+        y_plane.copy_from_slice(&sy);
+        b_plane.copy_from_slice(&sb);
+    }
+    Ok(())
+}
+
+/// §J.3.1 three-step EPF iteration driver for the **VarDCT
+/// per-block-sigma** case (§J.3.3) — the counterpart to
+/// [`apply_epf_iterations`], which handles the constant-sigma
+/// (Modular) case only.
+///
+/// Instead of one scalar sigma for the whole frame, each 8×8 block
+/// carries its own sigma (Listing J.3, built from `HfMul`/`Sharpness`
+/// via [`vardct_sigma_from_listing_j3`] by the caller and packed into
+/// a [`SigmaGrid`]).  For every pass, each pixel:
+///
+/// * is **skipped** (output == input) when its block sigma is
+///   `< EPF_SKIP_SIGMA` (0.3) — §J.3.3's per-block skip; or
+/// * is filtered with `inv_sigma` derived from its block sigma.
+///
+/// Pass dispatch by `rf.epf_iters` and the per-pass scalar sourcing
+/// (`step_multiplier`, `zeroflush`, `position_multiplier_border`,
+/// `channel_scale`) are identical to [`apply_epf_iterations`]; see its
+/// docs for the schedule table and the "Spec ambiguity" readings.
+///
+/// The three planes are filtered **in place**; the driver ping-pongs
+/// between the caller's buffers and a scratch triple (each pass is
+/// out-of-place per §J.3.4) and copies the final scratch result back
+/// when an odd number of passes runs.
+///
+/// `Err(InvalidData)` on plane-length mismatch, `epf_iters > 3`, or a
+/// non-positive / non-finite effective sigma (propagated from
+/// [`inv_sigma_for_pass`] for non-skipped blocks).  Zero-area planes
+/// and `epf_iters == 0` are a no-op.
+#[allow(clippy::too_many_arguments)]
+pub fn apply_epf_iterations_per_block_sigma(
+    x_plane: &mut [f32],
+    y_plane: &mut [f32],
+    b_plane: &mut [f32],
+    width: usize,
+    height: usize,
+    sigma_grid: &SigmaGrid,
+    rf: &RestorationFilter,
+) -> Result<()> {
+    check_plane(x_plane, width, height, "x_plane")?;
+    check_plane(y_plane, width, height, "y_plane")?;
+    check_plane(b_plane, width, height, "b_plane")?;
+
+    if rf.epf_iters == 0 || width == 0 || height == 0 {
+        return Ok(());
+    }
+    if rf.epf_iters > 3 {
+        return Err(Error::InvalidData(format!(
+            "JXL EPF: epf_iters {} > 3 (Table C.9 caps the field at u(2))",
+            rf.epf_iters
+        )));
+    }
+
+    // The §J.3.1 schedule, identical to apply_epf_iterations.
+    let mut schedule: Vec<(Pass, f32, f32)> = Vec::with_capacity(3);
+    if rf.epf_iters == 3 {
+        schedule.push((
+            Pass::Pass0,
+            rf.epf_pass0_sigma_scale,
+            rf.epf_pass1_zeroflush,
+        ));
+    }
+    schedule.push((Pass::Pass1, 1.0, rf.epf_pass1_zeroflush));
+    if rf.epf_iters >= 2 {
+        schedule.push((
+            Pass::Pass2,
+            rf.epf_pass2_sigma_scale,
+            rf.epf_pass2_zeroflush,
+        ));
+    }
+
+    let n = width * height;
+    let mut sx = vec![0.0_f32; n];
+    let mut sy = vec![0.0_f32; n];
+    let mut sb = vec![0.0_f32; n];
+
+    let mut into_scratch = false;
+    for (pass, step_multiplier, zeroflush) in schedule {
+        if into_scratch {
+            apply_step_per_block_sigma(
+                pass,
+                &sx,
+                &sy,
+                &sb,
+                x_plane,
+                y_plane,
+                b_plane,
+                width,
+                height,
+                sigma_grid,
+                step_multiplier,
+                zeroflush,
+                rf.epf_border_sad_mul,
+                rf.epf_channel_scale,
+            )?;
+        } else {
+            apply_step_per_block_sigma(
+                pass,
+                x_plane,
+                y_plane,
+                b_plane,
+                &mut sx,
+                &mut sy,
+                &mut sb,
+                width,
+                height,
+                sigma_grid,
+                step_multiplier,
+                zeroflush,
+                rf.epf_border_sad_mul,
+                rf.epf_channel_scale,
+            )?;
+        }
+        into_scratch = !into_scratch;
+    }
+
     if into_scratch {
         x_plane.copy_from_slice(&sx);
         y_plane.copy_from_slice(&sy);
@@ -1662,5 +2001,206 @@ mod tests {
         assert_eq!(dx, ox);
         assert_eq!(dy, oy);
         assert_eq!(db, ob);
+    }
+
+    // ---- §J.3.3 VarDCT per-block-sigma path ----
+
+    /// `SigmaGrid::new` rejects a length that doesn't equal
+    /// `blocks_w * blocks_h`.
+    #[test]
+    fn sigma_grid_rejects_wrong_length() {
+        assert!(SigmaGrid::new(vec![1.0; 3], 2, 2).is_err());
+        assert!(SigmaGrid::new(vec![1.0; 4], 2, 2).is_ok());
+    }
+
+    /// `SigmaGrid::new` rejects non-finite / non-positive entries
+    /// (Listing J.3 clamps sigma >= 1e-4, so a 0 / negative / NaN
+    /// value is malformed).
+    #[test]
+    fn sigma_grid_rejects_non_positive_entries() {
+        assert!(SigmaGrid::new(vec![1.0, 0.0, 1.0, 1.0], 2, 2).is_err());
+        assert!(SigmaGrid::new(vec![1.0, -0.5, 1.0, 1.0], 2, 2).is_err());
+        assert!(SigmaGrid::new(vec![1.0, f32::NAN, 1.0, 1.0], 2, 2).is_err());
+    }
+
+    /// `at_pixel` maps `(x, y)` to block `(x / 8, y / 8)` and clamps a
+    /// trailing partial block to the last block.
+    #[test]
+    fn sigma_grid_at_pixel_maps_and_clamps() {
+        // 2×1 blocks: block 0 covers x in 0..8, block 1 covers 8..16.
+        let g = SigmaGrid::new(vec![0.5, 0.9], 2, 1).unwrap();
+        assert_eq!(g.at_pixel(0, 0), 0.5);
+        assert_eq!(g.at_pixel(7, 0), 0.5);
+        assert_eq!(g.at_pixel(8, 0), 0.9);
+        assert_eq!(g.at_pixel(15, 0), 0.9);
+        // x beyond the grid (would be block 2) clamps to last block.
+        assert_eq!(g.at_pixel(20, 0), 0.9);
+        // y beyond the single block row clamps too.
+        assert_eq!(g.at_pixel(3, 40), 0.5);
+        assert_eq!(g.blocks_w(), 2);
+        assert_eq!(g.blocks_h(), 1);
+    }
+
+    /// A uniform sigma grid (every block the same value, all >= 0.3)
+    /// reduces the per-block driver to the constant-sigma driver: the
+    /// outputs must be bit-identical. This pins that the per-block path
+    /// is a strict generalisation of the constant-sigma path.
+    #[test]
+    fn per_block_uniform_grid_matches_constant_sigma() {
+        for iters in 1..=3 {
+            let rf = modular_rf(iters);
+            let sigma = 6.0_f32; // >= 0.3, so no block is skipped
+            let base: Vec<f32> = (0..256).map(|v| ((v * 7) % 13) as f32).collect();
+            let (w, h) = (16, 16); // 2×2 blocks of 8×8
+
+            let (mut cx, mut cy, mut cb) = (base.clone(), base.clone(), base.clone());
+            apply_epf_iterations(&mut cx, &mut cy, &mut cb, w, h, sigma, &rf).unwrap();
+
+            let grid = SigmaGrid::new(vec![sigma; 4], 2, 2).unwrap();
+            let (mut px, mut py, mut pb) = (base.clone(), base.clone(), base.clone());
+            apply_epf_iterations_per_block_sigma(&mut px, &mut py, &mut pb, w, h, &grid, &rf)
+                .unwrap();
+
+            assert_eq!(px, cx, "iters={iters} x plane diverged");
+            assert_eq!(py, cy, "iters={iters} y plane diverged");
+            assert_eq!(pb, cb, "iters={iters} b plane diverged");
+        }
+    }
+
+    /// A grid where every block's sigma is `< 0.3` skips all steps on
+    /// every pixel (§J.3.3): the planes survive unchanged regardless of
+    /// `epf_iters`.
+    #[test]
+    fn per_block_all_skipped_is_identity() {
+        for iters in 1..=3 {
+            let rf = modular_rf(iters);
+            let base: Vec<f32> = (0..256).map(|v| ((v * 5) % 17) as f32).collect();
+            let (w, h) = (16, 16);
+            // 0.2 < EPF_SKIP_SIGMA (0.3) for all four blocks.
+            let grid = SigmaGrid::new(vec![0.2; 4], 2, 2).unwrap();
+            let (mut x, mut y, mut b) = (base.clone(), base.clone(), base.clone());
+            apply_epf_iterations_per_block_sigma(&mut x, &mut y, &mut b, w, h, &grid, &rf).unwrap();
+            assert_eq!(x, base, "iters={iters}: skipped blocks must pass through");
+            assert_eq!(y, base);
+            assert_eq!(b, base);
+        }
+    }
+
+    /// A mixed grid: blocks below 0.3 pass through unchanged, blocks at
+    /// or above 0.3 are filtered. With a single pass (epf_iters == 1)
+    /// the skipped block's pixels equal the input exactly, while the
+    /// filtered block's pixels match the per-block applier run directly.
+    #[test]
+    fn per_block_mixed_grid_skips_low_sigma_blocks() {
+        let rf = modular_rf(1); // Step 1 only (5-tap, DistanceStep0and1)
+                                // 2×1 blocks across a 16×8 frame: left block skipped (0.1),
+                                // right block filtered (6.0).
+        let (w, h) = (16, 8);
+        let base: Vec<f32> = (0..(w * h)).map(|v| ((v * 3) % 19) as f32).collect();
+        let grid = SigmaGrid::new(vec![0.1, 6.0], 2, 1).unwrap();
+
+        let (mut dx, mut dy, mut db) = (base.clone(), base.clone(), base.clone());
+        apply_epf_iterations_per_block_sigma(&mut dx, &mut dy, &mut db, w, h, &grid, &rf).unwrap();
+
+        // Reference: a single per-block pass over the same grid gives
+        // the same result for a one-pass schedule (the driver runs
+        // exactly Pass1 once, copying scratch back).
+        let (mut rx, mut ry, mut rb) = (
+            vec![0.0_f32; w * h],
+            vec![0.0_f32; w * h],
+            vec![0.0_f32; w * h],
+        );
+        apply_step_per_block_sigma(
+            Pass::Pass1,
+            &base,
+            &base,
+            &base,
+            &mut rx,
+            &mut ry,
+            &mut rb,
+            w,
+            h,
+            &grid,
+            1.0,
+            rf.epf_pass1_zeroflush,
+            rf.epf_border_sad_mul,
+            rf.epf_channel_scale,
+        )
+        .unwrap();
+        assert_eq!(dx, rx);
+        assert_eq!(dy, ry);
+        assert_eq!(db, rb);
+
+        // Left block (x in 0..8) is skipped: equals input exactly.
+        for y in 0..h {
+            for x in 0..8 {
+                let i = y * w + x;
+                assert_eq!(dx[i], base[i], "left block skip failed at ({x},{y})");
+            }
+        }
+        // Right block (x in 8..16) was filtered: at least one interior
+        // pixel changed (the source is non-constant), proving the
+        // kernel actually ran there.
+        let mut changed = false;
+        for y in 1..h - 1 {
+            for x in 9..15 {
+                let i = y * w + x;
+                if (dx[i] - base[i]).abs() > 1e-6 {
+                    changed = true;
+                }
+            }
+        }
+        assert!(changed, "right (filtered) block did not change any pixel");
+    }
+
+    /// `epf_iters == 0` is a no-op for the per-block driver too.
+    #[test]
+    fn per_block_iters_zero_is_identity() {
+        let rf = modular_rf(0);
+        let base: Vec<f32> = (0..64).map(|v| v as f32).collect();
+        let grid = SigmaGrid::new(vec![5.0], 1, 1).unwrap();
+        let (mut x, mut y, mut b) = (base.clone(), base.clone(), base.clone());
+        apply_epf_iterations_per_block_sigma(&mut x, &mut y, &mut b, 8, 8, &grid, &rf).unwrap();
+        assert_eq!(x, base);
+        assert_eq!(y, base);
+        assert_eq!(b, base);
+    }
+
+    /// `epf_iters > 3` is rejected by the per-block driver as well.
+    #[test]
+    fn per_block_iters_above_three_is_error() {
+        let rf = modular_rf(4);
+        let grid = SigmaGrid::new(vec![5.0], 1, 1).unwrap();
+        let mut x = vec![1.0_f32; 64];
+        let mut y = vec![1.0_f32; 64];
+        let mut b = vec![1.0_f32; 64];
+        assert!(
+            apply_epf_iterations_per_block_sigma(&mut x, &mut y, &mut b, 8, 8, &grid, &rf).is_err()
+        );
+    }
+
+    /// A constant plane is a fixed point of the per-block driver for
+    /// every non-skipped sigma (all distances 0 → weight 1 → weighted
+    /// mean of identical samples).
+    #[test]
+    fn per_block_constant_plane_is_fixed_point() {
+        for iters in 1..=3 {
+            let rf = modular_rf(iters);
+            let grid = SigmaGrid::new(vec![5.0; 4], 2, 2).unwrap();
+            let mut x = vec![3.5_f32; 256];
+            let mut y = vec![-2.0_f32; 256];
+            let mut b = vec![7.25_f32; 256];
+            apply_epf_iterations_per_block_sigma(&mut x, &mut y, &mut b, 16, 16, &grid, &rf)
+                .unwrap();
+            for &v in &x {
+                assert!((v - 3.5).abs() < 1e-4, "iters={iters} x drifted: {v}");
+            }
+            for &v in &y {
+                assert!((v + 2.0).abs() < 1e-4, "iters={iters} y drifted: {v}");
+            }
+            for &v in &b {
+                assert!((v - 7.25).abs() < 1e-4, "iters={iters} b drifted: {v}");
+            }
+        }
     }
 }

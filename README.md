@@ -46,10 +46,16 @@ What is implemented and tested today:
 - **§J.3 restoration filters** — the Gabor-like 3×3 convolution
   (`gaborish::apply_xyb_planes_in_place`) and the edge-preserving
   filter, both as pure XYB-plane math. The §J.3.1 three-step EPF
-  iteration driver (`epf::apply_epf_iterations`) now composes the
+  iteration driver (`epf::apply_epf_iterations`) composes the
   up-to-three passes per `epf_iters`, feeding each step's output into
   the next (§J.3.4), for the constant-sigma (Modular,
-  `epf_sigma_for_modular`) case.
+  `epf_sigma_for_modular`) case. The §J.3.3 **VarDCT per-block-sigma**
+  driver (`epf::apply_epf_iterations_per_block_sigma`) generalises it:
+  each 8×8 block carries its own Listing J.3 sigma (packed into
+  `epf::SigmaGrid`, looked up per reference pixel) and the
+  `sigma < 0.3` block-skip (`epf::EPF_SKIP_SIGMA`) passes a block's
+  pixels through unchanged. A uniform grid reduces bit-exactly to the
+  constant-sigma path.
 
 ### Not yet implemented
 
@@ -61,9 +67,12 @@ What is implemented and tested today:
   flags).
 - The AFV non-DCT IDCT variants, the §C.7.2 entropy-histogram wiring,
   Gaborish + EPF integration into the registered path. The VarDCT
-  per-varblock EPF sigma (Listing J.3 from HfMul / Sharpness) and the
-  `sigma < 0.3` block-skip are not yet wired — `apply_epf_iterations`
-  currently drives the constant-sigma path only.
+  per-block EPF sigma (Listing J.3 from HfMul / Sharpness) and the
+  `sigma < 0.3` block-skip now have a dedicated driver
+  (`apply_epf_iterations_per_block_sigma` + `SigmaGrid`); deriving the
+  per-block `HfMul`/`Sharpness` grids from the §C.5.4 HF pipeline and
+  feeding them into that driver in the registered path is the
+  remaining wiring step.
 - Floating-point samples and `bps > 16`; high-bit-depth XYB / YCbCr.
 - The encoder (not registered).
 
