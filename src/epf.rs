@@ -653,6 +653,226 @@ pub fn apply_step_13tap(
     Ok(())
 }
 
+/// §J.3.1 three-step EPF iteration driver — composes the up-to-three
+/// passes (`apply_step_13tap` for Step 0, `apply_step_5tap` for Steps
+/// 1 and 2) sequentially, with the **output of each step feeding the
+/// input of the next** ("The output of each step of the filter is
+/// used as an input for the following step", §J.3.4).
+///
+/// This is the per-frame wiring the round-144 module comment deferred
+/// to "a follow-up round" for the **constant-sigma case**: in Modular
+/// mode §J.3.3 sets `sigma` to `rf.epf_sigma_for_modular` for every
+/// pixel, so the per-varblock sigma table (Listing J.3, which needs
+/// the as-yet-uncomposed HfMul / Sharpness grids) and the
+/// `sigma < 0.3` per-block skip do not apply. Callers in VarDCT mode
+/// must instead supply the per-block sigma; that path is a separate
+/// follow-up and is **not** what this driver implements.
+///
+/// ## Pass dispatch (§J.3.1)
+///
+/// | `rf.epf_iters` | Step 0 (13-tap) | Step 1 (5-tap) | Step 2 (5-tap) |
+/// | --------------:| :-------------- | :------------- | :------------- |
+/// | 0              | —               | —              | —              |
+/// | 1              | —               | applied        | —              |
+/// | 2              | —               | applied        | applied        |
+/// | 3              | applied         | applied        | applied        |
+///
+/// `epf_iters == 0` is a no-op: the three planes are returned
+/// unchanged (and `Ok(())`), matching "The filter is only performed
+/// if `rf.epf_iters > 0`". `epf_iters > 3` is rejected
+/// (`Err(InvalidData)`) — Table C.9 caps the field at `u(2)` so a
+/// value above 3 is a malformed header.
+///
+/// ## Per-pass scalar sourcing
+///
+/// Following the module-level "Spec ambiguity" readings (Listing J.2
+/// `step_multiplier` reading 1; zeroflush indexed by the compressed
+/// `step ∈ {0, 1}` = "0 if first or second step, 1 otherwise"):
+///
+/// * Step 0 — `step_multiplier = rf.epf_pass0_sigma_scale`,
+///   `zeroflush = rf.epf_pass1_zeroflush` (compressed step 0).
+/// * Step 1 — `step_multiplier = 1.0`,
+///   `zeroflush = rf.epf_pass1_zeroflush` (compressed step 0).
+/// * Step 2 — `step_multiplier = rf.epf_pass2_sigma_scale`,
+///   `zeroflush = rf.epf_pass2_zeroflush` (compressed step 1).
+///
+/// `position_multiplier_border = rf.epf_border_sad_mul`,
+/// `channel_scale = rf.epf_channel_scale` for every pass.
+///
+/// ## I/O
+///
+/// The three planes are filtered **in place**: each plane buffer is
+/// `width * height` row-major `f32`, and on return holds the result
+/// of the last applied step. Internally the driver ping-pongs between
+/// the caller's buffers and a scratch triple (each pass is
+/// out-of-place per §J.3.4 — a pixel's neighbours include samples the
+/// same pass has not yet rewritten — so an in-place pass would be
+/// incorrect). When an odd number of passes runs, the final scratch
+/// result is copied back into the caller's buffers so the in-place
+/// contract holds regardless of pass count.
+///
+/// `Err(InvalidData)` on plane-length mismatch, `epf_iters > 3`, or
+/// any non-positive / non-finite effective sigma (propagated from
+/// [`inv_sigma_for_pass`]). Zero-area planes are a no-op.
+#[allow(clippy::too_many_arguments)]
+pub fn apply_epf_iterations(
+    x_plane: &mut [f32],
+    y_plane: &mut [f32],
+    b_plane: &mut [f32],
+    width: usize,
+    height: usize,
+    sigma: f32,
+    rf: &RestorationFilter,
+) -> Result<()> {
+    check_plane(x_plane, width, height, "x_plane")?;
+    check_plane(y_plane, width, height, "y_plane")?;
+    check_plane(b_plane, width, height, "b_plane")?;
+
+    if rf.epf_iters == 0 || width == 0 || height == 0 {
+        return Ok(());
+    }
+    if rf.epf_iters > 3 {
+        return Err(Error::InvalidData(format!(
+            "JXL EPF: epf_iters {} > 3 (Table C.9 caps the field at u(2))",
+            rf.epf_iters
+        )));
+    }
+
+    // The ordered list of (Pass, step_multiplier, zeroflush) the
+    // §J.3.1 epf_iters value selects, in execution order.
+    let mut schedule: Vec<(Pass, f32, f32)> = Vec::with_capacity(3);
+    if rf.epf_iters == 3 {
+        // Step 0 — 13-tap, compressed step 0 zeroflush.
+        schedule.push((
+            Pass::Pass0,
+            rf.epf_pass0_sigma_scale,
+            rf.epf_pass1_zeroflush,
+        ));
+    }
+    // Step 1 — always done when epf_iters >= 1.
+    schedule.push((Pass::Pass1, 1.0, rf.epf_pass1_zeroflush));
+    if rf.epf_iters >= 2 {
+        // Step 2 — compressed step 1 zeroflush.
+        schedule.push((
+            Pass::Pass2,
+            rf.epf_pass2_sigma_scale,
+            rf.epf_pass2_zeroflush,
+        ));
+    }
+
+    let n = width * height;
+    let mut sx = vec![0.0_f32; n];
+    let mut sy = vec![0.0_f32; n];
+    let mut sb = vec![0.0_f32; n];
+
+    // `into_scratch` tracks which buffer currently holds the live
+    // samples: false = caller buffers, true = scratch. Each pass
+    // reads the live buffer and writes the other.
+    let mut into_scratch = false;
+    for (pass, step_multiplier, zeroflush) in schedule {
+        if into_scratch {
+            // live = scratch -> write to caller buffers
+            run_one_pass(
+                pass,
+                &sx,
+                &sy,
+                &sb,
+                x_plane,
+                y_plane,
+                b_plane,
+                width,
+                height,
+                sigma,
+                step_multiplier,
+                zeroflush,
+                rf.epf_border_sad_mul,
+                rf.epf_channel_scale,
+            )?;
+        } else {
+            // live = caller buffers -> write to scratch
+            run_one_pass(
+                pass,
+                x_plane,
+                y_plane,
+                b_plane,
+                &mut sx,
+                &mut sy,
+                &mut sb,
+                width,
+                height,
+                sigma,
+                step_multiplier,
+                zeroflush,
+                rf.epf_border_sad_mul,
+                rf.epf_channel_scale,
+            )?;
+        }
+        into_scratch = !into_scratch;
+    }
+
+    // If the live samples ended up in scratch (odd pass count), copy
+    // them back so the caller's buffers carry the final result.
+    if into_scratch {
+        x_plane.copy_from_slice(&sx);
+        y_plane.copy_from_slice(&sy);
+        b_plane.copy_from_slice(&sb);
+    }
+    Ok(())
+}
+
+/// Dispatch a single §J.3 pass to the right kernel applier.
+#[allow(clippy::too_many_arguments)]
+fn run_one_pass(
+    pass: Pass,
+    x_in: &[f32],
+    y_in: &[f32],
+    b_in: &[f32],
+    x_out: &mut [f32],
+    y_out: &mut [f32],
+    b_out: &mut [f32],
+    width: usize,
+    height: usize,
+    sigma: f32,
+    step_multiplier: f32,
+    zeroflush: f32,
+    position_multiplier_border: f32,
+    channel_scale: [f32; 3],
+) -> Result<()> {
+    match pass {
+        Pass::Pass0 => apply_step_13tap(
+            x_in,
+            y_in,
+            b_in,
+            x_out,
+            y_out,
+            b_out,
+            width,
+            height,
+            sigma,
+            step_multiplier,
+            zeroflush,
+            position_multiplier_border,
+            channel_scale,
+        ),
+        Pass::Pass1 | Pass::Pass2 => apply_step_5tap(
+            pass,
+            x_in,
+            y_in,
+            b_in,
+            x_out,
+            y_out,
+            b_out,
+            width,
+            height,
+            sigma,
+            step_multiplier,
+            zeroflush,
+            position_multiplier_border,
+            channel_scale,
+        ),
+    }
+}
+
 // ---- internal helpers ----
 
 fn check_plane(plane: &[f32], width: usize, height: usize, name: &str) -> Result<()> {
@@ -1271,5 +1491,176 @@ mod tests {
         for &v in xo.iter() {
             assert!((v - 1.0).abs() < 1e-4);
         }
+    }
+
+    // ---- §J.3.1 apply_epf_iterations driver ----
+
+    fn modular_rf(epf_iters: u32) -> RestorationFilter {
+        RestorationFilter {
+            epf_iters,
+            ..RestorationFilter::default()
+        }
+    }
+
+    /// `epf_iters == 0` leaves the planes untouched ("The filter is
+    /// only performed if `rf.epf_iters > 0`").
+    #[test]
+    fn epf_iters_zero_is_identity() {
+        let rf = modular_rf(0);
+        let mut x: Vec<f32> = (0..16).map(|v| v as f32).collect();
+        let mut y = x.clone();
+        let mut b = x.clone();
+        let orig = x.clone();
+        apply_epf_iterations(&mut x, &mut y, &mut b, 4, 4, 5.0, &rf).unwrap();
+        assert_eq!(x, orig);
+        assert_eq!(y, orig);
+        assert_eq!(b, orig);
+    }
+
+    /// A constant plane is a fixed point of every pass (all distances
+    /// 0 → weight 1 → weighted mean of identical samples), so for any
+    /// `epf_iters` the constant survives the full chain.
+    #[test]
+    fn epf_constant_plane_is_fixed_point_for_all_iters() {
+        for iters in 1..=3 {
+            let rf = modular_rf(iters);
+            let mut x = vec![3.5_f32; 64]; // 8×8 so no border-only block
+            let mut y = vec![-2.0_f32; 64];
+            let mut b = vec![7.25_f32; 64];
+            apply_epf_iterations(&mut x, &mut y, &mut b, 8, 8, 5.0, &rf).unwrap();
+            for &v in &x {
+                assert!((v - 3.5).abs() < 1e-4, "iters={iters} x drifted: {v}");
+            }
+            for &v in &y {
+                assert!((v + 2.0).abs() < 1e-4, "iters={iters} y drifted: {v}");
+            }
+            for &v in &b {
+                assert!((v - 7.25).abs() < 1e-4, "iters={iters} b drifted: {v}");
+            }
+        }
+    }
+
+    /// `epf_iters > 3` is rejected as a malformed header (Table C.9
+    /// `u(2)` cap).
+    #[test]
+    fn epf_iters_above_three_is_error() {
+        let rf = modular_rf(4);
+        let mut x = vec![1.0_f32; 16];
+        let mut y = vec![1.0_f32; 16];
+        let mut b = vec![1.0_f32; 16];
+        assert!(apply_epf_iterations(&mut x, &mut y, &mut b, 4, 4, 5.0, &rf).is_err());
+    }
+
+    /// Plane-length mismatch is rejected before any work.
+    #[test]
+    fn epf_plane_length_mismatch_is_error() {
+        let rf = modular_rf(1);
+        let mut x = vec![1.0_f32; 15]; // wrong: 4*4 = 16
+        let mut y = vec![1.0_f32; 16];
+        let mut b = vec![1.0_f32; 16];
+        assert!(apply_epf_iterations(&mut x, &mut y, &mut b, 4, 4, 5.0, &rf).is_err());
+    }
+
+    /// Zero-area planes are a no-op even with filtering requested.
+    #[test]
+    fn epf_zero_area_is_noop() {
+        let rf = modular_rf(3);
+        let mut x: Vec<f32> = vec![];
+        let mut y: Vec<f32> = vec![];
+        let mut b: Vec<f32> = vec![];
+        apply_epf_iterations(&mut x, &mut y, &mut b, 0, 0, 5.0, &rf).unwrap();
+        assert!(x.is_empty());
+    }
+
+    /// The driver's single-pass result (epf_iters == 1 → Step 1 only)
+    /// matches a direct `apply_step_5tap(Pass1)` call with the same
+    /// scalars: this pins the per-pass scalar sourcing (step
+    /// multiplier 1.0, zeroflush = epf_pass1_zeroflush) and the
+    /// in-place writeback for an odd pass count.
+    #[test]
+    fn epf_single_pass_matches_direct_step1() {
+        let rf = modular_rf(1);
+        let sigma = 6.0_f32;
+        // A non-constant plane so the filter actually moves samples.
+        let base: Vec<f32> = (0..64).map(|v| (v % 7) as f32).collect();
+        let (mut dx, mut dy, mut db) = (base.clone(), base.clone(), base.clone());
+        apply_epf_iterations(&mut dx, &mut dy, &mut db, 8, 8, sigma, &rf).unwrap();
+
+        let (mut rx, mut ry, mut rb) = (vec![0.0_f32; 64], vec![0.0_f32; 64], vec![0.0_f32; 64]);
+        apply_step_5tap(
+            Pass::Pass1,
+            &base,
+            &base,
+            &base,
+            &mut rx,
+            &mut ry,
+            &mut rb,
+            8,
+            8,
+            sigma,
+            1.0,
+            rf.epf_pass1_zeroflush,
+            rf.epf_border_sad_mul,
+            rf.epf_channel_scale,
+        )
+        .unwrap();
+        assert_eq!(dx, rx);
+        assert_eq!(dy, ry);
+        assert_eq!(db, rb);
+    }
+
+    /// The driver's two-pass result (epf_iters == 2 → Step 1 then
+    /// Step 2) matches running the two steps by hand with the Step-1
+    /// output feeding Step 2 (§J.3.4 "output of each step is used as
+    /// an input for the following step"). This pins both the ordering
+    /// and the even-pass-count buffer handoff.
+    #[test]
+    fn epf_two_pass_matches_manual_chain() {
+        let rf = modular_rf(2);
+        let sigma = 6.0_f32;
+        let base: Vec<f32> = (0..64).map(|v| ((v * 3) % 11) as f32).collect();
+        let (mut dx, mut dy, mut db) = (base.clone(), base.clone(), base.clone());
+        apply_epf_iterations(&mut dx, &mut dy, &mut db, 8, 8, sigma, &rf).unwrap();
+
+        // Manual: Step 1 (base -> mid), Step 2 (mid -> out).
+        let (mut mx, mut my, mut mb) = (vec![0.0_f32; 64], vec![0.0_f32; 64], vec![0.0_f32; 64]);
+        apply_step_5tap(
+            Pass::Pass1,
+            &base,
+            &base,
+            &base,
+            &mut mx,
+            &mut my,
+            &mut mb,
+            8,
+            8,
+            sigma,
+            1.0,
+            rf.epf_pass1_zeroflush,
+            rf.epf_border_sad_mul,
+            rf.epf_channel_scale,
+        )
+        .unwrap();
+        let (mut ox, mut oy, mut ob) = (vec![0.0_f32; 64], vec![0.0_f32; 64], vec![0.0_f32; 64]);
+        apply_step_5tap(
+            Pass::Pass2,
+            &mx,
+            &my,
+            &mb,
+            &mut ox,
+            &mut oy,
+            &mut ob,
+            8,
+            8,
+            sigma,
+            rf.epf_pass2_sigma_scale,
+            rf.epf_pass2_zeroflush,
+            rf.epf_border_sad_mul,
+            rf.epf_channel_scale,
+        )
+        .unwrap();
+        assert_eq!(dx, ox);
+        assert_eq!(dy, oy);
+        assert_eq!(db, ob);
     }
 }

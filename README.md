@@ -43,6 +43,13 @@ What is implemented and tested today:
   the padded block-grid reconstruction into the logical channel extent
   (`ResidualPlane::crop_to` / `ChannelResidualPlanes::crop_to`), and the
   inverse XYB / YCbCr colour transforms.
+- **§J.3 restoration filters** — the Gabor-like 3×3 convolution
+  (`gaborish::apply_xyb_planes_in_place`) and the edge-preserving
+  filter, both as pure XYB-plane math. The §J.3.1 three-step EPF
+  iteration driver (`epf::apply_epf_iterations`) now composes the
+  up-to-three passes per `epf_iters`, feeding each step's output into
+  the next (§J.3.4), for the constant-sigma (Modular,
+  `epf_sigma_for_modular`) case.
 
 ### Not yet implemented
 
@@ -53,7 +60,10 @@ What is implemented and tested today:
   intrinsic-size sub-bundles (parsing stops cleanly at the `have_*`
   flags).
 - The AFV non-DCT IDCT variants, the §C.7.2 entropy-histogram wiring,
-  Gaborish + EPF integration into the registered path.
+  Gaborish + EPF integration into the registered path. The VarDCT
+  per-varblock EPF sigma (Listing J.3 from HfMul / Sharpness) and the
+  `sigma < 0.3` block-skip are not yet wired — `apply_epf_iterations`
+  currently drives the constant-sigma path only.
 - Floating-point samples and `bps > 16`; high-bit-depth XYB / YCbCr.
 - The encoder (not registered).
 
