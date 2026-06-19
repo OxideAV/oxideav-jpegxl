@@ -529,6 +529,7 @@ pub mod residual_plane;
 pub mod toc;
 pub mod varblock_walk;
 pub mod vardct;
+pub mod vardct_reconstruct;
 pub mod xyb;
 
 pub use container::{detect, extract_codestream, Signature};
