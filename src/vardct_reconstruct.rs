@@ -42,6 +42,7 @@
 
 use oxideav_core::{Error, Result};
 
+use crate::block_context_resolver::BlockContextResolver;
 use crate::block_dequant::decode_block_to_residual_with_llf;
 use crate::cross_pass::accumulate_three_channel_multi_pass;
 use crate::dct_quant_weights::DequantMatrixSet;
@@ -51,8 +52,11 @@ use crate::hf_dequant::QmScaleFactors;
 use crate::lf_dequant::LfDequantOutput;
 use crate::lf_global::LfChannelCorrelation;
 use crate::metadata_fdis::OpsinInverseMatrix;
-use crate::multi_pass_decode::MultiPassThreeChannelOutput;
+use crate::multi_pass_decode::{
+    decode_multi_pass_three_channels_with_resolver, MultiPassThreeChannelOutput,
+};
 use crate::pass_group_hf::DecodedHfBlock;
+use crate::per_pass_non_zeros::PerPassNonZerosGrids;
 use crate::residual_plane::{
     apply_chroma_from_luma, assemble_three_channel_planes_with_lf, ChannelResidualPlanes,
 };
@@ -182,6 +186,102 @@ pub fn reconstruct_lf_group_cross_pass(
         apply_chroma_from_luma(&mut planes, x_from_y, b_from_y, cfl)?;
         Ok(planes)
     })
+}
+
+/// Reconstruct one LfGroup's three XYB residual planes **directly from
+/// the live §C.7.2 entropy stream**, fusing the multi-pass entropy
+/// decode with the cross-pass reconstruction in a single call.
+///
+/// This is the round-343 closer of the README-noted remaining wiring
+/// step: [`reconstruct_lf_group_cross_pass`] consumes a
+/// **caller-supplied** [`MultiPassThreeChannelOutput`] (the per-pass
+/// per-varblock coefficient stack), which a caller had to materialise by
+/// first running [`decode_multi_pass_three_channels_with_resolver`] and
+/// then hand the result over. This driver runs both halves end to end:
+///
+/// 1. [`decode_multi_pass_three_channels_with_resolver`] walks the
+///    [`DctSelectGrid`] once per pass against the live entropy closures
+///    (the §C.8.3 per-pass / per-varblock / per-channel decode order),
+///    producing the per-pass [`DecodedHfBlock`] stack from the entropy
+///    stream itself.
+/// 2. [`reconstruct_lf_group_cross_pass`] folds that stack across passes
+///    (§C.8.3 + Table C.6 `shift[]`), seeds each varblock's LLF from the
+///    dequantised LF image (Listing I.16), runs F.3 dequant → §I.2.4 LLF
+///    merge → §I.2.3.2 inverse DCT → §C.5.4 placement → Annex G CfL, and
+///    returns the three XYB residual planes on the padded block grid.
+///
+/// The entropy side is fully caller-parameterised — the closures are the
+/// exact ones [`decode_multi_pass_three_channels_with_resolver`] takes:
+///
+/// * `qdc_at(p, &vb)` reads the per-pass per-varblock quantised-DC triple
+///   (§F.2 quantised LF).
+/// * `read_non_zeros(p, channel, predicted)` reads the per-pass
+///   per-channel `NonZeros(x, y)` symbol against the predicted count.
+/// * `decode_symbol(p, channel, coeff_ctx)` reads one HF coefficient
+///   symbol against the resolved block context.
+///
+/// `nz` is the per-pass per-channel [`PerPassNonZerosGrids`] state
+/// container (its `num_passes()` is the authoritative pass count for the
+/// entropy walk and MUST equal `passes.num_passes`); `resolver` is the
+/// [`BlockContextResolver`] over the LfGroup's [`HfBlockContext`]. The
+/// reconstruction-side inputs (`grid` / `lf` / `dq` / CfL) match
+/// [`reconstruct_lf_group_cross_pass`] verbatim.
+///
+/// Errors from either stage propagate verbatim; a `nz.num_passes()` that
+/// disagrees with `passes.num_passes` is rejected before any entropy work
+/// (the cross-pass accumulator would otherwise reject it after a full
+/// decode, wasting the entropy walk).
+///
+/// [`HfBlockContext`]: crate::lf_global::HfBlockContext
+#[allow(clippy::too_many_arguments)]
+pub fn reconstruct_lf_group_from_entropy<Q, F, G>(
+    passes: &Passes,
+    grid: &DctSelectGrid,
+    nz: &mut PerPassNonZerosGrids,
+    resolver: &BlockContextResolver<'_>,
+    lf: &LfDequantOutput,
+    dq: &DequantContext<'_>,
+    x_from_y: &[i32],
+    b_from_y: &[i32],
+    cfl: &LfChannelCorrelation,
+    qdc_at: Q,
+    read_non_zeros: F,
+    decode_symbol: G,
+) -> Result<ChannelResidualPlanes>
+where
+    Q: FnMut(u32, &Varblock) -> Result<[i32; 3]>,
+    F: FnMut(u32, u32, u32) -> Result<u32>,
+    G: FnMut(u32, u32, u32) -> Result<u32>,
+{
+    // The entropy walk's pass count is driven off `nz.num_passes()`; the
+    // cross-pass accumulator validates `multi_pass.len() == num_passes`
+    // downstream, but checking here avoids running the whole entropy
+    // decode only to reject the (cheap, structural) pass-count mismatch
+    // afterwards.
+    if nz.num_passes() != passes.num_passes {
+        return Err(Error::InvalidData(format!(
+            "JXL vardct_reconstruct: PerPassNonZerosGrids pass count {} != \
+             Passes.num_passes {}",
+            nz.num_passes(),
+            passes.num_passes
+        )));
+    }
+
+    // Stage 1 — live multi-pass entropy decode → per-pass DecodedHfBlock
+    // stack (§C.8.3 outer pass loop over the round-221 inner driver).
+    let multi_pass = decode_multi_pass_three_channels_with_resolver(
+        grid,
+        nz,
+        resolver,
+        qdc_at,
+        read_non_zeros,
+        decode_symbol,
+    )?;
+
+    // Stage 2 — cross-pass accumulation → dequant → LLF merge → IDCT →
+    // placement → CfL, reusing the round-340 reconstruction driver
+    // unchanged so the two paths cannot diverge.
+    reconstruct_lf_group_cross_pass(passes, grid, lf, dq, x_from_y, b_from_y, cfl, &multi_pass)
 }
 
 #[cfg(test)]
@@ -490,6 +590,214 @@ mod tests {
             &[0i32; 1],
             &LfChannelCorrelation::default(),
             &mp,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::InvalidData(_)), "got {err:?}");
+    }
+
+    // ---- reconstruct_lf_group_from_entropy (round 343) ----
+
+    use crate::lf_global::HfBlockContext;
+
+    /// The round-214/221/228 default HfBlockContext — empty thresholds
+    /// collapse the qf/qdc knobs, default 39-entry block_ctx_map.
+    fn default_hbc() -> HfBlockContext {
+        HfBlockContext {
+            used_default: true,
+            qf_thresholds: vec![],
+            lf_thresholds: [vec![], vec![], vec![]],
+            block_ctx_map: vec![
+                7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 7, 8, 9, 9, 10, 11, 12, 13, 14, 0, 0, 0, 0,
+                7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            ],
+            nb_block_ctx: 15,
+        }
+    }
+
+    /// All-zero entropy stub: `qdc` triple zero, NonZeros zero, no HF
+    /// symbols. Drives the decode to an all-zero coefficient block —
+    /// the live-entropy analogue of a `vec![0; 64]` caller-supplied block.
+    #[allow(clippy::type_complexity)]
+    fn zero_entropy() -> (
+        impl FnMut(u32, &Varblock) -> Result<[i32; 3]>,
+        impl FnMut(u32, u32, u32) -> Result<u32>,
+        impl FnMut(u32, u32, u32) -> Result<u32>,
+    ) {
+        (
+            |_p, _vb| Ok([0i32; 3]),
+            |_p, _c, _pred| Ok(0u32),
+            |_p, _c, _coef| Ok(0u32),
+        )
+    }
+
+    /// The fused entropy→reconstruction driver, fed an all-zero entropy
+    /// stub, produces the same flat-DC reconstruction as the explicit
+    /// two-call (`decode_multi_pass…` then `reconstruct_lf_group_cross_pass`)
+    /// path. This is the round-343 milestone: live decode + cross-pass
+    /// reconstruction in one call.
+    #[test]
+    fn from_entropy_single_pass_dct8x8_flat() {
+        let set = materialise_default_dequant_set().unwrap();
+        let p = passes(1, vec![]);
+        let g = grid(
+            vec![DctSelectCell::TopLeft(TransformType::Dct8x8)],
+            vec![1],
+            1,
+            1,
+        );
+        let lf = lf_flat(4.0, 1, 1);
+        let dq = DequantContext {
+            set: &set,
+            oim: &oim(),
+            qm: &qm(),
+        };
+        let hbc = default_hbc();
+        let resolver = BlockContextResolver::new(&hbc);
+        let mut nz = PerPassNonZerosGrids::new_uniform(1, 3, 1, 1).unwrap();
+        let (qdc_at, rnz, dsym) = zero_entropy();
+        let planes = reconstruct_lf_group_from_entropy(
+            &p,
+            &g,
+            &mut nz,
+            &resolver,
+            &lf,
+            &dq,
+            &[0i32; 1],
+            &[0i32; 1],
+            &LfChannelCorrelation::default(),
+            qdc_at,
+            rnz,
+            dsym,
+        )
+        .unwrap();
+        assert_eq!(planes.dims(), (8, 8));
+        // Constant LF + zero HF → flat Y plane.
+        let v0 = planes.y().get(0, 0).unwrap();
+        for y in 0..8 {
+            for x in 0..8 {
+                let v = planes.y().get(x, y).unwrap();
+                assert!((v - v0).abs() < 1e-3, "Y ({x},{y}) = {v} != {v0}");
+            }
+        }
+    }
+
+    /// The fused driver is bit-for-bit identical to the explicit two-call
+    /// path on the same inputs: run `decode_multi_pass…` then
+    /// `reconstruct_lf_group_cross_pass` by hand and compare every sample.
+    #[test]
+    fn from_entropy_matches_explicit_two_call_path() {
+        let set = materialise_default_dequant_set().unwrap();
+        let p = passes(1, vec![]);
+        let g = grid(
+            vec![DctSelectCell::TopLeft(TransformType::Dct8x8)],
+            vec![1],
+            1,
+            1,
+        );
+        let lf = lf_flat(7.5, 1, 1);
+        let hbc = default_hbc();
+        let resolver = BlockContextResolver::new(&hbc);
+
+        // Explicit path: decode then reconstruct.
+        let mut nz_a = PerPassNonZerosGrids::new_uniform(1, 3, 1, 1).unwrap();
+        let mp = decode_multi_pass_three_channels_with_resolver(
+            &g,
+            &mut nz_a,
+            &resolver,
+            |_p, _vb| Ok([0i32; 3]),
+            |_p, _c, _pred| Ok(0u32),
+            |_p, _c, _coef| Ok(0u32),
+        )
+        .unwrap();
+        let dq = DequantContext {
+            set: &set,
+            oim: &oim(),
+            qm: &qm(),
+        };
+        let explicit = reconstruct_lf_group_cross_pass(
+            &p,
+            &g,
+            &lf,
+            &dq,
+            &[0i32; 1],
+            &[0i32; 1],
+            &LfChannelCorrelation::default(),
+            &mp,
+        )
+        .unwrap();
+
+        // Fused path: same closures, one call.
+        let mut nz_b = PerPassNonZerosGrids::new_uniform(1, 3, 1, 1).unwrap();
+        let (qdc_at, rnz, dsym) = zero_entropy();
+        let fused = reconstruct_lf_group_from_entropy(
+            &p,
+            &g,
+            &mut nz_b,
+            &resolver,
+            &lf,
+            &dq,
+            &[0i32; 1],
+            &[0i32; 1],
+            &LfChannelCorrelation::default(),
+            qdc_at,
+            rnz,
+            dsym,
+        )
+        .unwrap();
+
+        assert_eq!(fused.dims(), explicit.dims());
+        for ch in 0..3 {
+            let (pe, pf) = match ch {
+                0 => (explicit.x(), fused.x()),
+                1 => (explicit.y(), fused.y()),
+                _ => (explicit.b(), fused.b()),
+            };
+            for y in 0..8 {
+                for x in 0..8 {
+                    let a = pe.get(x, y).unwrap();
+                    let b = pf.get(x, y).unwrap();
+                    assert_eq!(a.to_bits(), b.to_bits(), "ch {ch} ({x},{y}): {a} != {b}");
+                }
+            }
+        }
+    }
+
+    /// A `PerPassNonZerosGrids` whose pass count disagrees with
+    /// `Passes.num_passes` is rejected up front — before any entropy work.
+    #[test]
+    fn from_entropy_rejects_pass_count_mismatch() {
+        let set = materialise_default_dequant_set().unwrap();
+        // Passes says 2 passes; nz container has only 1.
+        let p = passes(2, vec![1]);
+        let g = grid(
+            vec![DctSelectCell::TopLeft(TransformType::Dct8x8)],
+            vec![1],
+            1,
+            1,
+        );
+        let lf = lf_flat(0.0, 1, 1);
+        let dq = DequantContext {
+            set: &set,
+            oim: &oim(),
+            qm: &qm(),
+        };
+        let hbc = default_hbc();
+        let resolver = BlockContextResolver::new(&hbc);
+        let mut nz = PerPassNonZerosGrids::new_uniform(1, 3, 1, 1).unwrap();
+        let (qdc_at, rnz, dsym) = zero_entropy();
+        let err = reconstruct_lf_group_from_entropy(
+            &p,
+            &g,
+            &mut nz,
+            &resolver,
+            &lf,
+            &dq,
+            &[0i32; 1],
+            &[0i32; 1],
+            &LfChannelCorrelation::default(),
+            qdc_at,
+            rnz,
+            dsym,
         )
         .unwrap_err();
         assert!(matches!(err, Error::InvalidData(_)), "got {err:?}");

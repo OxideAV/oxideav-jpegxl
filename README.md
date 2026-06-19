@@ -59,6 +59,16 @@ What is implemented and tested today:
   merge → §I.2.3.2 IDCT → §C.5.4 placement → Annex G CfL — driving any
   mix of square / non-square / non-DCT varblocks (single- or multi-pass)
   to the three XYB residual planes.
+  `vardct_reconstruct::reconstruct_lf_group_from_entropy` fuses that
+  reconstruction with the **live** §C.8.3 multi-pass entropy decode
+  (`multi_pass_decode::decode_multi_pass_three_channels_with_resolver`) in
+  a single per-LfGroup call: it walks the DctSelect grid once per pass
+  against the caller's entropy closures
+  (`qdc_at` / `read_non_zeros` / `decode_symbol`), producing the per-pass
+  `DecodedHfBlock` stack from the stream itself, then runs the cross-pass
+  reconstruction on it — closing the "feed the live per-pass stack rather
+  than a caller-supplied one" wiring step. It is bit-for-bit identical to
+  the explicit decode-then-reconstruct two-call path.
 - **§J.3 restoration filters** — the Gabor-like 3×3 convolution
   (`gaborish::apply_xyb_planes_in_place`) and the edge-preserving
   filter, both as pure XYB-plane math. The §J.3.1 three-step EPF
@@ -80,9 +90,14 @@ What is implemented and tested today:
   lands. The per-LfGroup VarDCT reconstruction is now a single call
   (`vardct_reconstruct::reconstruct_lf_group_cross_pass`, covering
   square / non-square / non-DCT transforms and the §C.8.3 cross-pass
-  accumulation); what remains is feeding it the live per-pass
-  [`DecodedHfBlock`] stack from the §C.7.2 entropy stream rather than a
-  caller-supplied one.
+  accumulation), and `reconstruct_lf_group_from_entropy` now drives it
+  from the live per-pass [`DecodedHfBlock`] stack decoded out of the
+  §C.7.2 entropy stream (via the `qdc_at` / `read_non_zeros` /
+  `decode_symbol` closures) rather than a caller-supplied one. What
+  remains is the §C.7.2 entropy-histogram materialisation that backs
+  those closures (the histogram array + per-channel `BlockContext()`
+  history threading) and the frame-level framing that supplies the
+  per-LfGroup LF image + dequant context to this call.
 - ColorEncoding / ToneMapping fuller decode, preview / animation /
   intrinsic-size sub-bundles (parsing stops cleanly at the `have_*`
   flags).
