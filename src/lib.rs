@@ -492,6 +492,7 @@ pub mod block_dequant;
 pub mod chroma_from_luma;
 pub mod coeff_order;
 pub mod container;
+pub mod cross_pass;
 pub mod dct_quant_weights;
 pub mod dct_select;
 pub mod epf;
