@@ -42,7 +42,23 @@ What is implemented and tested today:
   residual-plane reconstruction, the §6.2 right/bottom crop that turns
   the padded block-grid reconstruction into the logical channel extent
   (`ResidualPlane::crop_to` / `ChannelResidualPlanes::crop_to`), and the
-  inverse XYB / YCbCr colour transforms.
+  inverse XYB / YCbCr colour transforms. The **non-square** transform
+  families (DCT8×16 / DCT16×8 / DCT32×8 / DCT8×32 / DCT32×16 / DCT16×32
+  and their larger relatives) reconstruct to spatial samples through the
+  same walk — the IDCT carries the Listing I.4 pre/post-transpose for
+  `R != C`, the LLF extraction reads a `cy × cx` sub-block, and the
+  dequant matrix is the wide `bwidth × bheight` layout.
+- **§C.8.3 cross-pass HF accumulation** — the multi-pass coefficient
+  stack the per-pass decode driver yields (`out[p][i]`) is folded into a
+  single accumulated quantised grid per varblock (`cross_pass`): each
+  pass's HF coefficients are left-shifted by the Table C.6 `shift[i]`
+  (last pass behaves as shift 0) and summed cell-wise, uniform across
+  every transform family. `vardct_reconstruct::reconstruct_lf_group_cross_pass`
+  is the one-call per-LfGroup driver tying it together — cross-pass
+  accumulate → LF→LLF seed (Listing I.16) → F.3 dequant → §I.2.4 LLF
+  merge → §I.2.3.2 IDCT → §C.5.4 placement → Annex G CfL — driving any
+  mix of square / non-square / non-DCT varblocks (single- or multi-pass)
+  to the three XYB residual planes.
 - **§J.3 restoration filters** — the Gabor-like 3×3 convolution
   (`gaborish::apply_xyb_planes_in_place`) and the edge-preserving
   filter, both as pure XYB-plane math. The §J.3.1 three-step EPF
@@ -61,7 +77,12 @@ What is implemented and tested today:
 
 - The integrated frame decode loop (FrameHeader + TOC + frame framing
   wiring the stages together); the registered decoder rejects until it
-  lands.
+  lands. The per-LfGroup VarDCT reconstruction is now a single call
+  (`vardct_reconstruct::reconstruct_lf_group_cross_pass`, covering
+  square / non-square / non-DCT transforms and the §C.8.3 cross-pass
+  accumulation); what remains is feeding it the live per-pass
+  [`DecodedHfBlock`] stack from the §C.7.2 entropy stream rather than a
+  caller-supplied one.
 - ColorEncoding / ToneMapping fuller decode, preview / animation /
   intrinsic-size sub-bundles (parsing stops cleanly at the `have_*`
   flags).
