@@ -204,11 +204,13 @@ use crate::block_context_resolver::{BlockContextResolver, ThreeChannelVarblock};
 use crate::coeff_order::{natural_coeff_order, order_id_for_transform};
 use crate::dct_select::{DctSelectGrid, TransformType};
 use crate::hf_coefficient_histograms::HfCoefficientHistograms;
+use crate::multi_pass_decode::MultiPassThreeChannelOutput;
 use crate::multi_pass_hf_header::PerPassHfHeaders;
 use crate::pass_group_hf::{
     coefficient_context, non_zeros_context, prev_for_context, transform_block_params,
     DecodedHfBlock,
 };
+use crate::per_pass_non_zeros::PerPassNonZerosGrids;
 use crate::varblock_walk::{count_varblocks, Varblock, VarblockWalk};
 
 /// Per-pass HF histogram decode context — owns the §C.7.2 entropy
@@ -807,6 +809,142 @@ impl<'a> HfHistogramDecodeContext<'a> {
             let (decoded, raw) =
                 self.decode_three_channel_varblock_for_pass(br, p, &vb, resolver, qdc, predicted)?;
             out.push((vb, decoded, raw));
+        }
+        Ok(out)
+    }
+
+    /// Full §C.8.3 multi-pass per-LfGroup three-channel decode driver
+    /// — the histogram-backed sibling of the closure-based
+    /// [`crate::multi_pass_decode::decode_multi_pass_three_channels_with_resolver`].
+    ///
+    /// Round 228 landed the outer pass loop over the round-221
+    /// closure-based inner driver: the caller passes abstract
+    /// `read_non_zeros(p, c, predicted)` / `decode_symbol(p, c,
+    /// coeff_ctx)` closures and is responsible for binding them to the
+    /// per-pass `hfp`-selected §C.7.2 histograms. This driver closes
+    /// that wiring step: it owns the §C.7.2 entropy-stream routing
+    /// itself (through `self`'s per-pass `histogram_offset` array), so
+    /// the only closure the caller still supplies is the (storage-only)
+    /// `qdc_at(p, &vb)` quantised-LF lookup. No `read_non_zeros` /
+    /// `decode_symbol` closures cross the boundary — the histogram
+    /// container is the symbol source.
+    ///
+    /// Spec walk per FDIS §C.8.3. The outer loop runs once per pass `p`
+    /// ∈ `[0, nz.num_passes())` (round 228's layer). Each pass
+    /// raster-walks the [`DctSelectGrid`] in row-major order
+    /// ([`VarblockWalk`]), and for each top-left varblock:
+    ///
+    /// 1. `qdc = qdc_at(p, &vb)` — the shared per-varblock quantised-LF
+    ///    top-left triple,
+    /// 2. `predicted[c] = nz.predicted(p, c, vb.x, vb.y)` for each
+    ///    channel (Listing C.13 `PredictedNonZeros`),
+    /// 3. `(decoded[3], raw[3]) =
+    ///    self.decode_three_channel_varblock_for_pass(br, p, &vb,
+    ///    resolver, qdc, predicted)` — the round-260 bundled Y → X → B
+    ///    three-channel walk against the live §C.7.2 stream,
+    /// 4. `nz.update_after_block_for_transform(p, c, vb.x, vb.y, raw[c],
+    ///    vb.transform)` for each channel (the `(raw + num_blocks - 1)
+    ///    Idiv num_blocks` line right after Listing C.14),
+    /// 5. push `(vb, decoded, raw)` onto pass `p`'s output vector.
+    ///
+    /// Each pass's vector is pushed onto the returned
+    /// [`MultiPassThreeChannelOutput`]: `out[p][i]` is the `i`-th
+    /// varblock (raster order) decoded in pass `p`, bit-for-bit the same
+    /// shape
+    /// [`crate::multi_pass_decode::decode_multi_pass_three_channels_with_resolver`]
+    /// produces, ready to feed the round-340 cross-pass reconstruction.
+    ///
+    /// The pass count is read off `nz.num_passes()` (the authoritative
+    /// loop bound, matching the per-pass per-channel container shapes the
+    /// caller built); it MUST equal `self.num_passes()` (the
+    /// `PerPassHfHeaders` pass count threaded into [`Self::new`]) so the
+    /// per-pass `histogram_offset(p)` lookup is in range for every pass
+    /// the NonZeros grids carry. A mismatch is rejected before any
+    /// entropy work (a `nz`-driven loop would otherwise run off the end
+    /// of the per-pass offset array mid-decode).
+    ///
+    /// `predicted` is read **before** the per-varblock decode and the
+    /// `NonZeros(x, y)` writeback happens **after**, identically to the
+    /// round-221 closure path's
+    /// [`crate::non_zeros_grid::decode_block_at`] — so the two drivers
+    /// produce identical NonZeros-grid evolution and identical
+    /// coefficient stacks for the same stream.
+    ///
+    /// Channel decode order is fixed at Y → X → B inside
+    /// [`Self::decode_three_channel_varblock_for_pass`]; the per-channel
+    /// `predicted` read and writeback loops here iterate channels 0..3
+    /// in index order because those are pure storage operations against
+    /// `nz` and do not advance the entropy stream.
+    ///
+    /// On any error (pass-count mismatch, `qdc_at` closure error,
+    /// `VarblockWalk` residual-`Empty` cell, resolver error,
+    /// per-varblock decode error, or a `predicted` / writeback bounds
+    /// error against `nz`) the driver propagates immediately and
+    /// discards in-flight partial output. The walk proceeds in pass
+    /// order then raster order; an error in pass `p` aborts before pass
+    /// `p + 1` begins, and an error on varblock `i` aborts before
+    /// varblock `i + 1`'s `qdc_at`.
+    ///
+    /// Per-pass vector lengths are uniform and equal
+    /// [`count_varblocks(grid)`].
+    pub fn decode_lf_group_multi_pass_three_channels<Q>(
+        &mut self,
+        br: &mut BitReader<'_>,
+        grid: &DctSelectGrid,
+        nz: &mut PerPassNonZerosGrids,
+        resolver: &BlockContextResolver<'_>,
+        mut qdc_at: Q,
+    ) -> Result<MultiPassThreeChannelOutput>
+    where
+        Q: FnMut(u32, &Varblock) -> Result<[i32; 3]>,
+    {
+        let num_passes = nz.num_passes();
+        // The per-pass `histogram_offset(p)` array (= self.num_passes())
+        // must cover every pass the NonZeros grids carry, or the inner
+        // decode would index past the offset table mid-walk. Reject the
+        // (cheap, structural) mismatch up front rather than after part
+        // of the entropy stream has been consumed.
+        if num_passes != self.num_passes() {
+            return Err(Error::InvalidData(format!(
+                "JXL HfHistogramDecodeContext::decode_lf_group_multi_pass_three_channels: \
+                 nz.num_passes()={num_passes} != self.num_passes()={}",
+                self.num_passes()
+            )));
+        }
+        let mut out: MultiPassThreeChannelOutput = Vec::with_capacity(num_passes as usize);
+        for p in 0..num_passes {
+            let mut per_pass: Vec<ThreeChannelVarblock> =
+                Vec::with_capacity(count_varblocks(grid) as usize);
+            let mut walk = VarblockWalk::new(grid);
+            while let Some(vb) = walk.next()? {
+                let qdc = qdc_at(p, &vb)?;
+                // PredictedNonZeros(x, y) per channel (Listing C.13);
+                // read before the decode, exactly as the round-221
+                // closure path does inside `decode_block_at`.
+                let predicted = [
+                    nz.predicted(p, 0, vb.x, vb.y)?,
+                    nz.predicted(p, 1, vb.x, vb.y)?,
+                    nz.predicted(p, 2, vb.x, vb.y)?,
+                ];
+                let (decoded, raw) = self
+                    .decode_three_channel_varblock_for_pass(br, p, &vb, resolver, qdc, predicted)?;
+                // NonZeros(x, y) writeback per channel (the `(raw +
+                // num_blocks - 1) Idiv num_blocks` line right after
+                // Listing C.14). Pure storage against `nz`, so the
+                // index-order channel loop is fine here.
+                for c in 0..3u32 {
+                    nz.update_after_block_for_transform(
+                        p,
+                        c,
+                        vb.x,
+                        vb.y,
+                        raw[c as usize],
+                        vb.transform,
+                    )?;
+                }
+                per_pass.push((vb, decoded, raw));
+            }
+            out.push(per_pass);
         }
         Ok(out)
     }
@@ -1634,6 +1772,74 @@ mod tests {
             width_blocks,
             height_blocks,
         }
+    }
+
+    #[test]
+    fn r346_multi_pass_single_pass_raster_and_short_circuit() {
+        // One pass, 2×2 DCT8×8 grid, default single-symbol prefix → every
+        // NonZeros = 0 → no coefficient symbols → BitReader unmoved, raster
+        // order preserved.
+        let mut h = make_minimal_histograms(1, 15);
+        let headers = PerPassHfHeaders::from_headers(vec![PassGroupHfHeader {
+            hfp: 0,
+            histogram_offset: 0,
+        }]);
+        let mut ctx_dec = HfHistogramDecodeContext::new(&mut h, &headers).unwrap();
+        let hbc = default_hbc_r260();
+        let resolver = BlockContextResolver::new(&hbc);
+        let grid = make_uniform_grid_r264(2, 2, TransformType::Dct8x8);
+        let mut nz = PerPassNonZerosGrids::new_uniform(1, 3, 2, 2).unwrap();
+        let bytes = [0u8; 8];
+        let mut br = BitReader::new(&bytes);
+        let before = br.bits_read();
+        let out = ctx_dec
+            .decode_lf_group_multi_pass_three_channels(
+                &mut br,
+                &grid,
+                &mut nz,
+                &resolver,
+                |_p, _vb| Ok([0i32; 3]),
+            )
+            .unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].len(), 4);
+        assert_eq!(br.bits_read(), before);
+        for (i, (vb, decoded, raw)) in out[0].iter().enumerate() {
+            assert_eq!((vb.x, vb.y), (i as u32 % 2, i as u32 / 2));
+            for c in 0..3 {
+                assert_eq!(decoded[c].coeffs.len(), 64);
+                assert_eq!(raw[c], 0);
+            }
+        }
+    }
+
+    #[test]
+    fn r346_multi_pass_rejects_nz_ctx_pass_count_mismatch() {
+        // ctx is single-pass; nz carries two passes → reject before any
+        // stream read.
+        let mut h = make_minimal_histograms(1, 15);
+        let headers = PerPassHfHeaders::from_headers(vec![PassGroupHfHeader {
+            hfp: 0,
+            histogram_offset: 0,
+        }]);
+        let mut ctx_dec = HfHistogramDecodeContext::new(&mut h, &headers).unwrap();
+        let hbc = default_hbc_r260();
+        let resolver = BlockContextResolver::new(&hbc);
+        let grid = make_uniform_grid_r264(1, 1, TransformType::Dct8x8);
+        let mut nz = PerPassNonZerosGrids::new_uniform(2, 3, 1, 1).unwrap();
+        let bytes = [0u8; 4];
+        let mut br = BitReader::new(&bytes);
+        let before = br.bits_read();
+        let r = ctx_dec.decode_lf_group_multi_pass_three_channels(
+            &mut br,
+            &grid,
+            &mut nz,
+            &resolver,
+            |_p, _vb| Ok([0i32; 3]),
+        );
+        assert!(matches!(r, Err(Error::InvalidData(_))));
+        // Rejected before consuming any stream bits.
+        assert_eq!(br.bits_read(), before);
     }
 
     #[test]

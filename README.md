@@ -68,7 +68,17 @@ What is implemented and tested today:
   `DecodedHfBlock` stack from the stream itself, then runs the cross-pass
   reconstruction on it — closing the "feed the live per-pass stack rather
   than a caller-supplied one" wiring step. It is bit-for-bit identical to
-  the explicit decode-then-reconstruct two-call path.
+  the explicit decode-then-reconstruct two-call path. The
+  **histogram-backed** sibling
+  (`vardct_reconstruct::reconstruct_lf_group_from_histogram` over
+  `HfHistogramDecodeContext::decode_lf_group_multi_pass_three_channels`)
+  goes one step further: it owns the §C.7.2 entropy-stream routing
+  itself — the per-pass `histogram_offset` selection, the per-pass
+  per-channel `PredictedNonZeros` read + `NonZeros(x, y)` writeback — so
+  the only entropy input the caller supplies is the storage-only `qdc_at`
+  quantised-LF lookup (no `read_non_zeros` / `decode_symbol` closures).
+  It is bit-for-bit identical to the closure path wired to the same
+  histogram context over the same stream.
 - **§J.3 restoration filters** — the Gabor-like 3×3 convolution
   (`gaborish::apply_xyb_planes_in_place`) and the edge-preserving
   filter, both as pure XYB-plane math. The §J.3.1 three-step EPF
@@ -90,14 +100,17 @@ What is implemented and tested today:
   lands. The per-LfGroup VarDCT reconstruction is now a single call
   (`vardct_reconstruct::reconstruct_lf_group_cross_pass`, covering
   square / non-square / non-DCT transforms and the §C.8.3 cross-pass
-  accumulation), and `reconstruct_lf_group_from_entropy` now drives it
-  from the live per-pass [`DecodedHfBlock`] stack decoded out of the
-  §C.7.2 entropy stream (via the `qdc_at` / `read_non_zeros` /
-  `decode_symbol` closures) rather than a caller-supplied one. What
-  remains is the §C.7.2 entropy-histogram materialisation that backs
-  those closures (the histogram array + per-channel `BlockContext()`
-  history threading) and the frame-level framing that supplies the
-  per-LfGroup LF image + dequant context to this call.
+  accumulation), and both `reconstruct_lf_group_from_entropy` (abstract
+  entropy closures) and `reconstruct_lf_group_from_histogram`
+  (histogram-backed, over `HfHistogramDecodeContext`) now drive it from
+  the live per-pass [`DecodedHfBlock`] stack decoded out of the §C.7.2
+  entropy stream rather than a caller-supplied one — the latter sourcing
+  every symbol from the materialised §C.7.2 HF-coefficient histograms
+  with the per-pass `histogram_offset` routing owned internally. What
+  remains is the frame-level framing that supplies the per-LfGroup LF
+  image + dequant context + the constructed `HfHistogramDecodeContext`
+  (its ANS-state init for ANS-coded histograms) to this call, plus the
+  per-channel `BlockContext()` history threading the resolver consumes.
 - ColorEncoding / ToneMapping fuller decode, preview / animation /
   intrinsic-size sub-bundles (parsing stops cleanly at the `have_*`
   flags).

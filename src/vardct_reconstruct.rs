@@ -42,6 +42,7 @@
 
 use oxideav_core::{Error, Result};
 
+use crate::bitreader::BitReader;
 use crate::block_context_resolver::BlockContextResolver;
 use crate::block_dequant::decode_block_to_residual_with_llf;
 use crate::cross_pass::accumulate_three_channel_multi_pass;
@@ -55,6 +56,7 @@ use crate::metadata_fdis::OpsinInverseMatrix;
 use crate::multi_pass_decode::{
     decode_multi_pass_three_channels_with_resolver, MultiPassThreeChannelOutput,
 };
+use crate::multi_pass_hf_histogram_decoder::HfHistogramDecodeContext;
 use crate::pass_group_hf::DecodedHfBlock;
 use crate::per_pass_non_zeros::PerPassNonZerosGrids;
 use crate::residual_plane::{
@@ -281,6 +283,104 @@ where
     // Stage 2 — cross-pass accumulation → dequant → LLF merge → IDCT →
     // placement → CfL, reusing the round-340 reconstruction driver
     // unchanged so the two paths cannot diverge.
+    reconstruct_lf_group_cross_pass(passes, grid, lf, dq, x_from_y, b_from_y, cfl, &multi_pass)
+}
+
+/// Reconstruct one LfGroup's three XYB residual planes **directly from
+/// the §C.7.2 HF-coefficient-histogram entropy stream**, fusing the
+/// histogram-backed multi-pass decode with the cross-pass
+/// reconstruction in a single call.
+///
+/// This is the histogram-source sibling of
+/// [`reconstruct_lf_group_from_entropy`]. Where that driver takes
+/// abstract `read_non_zeros` / `decode_symbol` closures the caller must
+/// bind to the per-pass `hfp`-selected histograms, this driver owns the
+/// §C.7.2 entropy-stream routing itself: it threads the live
+/// [`BitReader`] through the round-252 typed
+/// [`HfHistogramDecodeContext`], which selects the per-pass
+/// `histogram_offset` cluster-map slice internally. The only entropy
+/// input the caller still supplies is the (storage-only) `qdc_at(p,
+/// &vb)` quantised-LF lookup — closing the README-noted
+/// "§C.7.2 entropy-histogram materialisation that backs those closures"
+/// wiring step.
+///
+/// Two stages, both reusing existing drivers verbatim so the paths
+/// cannot diverge:
+///
+/// 1. [`HfHistogramDecodeContext::decode_lf_group_multi_pass_three_channels`]
+///    runs the full §C.8.3 outer-pass loop over the round-260
+///    three-channel varblock walk, threading the per-pass per-channel
+///    `PredictedNonZeros` read + `NonZeros(x, y)` writeback through
+///    `nz`, and yields the per-pass [`MultiPassThreeChannelOutput`]
+///    stack from the histogram stream itself.
+/// 2. [`reconstruct_lf_group_cross_pass`] folds that stack across
+///    passes (§C.8.3 + Table C.6 `shift[]`), seeds each varblock's LLF
+///    from the dequantised LF image (Listing I.16), runs F.3 dequant →
+///    §I.2.4 LLF merge → §I.2.3.2 inverse DCT → §C.5.4 placement →
+///    Annex G CfL, and returns the three XYB residual planes on the
+///    padded block grid.
+///
+/// `ctx` is the bound [`HfHistogramDecodeContext`] (post-ANS-state-init
+/// for ANS streams — the caller invokes
+/// [`crate::hf_coefficient_histograms::HfCoefficientHistograms::read_ans_state_init`]
+/// before this call when the histograms are ANS-coded); `br` is the
+/// live §C.7.2 entropy [`BitReader`]; `nz` is the per-pass per-channel
+/// [`PerPassNonZerosGrids`] state container. The reconstruction-side
+/// inputs (`grid` / `lf` / `dq` / CfL) match
+/// [`reconstruct_lf_group_cross_pass`] verbatim.
+///
+/// Pass-count cross-validation is layered: this call rejects a
+/// `nz.num_passes()` that disagrees with `passes.num_passes` up front
+/// (the cross-pass accumulator would otherwise reject it after a full
+/// decode), and the inner driver independently rejects a
+/// `nz.num_passes()` that disagrees with `ctx.num_passes()` (the
+/// per-pass `histogram_offset` array bound). All three must agree.
+///
+/// Errors from either stage propagate verbatim.
+#[allow(clippy::too_many_arguments)]
+pub fn reconstruct_lf_group_from_histogram<Q>(
+    passes: &Passes,
+    grid: &DctSelectGrid,
+    nz: &mut PerPassNonZerosGrids,
+    resolver: &BlockContextResolver<'_>,
+    ctx: &mut HfHistogramDecodeContext<'_>,
+    br: &mut BitReader<'_>,
+    lf: &LfDequantOutput,
+    dq: &DequantContext<'_>,
+    x_from_y: &[i32],
+    b_from_y: &[i32],
+    cfl: &LfChannelCorrelation,
+    qdc_at: Q,
+) -> Result<ChannelResidualPlanes>
+where
+    Q: FnMut(u32, &Varblock) -> Result<[i32; 3]>,
+{
+    // Structural pass-count guard (mirrors `reconstruct_lf_group_from_entropy`)
+    // so the entropy walk is not run only to be rejected by the
+    // cross-pass accumulator afterwards. The inner driver re-checks
+    // `nz.num_passes() == ctx.num_passes()` against the histogram-offset
+    // table.
+    if nz.num_passes() != passes.num_passes {
+        return Err(Error::InvalidData(format!(
+            "JXL vardct_reconstruct: PerPassNonZerosGrids pass count {} != \
+             Passes.num_passes {}",
+            nz.num_passes(),
+            passes.num_passes
+        )));
+    }
+
+    // Stage 1 — histogram-backed live multi-pass entropy decode →
+    // per-pass DecodedHfBlock stack (§C.8.3 outer pass loop over the
+    // round-260 three-channel varblock walk, with the per-pass
+    // per-channel NonZeros predicted-read + writeback threaded through
+    // `nz`).
+    let multi_pass =
+        ctx.decode_lf_group_multi_pass_three_channels(br, grid, nz, resolver, qdc_at)?;
+
+    // Stage 2 — cross-pass accumulation → dequant → LLF merge → IDCT →
+    // placement → CfL, reusing the round-340 reconstruction driver
+    // unchanged so the histogram path and the closure path
+    // (`reconstruct_lf_group_from_entropy`) cannot diverge.
     reconstruct_lf_group_cross_pass(passes, grid, lf, dq, x_from_y, b_from_y, cfl, &multi_pass)
 }
 
