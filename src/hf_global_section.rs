@@ -53,6 +53,8 @@ use crate::bitreader::BitReader;
 use crate::hf_coefficient_histograms::HfCoefficientHistograms;
 use crate::hf_global::HfGlobal;
 use crate::hf_pass::{read_hf_pass_sequence, HfPass};
+use crate::multi_pass_hf_header::PerPassHfHeaders;
+use crate::multi_pass_hf_histogram_decoder::HfHistogramDecodeContext;
 
 /// The fully-read HfGlobal TOC section of a VarDCT frame: the §I.2.4 /
 /// §I.2.6 [`HfGlobal`] bundle, the §C.7.1 per-preset [`HfPass`]
@@ -144,10 +146,34 @@ impl HfGlobalSection {
 
     /// Borrow the §C.7.2 histogram block (post-`read_ans_state_init`).
     /// Mutable so the caller can construct a
-    /// [`crate::multi_pass_hf_histogram_decoder::HfHistogramDecodeContext`]
-    /// (which borrows the histograms mutably for the ANS decode state).
+    /// [`HfHistogramDecodeContext`] (which borrows the histograms
+    /// mutably for the ANS decode state).
     pub fn histograms_mut(&mut self) -> &mut HfCoefficientHistograms {
         &mut self.histograms
+    }
+
+    /// Bind this section's §C.7.2 histograms to a per-frame §C.8.3
+    /// [`PerPassHfHeaders`] (the per-pass `hfp` / `histogram_offset`
+    /// sequence read at the start of each pass's PassGroup payload) to
+    /// produce the [`HfHistogramDecodeContext`] the per-LfGroup VarDCT
+    /// decode walks against.
+    ///
+    /// This is the bridge from the parsed HfGlobal section to the
+    /// histogram-backed decode: the §C.7.2 stream + its ANS-state init
+    /// live in `self.histograms` (already read by [`Self::read`]); the
+    /// per-pass `histogram_offset` routing lives in `headers`.
+    /// [`HfHistogramDecodeContext::new`] cross-validates every
+    /// `headers.hfp(p) < num_hf_presets` against this section's
+    /// authoritative `num_hf_presets`.
+    ///
+    /// The returned context borrows `self.histograms` mutably (it owns
+    /// the per-symbol ANS decode state), so the section is borrowed for
+    /// the lifetime of the decode.
+    pub fn decode_context<'a>(
+        &'a mut self,
+        headers: &PerPassHfHeaders,
+    ) -> Result<HfHistogramDecodeContext<'a>> {
+        HfHistogramDecodeContext::new(&mut self.histograms, headers)
     }
 }
 
@@ -247,6 +273,55 @@ mod tests {
         let pieces_bits = br_pieces.bits_read();
 
         assert_eq!(bundle_bits, pieces_bits);
+    }
+
+    /// `decode_context` binds the section's §C.7.2 histograms to a
+    /// per-frame §C.8.3 [`PerPassHfHeaders`], producing the
+    /// [`HfHistogramDecodeContext`] the per-LfGroup decode walks
+    /// against. A single-pass `hfp = 0` header yields offset 0.
+    #[test]
+    fn decode_context_binds_histograms_to_per_pass_headers() {
+        use crate::multi_pass_hf_header::PerPassHfHeaders;
+        use crate::pass_group_hf::PassGroupHfHeader;
+
+        let mut parts: Vec<(u32, u32)> = vec![(1, 1), (2, 2)];
+        parts.extend(histogram_prelude_parts());
+        let bytes = pack_lsb(&parts);
+        let mut br = BitReader::new(&bytes);
+        let mut section = HfGlobalSection::read(&mut br, 1, 1).unwrap();
+
+        // Single pass, hfp = 0 → histogram_offset = 0.
+        let headers = PerPassHfHeaders::from_headers(vec![PassGroupHfHeader {
+            hfp: 0,
+            histogram_offset: 0,
+        }]);
+        let ctx = section.decode_context(&headers).unwrap();
+        assert_eq!(ctx.num_passes(), 1);
+        assert_eq!(ctx.histogram_offset(0).unwrap(), 0);
+    }
+
+    /// `decode_context` rejects a per-pass header whose `hfp` exceeds the
+    /// section's authoritative `num_hf_presets` (the cross-container
+    /// invariant `HfHistogramDecodeContext::new` enforces).
+    #[test]
+    fn decode_context_rejects_out_of_range_hfp() {
+        use crate::multi_pass_hf_header::PerPassHfHeaders;
+        use crate::pass_group_hf::PassGroupHfHeader;
+
+        let mut parts: Vec<(u32, u32)> = vec![(1, 1), (2, 2)];
+        parts.extend(histogram_prelude_parts());
+        let bytes = pack_lsb(&parts);
+        let mut br = BitReader::new(&bytes);
+        let mut section = HfGlobalSection::read(&mut br, 1, 1).unwrap();
+        assert_eq!(section.num_hf_presets(), 1);
+
+        // hfp = 1 ≥ num_hf_presets = 1 → rejected.
+        let headers = PerPassHfHeaders::from_headers(vec![PassGroupHfHeader {
+            hfp: 1,
+            histogram_offset: 495,
+        }]);
+        let r = section.decode_context(&headers);
+        assert!(matches!(r, Err(Error::InvalidData(_))));
     }
 
     #[test]
