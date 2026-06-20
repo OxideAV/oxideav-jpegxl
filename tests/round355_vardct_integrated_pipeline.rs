@@ -75,3 +75,37 @@ fn vardct_d1_integrated_frame_is_correctly_shaped() {
         );
     }
 }
+
+/// Non-degeneracy: the reconstructed frame must carry real image content,
+/// not a constant colour. This pins the LF channel-order reindex
+/// (modular `(Y, X, B)` → Listing-F.1 `[X, Y, B]`): before that fix the
+/// luma (Y) plane was dequantised with the X multiplier and fed to
+/// `inverse_xyb_to_rgb` as chroma, collapsing every pixel of the frame
+/// to a single constant colour (R=255, G=0, B=0). We don't assert exact
+/// pixel values (HF scaling is not reference-validated), but a real photo
+/// fixture must produce many distinct sample values spanning a wide range
+/// in every plane.
+#[test]
+fn vardct_d1_reconstruction_is_not_a_constant_colour() {
+    let frame = oxideav_jpegxl::decode_vardct_frame_from_codestream(VARDCT_D1_JXL, None)
+        .expect("integrated VarDCT reconstruction should run end-to-end on vardct-d1");
+    for (ci, plane) in frame.planes.iter().enumerate() {
+        let mut seen = [false; 256];
+        for &b in &plane.data {
+            seen[b as usize] = true;
+        }
+        let distinct = seen.iter().filter(|&&s| s).count();
+        let min = *plane.data.iter().min().unwrap();
+        let max = *plane.data.iter().max().unwrap();
+        assert!(
+            distinct > 16,
+            "plane {ci} is near-constant ({distinct} distinct values) — the LF channel-order \
+             reindex regressed (frame collapsed toward a constant colour)"
+        );
+        assert!(
+            (max - min) > 64,
+            "plane {ci} sample range {min}..={max} is too narrow for the photo fixture — \
+             likely an XYB channel-mapping regression"
+        );
+    }
+}

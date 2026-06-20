@@ -1597,16 +1597,39 @@ pub fn decode_vardct_frame(
             lf_coeff.lf_quant.len()
         )));
     }
+    // Channel-order reindex: the LfCoefficients modular sub-bitstream
+    // stores the three LF channels in JXL's native XYB **modular** order
+    // `(Y, X, B)` — the same "first three channels are Y', X', B'"
+    // convention §L.2.2 documents for the kModular path (see
+    // `xyb::modular_xyb_rescale`). `dequant_lf` / `LfDequantOutput`, by
+    // contrast, are contractually `[X, Y, B]` (Listing F.1 applies
+    // `m_x_dc` to channel 0, `m_y_dc` to channel 1). So map modular
+    // index 1 → X-slot 0 and modular index 0 → Y-slot 1; B (index 2) is
+    // unchanged. Without this swap the large-magnitude luma (Y) plane is
+    // dequantised with the X multiplier and fed to `inverse_xyb_to_rgb`
+    // as the chroma channel, collapsing the whole frame to a constant
+    // colour (the X↔Y swap was latent because no integrated VarDCT path
+    // reached the XYB→RGB step before round 355).
     let lf_quant: [Vec<i32>; 3] = [
-        lf_coeff.lf_quant[0].clone(),
         lf_coeff.lf_quant[1].clone(),
+        lf_coeff.lf_quant[0].clone(),
         lf_coeff.lf_quant[2].clone(),
+    ];
+    let lf_quant_widths = [
+        lf_coeff.lf_quant_widths[1],
+        lf_coeff.lf_quant_widths[0],
+        lf_coeff.lf_quant_widths[2],
+    ];
+    let lf_quant_heights = [
+        lf_coeff.lf_quant_heights[1],
+        lf_coeff.lf_quant_heights[0],
+        lf_coeff.lf_quant_heights[2],
     ];
     let multipliers = crate::lf_dequant::LfMultipliers::compute(&lf_global.lf_dequant, &quantizer);
     let mut dequant = crate::lf_dequant::dequant_lf(
         &lf_quant,
-        lf_coeff.lf_quant_widths,
-        lf_coeff.lf_quant_heights,
+        lf_quant_widths,
+        lf_quant_heights,
         lf_coeff.extra_precision,
         &multipliers,
     );
