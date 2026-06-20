@@ -199,9 +199,11 @@ println!("{} bits/sample, float={}",
 
 ### Codec / container IDs
 
-- Codec `"jpegxl"` — decoder slot registered (returns
-  `Error::Unsupported` on instantiation until the integrated decode loop
-  lands); no encoder slot.
+- Codec `"jpegxl"` — decoder slot registered; no encoder slot. The
+  registered decoder handles the Modular path (grey / RGB / RGBA, 1–16-bit
+  integer); a VarDCT codestream runs the full reconstruction but the
+  public path returns `Error::Unsupported` while its pixels await
+  reference validation (see Status).
 - No demuxer is registered: a JXL file is treated as a single
   codestream buffer fed directly to `probe(...)`.
 
