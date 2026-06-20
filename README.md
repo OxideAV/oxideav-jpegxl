@@ -79,6 +79,23 @@ What is implemented and tested today:
   quantised-LF lookup (no `read_non_zeros` / `decode_symbol` closures).
   It is bit-for-bit identical to the closure path wired to the same
   histogram context over the same stream.
+- **§C.7 HfGlobal-section assembly** — `hf_global_section::HfGlobalSection`
+  reads the HfGlobal TOC slot as the three contiguous pieces the spec
+  lays out on one bit cursor with no byte alignment between them:
+  §I.2.4 dequant matrices + §I.2.6 `num_hf_presets`
+  (`HfGlobal::read`) → §C.7.1 `num_hf_presets` `HfPass` coefficient-order
+  bundles (`read_hf_pass_sequence`) → §C.7.2
+  `495 × num_hf_presets × nb_block_ctx` HF-coefficient histograms
+  (`HfCoefficientHistograms`) + the §C.3.2 ANS-state init (`u(32)`,
+  a no-op for prefix streams). `nb_block_ctx` is threaded in from the
+  LfGlobal `HfBlockContext` (§I.2.2). `HfGlobalSection::decode_context`
+  binds the parsed §C.7.2 histograms to a per-frame §C.8.3
+  `PerPassHfHeaders` to produce the
+  `HfHistogramDecodeContext` (cross-validating every per-pass `hfp`
+  against the section's authoritative `num_hf_presets`) — the bridge
+  the per-LfGroup `reconstruct_lf_group_from_histogram` decode walks
+  against. The integrated VarDCT decode path now parses through this
+  full §C.7 section on a real codestream (`vardct_256x256_d1.jxl`).
 - **§J.3 restoration filters** — the Gabor-like 3×3 convolution
   (`gaborish::apply_xyb_planes_in_place`) and the edge-preserving
   filter, both as pure XYB-plane math. The §J.3.1 three-step EPF
@@ -106,11 +123,16 @@ What is implemented and tested today:
   the live per-pass [`DecodedHfBlock`] stack decoded out of the §C.7.2
   entropy stream rather than a caller-supplied one — the latter sourcing
   every symbol from the materialised §C.7.2 HF-coefficient histograms
-  with the per-pass `histogram_offset` routing owned internally. What
-  remains is the frame-level framing that supplies the per-LfGroup LF
-  image + dequant context + the constructed `HfHistogramDecodeContext`
-  (its ANS-state init for ANS-coded histograms) to this call, plus the
-  per-channel `BlockContext()` history threading the resolver consumes.
+  with the per-pass `histogram_offset` routing owned internally. The
+  §C.7 HfGlobal section that materialises that `HfHistogramDecodeContext`
+  (dequant matrices + HfPass orders + §C.7.2 histograms + ANS-state init)
+  is now read end-to-end by `hf_global_section::HfGlobalSection`, and the
+  integrated decode parses through it on the `vardct_256x256_d1.jxl`
+  fixture. What remains is the frame-level framing that supplies the
+  per-LfGroup LF image + dequant context + the §C.8.3 per-pass header
+  reads (`PerPassHfHeaders`) + the `qdc_at` LF lookup to
+  `reconstruct_lf_group_from_histogram`, plus the per-channel
+  `BlockContext()` history threading the resolver consumes.
 - ColorEncoding / ToneMapping fuller decode, preview / animation /
   intrinsic-size sub-bundles (parsing stops cleanly at the `have_*`
   flags).

@@ -1238,7 +1238,7 @@ fn decode_vardct_round13(
         && fh.passes.num_passes == 1
         && num_lf_groups == 1;
 
-    let (lf_global, lf_group, _hf_global) = if single_toc {
+    let (lf_global, lf_group, _hf_global_section) = if single_toc {
         // Single-TOC-entry path: chain section reads on the same bit
         // reader, no byte-aligned slicing between sections.
         let lf_global_bytes = section_byte_range(lf_global_slot)?;
@@ -1256,8 +1256,21 @@ fn decode_vardct_round13(
 
         let lf_group = crate::lf_group::LfGroup::read(&mut shared_br, fh, &lf_global, metadata, 0)?;
 
-        let hf_global = crate::hf_global::HfGlobal::read(&mut shared_br, num_groups)?;
-        (lf_global, lf_group, hf_global)
+        // §C.7: the HfGlobal TOC slot is three contiguous pieces on the
+        // same bit cursor — HfGlobal (§I.2.4 + §I.2.6) → HfPass sequence
+        // (§C.7.1) → HF-coefficient histograms (§C.7.2) + ANS-state init.
+        // `nb_block_ctx` is the LfGlobal HfBlockContext invariant (§I.2.2).
+        let nb_block_ctx = lf_global
+            .hf_block_context
+            .as_ref()
+            .expect("HfBlockContext presence checked above")
+            .nb_block_ctx;
+        let hf_global_section = crate::hf_global_section::HfGlobalSection::read(
+            &mut shared_br,
+            num_groups,
+            nb_block_ctx,
+        )?;
+        (lf_global, lf_group, hf_global_section)
     } else {
         // Multi-TOC-entry path: slice each section into its own byte
         // range and read against a fresh BitReader.
@@ -1278,10 +1291,17 @@ fn decode_vardct_round13(
         let mut lg_br = BitReader::new_section(lf_group_bytes);
         let lf_group = crate::lf_group::LfGroup::read(&mut lg_br, fh, &lf_global, metadata, 0)?;
 
+        // §C.7 full HfGlobal section (see single-TOC branch comment).
+        let nb_block_ctx = lf_global
+            .hf_block_context
+            .as_ref()
+            .expect("HfBlockContext presence checked above")
+            .nb_block_ctx;
         let hf_global_bytes = section_byte_range(hf_global_slot)?;
         let mut hg_br = BitReader::new_section(hf_global_bytes);
-        let hf_global = crate::hf_global::HfGlobal::read(&mut hg_br, num_groups)?;
-        (lf_global, lf_group, hf_global)
+        let hf_global_section =
+            crate::hf_global_section::HfGlobalSection::read(&mut hg_br, num_groups, nb_block_ctx)?;
+        (lf_global, lf_group, hf_global_section)
     };
 
     // Re-extract Quantizer for the dequant path below (it was already
@@ -1304,8 +1324,14 @@ fn decode_vardct_round13(
     let lf_h = lf_group.mlf_group.lf_group_height;
     let _dct_grid = crate::dct_select::derive_dct_select(&hf_meta, lf_w, lf_h)?;
 
-    // HfGlobal already decoded above (in either single-TOC or multi-TOC
-    // branch); `_hf_global` is the parsed bundle for round 14+ wiring.
+    // The full §C.7 HfGlobal section (dequant matrices + num_hf_presets
+    // + HfPass coefficient orders + §C.7.2 HF-coefficient histograms,
+    // ANS-state init applied) is decoded above in either branch;
+    // `_hf_global_section` is the bundle the per-LfGroup VarDCT HF
+    // decode walks against (its `decode_context(&PerPassHfHeaders)` →
+    // HfHistogramDecodeContext → reconstruct_lf_group_from_histogram).
+    // The remaining wiring is the §C.8.3 per-pass header reads + the
+    // qdc_at LF lookup + BlockContextResolver history threading.
 
     // F.1 LF dequantisation (Listing F.1) over the per-LfGroup
     // LfCoefficients. Unwrap the lf_quant Vec into a fixed-size [3]
@@ -1341,9 +1367,12 @@ fn decode_vardct_round13(
     let _ = dequant;
 
     Err(Error::Unsupported(format!(
-        "jxl VarDCT decoder (round 13): codestream parsed and LfCoefficients dequantised + \
-         smoothed ({}x{}, {} colour channels, group_dim={}, num_groups={}) — HF coefficient \
-         subband + IDCT dispatch + CfL + Gaborish + EPF defer to round 14+",
+        "jxl VarDCT decoder: codestream parsed through the full §C.7 HfGlobal section \
+         (dequant matrices + HfPass coefficient orders + §C.7.2 HF-coefficient histograms, \
+         ANS-state init applied) and LfCoefficients dequantised + smoothed ({}x{}, {} colour \
+         channels, group_dim={}, num_groups={}) — remaining: §C.8.3 per-pass header reads + \
+         qdc_at LF lookup + BlockContextResolver history feeding \
+         reconstruct_lf_group_from_histogram",
         scaffold.width,
         scaffold.height,
         scaffold.num_colour_channels,
