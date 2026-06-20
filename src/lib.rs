@@ -660,10 +660,39 @@ fn decode_icc_stream_at(br: &mut BitReader<'_>) -> Result<Vec<u8>> {
 /// Decode the entire JXL packet (raw codestream OR ISOBMFF-wrapped) and
 /// return the first frame as a [`VideoFrame`]. Round-3 envelope.
 pub fn decode_one_frame(input: &[u8], pts: Option<i64>) -> Result<VideoFrame> {
+    decode_first_frame(input, pts, false)
+}
+
+/// Decode the first frame, returning the integrated VarDCT
+/// reconstruction's pixels **without** the public path's pixel-withhold
+/// gate. Exposed for the crate's integration tests and offline tooling
+/// that want to exercise the full §C.8.3 → §L.2.2 VarDCT chain on a real
+/// codestream and inspect its output.
+///
+/// For non-VarDCT (Modular) frames this is identical to
+/// [`decode_one_frame`]. For VarDCT frames it returns the reconstructed
+/// RGB frame instead of the "pixels not yet validated" sentinel error
+/// that [`decode_one_frame`] returns — see [`decode_vardct_frame`] for
+/// the pixel-validation caveat.
+pub fn decode_vardct_frame_from_codestream(input: &[u8], pts: Option<i64>) -> Result<VideoFrame> {
+    decode_first_frame(input, pts, true)
+}
+
+/// Shared container-strip + codestream dispatch for [`decode_one_frame`]
+/// and [`decode_vardct_frame_from_codestream`]. `return_vardct_pixels`
+/// selects whether a successful VarDCT reconstruction returns its
+/// (not-yet-pixel-validated) frame or the public-path withhold sentinel.
+fn decode_first_frame(
+    input: &[u8],
+    pts: Option<i64>,
+    return_vardct_pixels: bool,
+) -> Result<VideoFrame> {
     let sig = container::detect(input)
         .ok_or_else(|| Error::InvalidData("jxl decoder: no JXL signature".into()))?;
     match sig {
-        container::Signature::RawCodestream => decode_codestream(&input[2..], pts),
+        container::Signature::RawCodestream => {
+            decode_codestream(&input[2..], pts, return_vardct_pixels)
+        }
         container::Signature::Isobmff => {
             // The jxlc/jxlp box payload concatenation is itself a JXL
             // codestream and therefore begins with the 2-byte `FF 0A`
@@ -680,12 +709,16 @@ pub fn decode_one_frame(input: &[u8], pts: Option<i64>) -> Result<VideoFrame> {
                     "JXL ISOBMFF: jxlc/jxlp payload missing FF 0A codestream signature".into(),
                 ));
             }
-            decode_codestream(&cs[2..], pts)
+            decode_codestream(&cs[2..], pts, return_vardct_pixels)
         }
     }
 }
 
-fn decode_codestream(codestream: &[u8], pts: Option<i64>) -> Result<VideoFrame> {
+fn decode_codestream(
+    codestream: &[u8],
+    pts: Option<i64>,
+    return_vardct_pixels: bool,
+) -> Result<VideoFrame> {
     let mut br = BitReader::new(codestream);
 
     // 1. SizeHeader (FDIS A.3).
@@ -750,7 +783,32 @@ fn decode_codestream(codestream: &[u8], pts: Option<i64>) -> Result<VideoFrame> 
     // when `kSkipAdaptiveLFSmoothing == 0`.
     if fh.encoding == crate::frame_header::Encoding::VarDct {
         let scaffold = crate::vardct::recognise_vardct_codestream(&fh, &metadata)?;
-        return decode_vardct_round13(&fh, &metadata, &toc, &mut br, scaffold);
+        // The integrated VarDCT decode (`decode_vardct_frame`) now runs
+        // the whole §C.8.3 HF-entropy → F.3 dequant → IDCT → CfL →
+        // §6.2 crop → §L.2.2 XYB→RGB chain end-to-end on a real
+        // codestream. Genuine parse errors (malformed sections, an
+        // unhandled sub-case) propagate verbatim. A *successful*
+        // reconstruction is NOT yet surfaced from the public decode
+        // path: the per-block HF coefficient scaling has not been
+        // validated bit-exact against a reference decode, so returning
+        // its pixels would be a silent-misparse risk (the very thing
+        // this crate's "no silent misparse" contract forbids). The
+        // reconstruction is instead exercised structurally by the
+        // crate's integration tests against `decode_vardct_frame`
+        // directly. Once the per-block scaling is pixel-validated this
+        // branch returns the frame.
+        let frame = decode_vardct_frame(&fh, &metadata, &toc, &mut br, scaffold, pts)?;
+        if return_vardct_pixels {
+            return Ok(frame);
+        }
+        return Err(Error::Unsupported(
+            "jxl VarDCT decoder: the integrated reconstruction (HF entropy decode + \
+             F.3 dequant + IDCT + CfL + §6.2 crop + §L.2.2 XYB→RGB) runs end-to-end on \
+             this codestream, but per-block HF coefficient scaling is not yet \
+             pixel-validated against a reference decode — the public path withholds \
+             unvalidated pixels rather than risk a silent misparse"
+                .into(),
+        ));
     }
     if fh.encoding != crate::frame_header::Encoding::Modular {
         return Err(Error::Unsupported(format!(
@@ -1152,21 +1210,211 @@ fn build_rgb_planes_from_ycbcr(img: &crate::modular_fdis::ModularImage) -> Resul
     ])
 }
 
-/// VarDCT round-13 driver. Reads LfGlobal + LfGroup + HfGlobal off
-/// the TOC for a single-LfGroup frame, computes per-channel LF
-/// multipliers per Listing C.1 / F.1, runs Listing F.1 dequant on the
-/// LfCoefficients, and (when `kSkipAdaptiveLFSmoothing` is clear and no
-/// channel is subsampled) applies F.2 adaptive smoothing in place. The
-/// dequantised LF samples are then dropped — round 14 will pick up from
-/// here and dispatch IDCT / CfL / Gaborish / EPF. Returns
-/// `Error::Unsupported` with a precise "round 14+: HF subband decode +
-/// IDCT not yet wired" message at the end of the round-13 pipeline.
-fn decode_vardct_round13(
+/// Inputs the integrated single-pass VarDCT finish step (`finish_vardct_decode`)
+/// pulls together once the LfGlobal / LfGroup / HfGlobal sections have
+/// been parsed and the LF image dequantised. Grouped into one struct so
+/// the finisher's arity stays manageable (Clippy `too_many_arguments`).
+struct VarDctFinishInputs<'a> {
+    fh: &'a FrameHeader,
+    metadata: &'a ImageMetadataFdis,
+    /// Dequantised + (optionally) smoothed per-LfGroup LF image (Listing
+    /// F.1). Channel order `[X, Y, B]`.
+    lf: crate::lf_dequant::LfDequantOutput,
+    /// The §C.5.4 per-LfGroup DctSelect + HfMul grid.
+    grid: crate::dct_select::DctSelectGrid,
+    /// Per-64×64-tile chroma-from-luma factor channels (HfMetadata).
+    x_from_y: &'a [i32],
+    b_from_y: &'a [i32],
+    /// LfGlobal §I.2.7 colour-correlation base/colour factors.
+    cfl: crate::lf_global::LfChannelCorrelation,
+    /// LfGlobal §I.2.2 block-context bundle (drives the resolver).
+    hf_block_context: crate::lf_global::HfBlockContext,
+    /// Logical frame extent the padded block grid is cropped to (§6.2).
+    frame_width: u32,
+    frame_height: u32,
+}
+
+/// Finish an integrated single-LfGroup single-pass VarDCT decode.
+///
+/// `br` is positioned at the start of the frame's PassGroup payload (the
+/// §C.8.3 per-pass HF header `hfp` followed by the HF-coefficient
+/// entropy stream). `hf_section` is the parsed §C.7 HfGlobal section
+/// (borrowed mutably so its §C.7.2 histograms drive the ANS decode
+/// state). The function reads the per-pass HF header, builds the
+/// histogram-decode context, runs
+/// [`crate::vardct_reconstruct::reconstruct_lf_group_from_histogram`] to
+/// the three XYB residual planes, crops them to the logical frame
+/// extent (§6.2), and converts XYB → 8-bit RGB (§L.2.2).
+///
+/// Restoration filters (Gaborish §J.2, EPF §J.3) are NOT applied here —
+/// the default-encoding fixtures this lands against carry `gab` / `epf`
+/// enabled, so the output is "IDCT-exact, pre-filter". The pre-filter
+/// XYB planes are the input the §J pipeline consumes; wiring those two
+/// filters into this path is the documented follow-up.
+fn finish_vardct_decode(
+    inputs: VarDctFinishInputs<'_>,
+    hf_section: &mut crate::hf_global_section::HfGlobalSection,
+    br: &mut BitReader<'_>,
+    pts: Option<i64>,
+) -> Result<VideoFrame> {
+    use crate::block_context_resolver::BlockContextResolver;
+    use crate::hf_dequant::QmScaleFactors;
+    use crate::multi_pass_hf_header::PerPassHfHeaders;
+    use crate::per_pass_non_zeros::PerPassNonZerosGrids;
+    use crate::vardct_reconstruct::{reconstruct_lf_group_from_histogram, DequantContext};
+
+    let VarDctFinishInputs {
+        fh,
+        metadata,
+        lf,
+        grid,
+        x_from_y,
+        b_from_y,
+        cfl,
+        hf_block_context,
+        frame_width,
+        frame_height,
+    } = inputs;
+
+    // Single-pass only: the §C.8.3 cross-pass accumulation is exercised
+    // by the reconstruction driver's unit tests, but the integrated
+    // multi-pass PassGroup framing (per-group section slicing for
+    // num_groups > 1) is a separate wiring step. Reject here so a
+    // multi-pass / multi-group frame surfaces precisely rather than
+    // mis-reading the single-section layout.
+    if fh.passes.num_passes != 1 {
+        return Err(Error::Unsupported(format!(
+            "jxl VarDCT integrated decode: num_passes={} — only single-pass frames \
+             are wired end-to-end (multi-pass cross-pass framing is the next step)",
+            fh.passes.num_passes
+        )));
+    }
+
+    let num_hf_presets = hf_section.num_hf_presets();
+    let nb_block_ctx = hf_block_context.nb_block_ctx;
+
+    // §C.8.3 per-pass HF header (`hfp` selector + derived
+    // histogram_offset). For a single-pass frame this is one header read
+    // at the head of the PassGroup payload.
+    let headers = PerPassHfHeaders::read(br, fh.passes.num_passes, num_hf_presets, nb_block_ctx)?;
+
+    // Bind the §C.7.2 histograms to the per-pass headers → the
+    // histogram-backed decode context.
+    let mut ctx = hf_section.decode_context(&headers)?;
+
+    // Per-pass per-channel NonZeros grids, sized to the DctSelect grid's
+    // block dimensions (the non-subsampled VarDCT case: every channel
+    // shares the LfGroup's block geometry).
+    let mut nz = PerPassNonZerosGrids::new_uniform(
+        fh.passes.num_passes,
+        3,
+        grid.width_blocks,
+        grid.height_blocks,
+    )?;
+
+    let resolver = BlockContextResolver::new(&hf_block_context);
+
+    // F.3 dequant context: default dequant-matrix set + opsin-inverse
+    // bias + per-channel 0.8^(qm_scale - 2) factors.
+    let set = crate::dct_quant_weights::materialise_default_dequant_set()?;
+    let qm = QmScaleFactors::for_frame(fh);
+    let dq = DequantContext {
+        set: &set,
+        oim: &metadata.opsin_inverse_matrix,
+        qm: &qm,
+    };
+
+    // qdc_at: the quantised LF DC triple at each varblock's top-left 8×8
+    // cell. The §I.2.2 *default* HfBlockContext (the only case this path
+    // accepts — see caller gate) has empty `lf_thresholds`, so the
+    // resolver never consults `qdc`; a zero triple is therefore exact
+    // for the default-context fixtures. Non-default contexts are gated
+    // out by the caller, so this never silently mis-derives a block
+    // context.
+    let qdc_at =
+        |_p: u32, _vb: &crate::varblock_walk::Varblock| -> Result<[i32; 3]> { Ok([0, 0, 0]) };
+
+    let planes_xyb = reconstruct_lf_group_from_histogram(
+        &fh.passes, &grid, &mut nz, &resolver, &mut ctx, br, &lf, &dq, x_from_y, b_from_y, &cfl,
+        qdc_at,
+    )?;
+
+    // §6.2 crop the padded block-grid reconstruction to the logical
+    // frame extent.
+    let cropped = planes_xyb.crop_to(frame_width as usize, frame_height as usize)?;
+
+    // §L.2.2 inverse XYB → linear RGB → 8-bit. The reconstructed XYB
+    // samples come straight out of the IDCT (no §L.2.2 kModular rescale
+    // preamble — that is the modular path's step).
+    let oim = &metadata.opsin_inverse_matrix;
+    let tone = &metadata.tone_mapping;
+    let w = frame_width as usize;
+    let h = frame_height as usize;
+    let x_plane = &cropped.planes[0];
+    let y_plane = &cropped.planes[1];
+    let b_plane = &cropped.planes[2];
+    let mut r_bytes = Vec::with_capacity(w * h);
+    let mut g_bytes = Vec::with_capacity(w * h);
+    let mut b_bytes = Vec::with_capacity(w * h);
+    for i in 0..(w * h) {
+        let (r, g, bb) = crate::xyb::inverse_xyb_to_rgb(
+            x_plane.samples[i],
+            y_plane.samples[i],
+            b_plane.samples[i],
+            oim,
+            tone,
+        );
+        r_bytes.push(crate::xyb::linear_rgb_to_u8(r));
+        g_bytes.push(crate::xyb::linear_rgb_to_u8(g));
+        b_bytes.push(crate::xyb::linear_rgb_to_u8(bb));
+    }
+    Ok(VideoFrame {
+        pts,
+        planes: vec![
+            VideoPlane {
+                stride: w,
+                data: r_bytes,
+            },
+            VideoPlane {
+                stride: w,
+                data: g_bytes,
+            },
+            VideoPlane {
+                stride: w,
+                data: b_bytes,
+            },
+        ],
+    })
+}
+
+/// Integrated single-LfGroup VarDCT decode. Reads LfGlobal + LfGroup +
+/// HfGlobal off the TOC, computes the per-channel LF multipliers
+/// (Listing C.1 / F.1), runs Listing F.1 dequant + F.2 adaptive
+/// smoothing on the LfCoefficients, then — for a single-pass frame whose
+/// HfBlockContext carries empty `lf_thresholds` — feeds the dequantised
+/// LF image into the integrated HF-entropy decode + F.3 dequant + §I.2.4
+/// LLF merge + §I.2.3.2 IDCT + Annex G CfL finish step
+/// (`finish_vardct_decode`), crops to the logical frame extent (§6.2),
+/// and converts XYB → 8-bit RGB (§L.2.2). Sub-cases outside that
+/// envelope (multi-pass, non-empty `lf_thresholds`, …) surface a precise
+/// `Error::Unsupported`.
+///
+/// **Pixel-validation status.** The whole chain executes on a real
+/// codestream, but the per-block HF coefficient scaling is not yet
+/// validated bit-exact against a reference decode. The public
+/// [`decode_one_frame`] path therefore withholds the reconstructed
+/// pixels (see `decode_codestream`); this function is exposed so the
+/// crate's integration tests can drive the pipeline end-to-end and pin
+/// its structural invariants (plane count, dimensions, that every stage
+/// runs without aborting). Restoration filters (Gaborish §J.2, EPF
+/// §J.3) are likewise not applied here yet.
+pub fn decode_vardct_frame(
     fh: &FrameHeader,
     metadata: &ImageMetadataFdis,
     toc: &Toc,
     br: &mut BitReader<'_>,
     scaffold: crate::vardct::VarDctScaffold,
+    pts: Option<i64>,
 ) -> Result<VideoFrame> {
     let num_groups = fh.num_groups();
     let num_lf_groups = fh.num_lf_groups();
@@ -1238,7 +1486,19 @@ fn decode_vardct_round13(
         && fh.passes.num_passes == 1
         && num_lf_groups == 1;
 
-    let (lf_global, lf_group, _hf_global_section) = if single_toc {
+    // The PassGroup slot (the §C.8.3 per-pass header + HF-coefficient
+    // entropy stream) is decoded by the integrated finish step below.
+    // For single-pass single-group VarDCT it is slot
+    // `2 + num_lf_groups` (one PassGroup, pass 0, group 0). In the
+    // single-TOC layout the PassGroup continues on the *same* bit cursor
+    // immediately after HfGlobal (no byte alignment); in the multi-TOC
+    // layout it is its own byte-aligned section.
+    let pass_group_slot_0 = 2 + num_lf_groups as usize;
+
+    // The continuation bit reader positioned at the PassGroup start.
+    // Single-TOC: a reader sharing the whole frame buffer, advanced past
+    // HfGlobal. Multi-TOC: a fresh section reader on the PassGroup slot.
+    let (lf_global, lf_group, mut hf_global_section, mut pass_group_br) = if single_toc {
         // Single-TOC-entry path: chain section reads on the same bit
         // reader, no byte-aligned slicing between sections.
         let lf_global_bytes = section_byte_range(lf_global_slot)?;
@@ -1270,7 +1530,8 @@ fn decode_vardct_round13(
             num_groups,
             nb_block_ctx,
         )?;
-        (lf_global, lf_group, hf_global_section)
+        // PassGroup continues on the same cursor (no byte alignment).
+        (lf_global, lf_group, hf_global_section, shared_br)
     } else {
         // Multi-TOC-entry path: slice each section into its own byte
         // range and read against a fresh BitReader.
@@ -1301,7 +1562,10 @@ fn decode_vardct_round13(
         let mut hg_br = BitReader::new_section(hf_global_bytes);
         let hf_global_section =
             crate::hf_global_section::HfGlobalSection::read(&mut hg_br, num_groups, nb_block_ctx)?;
-        (lf_global, lf_group, hf_global_section)
+        // PassGroup is its own byte-aligned section slot.
+        let pg_bytes = section_byte_range(pass_group_slot_0)?;
+        let pg_br = BitReader::new_section(pg_bytes);
+        (lf_global, lf_group, hf_global_section, pg_br)
     };
 
     // Re-extract Quantizer for the dequant path below (it was already
@@ -1322,16 +1586,7 @@ fn decode_vardct_round13(
     // LfGroup frame that's the full frame.
     let lf_w = lf_group.mlf_group.lf_group_width;
     let lf_h = lf_group.mlf_group.lf_group_height;
-    let _dct_grid = crate::dct_select::derive_dct_select(&hf_meta, lf_w, lf_h)?;
-
-    // The full §C.7 HfGlobal section (dequant matrices + num_hf_presets
-    // + HfPass coefficient orders + §C.7.2 HF-coefficient histograms,
-    // ANS-state init applied) is decoded above in either branch;
-    // `_hf_global_section` is the bundle the per-LfGroup VarDCT HF
-    // decode walks against (its `decode_context(&PerPassHfHeaders)` →
-    // HfHistogramDecodeContext → reconstruct_lf_group_from_histogram).
-    // The remaining wiring is the §C.8.3 per-pass header reads + the
-    // qdc_at LF lookup + BlockContextResolver history threading.
+    let dct_grid = crate::dct_select::derive_dct_select(&hf_meta, lf_w, lf_h)?;
 
     // F.1 LF dequantisation (Listing F.1) over the per-LfGroup
     // LfCoefficients. Unwrap the lf_quant Vec into a fixed-size [3]
@@ -1361,24 +1616,55 @@ fn decode_vardct_round13(
     if crate::lf_dequant::should_apply_adaptive_lf_smoothing(fh) {
         crate::lf_dequant::apply_adaptive_lf_smoothing(&mut dequant, &multipliers);
     }
-    // The dequantised LF samples in `dequant` are now the inputs to
-    // round-14's IDCT / CfL / Gaborish / EPF chain. For now we drop
-    // them and report a precise "next round" Unsupported.
-    let _ = dequant;
 
-    Err(Error::Unsupported(format!(
-        "jxl VarDCT decoder: codestream parsed through the full §C.7 HfGlobal section \
-         (dequant matrices + HfPass coefficient orders + §C.7.2 HF-coefficient histograms, \
-         ANS-state init applied) and LfCoefficients dequantised + smoothed ({}x{}, {} colour \
-         channels, group_dim={}, num_groups={}) — remaining: §C.8.3 per-pass header reads + \
-         qdc_at LF lookup + BlockContextResolver history feeding \
-         reconstruct_lf_group_from_histogram",
-        scaffold.width,
-        scaffold.height,
-        scaffold.num_colour_channels,
-        scaffold.group_dim,
-        num_groups
-    )))
+    // Integrated finish: §C.8.3 per-pass HF header + histogram-backed HF
+    // decode + F.3 dequant + LLF merge + IDCT + CfL → XYB residual
+    // planes → §6.2 crop → §L.2.2 XYB→RGB. The integrated `qdc_at`
+    // supplies a zero quantised-LF DC triple, which the §C.13
+    // `block_context` derivation consumes ONLY through the
+    // `lf_thresholds` ladder. A bundle with empty `lf_thresholds` (the
+    // common case, including the default §I.2.2 bundle and many custom
+    // bundles that only override `qf_thresholds` / `block_ctx_map`)
+    // therefore never reads `qdc`, so the zero triple is exact. A bundle
+    // with non-empty `lf_thresholds` would mis-derive the context, so
+    // reject it precisely — wiring the per-varblock LF-DC lookup is the
+    // next step.
+    let hbc = lf_global
+        .hf_block_context
+        .clone()
+        .ok_or_else(|| Error::InvalidData("JXL VarDCT round 13: HfBlockContext missing".into()))?;
+    let cfl = lf_global.lf_channel_correlation.ok_or_else(|| {
+        Error::InvalidData("JXL VarDCT round 13: LfChannelCorrelation missing".into())
+    })?;
+    let lf_thresholds_present = hbc.lf_thresholds.iter().any(|t| !t.is_empty());
+    if lf_thresholds_present {
+        return Err(Error::Unsupported(format!(
+            "jxl VarDCT integrated decode: HfBlockContext carries non-empty lf_thresholds \
+             (nb_block_ctx={}) — the integrated qdc_at LF-DC lookup feeding the \
+             BlockContextResolver is the next wiring step; bundles with empty lf_thresholds \
+             decode end-to-end",
+            hbc.nb_block_ctx
+        )));
+    }
+
+    let finish_inputs = VarDctFinishInputs {
+        fh,
+        metadata,
+        lf: dequant,
+        grid: dct_grid,
+        x_from_y: &hf_meta.x_from_y,
+        b_from_y: &hf_meta.b_from_y,
+        cfl,
+        hf_block_context: hbc,
+        frame_width: scaffold.width,
+        frame_height: scaffold.height,
+    };
+    finish_vardct_decode(
+        finish_inputs,
+        &mut hf_global_section,
+        &mut pass_group_br,
+        pts,
+    )
 }
 
 /// FDIS-side `Headers` returned by [`probe_fdis`]. Mirrors the

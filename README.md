@@ -9,12 +9,21 @@ zero `*-sys`.
 
 ## Status
 
-This crate is a **decoder under active construction**. The integrated,
-registry-driven decoder is **not yet wired end to end**: a registered
-`make_decoder` returns `Error::Unsupported` because the codestream
-framing (FrameHeader + TOC + frame-byte alignment) that ties the
-per-stage machinery together is still in progress. Programs that only
-need probe-level information should call `probe(...)` directly.
+This crate is a **decoder under active construction**. The Modular path
+decodes end to end (grey / RGB / RGBA, 1–16-bit integer, XYB / YCbCr
+inverse colour) for the small lossless fixtures; the **VarDCT** path now
+runs the full per-LfGroup reconstruction chain (§C.8.3 HF-entropy decode
+→ F.3 dequant → §I.2.3.2 IDCT → Annex G chroma-from-luma → §6.2 crop →
+§L.2.2 XYB→RGB) end to end on a real single-LfGroup single-pass
+codestream (`vardct-256x256-d1.jxl`) — producing a shaped RGB frame.
+That VarDCT output is **not yet exposed from the public decode path**:
+the per-block HF coefficient scaling is not yet validated bit-exact
+against a reference decode, so a registered `make_decoder` /
+`decode_one_frame` on a VarDCT codestream returns a precise "runs
+end-to-end but pixels not yet validated" `Error::Unsupported` rather
+than risk a silent misparse. The reconstruction is reachable for tooling
+via `decode_vardct_frame_from_codestream`. Programs that only need
+probe-level information should call `probe(...)` directly.
 
 What is implemented and tested today:
 
@@ -112,27 +121,25 @@ What is implemented and tested today:
 
 ### Not yet implemented
 
-- The integrated frame decode loop (FrameHeader + TOC + frame framing
-  wiring the stages together); the registered decoder rejects until it
-  lands. The per-LfGroup VarDCT reconstruction is now a single call
-  (`vardct_reconstruct::reconstruct_lf_group_cross_pass`, covering
-  square / non-square / non-DCT transforms and the §C.8.3 cross-pass
-  accumulation), and both `reconstruct_lf_group_from_entropy` (abstract
-  entropy closures) and `reconstruct_lf_group_from_histogram`
-  (histogram-backed, over `HfHistogramDecodeContext`) now drive it from
-  the live per-pass [`DecodedHfBlock`] stack decoded out of the §C.7.2
-  entropy stream rather than a caller-supplied one — the latter sourcing
-  every symbol from the materialised §C.7.2 HF-coefficient histograms
-  with the per-pass `histogram_offset` routing owned internally. The
-  §C.7 HfGlobal section that materialises that `HfHistogramDecodeContext`
-  (dequant matrices + HfPass orders + §C.7.2 histograms + ANS-state init)
-  is now read end-to-end by `hf_global_section::HfGlobalSection`, and the
-  integrated decode parses through it on the `vardct_256x256_d1.jxl`
-  fixture. What remains is the frame-level framing that supplies the
-  per-LfGroup LF image + dequant context + the §C.8.3 per-pass header
-  reads (`PerPassHfHeaders`) + the `qdc_at` LF lookup to
-  `reconstruct_lf_group_from_histogram`, plus the per-channel
-  `BlockContext()` history threading the resolver consumes.
+- **VarDCT pixel validation + public exposure.** The integrated
+  single-LfGroup single-pass VarDCT decode (`decode_vardct_frame`) now
+  assembles every input — the §C.8.3 per-pass `hfp` header
+  (`PerPassHfHeaders::read`), the `HfHistogramDecodeContext`
+  (`HfGlobalSection::decode_context`), the `PerPassNonZerosGrids`, the
+  `BlockContextResolver`, the F.3 `DequantContext`, the LfGroup LF image,
+  the CfL factor channels — and drives
+  `reconstruct_lf_group_from_histogram` → §6.2 crop → §L.2.2 XYB→RGB to a
+  shaped frame on `vardct-256x256-d1.jxl`. The per-block HF coefficient
+  scaling is **not yet validated bit-exact** against a reference decode,
+  so the public `decode_one_frame` path withholds the pixels (precise
+  `Error::Unsupported`); `decode_vardct_frame_from_codestream` returns
+  them for tooling. Validating the scaling (and then exposing the public
+  pixels) is the next step. The integrated `qdc_at` supplies a zero
+  quantised-LF DC triple — exact for any `HfBlockContext` with empty
+  `lf_thresholds`; a bundle with non-empty `lf_thresholds` is rejected
+  precisely until the per-varblock LF-DC lookup feeding the resolver is
+  wired. Multi-pass / multi-group / multi-LfGroup VarDCT framing is also
+  still pending.
 - ColorEncoding / ToneMapping fuller decode, preview / animation /
   intrinsic-size sub-bundles (parsing stops cleanly at the `have_*`
   flags).
