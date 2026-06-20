@@ -504,6 +504,7 @@ pub mod hf_coeff_histogram_size;
 pub mod hf_coefficient_histograms;
 pub mod hf_dequant;
 pub mod hf_global;
+pub mod hf_global_section;
 pub mod hf_pass;
 pub mod icc;
 pub mod idct;
