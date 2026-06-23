@@ -129,12 +129,26 @@ What is implemented and tested today:
   `BlockContextResolver`, the F.3 `DequantContext`, the LfGroup LF image,
   the CfL factor channels — and drives
   `reconstruct_lf_group_from_histogram` → §6.2 crop → §L.2.2 XYB→RGB to a
-  shaped frame on `vardct-256x256-d1.jxl`. The per-block HF coefficient
+  shaped frame on `vardct-256x256-d1.jxl`. The per-block coefficient
   scaling is **not yet validated bit-exact** against a reference decode,
   so the public `decode_one_frame` path withholds the pixels (precise
   `Error::Unsupported`); `decode_vardct_frame_from_codestream` returns
-  them for tooling. Validating the scaling (and then exposing the public
-  pixels) is the next step. The integrated `qdc_at` supplies a zero
+  them for tooling. Round 362 commits the missing **measurement**: a
+  `djxl`-decoded reference PNG (`vardct_256x256_d1_expected.png`, the
+  validator's opaque output — never its source) plus
+  `round362_vardct_d1_reference_divergence` pinning the divergence
+  (currently ~99.8 % of samples rail to 0/255 because the internal XYB
+  magnitude is several times too large). The round-362 trace localises
+  the error to the **coefficient-magnitude path**, not the IDCT /
+  placement / crop / XYB→RGB (each verified spec-conformant): the Y luma
+  plane is ≈ 4.0× too large in the XYB domain (a clean LF-coefficient
+  factor, since `Y = dY` has no CfL and the spec IDCT has unit DC gain),
+  with the Listing F.1 dequant, the Table C.12 Quantizer parse and the
+  Table C.11 `m_*_lf_unscaled` all confirmed correct — pointing at the
+  LfQuant modular sub-bitstream decode (a power-of-two factor is
+  consistent with the clean 4×). The X chroma plane's oversized swing is
+  the same magnitude family on the X HF coefficients (`kX == 0` for this
+  fixture, so it is not a CfL artefact). The integrated `qdc_at` supplies a zero
   quantised-LF DC triple — exact for any `HfBlockContext` with empty
   `lf_thresholds`; a bundle with non-empty `lf_thresholds` is rejected
   precisely until the per-varblock LF-DC lookup feeding the resolver is
