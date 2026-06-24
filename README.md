@@ -138,17 +138,26 @@ What is implemented and tested today:
   validator's opaque output — never its source) plus
   `round362_vardct_d1_reference_divergence` pinning the divergence
   (currently ~99.8 % of samples rail to 0/255 because the internal XYB
-  magnitude is several times too large). The round-362 trace localises
-  the error to the **coefficient-magnitude path**, not the IDCT /
-  placement / crop / XYB→RGB (each verified spec-conformant): the Y luma
-  plane is ≈ 4.0× too large in the XYB domain (a clean LF-coefficient
-  factor, since `Y = dY` has no CfL and the spec IDCT has unit DC gain),
-  with the Listing F.1 dequant, the Table C.12 Quantizer parse and the
-  Table C.11 `m_*_lf_unscaled` all confirmed correct — pointing at the
-  LfQuant modular sub-bitstream decode (a power-of-two factor is
-  consistent with the clean 4×). The X chroma plane's oversized swing is
-  the same magnitude family on the X HF coefficients (`kX == 0` for this
-  fixture, so it is not a CfL artefact). The integrated `qdc_at` supplies a zero
+  magnitude is several times too large). The error localises to the
+  **coefficient-magnitude path**, not the IDCT / placement / crop /
+  XYB→RGB. Round 367 corrected a round-362 assumption: every one of
+  d1's 16 varblocks is **DCT64×64** (Table C.16 value 18 — 8×8 LF-block
+  units tiling the 32×32 LF grid), *not* DCT8×8, so the LF→spatial path
+  is the non-trivial §I.2.5 Listing I.16 chain (forward `DCT_2D` ×
+  `ScaleF(8,64,·)` → §I.2.4 LLF merge → §I.2.3.2 IDCT64×64). The
+  `round367_lf_to_llf_dc_preservation` test pins that this longer chain
+  still preserves DC magnitude exactly (flat LF `V` → flat spatial `V`
+  for DCT8×8 .. DCT256×256), so — together with the round-362-confirmed
+  spec-correct Listing F.1 dequant, Table C.12 Quantizer parse and
+  Table C.11 `m_*_lf_unscaled` — the §I.2.5/§I.2.3.2/§C.5.4/§6.2/§L.2.2
+  stages are all ruled out, leaving the **LfQuant modular sub-bitstream
+  decode** (the decoded `qX/qY/qB` integers, ≈ 4× too large) as the sole
+  suspect, consistent with the round-17 bit-over-consumption record.
+  Pinning the exact per-token divergence needs a per-sample LF reference
+  trace for `vardct-256x256-d1` (a docs gap). The X chroma plane's
+  oversized swing is the same magnitude family on the X HF coefficients
+  (`kX == 0` for this fixture, so it is not a CfL artefact). The
+  integrated `qdc_at` supplies a zero
   quantised-LF DC triple — exact for any `HfBlockContext` with empty
   `lf_thresholds`; a bundle with non-empty `lf_thresholds` is rejected
   precisely until the per-varblock LF-DC lookup feeding the resolver is
