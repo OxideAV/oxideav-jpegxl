@@ -969,7 +969,12 @@ impl ImageMetadataFdis {
         Ok(())
     }
 
-    fn defaults() -> Self {
+    /// The `all_default` ImageMetadata bundle (FDIS A.6): an
+    /// XYB-encoded, 8-bit-per-sample sRGB image with no preview /
+    /// animation / extra channels and the default OpsinInverseMatrix.
+    /// Exposed for tests and tooling that need a baseline metadata
+    /// without round-tripping a codestream.
+    pub fn defaults() -> Self {
         Self {
             all_default: true,
             extra_fields: false,

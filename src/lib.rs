@@ -1022,7 +1022,12 @@ fn decode_codestream(
                 metadata.bit_depth.bits_per_sample
             )));
         }
-        let planes = build_rgb_planes_from_xyb(&img, &lf_global.lf_dequant, &metadata)?;
+        let planes = build_rgb_planes_from_xyb(
+            &img,
+            &lf_global.lf_dequant,
+            &metadata,
+            &fh.restoration_filter,
+        )?;
         return Ok(VideoFrame { pts, planes });
     }
     if expected_chans == 3 && fh.do_ycbcr {
@@ -1092,10 +1097,21 @@ fn decode_codestream(
 /// triple (per §L.2.2). All three channels must share the same
 /// dimensions; the output planes are byte-stride packed at the same
 /// width × height.
+///
+/// `rf` is the frame's `RestorationFilter` (FDIS Table C.9). When
+/// `rf.gab` and/or `rf.epf_iters > 0`, the §J.2 Gabor-like transform
+/// and §J.3 edge-preserving filter are applied to the float XYB planes
+/// **in the XYB sample domain** — i.e. after the integer→float dequant
+/// rescale (Listing L.2.2 preamble) but before the inverse XYB colour
+/// transform — matching the decode order pinned in §5.2 (IT → RF →
+/// features → colour transform). For a Modular frame the EPF degree of
+/// smoothing is the constant `rf.epf_sigma_for_modular` (§J.3.3: "set
+/// to rf.epf_sigma_for_modular" for non-kVarDCT frames).
 fn build_rgb_planes_from_xyb(
     img: &crate::modular_fdis::ModularImage,
     lf_dequant: &crate::lf_global::LfChannelDequantization,
     metadata: &ImageMetadataFdis,
+    rf: &crate::frame_header::RestorationFilter,
 ) -> Result<Vec<VideoPlane>> {
     if img.channels.len() != 3 {
         return Err(Error::InvalidData(format!(
@@ -1122,19 +1138,67 @@ fn build_rgb_planes_from_xyb(
             w, h
         )));
     }
+
+    // Step 1 — dequant rescale: integer (Y', X', B') channels →
+    // float XYB planes (Listing L.2.2 preamble, `modular_xyb_rescale`).
+    // The restoration filters (§J) and inverse XYB colour transform
+    // (§L.2.2) both consume these float samples; the filters operate on
+    // planes in `(x, y, b)` channel order (matching `epf_channel_scale`
+    // and the §J.2 per-channel `gab_C_weight` indexing).
+    let mut x_plane = vec![0.0_f32; n];
+    let mut y_plane = vec![0.0_f32; n];
+    let mut b_plane = vec![0.0_f32; n];
+    for idx in 0..n {
+        let y_prime = img.channels[0][idx];
+        let x_prime = img.channels[1][idx];
+        let b_prime = img.channels[2][idx];
+        let (x, y, b) = crate::xyb::modular_xyb_rescale(y_prime, x_prime, b_prime, lf_dequant);
+        x_plane[idx] = x;
+        y_plane[idx] = y;
+        b_plane[idx] = b;
+    }
+
+    // Step 2 — §J restoration filters, in spec order (§J.1): the
+    // Gabor-like transform (§J.2) first, then the edge-preserving
+    // filter (§J.3) "immediately after". Both are no-ops when their
+    // respective enable flags are clear, so a frame with `gab == false`
+    // and `epf_iters == 0` leaves the dequantised XYB planes untouched
+    // (preserving the pre-filter result this path produced before the
+    // filters were wired in).
+    if rf.gab {
+        crate::gaborish::apply_xyb_planes_in_place(
+            &mut x_plane,
+            &mut y_plane,
+            &mut b_plane,
+            w,
+            h,
+            rf,
+        )?;
+    }
+    if rf.epf_iters > 0 {
+        // §J.3.3: Modular frames use the constant degree of smoothing
+        // `rf.epf_sigma_for_modular` for every reference pixel.
+        crate::epf::apply_epf_iterations(
+            &mut x_plane,
+            &mut y_plane,
+            &mut b_plane,
+            w,
+            h,
+            rf.epf_sigma_for_modular,
+            rf,
+        )?;
+    }
+
+    // Step 3 — inverse XYB colour transform (§L.2.2) → linear RGB →
+    // 8-bit, per sample.
     let mut r_bytes = Vec::with_capacity(n);
     let mut g_bytes = Vec::with_capacity(n);
     let mut b_bytes = Vec::with_capacity(n);
     let oim = &metadata.opsin_inverse_matrix;
     let tm = &metadata.tone_mapping;
     for idx in 0..n {
-        // Channel order on input is `(Y', X', B')` per FDIS §L.2.2
-        // first paragraph.
-        let y_prime = img.channels[0][idx];
-        let x_prime = img.channels[1][idx];
-        let b_prime = img.channels[2][idx];
         let (r_lin, g_lin, b_lin) =
-            crate::xyb::modular_xyb_to_linear_rgb(y_prime, x_prime, b_prime, lf_dequant, oim, tm);
+            crate::xyb::inverse_xyb_to_rgb(x_plane[idx], y_plane[idx], b_plane[idx], oim, tm);
         r_bytes.push(crate::xyb::linear_rgb_to_u8(r_lin));
         g_bytes.push(crate::xyb::linear_rgb_to_u8(g_lin));
         b_bytes.push(crate::xyb::linear_rgb_to_u8(b_lin));
@@ -1786,5 +1850,126 @@ mod tests {
     fn encoder_factory_rejects_cleanly() {
         let params = CodecParameters::video(CodecId::new(CODEC_ID_STR));
         assert!(matches!(make_encoder(&params), Err(Error::Unsupported(_))));
+    }
+
+    // ---- §J restoration-filter wiring into the modular XYB path ----
+
+    /// Build a flat 3-channel XYB modular image whose `(Y', X', B')`
+    /// integer samples are all `(yv, xv, bv)` over `w × h`.
+    fn flat_xyb_image(w: u32, h: u32, yv: i32, xv: i32, bv: i32) -> modular_fdis::ModularImage {
+        let n = (w * h) as usize;
+        let desc = modular_fdis::ChannelDesc {
+            width: w,
+            height: h,
+            hshift: 0,
+            vshift: 0,
+        };
+        modular_fdis::ModularImage {
+            channels: vec![vec![yv; n], vec![xv; n], vec![bv; n]],
+            descs: vec![desc; 3],
+        }
+    }
+
+    /// §J.2 (Gabor-like kernel sums to 1) and §J.3 (all neighbour
+    /// distances are 0 → identical weights → weighted average is the
+    /// reference value) both preserve a *flat* field exactly. So a flat
+    /// XYB modular image must decode to the same RGB whether the
+    /// restoration filters are enabled or disabled — pinning that the
+    /// §J stage was wired into `build_rgb_planes_from_xyb` without
+    /// perturbing constant input.
+    #[test]
+    fn xyb_restoration_filters_preserve_flat_field() {
+        let metadata = metadata_fdis::ImageMetadataFdis::defaults();
+        let lf_dequant = lf_global::LfChannelDequantization::default();
+        let img = flat_xyb_image(16, 16, 30, -5, 12);
+
+        let rf_on = frame_header::RestorationFilter::default();
+        assert!(
+            rf_on.gab && rf_on.epf_iters > 0,
+            "default RF enables gab+epf"
+        );
+        let rf_off = frame_header::RestorationFilter {
+            gab: false,
+            epf_iters: 0,
+            ..frame_header::RestorationFilter::default()
+        };
+
+        let with_filters = build_rgb_planes_from_xyb(&img, &lf_dequant, &metadata, &rf_on).unwrap();
+        let without_filters =
+            build_rgb_planes_from_xyb(&img, &lf_dequant, &metadata, &rf_off).unwrap();
+
+        assert_eq!(with_filters.len(), 3);
+        for (p_on, p_off) in with_filters.iter().zip(without_filters.iter()) {
+            assert_eq!(p_on.data, p_off.data, "flat field perturbed by §J filters");
+        }
+        // A flat input also yields a spatially-constant output plane.
+        for plane in &with_filters {
+            let first = plane.data[0];
+            assert!(
+                plane.data.iter().all(|&b| b == first),
+                "flat XYB field must produce a constant RGB plane"
+            );
+        }
+    }
+
+    /// Disabling `gab`/`epf` must reproduce the pre-filter output
+    /// byte-for-byte for a *non*-flat XYB image (regression guard: the
+    /// re-plumbed step-1/step-3 split must equal the old single-loop
+    /// `modular_xyb_to_linear_rgb` path when the filters are off).
+    #[test]
+    fn xyb_filters_off_matches_unfiltered_gradient() {
+        let metadata = metadata_fdis::ImageMetadataFdis::defaults();
+        let lf_dequant = lf_global::LfChannelDequantization::default();
+        // A small non-constant field.
+        let (w, h) = (8u32, 8u32);
+        let n = (w * h) as usize;
+        let mut ych = vec![0i32; n];
+        let mut xch = vec![0i32; n];
+        let mut bch = vec![0i32; n];
+        for (i, ((y, x), b)) in ych
+            .iter_mut()
+            .zip(xch.iter_mut())
+            .zip(bch.iter_mut())
+            .enumerate()
+        {
+            *y = (i as i32) - 32;
+            *x = ((i as i32) % 7) - 3;
+            *b = ((i as i32) % 5) + 1;
+        }
+        let desc = modular_fdis::ChannelDesc {
+            width: w,
+            height: h,
+            hshift: 0,
+            vshift: 0,
+        };
+        let img = modular_fdis::ModularImage {
+            channels: vec![ych, xch, bch],
+            descs: vec![desc; 3],
+        };
+
+        let rf_off = frame_header::RestorationFilter {
+            gab: false,
+            epf_iters: 0,
+            ..frame_header::RestorationFilter::default()
+        };
+        let planes = build_rgb_planes_from_xyb(&img, &lf_dequant, &metadata, &rf_off).unwrap();
+
+        // Independent recompute via the convenience wrapper used before
+        // the filter split.
+        let oim = &metadata.opsin_inverse_matrix;
+        let tm = &metadata.tone_mapping;
+        for idx in 0..n {
+            let (r, g, b) = xyb::modular_xyb_to_linear_rgb(
+                img.channels[0][idx],
+                img.channels[1][idx],
+                img.channels[2][idx],
+                &lf_dequant,
+                oim,
+                tm,
+            );
+            assert_eq!(planes[0].data[idx], xyb::linear_rgb_to_u8(r));
+            assert_eq!(planes[1].data[idx], xyb::linear_rgb_to_u8(g));
+            assert_eq!(planes[2].data[idx], xyb::linear_rgb_to_u8(b));
+        }
     }
 }
