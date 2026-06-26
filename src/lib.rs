@@ -820,6 +820,16 @@ fn decode_codestream(
         return Err(Error::InvalidData("jxl decoder: zero-dim frame".into()));
     }
 
+    // FDIS §5.2 / Table C.5: when the FrameHeader `flags` bitfield
+    // carries kNoise / kPatches / kSplines, the decoder must draw those
+    // image features (Annex K.4 / K.2 / K.3) *after* the restoration
+    // filters, in that listed order, before the colour transform. This
+    // crate does not yet render any of those features, so a frame that
+    // requests one would have its pixels emitted with the feature
+    // silently omitted — exactly the "no silent misparse" failure this
+    // crate's contract forbids. Reject precisely instead.
+    reject_undrawn_image_features(fh.flags)?;
+
     // Map TOC entries to byte ranges (post-permutation order). Each
     // section starts byte-aligned and runs `entries[i]` bytes. The
     // bit reader is currently aligned to a byte (TOC consumed); the
@@ -1090,6 +1100,42 @@ fn decode_codestream(
         debug_assert_eq!(planes[i].data.len(), expected_len);
     }
     Ok(VideoFrame { pts, planes })
+}
+
+/// Reject a frame whose `FrameHeader.flags` (FDIS Table C.5) requests
+/// an image feature this decoder does not yet draw — kNoise (§K.4),
+/// kPatches (§K.2), or kSplines (§K.3). Per the §5.2 decode order these
+/// features are rendered *after* the restoration filters and before the
+/// colour transform; emitting pixels without them would silently drop a
+/// visible part of the image, which the crate's "no silent misparse"
+/// contract forbids. `kUseLfFrame` (0x20) and `kSkipAdaptiveLFSmoothing`
+/// (0x80) carry no separate draw step and are handled by the LF
+/// pipeline, so they are not gated here.
+///
+/// Returns `Ok(())` when none of the three drawn-feature bits are set.
+fn reject_undrawn_image_features(frame_flags: u64) -> Result<()> {
+    use crate::frame_header::flags;
+    let drawn = frame_flags & (flags::NOISE | flags::PATCHES | flags::SPLINES);
+    if drawn == 0 {
+        return Ok(());
+    }
+    let mut names: Vec<&str> = Vec::new();
+    if frame_flags & flags::PATCHES != 0 {
+        names.push("patches (K.2)");
+    }
+    if frame_flags & flags::SPLINES != 0 {
+        names.push("splines (K.3)");
+    }
+    if frame_flags & flags::NOISE != 0 {
+        names.push("noise (K.4)");
+    }
+    Err(Error::Unsupported(format!(
+        "jxl Modular decoder: frame requests image feature(s) {} (FrameHeader.flags = {:#x}) \
+         that are drawn after restoration filters per §5.2 — not yet rendered, so the decoder \
+         withholds pixels rather than emit them with the feature silently omitted",
+        names.join(" + "),
+        frame_flags
+    )))
 }
 
 /// Convert a 3-channel decoded modular image whose channels carry
@@ -1910,6 +1956,60 @@ mod tests {
                 "flat XYB field must produce a constant RGB plane"
             );
         }
+    }
+
+    // ---- §5.2 / Table C.5 drawn-image-feature gate ----
+
+    #[test]
+    fn no_feature_flags_passes_the_gate() {
+        assert!(reject_undrawn_image_features(0).is_ok());
+        // kUseLfFrame (0x20) and kSkipAdaptiveLFSmoothing (0x80) are not
+        // drawn features, so they do not trip the gate.
+        use frame_header::flags;
+        assert!(reject_undrawn_image_features(flags::USE_LF_FRAME).is_ok());
+        assert!(reject_undrawn_image_features(flags::SKIP_ADAPTIVE_LF_SMOOTHING).is_ok());
+        assert!(reject_undrawn_image_features(
+            flags::USE_LF_FRAME | flags::SKIP_ADAPTIVE_LF_SMOOTHING
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn each_drawn_feature_flag_is_rejected() {
+        use frame_header::flags;
+        for (bit, needle) in [
+            (flags::NOISE, "noise (K.4)"),
+            (flags::PATCHES, "patches (K.2)"),
+            (flags::SPLINES, "splines (K.3)"),
+        ] {
+            let err = reject_undrawn_image_features(bit).unwrap_err();
+            match err {
+                Error::Unsupported(msg) => assert!(
+                    msg.contains(needle),
+                    "flag {bit:#x} message should mention {needle}, got: {msg}"
+                ),
+                other => panic!("expected Unsupported for flag {bit:#x}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn combined_feature_flags_list_all_in_draw_order() {
+        use frame_header::flags;
+        let err = reject_undrawn_image_features(flags::NOISE | flags::PATCHES | flags::SPLINES)
+            .unwrap_err();
+        let msg = match err {
+            Error::Unsupported(m) => m,
+            other => panic!("expected Unsupported, got {other:?}"),
+        };
+        // §5.2 listed order is patches → splines → noise.
+        let p = msg.find("patches").expect("patches listed");
+        let s = msg.find("splines").expect("splines listed");
+        let n = msg.find("noise").expect("noise listed");
+        assert!(
+            p < s && s < n,
+            "features not listed in §5.2 draw order: {msg}"
+        );
     }
 
     /// Disabling `gab`/`epf` must reproduce the pre-filter output
