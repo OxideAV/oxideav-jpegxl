@@ -153,10 +153,27 @@ What is implemented and tested today:
   stages are all ruled out, leaving the **LfQuant modular sub-bitstream
   decode** (the decoded `qX/qY/qB` integers, ≈ 4× too large) as the sole
   suspect, consistent with the round-17 bit-over-consumption record.
-  Pinning the exact per-token divergence needs a per-sample LF reference
-  trace for `vardct-256x256-d1` (a docs gap). The X chroma plane's
-  oversized swing is the same magnitude family on the X HF coefficients
-  (`kX == 0` for this fixture, so it is not a CfL artefact). The
+  Round 372 **measures** what rounds 362/367 inferred:
+  `round372_vardct_lf_magnitude_ratio` decodes the real LfGroup through
+  the public LF primitives, dequantises it (Listing C.1 / F.1), and
+  inverts the reference PNG through the spec forward-XYB transform — the
+  ratio of our dequantised LF Y-mean to the reference's forward-XYB Y-mean
+  is **exactly 4.0** (`global_scale = 5111`, `quant_lf = 17`,
+  `extra_precision = 1`, `m_y_lf_unscaled = 512` → `m_y_dc = 0.005893`;
+  decoded `qY` mean ≈ 622 → dequant Y mean ≈ 1.832 vs reference 0.458).
+  The same test pins that the Y plane is **shape-correct** (its `/4`-scaled
+  values form a smooth luma-DC field, monotone gradients, not entropy
+  garbage), which rules out a structural mis-decode and isolates the
+  divergence to a scalar 4× on the modular-decoded LF quantities. A
+  controlled HF-isolation experiment (this round, not committed) further
+  showed that even with the HF AC coefficients zeroed and Y scaled by the
+  measured 4×, the reconstruction still rails: the residual railing comes
+  from the **X chroma DC plane** (a ±0.5 XYB swing where the reference X is
+  ≈ 0) and a **B plane that under-shoots ≈ 2×** — both the same
+  modular-magnitude family as Y, not an IDCT/CfL artefact (`x_from_y`/`kX`
+  are all-zero for this fixture, so the existing spatial HF chroma-from-luma
+  is a no-op on X). Pinning the exact per-token divergence needs a
+  per-sample LF reference trace for `vardct-256x256-d1` (a docs gap). The
   integrated `qdc_at` supplies a zero
   quantised-LF DC triple — exact for any `HfBlockContext` with empty
   `lf_thresholds`; a bundle with non-empty `lf_thresholds` is rejected
