@@ -579,6 +579,7 @@ fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
     Ok(Box::new(JxlDecoder {
         codec_id,
         pending: None,
+        ready: std::collections::VecDeque::new(),
         eof: false,
     }))
 }
@@ -599,6 +600,11 @@ fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
 struct JxlDecoder {
     codec_id: CodecId,
     pending: Option<Packet>,
+    /// Frames decoded from the most recent packet, drained one per
+    /// [`Decoder::receive_frame`] call. A JXL codestream can be
+    /// multi-frame (animation), so a single packet may yield several
+    /// [`VideoFrame`]s.
+    ready: std::collections::VecDeque<VideoFrame>,
     eof: bool,
 }
 
@@ -608,9 +614,9 @@ impl Decoder for JxlDecoder {
     }
 
     fn send_packet(&mut self, packet: &Packet) -> Result<()> {
-        if self.pending.is_some() {
+        if self.pending.is_some() || !self.ready.is_empty() {
             return Err(Error::other(
-                "jxl decoder: receive_frame must be called before sending another packet",
+                "jxl decoder: drain receive_frame before sending another packet",
             ));
         }
         self.pending = Some(packet.clone());
@@ -618,15 +624,22 @@ impl Decoder for JxlDecoder {
     }
 
     fn receive_frame(&mut self) -> Result<Frame> {
-        let Some(pkt) = self.pending.take() else {
-            return if self.eof {
-                Err(Error::Eof)
-            } else {
-                Err(Error::NeedMore)
-            };
-        };
-        let vf = decode_one_frame(&pkt.data, pkt.pts)?;
-        Ok(Frame::Video(vf))
+        // Decode the pending packet's full frame array on first pull,
+        // then drain the queue one frame at a time.
+        if let Some(pkt) = self.pending.take() {
+            let frames = decode_all_frames(&pkt.data, pkt.pts)?;
+            self.ready.extend(frames);
+        }
+        match self.ready.pop_front() {
+            Some(vf) => Ok(Frame::Video(vf)),
+            None => {
+                if self.eof {
+                    Err(Error::Eof)
+                } else {
+                    Err(Error::NeedMore)
+                }
+            }
+        }
     }
 
     fn flush(&mut self) -> Result<()> {
@@ -661,6 +674,101 @@ fn decode_icc_stream_at(br: &mut BitReader<'_>) -> Result<Vec<u8>> {
 /// return the first frame as a [`VideoFrame`]. Round-3 envelope.
 pub fn decode_one_frame(input: &[u8], pts: Option<i64>) -> Result<VideoFrame> {
     decode_first_frame(input, pts, false)
+}
+
+/// Decode **every** frame in a JXL codestream (raw or ISOBMFF-wrapped),
+/// returning them in codestream order.
+///
+/// A JXL codestream may carry more than one frame (§C.1): the codestream
+/// prelude (SizeHeader / ImageMetadata / ICC) is read once, then frames
+/// follow back-to-back, each a byte-aligned FrameHeader + TOC + section
+/// array. The array ends at the frame whose FrameHeader sets `is_last`
+/// (§C.2). This is the framing that drives animation: the 3-frame
+/// `animation-3frame` fixture, for example, carries three Regular frames
+/// with `is_last = 0, 0, 1`.
+///
+/// Only the colour (`kRegular`) frame types are surfaced as output
+/// frames; each decoded frame is subject to the same envelope as
+/// [`decode_one_frame`] (Modular path, Grey/RGB, 1–16-bit integer). A
+/// frame that falls outside that envelope surfaces its precise
+/// `Error::Unsupported` / `Error::InvalidData` rather than a silent
+/// misparse. `pts` is applied to the first frame only; subsequent frames
+/// carry `None` (per-frame animation timing lives in each FrameHeader's
+/// `duration` field and is not yet mapped onto `VideoFrame::pts`).
+///
+/// The returned vector always has at least one frame on success.
+pub fn decode_all_frames(input: &[u8], pts: Option<i64>) -> Result<Vec<VideoFrame>> {
+    let sig = container::detect(input)
+        .ok_or_else(|| Error::InvalidData("jxl decoder: no JXL signature".into()))?;
+    let codestream_owned;
+    let codestream: &[u8] = match sig {
+        container::Signature::RawCodestream => &input[2..],
+        container::Signature::Isobmff => {
+            codestream_owned = container::extract_codestream(input)?;
+            let cs: &[u8] = &codestream_owned;
+            if cs.len() < 2 || cs[0] != 0xFF || cs[1] != 0x0A {
+                return Err(Error::InvalidData(
+                    "JXL ISOBMFF: jxlc/jxlp payload missing FF 0A codestream signature".into(),
+                ));
+            }
+            &codestream_owned[2..]
+        }
+    };
+    decode_all_frames_from_codestream(codestream, pts)
+}
+
+/// Frame-array loop shared by [`decode_all_frames`]. Reads the codestream
+/// prelude once, then decodes frames until the one flagged `is_last`.
+fn decode_all_frames_from_codestream(
+    codestream: &[u8],
+    pts: Option<i64>,
+) -> Result<Vec<VideoFrame>> {
+    let (prelude_br, size, metadata) = read_codestream_prelude(codestream)?;
+    // Each frame gets a fresh reader positioned at its own byte offset
+    // (frames are byte-aligned per §6.3, so a byte offset uniquely
+    // identifies a frame boundary). The prelude reader only supplies the
+    // first frame's start offset.
+    let mut offset = prelude_br.bytes_consumed();
+
+    let mut frames: Vec<VideoFrame> = Vec::new();
+    // A conservative bound on the number of frames: no frame is smaller
+    // than a FrameHeader, so the codestream byte length caps the count.
+    // This guards against a malformed `is_last`-never-set stream.
+    let max_frames = codestream.len().max(1);
+    let mut frame_pts = pts;
+    loop {
+        if offset >= codestream.len() {
+            return Err(Error::InvalidData(
+                "jxl decoder: frame array ended before an is_last frame".into(),
+            ));
+        }
+        // Each frame reads from a sub-slice starting at its own byte
+        // boundary; `decode_frame_body` reports the *next* frame offset
+        // relative to that sub-slice, so we add `offset` back to get an
+        // absolute codestream offset.
+        let frame_slice = &codestream[offset..];
+        let mut br = BitReader::new(frame_slice);
+        let decoded = decode_frame_body(&mut br, frame_slice, &size, &metadata, frame_pts, false)?;
+        let is_last = decoded.is_last;
+        let next_rel = decoded.next_frame_offset;
+        frames.push(decoded.frame);
+        frame_pts = None;
+        if is_last {
+            break;
+        }
+        if next_rel == 0 {
+            return Err(Error::InvalidData(
+                "jxl decoder: frame array made no forward progress (zero-length frame)".into(),
+            ));
+        }
+        offset = offset.saturating_add(next_rel);
+        if frames.len() > max_frames {
+            return Err(Error::InvalidData(
+                "jxl decoder: frame array exceeds codestream-length bound".into(),
+            ));
+        }
+    }
+    Ok(frames)
 }
 
 /// Decode the first frame, returning the integrated VarDCT
@@ -770,11 +878,23 @@ fn read_frame_header_and_toc(
     Ok((fh, toc))
 }
 
-fn decode_codestream(
+/// A single decoded frame plus the framing metadata a multi-frame loop
+/// needs: whether it was the codestream's last frame, and the byte
+/// offset (within the codestream) at which the next frame's FrameHeader
+/// begins (byte-aligned per FDIS §6.3).
+struct DecodedFrame {
+    frame: VideoFrame,
+    is_last: bool,
+    next_frame_offset: usize,
+}
+
+/// Read the codestream prelude that precedes the frame array: SizeHeader
+/// (§A.3), ImageMetadata (§A.6), the optional ICC stream (§E.4), and the
+/// byte-align (§6.3). Returns a [`BitReader`] positioned at the first
+/// FrameHeader plus the parsed `size` / `metadata`.
+fn read_codestream_prelude(
     codestream: &[u8],
-    pts: Option<i64>,
-    return_vardct_pixels: bool,
-) -> Result<VideoFrame> {
+) -> Result<(BitReader<'_>, SizeHeaderFdis, ImageMetadataFdis)> {
     let mut br = BitReader::new(codestream);
 
     // 1. SizeHeader (FDIS A.3).
@@ -799,6 +919,40 @@ fn decode_codestream(
     // 4. Byte-align before frame data per FDIS 6.3.
     br.pu0()?;
 
+    Ok((br, size, metadata))
+}
+
+fn decode_codestream(
+    codestream: &[u8],
+    pts: Option<i64>,
+    return_vardct_pixels: bool,
+) -> Result<VideoFrame> {
+    let (mut br, size, metadata) = read_codestream_prelude(codestream)?;
+    let decoded = decode_frame_body(
+        &mut br,
+        codestream,
+        &size,
+        &metadata,
+        pts,
+        return_vardct_pixels,
+    )?;
+    Ok(decoded.frame)
+}
+
+/// Decode one frame whose FrameHeader begins at `br`'s current
+/// (byte-aligned) position. `codestream` is the full codestream slice
+/// `br` reads from; `size` / `metadata` come from the shared prelude.
+///
+/// Returns the frame plus its framing metadata (`is_last`, next frame
+/// offset) so a multi-frame loop can continue past it.
+fn decode_frame_body(
+    br: &mut BitReader<'_>,
+    codestream: &[u8],
+    size: &SizeHeaderFdis,
+    metadata: &ImageMetadataFdis,
+    pts: Option<i64>,
+    return_vardct_pixels: bool,
+) -> Result<DecodedFrame> {
     // 5. FrameHeader (FDIS C.2).
     let fh_params = FrameDecodeParams {
         xyb_encoded: metadata.xyb_encoded,
@@ -818,7 +972,18 @@ fn decode_codestream(
     //     resulting TOC is self-consistent with the remaining codestream
     //     bytes; otherwise we fall back to the 2021 layout. The winning
     //     reader position is committed back into `br`.
-    let (fh, toc) = read_frame_header_and_toc(&mut br, &fh_params, codestream)?;
+    let (fh, toc) = read_frame_header_and_toc(br, &fh_params, codestream)?;
+
+    // Compute the framing metadata up front: `br` is positioned at the
+    // first section (byte-aligned) and the per-section decode below only
+    // reads through sliced sub-readers, never advancing `br` further.
+    // The next frame's FrameHeader therefore begins at the current byte
+    // offset plus the TOC-declared total frame byte length (each section
+    // is byte-sized so the sum is already byte-aligned, §C.3.1 / §6.3).
+    let is_last = fh.is_last;
+    let frame_start_byte = br.bytes_consumed();
+    let total_frame_len: usize = toc.entries.iter().map(|&e| e as usize).sum();
+    let next_frame_offset = frame_start_byte.saturating_add(total_frame_len);
 
     // 7. Single-group frames have a single TOC entry containing all
     //    frame data. Round 6 only handled that case; round 7 wires
@@ -842,7 +1007,7 @@ fn decode_codestream(
     // dequantised LF samples per Listing F.1 + applying F.2 smoothing
     // when `kSkipAdaptiveLFSmoothing == 0`.
     if fh.encoding == crate::frame_header::Encoding::VarDct {
-        let scaffold = crate::vardct::recognise_vardct_codestream(&fh, &metadata)?;
+        let scaffold = crate::vardct::recognise_vardct_codestream(&fh, metadata)?;
         // The integrated VarDCT decode (`decode_vardct_frame`) now runs
         // the whole §C.8.3 HF-entropy → F.3 dequant → IDCT → CfL →
         // §6.2 crop → §L.2.2 XYB→RGB chain end-to-end on a real
@@ -857,9 +1022,13 @@ fn decode_codestream(
         // crate's integration tests against `decode_vardct_frame`
         // directly. Once the per-block scaling is pixel-validated this
         // branch returns the frame.
-        let frame = decode_vardct_frame(&fh, &metadata, &toc, &mut br, scaffold, pts)?;
+        let frame = decode_vardct_frame(&fh, metadata, &toc, br, scaffold, pts)?;
         if return_vardct_pixels {
-            return Ok(frame);
+            return Ok(DecodedFrame {
+                frame,
+                is_last,
+                next_frame_offset,
+            });
         }
         return Err(Error::Unsupported(
             "jxl VarDCT decoder: the integrated reconstruction (HF entropy decode + \
@@ -970,7 +1139,7 @@ fn decode_codestream(
     let lf_global_bytes = section_byte_range(lf_global_slot)?;
     let mut lf_global = {
         let mut lf_br = BitReader::new_section(lf_global_bytes);
-        LfGlobal::read(&mut lf_br, &fh, &metadata)?
+        LfGlobal::read(&mut lf_br, &fh, metadata)?
     };
 
     // 8b. LfGroups (slots 1..1+num_lf_groups) — round 7 only handles
@@ -1095,10 +1264,14 @@ fn decode_codestream(
         let planes = build_rgb_planes_from_xyb(
             &img,
             &lf_global.lf_dequant,
-            &metadata,
+            metadata,
             &fh.restoration_filter,
         )?;
-        return Ok(VideoFrame { pts, planes });
+        return Ok(DecodedFrame {
+            frame: VideoFrame { pts, planes },
+            is_last,
+            next_frame_offset,
+        });
     }
     if expected_chans == 3 && fh.do_ycbcr {
         if metadata.bit_depth.bits_per_sample != 8 {
@@ -1108,7 +1281,11 @@ fn decode_codestream(
             )));
         }
         let planes = build_rgb_planes_from_ycbcr(&img)?;
-        return Ok(VideoFrame { pts, planes });
+        return Ok(DecodedFrame {
+            frame: VideoFrame { pts, planes },
+            is_last,
+            next_frame_offset,
+        });
     }
 
     // Pass-through path: each channel becomes a plane (no colour
@@ -1159,7 +1336,11 @@ fn decode_codestream(
         let expected_len = if bps <= 8 { w * h } else { w * h * 2 };
         debug_assert_eq!(planes[i].data.len(), expected_len);
     }
-    Ok(VideoFrame { pts, planes })
+    Ok(DecodedFrame {
+        frame: VideoFrame { pts, planes },
+        is_last,
+        next_frame_offset,
+    })
 }
 
 /// Reject a frame whose `FrameHeader.flags` (FDIS Table C.5) requests
