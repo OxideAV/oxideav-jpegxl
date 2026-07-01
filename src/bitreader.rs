@@ -6,6 +6,7 @@
 
 use oxideav_core::{Error, Result};
 
+#[derive(Clone)]
 pub struct BitReader<'a> {
     data: &'a [u8],
     byte_pos: usize,

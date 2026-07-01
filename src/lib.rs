@@ -543,7 +543,7 @@ use oxideav_core::{
 };
 
 use crate::bitreader::BitReader;
-use crate::frame_header::{FrameDecodeParams, FrameHeader};
+use crate::frame_header::{FrameDecodeParams, FrameHeader, RfEdition};
 use crate::lf_global::LfGlobal;
 use crate::metadata_fdis::{ColourSpace, ImageMetadataFdis, SizeHeaderFdis};
 use crate::toc::Toc;
@@ -714,6 +714,62 @@ fn decode_first_frame(
     }
 }
 
+/// Validate that a parsed [`Toc`] is self-consistent with the bytes
+/// remaining after the FrameHeader + TOC. Used by the edition-resolution
+/// trial parse: a wrong RestorationFilter edition shifts the bit cursor
+/// so the TOC entries parse as garbage (typically a single 0-byte entry
+/// or a sum that overruns the codestream). A TOC that (a) declares a
+/// non-zero total and (b) fits within the remaining codestream bytes is
+/// accepted as the correct edition.
+fn toc_is_self_consistent(br_after_toc: &BitReader<'_>, toc: &Toc, codestream_len: usize) -> bool {
+    let frame_data_start = br_after_toc.bytes_consumed();
+    if frame_data_start > codestream_len {
+        return false;
+    }
+    let remaining = (codestream_len - frame_data_start) as u64;
+    let total: u64 = toc.entries.iter().map(|&e| e as u64).sum();
+    // A live frame always has a strictly positive byte body (even the
+    // smallest single-section frame carries the LfGlobal prelude), and
+    // the declared body must fit in the codestream.
+    total > 0 && total <= remaining
+}
+
+/// Parse FrameHeader + TOC, resolving which RestorationFilter table
+/// edition (§C.2 → Table J.1 vs Table C.9) the codestream uses.
+///
+/// The codestream carries no explicit edition tag. We trial-parse the
+/// current published edition (2024, [`RfEdition::V2024`]) first: on a
+/// clean parse whose TOC is self-consistent with the remaining bytes we
+/// commit it. If the 2024 parse errors or yields an inconsistent TOC we
+/// retry the 2021 layout ([`RfEdition::V2021`]). The winning reader
+/// position is written back into `br`.
+fn read_frame_header_and_toc(
+    br: &mut BitReader<'_>,
+    fh_params: &FrameDecodeParams,
+    codestream: &[u8],
+) -> Result<(FrameHeader, Toc)> {
+    for edition in [RfEdition::V2024, RfEdition::V2021] {
+        let mut trial = br.clone();
+        let fh = match FrameHeader::read_with_edition(&mut trial, fh_params, edition) {
+            Ok(fh) => fh,
+            Err(_) => continue,
+        };
+        let toc = match Toc::read(&mut trial, &fh) {
+            Ok(toc) => toc,
+            Err(_) => continue,
+        };
+        if toc_is_self_consistent(&trial, &toc, codestream.len()) {
+            *br = trial;
+            return Ok((fh, toc));
+        }
+    }
+    // Neither edition produced a self-consistent TOC. Surface the 2024
+    // (current-edition) parse error verbatim so the failure is precise.
+    let fh = FrameHeader::read_with_edition(br, fh_params, RfEdition::V2024)?;
+    let toc = Toc::read(br, &fh)?;
+    Ok((fh, toc))
+}
+
 fn decode_codestream(
     codestream: &[u8],
     pts: Option<i64>,
@@ -755,10 +811,14 @@ fn decode_codestream(
         image_width: size.width,
         image_height: size.height,
     };
-    let fh = FrameHeader::read(&mut br, &fh_params)?;
-
-    // 6. TOC (FDIS C.3) — entries byte-aligned per spec.
-    let toc = Toc::read(&mut br, &fh)?;
+    // 5b. Resolve the RestorationFilter table edition (§C.2 → Table J.1
+    //     vs Table C.9) and parse FrameHeader + TOC together. The
+    //     codestream carries no explicit edition tag, so we trial-parse
+    //     the current-edition (2024) layout first and accept it if the
+    //     resulting TOC is self-consistent with the remaining codestream
+    //     bytes; otherwise we fall back to the 2021 layout. The winning
+    //     reader position is committed back into `br`.
+    let (fh, toc) = read_frame_header_and_toc(&mut br, &fh_params, codestream)?;
 
     // 7. Single-group frames have a single TOC entry containing all
     //    frame data. Round 6 only handled that case; round 7 wires

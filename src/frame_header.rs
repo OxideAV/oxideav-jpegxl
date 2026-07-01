@@ -329,11 +329,46 @@ impl Default for RestorationFilter {
 impl RestorationFilter {
     // Start from spec defaults, then mutate per the bitstream. We
     // intentionally use direct field writes rather than the
-    // struct-update syntax because Table C.9 conditionals make a
+    // struct-update syntax because the Table J.1 conditionals make a
     // builder-style assembly far less readable.
+    //
+    // Layout: ISO/IEC 18181-1:2024 Annex J, Table J.1 (the current
+    // published edition; the earlier 2021 FDIS Table C.9 omitted the
+    // leading `all_default` row and the trailing ignored `u(32)`). The
+    // normative JXL codestream format carries both fields; the 2021 PDF
+    // simply under-specified the table. Reading against Table J.1
+    // recovers the correct bit cursor for every fixture.
+    //
+    // The table's fields and their gating conditions:
+    //   all_default        Bool()    true   —
+    //   !all_default        → gab            Bool()  true
+    //   gab                 → gab_custom     Bool()  false
+    //   gab_custom          → 6× F16 weights
+    //   !all_default        → epf_iters      u(2)    2
+    //   !all_default && epf_iters && kVarDCT → epf_sharp_custom  Bool() false
+    //   epf_sharp_custom    → epf_sharp_lut[8]  8× F16
+    //   !all_default && epf_iters → epf_weight_custom  Bool()  false
+    //   epf_weight_custom   → epf_channel_scale[3]  3× F16
+    //   epf_weight_custom   → (ignored)      u(32)   0
+    //   !all_default && epf_iters → epf_sigma_custom  Bool()  false
+    //   epf_sigma_custom && kVarDCT → epf_quant_mul  F16   0.46
+    //   epf_sigma_custom    → epf_pass0_sigma_scale  F16   0.9
+    //   epf_sigma_custom    → epf_pass2_sigma_scale  F16   6.5
+    //   epf_sigma_custom    → epf_border_sad_mul     F16   2/3
+    //   !all_default && epf_iters && kModular → epf_sigma_for_modular  F16  1.0
+    //   !all_default        → extensions     Extensions
     #[allow(clippy::field_reassign_with_default)]
-    fn read(br: &mut BitReader<'_>, encoding: Encoding) -> Result<Self> {
+    fn read(br: &mut BitReader<'_>, encoding: Encoding, edition: RfEdition) -> Result<Self> {
         let mut rf = RestorationFilter::default();
+        // 2024 Table J.1 opens with an `all_default` Bool(); when set,
+        // the whole bundle keeps its defaults and no further bits are
+        // read. The 2021 FDIS Table C.9 has no such row.
+        if edition == RfEdition::V2024 {
+            let all_default = br.read_bool()?;
+            if all_default {
+                return Ok(rf);
+            }
+        }
         rf.gab = br.read_bool()?;
         if rf.gab {
             rf.gab_custom = br.read_bool()?;
@@ -363,8 +398,20 @@ impl RestorationFilter {
                 for slot in rf.epf_channel_scale.iter_mut() {
                     *slot = br.read_f16()?;
                 }
-                rf.epf_pass1_zeroflush = br.read_f16()?;
-                rf.epf_pass2_zeroflush = br.read_f16()?;
+                match edition {
+                    RfEdition::V2024 => {
+                        // Table J.1: a single ignored `u(32)` follows the
+                        // three channel scales. Consume it to keep the
+                        // cursor aligned; the value is discarded (the EPF
+                        // pipeline uses the struct's default zeroflush).
+                        let _ignored = br.read_bits(32)?;
+                    }
+                    RfEdition::V2021 => {
+                        // Table C.9: two F16 zeroflush fields.
+                        rf.epf_pass1_zeroflush = br.read_f16()?;
+                        rf.epf_pass2_zeroflush = br.read_f16()?;
+                    }
+                }
             }
             rf.epf_sigma_custom = br.read_bool()?;
             if rf.epf_sigma_custom {
@@ -436,6 +483,38 @@ pub struct FrameDecodeParams {
     pub image_height: u32,
 }
 
+/// Which edition of the `RestorationFilter` sub-bundle table the
+/// codestream was encoded against.
+///
+/// The two published editions differ in the on-the-wire layout of the
+/// `RestorationFilter` bundle (§C.2 → Table J.1 / Table C.9), and the
+/// codestream carries no explicit edition tag, so the caller selects
+/// which table [`RestorationFilter::read`] applies:
+///
+/// * [`RfEdition::V2024`] — ISO/IEC 18181-1:**2024** Annex J, Table J.1.
+///   The bundle opens with an `all_default` `Bool()` (default `true`);
+///   when set, every field keeps its default and no further bits are
+///   read. `epf_weight_custom` is followed by a single ignored `u(32)`.
+/// * [`RfEdition::V2021`] — ISO/IEC FDIS 18181-1:**2021** Table C.9.
+///   No leading `all_default` row; `epf_weight_custom` is followed by
+///   two `F16` fields (`epf_pass1_zeroflush`, `epf_pass2_zeroflush`).
+///
+/// The two layouts consume different numbers of bits, so mis-selecting
+/// the edition shifts the bit cursor and cascades into a corrupt TOC.
+/// [`crate::decode_codestream`] resolves the edition by trial parse
+/// (2024 first, then 2021) validated against the resulting TOC.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RfEdition {
+    /// ISO/IEC 18181-1:2024 Annex J, Table J.1. The current published
+    /// edition and the default truth; the trial parse in
+    /// `decode_codestream` overrides per-codestream when the 2024 parse
+    /// fails to yield a self-consistent TOC.
+    #[default]
+    V2024,
+    /// ISO/IEC FDIS 18181-1:2021 Table C.9.
+    V2021,
+}
+
 /// FDIS implicit cap on `num_extra_channels` from §A.6 (Table A.16):
 /// `U32(Val(0), Val(1), BitsOffset(4, 2), BitsOffset(12, 1))` →
 /// max `4096 + 1 = 4097`.
@@ -453,6 +532,20 @@ impl FrameHeader {
     /// FDIS Table C.1 — the byte-aligned TOC — is read by [`crate::toc`]
     /// which performs its own `pu0()` first).
     pub fn read(br: &mut BitReader<'_>, params: &FrameDecodeParams) -> Result<Self> {
+        Self::read_with_edition(br, params, RfEdition::V2021)
+    }
+
+    /// Like [`FrameHeader::read`] but selects which edition of the
+    /// `RestorationFilter` sub-bundle table (§C.2 → Table J.1 / C.9) to
+    /// apply. [`FrameHeader::read`] defaults to [`RfEdition::V2021`] to
+    /// preserve the historical bit layout its unit tests were pinned
+    /// against; the integrated [`crate::decode_codestream`] path picks
+    /// the edition by trial parse.
+    pub fn read_with_edition(
+        br: &mut BitReader<'_>,
+        params: &FrameDecodeParams,
+        rf_edition: RfEdition,
+    ) -> Result<Self> {
         if params.num_extra_channels > MAX_NUM_EXTRA_CHANNELS {
             return Err(Error::InvalidData(format!(
                 "JXL FrameHeader: caller's num_extra_channels ({}) exceeds spec maximum",
@@ -652,7 +745,7 @@ impl FrameHeader {
         let name = String::from_utf8(name_bytes)
             .map_err(|_| Error::InvalidData("JXL FrameHeader: name is not valid UTF-8".into()))?;
 
-        let restoration_filter = RestorationFilter::read(br, encoding)?;
+        let restoration_filter = RestorationFilter::read(br, encoding, rf_edition)?;
 
         let extensions = Extensions::read(br)?;
         extensions.skip_payload(br)?;
