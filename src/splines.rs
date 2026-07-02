@@ -148,6 +148,68 @@ pub fn upsample_control_points(control_points: &[Point]) -> Vec<Point> {
     out
 }
 
+/// A point sampled along a spline at (nominally) unit arc-length spacing,
+/// together with the listing's `.arclength` weight `d` (1 for interior
+/// samples, the fractional remainder for the final sample). Produced by
+/// [`resample_by_arclength`] and consumed by the §K.1 Gaussian splat.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ArcSample {
+    pub point: Point,
+    /// The listing's `.arclength` field (`d`) — a per-sample brightness
+    /// weight, `1.0` except for the trailing partial sample.
+    pub d: f32,
+}
+
+/// FDIS §K.3, Listing K.1 (middle block) — resample the upsampled
+/// polyline into points spaced one unit apart along the arc length.
+///
+/// The first sample is the polyline's start (weight `1`). Thereafter the
+/// walker accumulates segment lengths between consecutive upsampled
+/// points; whenever the running length reaches `1` it interpolates a new
+/// sample exactly one unit from the previous emitted sample (weight `1`).
+/// When the polyline is exhausted mid-unit the leftover length is emitted
+/// as the final sample's weight `d`.
+pub fn resample_by_arclength(upsampled: &[Point]) -> Vec<ArcSample> {
+    if upsampled.is_empty() {
+        return Vec::new();
+    }
+    let mut all_samples = Vec::new();
+    let mut current = upsampled[0];
+    all_samples.push(ArcSample {
+        point: current,
+        d: 1.0,
+    });
+    let mut next = 0usize;
+    while next < upsampled.len() {
+        let mut previous = current;
+        let mut arclength = 0.0f32;
+        loop {
+            if next == upsampled.len() {
+                all_samples.push(ArcSample {
+                    point: previous,
+                    d: arclength,
+                });
+                break;
+            }
+            let d = upsampled[next].sub(previous);
+            let arclength_to_next = (d.x * d.x + d.y * d.y).sqrt();
+            if arclength + arclength_to_next >= 1.0 {
+                let s = (1.0 - arclength) / arclength_to_next;
+                current = previous.lerp(upsampled[next], s);
+                all_samples.push(ArcSample {
+                    point: current,
+                    d: 1.0,
+                });
+                break;
+            }
+            arclength += arclength_to_next;
+            previous = upsampled[next];
+            next += 1;
+        }
+    }
+    all_samples
+}
+
 /// Per-channel weight applied to the dequantized DCT32 coefficients,
 /// indexed by channel in the order X, Y, B, σ (FDIS §C.4.6):
 /// `kChannelWeight[4] = {0.0042, 0.075, 0.07, 0.3333}`.
@@ -407,6 +469,48 @@ mod tests {
     #[test]
     fn upsample_empty_is_empty() {
         assert!(upsample_control_points(&[]).is_empty());
+    }
+
+    #[test]
+    fn resample_empty_is_empty() {
+        assert!(resample_by_arclength(&[]).is_empty());
+    }
+
+    #[test]
+    fn resample_horizontal_line_is_unit_spaced() {
+        // A dense horizontal polyline from x=0..=10 (0.25 spacing).
+        let up: Vec<Point> = (0..=40).map(|i| Point::new(i as f32 * 0.25, 0.0)).collect();
+        let s = resample_by_arclength(&up);
+        // First sample is the start with weight 1.
+        assert_eq!(s[0].point, Point::new(0.0, 0.0));
+        assert_eq!(s[0].d, 1.0);
+        // Consecutive emitted samples are ~1 unit apart in x, y unchanged.
+        for w in s.windows(2) {
+            assert!((w[0].point.y).abs() < 1e-4);
+            let dx = w[1].point.x - w[0].point.x;
+            // Interior gaps are ~1; the final (partial/zero-length) gap
+            // may be anywhere in [0, 1].
+            assert!((0.0..=1.0 + 1e-4).contains(&dx), "gap {dx}");
+        }
+        // Interior samples carry weight 1; only the trailing sample may be
+        // fractional.
+        for interior in &s[..s.len() - 1] {
+            assert_eq!(interior.d, 1.0);
+        }
+        assert!(s.last().unwrap().d <= 1.0);
+    }
+
+    #[test]
+    fn resample_endpoint_weight_is_fractional_remainder() {
+        // Total length 2.5 → samples at arclength 0,1,2 (weight 1) and a
+        // trailing 0.5 remainder.
+        let up = vec![Point::new(0.0, 0.0), Point::new(2.5, 0.0)];
+        let s = resample_by_arclength(&up);
+        assert!(
+            (s.last().unwrap().d - 0.5).abs() < 1e-4,
+            "d = {}",
+            s.last().unwrap().d
+        );
     }
 
     #[test]
