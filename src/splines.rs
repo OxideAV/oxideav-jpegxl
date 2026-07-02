@@ -24,6 +24,8 @@
 //! All maths follows the FDIS listings verbatim; no external decoder
 //! source is consulted (see the crate README "History" note).
 
+use oxideav_core::{Error, Result};
+
 /// A 2-D point with element-wise arithmetic, as used by the §K.1
 /// rendering listing (`Mirror`, control-point upsampling, arc-length
 /// sampling). Coordinates are pixel positions and become fractional
@@ -332,6 +334,182 @@ pub fn continuous_idct(dct: &[f32; SPLINE_DCT_LEN], t: f32) -> f32 {
     acc as f32
 }
 
+/// Gauss error function, `erf(x)`.
+///
+/// The §K.1 Gaussian brush integrates the 2-D Gaussian over each pixel
+/// cell as a product of `erf` differences. This is a standard rational
+/// approximation of `erf` (maximum absolute error ≈ 1.5e-7), evaluated in
+/// `f64` for headroom and returned as `f32`. It is a general numerical
+/// identity for the error function, not derived from any codec source.
+pub fn erf(x: f32) -> f32 {
+    erf_f64(x as f64) as f32
+}
+
+fn erf_f64(x: f64) -> f64 {
+    const P: f64 = 0.327_591_1;
+    const A: [f64; 5] = [
+        0.254_829_592,
+        -0.284_496_736,
+        1.421_413_741,
+        -1.453_152_027,
+        1.061_405_429,
+    ];
+    let sign = if x < 0.0 { -1.0 } else { 1.0 };
+    let ax = x.abs();
+    let t = 1.0 / (1.0 + P * ax);
+    let poly = ((((A[4] * t + A[3]) * t + A[2]) * t + A[1]) * t + A[0]) * t;
+    sign * (1.0 - poly * (-ax * ax).exp())
+}
+
+/// One decoded spline, ready to render: its control points plus the
+/// dequantized and recorrelated DCT32 coefficients of the X, Y, B and σ
+/// channels (§C.4.6). The coefficients are already through
+/// [`dequant_dct32`] + [`recorrelate_xb`]; rendering only evaluates them.
+#[derive(Debug, Clone)]
+pub struct Spline {
+    pub control_points: Vec<Point>,
+    pub dct_x: [f32; SPLINE_DCT_LEN],
+    pub dct_y: [f32; SPLINE_DCT_LEN],
+    pub dct_b: [f32; SPLINE_DCT_LEN],
+    pub dct_sigma: [f32; SPLINE_DCT_LEN],
+}
+
+/// `-2 × ln(0.1)` — the constant factor in the §K.1 `maximum_distance`
+/// bound (`maximum_distance = -2 × log(0.1) × σ²`, natural log).
+const NEG_TWO_LN_TENTH: f32 = 4.605_170_2;
+
+impl Spline {
+    /// FDIS §K.3, Listing K.1 (final block) — render this spline onto the
+    /// three XYB planes by additive Gaussian splatting along its arc
+    /// length.
+    ///
+    /// `x_plane` / `y_plane` / `b_plane` are row-major `width × height`
+    /// buffers (the XYB frame planes); the spline's contribution is
+    /// **added** to them. Coordinates outside a plane are clipped (the
+    /// listing clamps `xbegin/xend/ybegin/yend` to the image bounds).
+    ///
+    /// ## Errata note (DCT32 arc parameter)
+    ///
+    /// Listing K.1 writes the `ContinuousIDCT` argument as
+    /// `31 × arclength_from_start / arclength`. With
+    /// `arclength_from_start = min(1, i / arclength) ∈ [0, 1]`, the extra
+    /// `/ arclength` collapses the parameter to `≪ 1` for any spline
+    /// longer than a few pixels, so every channel would evaluate to its DC
+    /// coefficient alone — defeating the 32 encoded DCT coefficients per
+    /// channel. The internally-consistent reading (used here) is
+    /// `t = 31 × arclength_from_start`, mapping the normalized arc position
+    /// onto the DCT32 domain `[0, 31]`. Recorded as a suspected FDIS typo.
+    pub fn render(
+        &self,
+        x_plane: &mut [f32],
+        y_plane: &mut [f32],
+        b_plane: &mut [f32],
+        width: usize,
+        height: usize,
+    ) -> Result<()> {
+        let expected = width
+            .checked_mul(height)
+            .ok_or_else(|| Error::InvalidData("JXL splines: width × height overflow".into()))?;
+        for (name, plane) in [("X", &*x_plane), ("Y", &*y_plane), ("B", &*b_plane)] {
+            if plane.len() != expected {
+                return Err(Error::InvalidData(format!(
+                    "JXL splines: {name} plane length {} != width×height {expected}",
+                    plane.len()
+                )));
+            }
+        }
+        if width == 0 || height == 0 {
+            return Ok(());
+        }
+
+        let upsampled = upsample_control_points(&self.control_points);
+        let samples = resample_by_arclength(&upsampled);
+        if samples.len() < 2 {
+            // A degenerate (single-point) spline has zero arc length and
+            // draws nothing (Listing K.1: arclength = size − 2 + back.d).
+            return Ok(());
+        }
+        let total = samples.len() as f32 - 2.0 + samples.last().unwrap().d;
+        if !total.is_finite() || total <= 0.0 {
+            return Ok(());
+        }
+
+        const SQRT2: f32 = std::f32::consts::SQRT_2;
+        let w_i = width as i64;
+        let h_i = height as i64;
+
+        for (i, sample) in samples.iter().enumerate() {
+            let arclength_from_start = (i as f32 / total).min(1.0);
+            // Errata-corrected DCT32 arc parameter (see doc comment).
+            let t = 31.0 * arclength_from_start;
+
+            let sigma = continuous_idct(&self.dct_sigma, t);
+            let s2s = SQRT2 * sigma;
+            if !s2s.is_finite() || s2s.abs() < 1e-20 {
+                // Zero/degenerate thickness → no visible brush.
+                continue;
+            }
+            let maximum_distance = NEG_TWO_LN_TENTH * sigma * sigma;
+            if !maximum_distance.is_finite() {
+                continue;
+            }
+
+            let p = sample.point;
+            let d = sample.d;
+
+            let xbegin = ((p.x - maximum_distance + 0.5).floor() as i64).max(0);
+            let xend = ((p.x + maximum_distance + 0.5).floor() as i64).min(w_i - 1);
+            let ybegin = ((p.y - maximum_distance + 0.5).floor() as i64).max(0);
+            let yend = ((p.y + maximum_distance + 0.5).floor() as i64).min(h_i - 1);
+            if xend < xbegin || yend < ybegin {
+                continue;
+            }
+
+            let vx = continuous_idct(&self.dct_x, t);
+            let vy = continuous_idct(&self.dct_y, t);
+            let vb = continuous_idct(&self.dct_b, t);
+            // The geometric erf factor is identical across the three
+            // channels (the listing's per-channel `× (erf..) × (erf..)`);
+            // the per-sample `d × σ / 4` scale is likewise shared.
+            let scale = d * sigma / 4.0;
+
+            for x in xbegin..=xend {
+                let xf = x as f32;
+                let ex = erf((p.x - xf + 0.5) / s2s) - erf((p.x - xf - 0.5) / s2s);
+                if ex == 0.0 {
+                    continue;
+                }
+                for y in ybegin..=yend {
+                    let yf = y as f32;
+                    let ey = erf((p.y - yf + 0.5) / s2s) - erf((p.y - yf - 0.5) / s2s);
+                    let g = scale * ex * ey;
+                    let idx = (y as usize) * width + (x as usize);
+                    x_plane[idx] += vx * g;
+                    y_plane[idx] += vy * g;
+                    b_plane[idx] += vb * g;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// FDIS §K.3 — render every spline in draw order onto the XYB planes
+/// (additive; patches have already been drawn, noise follows).
+pub fn render_splines(
+    splines: &[Spline],
+    x_plane: &mut [f32],
+    y_plane: &mut [f32],
+    b_plane: &mut [f32],
+    width: usize,
+    height: usize,
+) -> Result<()> {
+    for spline in splines {
+        spline.render(x_plane, y_plane, b_plane, width, height)?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -511,6 +689,122 @@ mod tests {
             "d = {}",
             s.last().unwrap().d
         );
+    }
+
+    #[test]
+    fn erf_known_values() {
+        assert!(erf(0.0).abs() < 1e-6);
+        assert!((erf(0.5) - 0.520_499_9).abs() < 1e-4);
+        assert!((erf(1.0) - 0.842_700_8).abs() < 1e-4);
+        assert!((erf(3.0) - 1.0).abs() < 1e-4);
+        // Odd symmetry.
+        assert!((erf(-0.7) + erf(0.7)).abs() < 1e-6);
+    }
+
+    /// A dequantized Y-only DC spline: `continuous_idct` returns the DC
+    /// coefficient for every arc position.
+    fn dc_only(dc: f32) -> [f32; SPLINE_DCT_LEN] {
+        let mut c = [0.0f32; SPLINE_DCT_LEN];
+        c[0] = dc;
+        c
+    }
+
+    #[test]
+    fn render_horizontal_streak_is_symmetric_and_localised() {
+        let w = 48usize;
+        let h = 48usize;
+        let mut x = vec![0.0f32; w * h];
+        let mut y = vec![0.0f32; w * h];
+        let mut b = vec![0.0f32; w * h];
+        // A short horizontal spline at y = 24, Y-channel only, σ ≈ 1.5.
+        let spline = Spline {
+            control_points: vec![Point::new(12.0, 24.0), Point::new(36.0, 24.0)],
+            dct_x: [0.0; SPLINE_DCT_LEN],
+            dct_y: dc_only(10.0),
+            dct_b: [0.0; SPLINE_DCT_LEN],
+            dct_sigma: dc_only(1.5),
+        };
+        spline.render(&mut x, &mut y, &mut b, w, h).unwrap();
+
+        // X and B planes are untouched (their DCT is zero).
+        assert!(x.iter().all(|&v| v == 0.0));
+        assert!(b.iter().all(|&v| v == 0.0));
+
+        let at = |px: usize, py: usize| y[py * w + px];
+        // The streak is present near the centre line.
+        assert!(at(24, 24) > 0.0, "centre of streak must be positive");
+        // Vertically symmetric about y = 24 for a mid-line column.
+        assert!((at(24, 23) - at(24, 25)).abs() < 1e-3);
+        assert!((at(24, 22) - at(24, 26)).abs() < 1e-3);
+        // Energy decays away from the line (peak on the line).
+        assert!(at(24, 24) > at(24, 27));
+        // Far corner is essentially untouched.
+        assert!(at(2, 2).abs() < 1e-3);
+    }
+
+    #[test]
+    fn render_rejects_wrong_plane_length() {
+        let spline = Spline {
+            control_points: vec![Point::new(0.0, 0.0), Point::new(4.0, 0.0)],
+            dct_x: [0.0; SPLINE_DCT_LEN],
+            dct_y: dc_only(1.0),
+            dct_b: [0.0; SPLINE_DCT_LEN],
+            dct_sigma: dc_only(1.0),
+        };
+        let mut x = vec![0.0f32; 10];
+        let mut good = vec![0.0f32; 16];
+        assert!(spline
+            .render(&mut x, &mut good.clone(), &mut good, 4, 4)
+            .is_err());
+    }
+
+    #[test]
+    fn render_single_control_point_draws_nothing() {
+        let spline = Spline {
+            control_points: vec![Point::new(8.0, 8.0)],
+            dct_x: [0.0; SPLINE_DCT_LEN],
+            dct_y: dc_only(10.0),
+            dct_b: [0.0; SPLINE_DCT_LEN],
+            dct_sigma: dc_only(2.0),
+        };
+        let mut x = vec![0.0f32; 256];
+        let mut y = vec![0.0f32; 256];
+        let mut b = vec![0.0f32; 256];
+        spline.render(&mut x, &mut y, &mut b, 16, 16).unwrap();
+        assert!(y.iter().all(|&v| v == 0.0));
+    }
+
+    #[test]
+    fn render_splines_batch_is_additive() {
+        let w = 32usize;
+        let h = 32usize;
+        let spline = Spline {
+            control_points: vec![Point::new(6.0, 16.0), Point::new(26.0, 16.0)],
+            dct_x: [0.0; SPLINE_DCT_LEN],
+            dct_y: dc_only(5.0),
+            dct_b: [0.0; SPLINE_DCT_LEN],
+            dct_sigma: dc_only(1.2),
+        };
+        let mut y1 = vec![0.0f32; w * h];
+        let (mut zx, mut zb) = (vec![0.0f32; w * h], vec![0.0f32; w * h]);
+        spline
+            .render(&mut zx.clone(), &mut y1, &mut zb.clone(), w, h)
+            .unwrap();
+
+        // Two copies via render_splines double every sample.
+        let mut y2 = vec![0.0f32; w * h];
+        render_splines(
+            &[spline.clone(), spline.clone()],
+            &mut zx,
+            &mut y2,
+            &mut zb,
+            w,
+            h,
+        )
+        .unwrap();
+        for (a, c) in y1.iter().zip(y2.iter()) {
+            assert!((2.0 * a - c).abs() < 1e-4);
+        }
     }
 
     #[test]
