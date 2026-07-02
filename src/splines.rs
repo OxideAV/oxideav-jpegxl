@@ -39,6 +39,113 @@ impl Point {
     pub fn new(x: f32, y: f32) -> Self {
         Self { x, y }
     }
+
+    /// Element-wise `self + other`.
+    #[inline]
+    fn add(self, other: Point) -> Point {
+        Point::new(self.x + other.x, self.y + other.y)
+    }
+
+    /// Element-wise `self - other`.
+    #[inline]
+    fn sub(self, other: Point) -> Point {
+        Point::new(self.x - other.x, self.y - other.y)
+    }
+
+    /// Element-wise `self × scalar`.
+    #[inline]
+    fn scale(self, s: f32) -> Point {
+        Point::new(self.x * s, self.y * s)
+    }
+
+    /// §K.3 `Mirror(center, point) = center + (center - point)`
+    /// (= `2·center − point`, element-wise).
+    #[inline]
+    fn mirror(center: Point, point: Point) -> Point {
+        center.add(center.sub(point))
+    }
+
+    /// Linear interpolation `self + s × (other − self)`.
+    #[inline]
+    fn lerp(self, other: Point, s: f32) -> Point {
+        self.add(other.sub(self).scale(s))
+    }
+}
+
+/// Number of interior sub-steps inserted between each pair of adjacent
+/// control points by the §K.1 Catmull-Rom upsampling loop (`step` runs
+/// over `[1, 16)`).
+const UPSAMPLE_STEPS: u32 = 16;
+
+/// FDIS §K.3, Listing K.1 (first block) — upsample the decoded control
+/// points into a dense polyline via *centripetal* Catmull-Rom
+/// interpolation.
+///
+/// A single control point yields itself. Otherwise the point list is
+/// extended at both ends with mirror points, then for every window of
+/// four consecutive extended points the segment between the two middle
+/// points is subdivided into 16 sub-steps using the centripetal knot
+/// spacing `t[k] = t[k-1] + ((Δx)² + (Δy)²)^0.25` (i.e. `√distance`). The
+/// final control point is appended verbatim.
+///
+/// NOTE (spec faithfulness): the listing performs no guard against
+/// coincident consecutive control points; when two points coincide a knot
+/// interval is zero and the interpolation divides by zero, exactly as the
+/// listing is written. Encoders do not emit coincident control points, so
+/// this matches conformant streams.
+pub fn upsample_control_points(control_points: &[Point]) -> Vec<Point> {
+    if control_points.is_empty() {
+        return Vec::new();
+    }
+    if control_points.len() == 1 {
+        return vec![control_points[0]];
+    }
+
+    let n = control_points.len();
+    // extended = [Mirror(S[0], S[1]), S..., Mirror(S[n-1], S[n-2])].
+    let mut extended = Vec::with_capacity(n + 2);
+    extended.push(Point::mirror(control_points[0], control_points[1]));
+    extended.extend_from_slice(control_points);
+    extended.push(Point::mirror(control_points[n - 1], control_points[n - 2]));
+
+    let mut out = Vec::new();
+    // for (i = 0; i < extended.size() - 3; ++i)
+    for i in 0..extended.len().saturating_sub(3) {
+        let p = [
+            extended[i],
+            extended[i + 1],
+            extended[i + 2],
+            extended[i + 3],
+        ];
+        out.push(p[1]);
+
+        // Centripetal knot vector t[0..4], t[0] = 0.
+        let mut t = [0.0f32; 4];
+        for k in 1..4 {
+            let d = p[k].sub(p[k - 1]);
+            t[k] = t[k - 1] + (d.x * d.x + d.y * d.y).powf(0.25);
+        }
+
+        for step in 1..UPSAMPLE_STEPS {
+            let knot = t[1] + (step as f32 / UPSAMPLE_STEPS as f32) * (t[2] - t[1]);
+            // A[k] = p[k] + ((knot - t[k]) / (t[k+1] - t[k])) × (p[k+1] - p[k])
+            let mut a = [Point::new(0.0, 0.0); 3];
+            for (k, ak) in a.iter_mut().enumerate() {
+                let s = (knot - t[k]) / (t[k + 1] - t[k]);
+                *ak = p[k].lerp(p[k + 1], s);
+            }
+            // B[k] = A[k] + ((knot - t[k]) / (t[k+2] - t[k])) × (A[k+1] - A[k])
+            let mut b = [Point::new(0.0, 0.0); 2];
+            for (k, bk) in b.iter_mut().enumerate() {
+                let s = (knot - t[k]) / (t[k + 2] - t[k]);
+                *bk = a[k].lerp(a[k + 1], s);
+            }
+            let s = (knot - t[1]) / (t[2] - t[1]);
+            out.push(b[0].lerp(b[1], s));
+        }
+    }
+    out.push(control_points[n - 1]);
+    out
 }
 
 /// Per-channel weight applied to the dequantized DCT32 coefficients,
@@ -251,6 +358,55 @@ mod tests {
         recorrelate_xb(&mut dct_x2, &mut dct_b2, &dct_y, 0.5, 0.9921875);
         assert!((dct_x2[0] - 2.0).abs() < 1e-6);
         assert!((dct_b2[0] - 4.0 * 0.9921875).abs() < 1e-6);
+    }
+
+    #[test]
+    fn upsample_single_point_is_itself() {
+        let out = upsample_control_points(&[Point::new(3.0, 4.0)]);
+        assert_eq!(out, vec![Point::new(3.0, 4.0)]);
+    }
+
+    #[test]
+    fn upsample_two_points_endpoints_and_length() {
+        // Two control points: extended has 4 entries, one window (i=0)
+        // emits p[1] then 15 interior sub-steps, then S.back() is
+        // appended → 1 + 15 + 1 = 17 points, starting at S[0], ending at
+        // S[1].
+        let s0 = Point::new(0.0, 0.0);
+        let s1 = Point::new(16.0, 0.0);
+        let out = upsample_control_points(&[s0, s1]);
+        assert_eq!(out.len(), 17);
+        assert_eq!(out[0], s0);
+        assert_eq!(*out.last().unwrap(), s1);
+    }
+
+    #[test]
+    fn upsample_collinear_stays_on_the_line() {
+        // Equally-spaced collinear control points on y = 5: the
+        // centripetal interpolation must keep every upsampled sample on
+        // that line, with monotone non-decreasing x.
+        let pts: Vec<Point> = (0..4).map(|i| Point::new(i as f32 * 4.0, 5.0)).collect();
+        let out = upsample_control_points(&pts);
+        assert!(out.len() > pts.len());
+        for w in out.windows(2) {
+            assert!(
+                (w[0].y - 5.0).abs() < 1e-3,
+                "sample left the line: y = {}",
+                w[0].y
+            );
+            assert!(
+                w[1].x + 1e-3 >= w[0].x,
+                "x must be monotone non-decreasing: {} then {}",
+                w[0].x,
+                w[1].x
+            );
+        }
+        assert!((out.last().unwrap().y - 5.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn upsample_empty_is_empty() {
+        assert!(upsample_control_points(&[]).is_empty());
     }
 
     #[test]
