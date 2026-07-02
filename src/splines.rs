@@ -24,6 +24,7 @@
 //! All maths follows the FDIS listings verbatim; no external decoder
 //! source is consulted (see the crate README "History" note).
 
+use crate::bitreader::unpack_signed;
 use oxideav_core::{Error, Result};
 
 /// A 2-D point with element-wise arithmetic, as used by the §K.1
@@ -494,6 +495,131 @@ impl Spline {
     }
 }
 
+/// Number of clustered distributions (contexts) in the §C.4.6 spline ANS
+/// stream — one per `ReadHybridVarLenUint` context index 0..6.
+pub const SPLINE_NUM_CONTEXTS: usize = 6;
+
+/// FDIS §C.4.6 — decode the spline dictionary from an abstract
+/// `ReadHybridVarLenUint(ctx)` source.
+///
+/// This carries the full Listing C.3 / Listing C.4 structure independent
+/// of the entropy back-end: `read_uint(ctx)` returns the next hybrid
+/// var-len uint for context `ctx`. [`decode_splines`] wraps it with the
+/// real §D.3 [`crate::modular_fdis::EntropyStream`]; tests drive it with a
+/// scripted token source.
+///
+/// Context assignment (per Listing C.3 and the per-spline steps):
+/// `2` num_splines, `0` quant_adjust, `1` start coords, `3`
+/// num_control_points, `4` control-point deltas, `5` DCT32 coefficients.
+pub fn decode_splines_with<F>(
+    mut read_uint: F,
+    base_correlation_x: f32,
+    base_correlation_b: f32,
+) -> Result<Vec<Spline>>
+where
+    F: FnMut(u32) -> Result<u32>,
+{
+    // num_splines = ReadHybridVarLenUint(2) + 1;
+    let num_splines = read_uint(2)?
+        .checked_add(1)
+        .ok_or_else(|| Error::InvalidData("JXL splines: num_splines overflow".into()))?
+        as usize;
+    // quant_adjust = UnpackSigned(ReadHybridVarLenUint(0));
+    let quant_adjust = unpack_signed(read_uint(0)?);
+
+    // Listing C.3 — starting coordinates (delta-coded after the first).
+    let mut start = Vec::with_capacity(num_splines.min(1024));
+    let (mut last_x, mut last_y): (i64, i64) = (0, 0);
+    for i in 0..num_splines {
+        let rx = read_uint(1)?;
+        let ry = read_uint(1)?;
+        let (x, y) = if i == 0 {
+            (rx as i64, ry as i64)
+        } else {
+            (
+                unpack_signed(rx) as i64 + last_x,
+                unpack_signed(ry) as i64 + last_y,
+            )
+        };
+        start.push((x, y));
+        last_x = x;
+        last_y = y;
+    }
+
+    // Per-spline: control points (double-delta) + 4×32 DCT coefficients.
+    let mut out = Vec::with_capacity(num_splines.min(1024));
+    for &(sp_x, sp_y) in &start {
+        // num_control_points = 1 + ReadHybridVarLenUint(3);
+        let num_cp = (read_uint(3)? as usize)
+            .checked_add(1)
+            .ok_or_else(|| Error::InvalidData("JXL splines: num_control_points overflow".into()))?;
+        // Interleaved (x1, y1, x2, y2, …) second-order deltas.
+        let mut dx = Vec::with_capacity((num_cp - 1).min(1 << 20));
+        let mut dy = Vec::with_capacity((num_cp - 1).min(1 << 20));
+        for _ in 0..num_cp - 1 {
+            dx.push(unpack_signed(read_uint(4)?) as i64);
+            dy.push(unpack_signed(read_uint(4)?) as i64);
+        }
+        let cx = decode_double_delta(sp_x, &dx);
+        let cy = decode_double_delta(sp_y, &dy);
+        let control_points: Vec<Point> = cx
+            .iter()
+            .zip(cy.iter())
+            .map(|(&x, &y)| Point::new(x as f32, y as f32))
+            .collect();
+
+        // Four channels of 32 quantized DCT coefficients: X, Y, B, σ.
+        let mut raw = [[0i32; SPLINE_DCT_LEN]; 4];
+        for chan in raw.iter_mut() {
+            for c in chan.iter_mut() {
+                *c = unpack_signed(read_uint(5)?);
+            }
+        }
+        let mut dct_x = dequant_dct32(&raw[0], quant_adjust, 0).unwrap();
+        let dct_y = dequant_dct32(&raw[1], quant_adjust, 1).unwrap();
+        let mut dct_b = dequant_dct32(&raw[2], quant_adjust, 2).unwrap();
+        let dct_sigma = dequant_dct32(&raw[3], quant_adjust, 3).unwrap();
+        recorrelate_xb(
+            &mut dct_x,
+            &mut dct_b,
+            &dct_y,
+            base_correlation_x,
+            base_correlation_b,
+        );
+
+        out.push(Spline {
+            control_points,
+            dct_x,
+            dct_y,
+            dct_b,
+            dct_sigma,
+        });
+    }
+    Ok(out)
+}
+
+/// FDIS §C.4.6 — decode the spline dictionary from the codestream.
+///
+/// Reads the §D.3 six-distribution ANS prelude, its ANS-state init
+/// (§C.3.2), then drives [`decode_splines_with`] against the resulting
+/// entropy stream. `base_correlation_{x,b}` come from the frame's
+/// LfChannelCorrelation bundle (§C.4.4).
+pub fn decode_splines(
+    br: &mut crate::bitreader::BitReader<'_>,
+    base_correlation_x: f32,
+    base_correlation_b: f32,
+) -> Result<Vec<Spline>> {
+    use crate::modular_fdis::{decode_uint_in_with_dist_pub, EntropyStream};
+    let mut entropy = EntropyStream::read(br, SPLINE_NUM_CONTEXTS)?;
+    entropy.read_ans_state_init(br)?;
+    let mut hybrid = crate::ans::hybrid::HybridUintState::new(entropy.lz77, entropy.lz_len_conf);
+    decode_splines_with(
+        |ctx| decode_uint_in_with_dist_pub(&mut hybrid, &mut entropy, br, ctx, 0),
+        base_correlation_x,
+        base_correlation_b,
+    )
+}
+
 /// FDIS §K.3 — render every spline in draw order onto the XYB planes
 /// (additive; patches have already been drawn, noise follows).
 pub fn render_splines(
@@ -805,6 +931,106 @@ mod tests {
         for (a, c) in y1.iter().zip(y2.iter()) {
             assert!((2.0 * a - c).abs() < 1e-4);
         }
+    }
+
+    #[test]
+    fn decode_splines_with_parses_one_spline() {
+        // Scripted ReadHybridVarLenUint returns; also records the ctx
+        // sequence so the parse's context routing is verified.
+        // ctx2 num_splines-1=0; ctx0 quant_adjust=0; ctx1 sp_x[0]=10,
+        // sp_y[0]=24; ctx3 num_control_points-1=1; ctx4 x1 raw
+        // (UnpackSigned=20), y1 raw (0).
+        let mut script: Vec<u32> = vec![0, 0, 10, 24, 1, 40, 0];
+        // X channel: 32 zeros.
+        script.extend(std::iter::repeat_n(0, 32));
+        // Y channel: index 0 = UnpackSigned(200) = 100, rest 0.
+        script.push(200);
+        script.extend(std::iter::repeat_n(0, 31));
+        // B channel: 32 zeros.
+        script.extend(std::iter::repeat_n(0, 32));
+        // σ channel: index 0 = UnpackSigned(40) = 20, rest 0.
+        script.push(40);
+        script.extend(std::iter::repeat_n(0, 31));
+
+        let expected_ctx_prefix = [2u32, 0, 1, 1, 3, 4, 4];
+
+        let mut idx = 0usize;
+        let mut ctxs: Vec<u32> = Vec::new();
+        let splines = decode_splines_with(
+            |ctx| {
+                ctxs.push(ctx);
+                let v = script[idx];
+                idx += 1;
+                Ok(v)
+            },
+            0.0,
+            1.0,
+        )
+        .unwrap();
+
+        // All scripted tokens consumed, correct context routing.
+        assert_eq!(idx, script.len());
+        assert_eq!(&ctxs[..expected_ctx_prefix.len()], &expected_ctx_prefix);
+        assert!(ctxs[expected_ctx_prefix.len()..].iter().all(|&c| c == 5));
+
+        assert_eq!(splines.len(), 1);
+        let s = &splines[0];
+        assert_eq!(
+            s.control_points,
+            vec![Point::new(10.0, 24.0), Point::new(30.0, 24.0)]
+        );
+        // qa = 0 → divisor 1. Y DC = 100 × 0.075 = 7.5.
+        assert!((s.dct_y[0] - 7.5).abs() < 1e-4);
+        // σ DC = 20 × 0.3333.
+        assert!((s.dct_sigma[0] - 20.0 * 0.3333).abs() < 1e-4);
+        // X DC = 0 + base_correlation_x(0) × Y = 0.
+        assert_eq!(s.dct_x[0], 0.0);
+        // B DC = 0 + base_correlation_b(1) × Y = 7.5.
+        assert!((s.dct_b[0] - 7.5).abs() < 1e-4);
+    }
+
+    #[test]
+    fn decode_splines_with_delta_coded_start_points() {
+        // Two splines: second start point is delta-coded off the first.
+        // sp[0] = (5, 5); sp[1] = (5 + UnpackSigned(4), 5 + UnpackSigned(2))
+        //       = (5 + 2, 5 + 1) = (7, 6).
+        let mut script: Vec<u32> = vec![
+            1, // ctx2: num_splines - 1 = 1 → 2 splines
+            0, // ctx0: quant_adjust = 0
+            5, // ctx1: sp_x[0] = 5 (literal)
+            5, // ctx1: sp_y[0] = 5
+            4, // ctx1: sp_x[1] raw → UnpackSigned(4) = 2 → 7
+            2, // ctx1: sp_y[1] raw → UnpackSigned(2) = 1 → 6
+        ];
+        // Spline 0: 1 control point (num_cp - 1 = 0), then 4×32 coeffs.
+        script.push(0); // ctx3
+        script.extend(std::iter::repeat_n(0, 128));
+        // Spline 1: 1 control point, then 4×32 coeffs.
+        script.push(0); // ctx3
+        script.extend(std::iter::repeat_n(0, 128));
+
+        let mut idx = 0usize;
+        let splines = decode_splines_with(
+            |_ctx| {
+                let v = script[idx];
+                idx += 1;
+                Ok(v)
+            },
+            0.0,
+            1.0,
+        )
+        .unwrap();
+        assert_eq!(idx, script.len());
+        assert_eq!(splines.len(), 2);
+        assert_eq!(splines[0].control_points, vec![Point::new(5.0, 5.0)]);
+        assert_eq!(splines[1].control_points, vec![Point::new(7.0, 6.0)]);
+    }
+
+    #[test]
+    fn decode_splines_propagates_read_error() {
+        // A read that fails partway is surfaced, not swallowed.
+        let err = decode_splines_with(|_ctx| Err(Error::InvalidData("boom".into())), 0.0, 1.0);
+        assert!(err.is_err());
     }
 
     #[test]
