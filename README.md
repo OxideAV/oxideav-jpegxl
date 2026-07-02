@@ -118,6 +118,24 @@ What is implemented and tested today:
   `sigma < 0.3` block-skip (`epf::EPF_SKIP_SIGMA`) passes a block's
   pixels through unchanged. A uniform grid reduces bit-exactly to the
   constant-sigma path.
+- **§C.4.6 + §K.3 Splines image feature** — the self-contained `splines`
+  module decodes and renders centripetal Catmull-Rom splines. The §C.4.6
+  parse (`decode_splines` / `decode_splines_with`) reads Listing C.3
+  (num_splines, `quant_adjust`, delta-coded start coords) + per-spline
+  control points (Listing C.4 `DecodeDoubleDelta`) and 4×32 DCT
+  coefficients over the §D.3 six-distribution ANS stream, dequantizes
+  (`dequant_dct32`, `kChannelWeight`) and recorrelates (`recorrelate_xb`,
+  `Y × base_correlation_{x,b}`). The §K.3 render (`Spline::render` /
+  `render_splines`) upsamples control points (`upsample_control_points`),
+  resamples by unit arc length (`resample_by_arclength`), and additively
+  splats an `erf`-based Gaussian brush (`s2s = √2·σ`,
+  `maximum_distance = -2·ln(0.1)·σ²`) onto the XYB planes, evaluating each
+  channel via `continuous_idct`. A suspected FDIS typo in the Listing K.1
+  arc parameter is corrected (see below). 25 unit tests + 3 end-to-end
+  integration tests. **Not yet wired into the registered decode path** —
+  that needs an f32-XYB plane hand-off at the §C.4 LfGlobal splines
+  section plus a spline conformance fixture; the `lf_global.rs` splines
+  rejection is the integration hook.
 
 ### Not yet implemented
 

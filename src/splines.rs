@@ -942,15 +942,15 @@ mod tests {
         // (UnpackSigned=20), y1 raw (0).
         let mut script: Vec<u32> = vec![0, 0, 10, 24, 1, 40, 0];
         // X channel: 32 zeros.
-        script.extend(std::iter::repeat_n(0, 32));
+        script.resize(script.len() + 32, 0);
         // Y channel: index 0 = UnpackSigned(200) = 100, rest 0.
         script.push(200);
-        script.extend(std::iter::repeat_n(0, 31));
+        script.resize(script.len() + 31, 0);
         // B channel: 32 zeros.
-        script.extend(std::iter::repeat_n(0, 32));
+        script.resize(script.len() + 32, 0);
         // σ channel: index 0 = UnpackSigned(40) = 20, rest 0.
         script.push(40);
-        script.extend(std::iter::repeat_n(0, 31));
+        script.resize(script.len() + 31, 0);
 
         let expected_ctx_prefix = [2u32, 0, 1, 1, 3, 4, 4];
 
@@ -1004,10 +1004,10 @@ mod tests {
         ];
         // Spline 0: 1 control point (num_cp - 1 = 0), then 4×32 coeffs.
         script.push(0); // ctx3
-        script.extend(std::iter::repeat_n(0, 128));
+        script.resize(script.len() + 128, 0);
         // Spline 1: 1 control point, then 4×32 coeffs.
         script.push(0); // ctx3
-        script.extend(std::iter::repeat_n(0, 128));
+        script.resize(script.len() + 128, 0);
 
         let mut idx = 0usize;
         let splines = decode_splines_with(
