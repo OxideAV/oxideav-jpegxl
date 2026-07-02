@@ -7,6 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.12](https://github.com/OxideAV/oxideav-jpegxl/compare/v0.0.11...v0.0.12) - 2026-07-02
+
+### Other
+
+- splines end-to-end integration test + README/CHANGELOG
+- splines §C.4.6 codestream entropy parse (Listing C.3/C.4)
+- splines §K.1 Gaussian-brush splat + Spline render (erf)
+- splines §K.1 arc-length resampling into unit-spaced samples
+- splines §K.1 centripetal Catmull-Rom control-point upsampling
+- splines §C.4.6 coefficient math + §K.3 ContinuousIDCT
+- multi-frame codestream iteration — decode_all_frames + animation walk
+- decode 2024-edition RestorationFilter (Table J.1), unblock animation-3frame first frame
+- jpegxl r375: gate undrawn image features (noise/patches/splines) in Modular decode
+- jpegxl r375: wire §J restoration filters into the Modular XYB decode path
+- jpegxl r372: pin vardct-d1 LF-magnitude divergence as exact 4.0x measurement + HF-isolation localisation
+- jpegxl r367: correct vardct-d1 magnitude-bug localisation (DCT64x64, not DCT8x8) + LF→LLF→IDCT DC-preservation invariant
+- jpegxl r362: VarDCT reference-divergence harness + magnitude-bug localisation
+- jpegxl r355: README — accurate registered-codec decode status
+- jpegxl r355: fix LF channel-order swap in integrated VarDCT decode
+- jpegxl r355: integrated single-LfGroup VarDCT decode reaches pixels end-to-end
+- round-349 (parent-dispatch r349) against ISO/IEC FDIS 18181-1:2021 — wire HfGlobalSection into the integrated VarDCT decode: parse through the full §C.7 section on real bytes
+- round-349 (parent-dispatch r349) against ISO/IEC FDIS 18181-1:2021 — HfGlobalSection::decode_context: bridge parsed §C.7.2 histograms → HfHistogramDecodeContext
+- round-349 (parent-dispatch r349) against ISO/IEC FDIS 18181-1:2021 — §C.7 HfGlobalSection: chain HfGlobal + HfPass sequence + §C.7.2 histograms on one bit cursor
+- round-346 (parent-dispatch r346) against ISO/IEC FDIS 18181-1:2021 — histogram-backed multi-pass per-LfGroup VarDCT decode + reconstruction
+- round-343 (parent-dispatch r343) against ISO/IEC FDIS 18181-1:2021 — fused live-entropy per-LfGroup VarDCT reconstruction
+- end-to-end non-square VarDCT integration tests + README — six rectangular DCT families reconstruct to spatial samples through the cross-pass walk
+- §C.8.3+F.3+I.2 integration — one-call per-LfGroup non-square VarDCT reconstruction from cross-pass accumulated coefficients to spatial residual planes
+- round-340 (parent-dispatch r340) against ISO/IEC FDIS 18181-1:2021 — §C.8.3 cross-pass HF coefficient accumulation (per-pass shift[] left-shift + sum) for the multi-pass VarDCT decode walk
+- round-336 (parent-dispatch r336) against ISO/IEC FDIS 18181-1:2021 — §J.3.3 VarDCT per-block-sigma EPF driver + sigma<0.3 block-skip
+- §J.3.1 three-step EPF iteration driver (constant-sigma)
+- round-328 (parent-dispatch r328) against ISO/IEC FDIS 18181-1:2021 — §6.2 right/bottom crop of the padded VarDCT reconstruction (ResidualPlane::crop_to + ChannelResidualPlanes::crop_to)
+- round-322 (parent-dispatch r322) against ISO/IEC FDIS 18181-1:2021 — LF-aware per-LfGroup VarDCT three-channel residual-plane reconstruction (§I.2.4 LLF prefix → §I.2.3.2 IDCT, wired into §C.5.4 placement + Annex G CfL)
+- round-316 (parent-dispatch r316) against ISO/IEC FDIS 18181-1:2021 — per-block VarDCT LLF-coefficient placement (§I.2.4 natural-order LLF prefix → §I.2.3.2 IDCT)
+- refresh to current status, drop per-round changelog cruft
+
 ### Other
 
 - round-382 (parent-dispatch r382) against ISO/IEC FDIS 18181-1:2021 — **Splines image feature (§C.4.6 decode + §K.3 render), complete self-contained `splines` module.** Built in five spec-cited layers, each independently tested against the FDIS listings: (1) coefficient post-processing — `decode_double_delta` (Listing C.4), `quant_adjust_divisor` + `dequant_dct32` (per-channel DCT32 dequant with `kChannelWeight = {0.0042, 0.075, 0.07, 0.3333}`), `recorrelate_xb` (add `Y × base_correlation_{x,b}` to X/B), and `continuous_idct` (§K.3 `ContinuousIDCT`); (2) `upsample_control_points` — §K.1 centripetal Catmull-Rom control-point upsampling (mirror-extended windows, `√distance` knot spacing, 16 sub-steps); (3) `resample_by_arclength` — §K.1 unit-arc-length resampling into `ArcSample`s carrying the `.arclength` weight `d`; (4) `Spline::render` / `render_splines` — the §K.1 Gaussian brush (`erf`-based per-pixel-cell integration, `s2s = √2·σ`, `maximum_distance = -2·ln(0.1)·σ²`, box clamp, additive XYB splat), with a standard `erf` rational approximation (err ≈1.5e-7); (5) `decode_splines_with` / `decode_splines` — the §C.4.6 codestream parse (Listing C.3: num_splines, quant_adjust, delta-coded start coords, per-spline control points + 4×32 DCT coefficients) over the §D.3 six-distribution ANS stream (`EntropyStream` + `HybridUintState`), factored over an abstract `ReadHybridVarLenUint(ctx)` source for full unit-testability. 25 module unit tests + 3 end-to-end integration tests (`tests/r382_splines.rs`). **Errata note (suspected FDIS typo):** Listing K.1's `ContinuousIDCT` arc parameter `31 × arclength_from_start / arclength` is dimensionally inconsistent — `arclength_from_start ∈ [0,1]` already, so the extra `/ arclength` collapses the DCT32 parameter to ≪1, reducing every channel to its DC coefficient and defeating the 32 encoded coefficients; the internally-consistent reading `t = 31 × arclength_from_start` (normalized arc → DCT32 domain [0,31]) is used. Not yet wired into the registered decode path (needs an f32-XYB plane hand-off at the §C.4 LfGlobal splines section + a spline conformance fixture); the `lf_global.rs` splines rejection remains as the integration hook.
