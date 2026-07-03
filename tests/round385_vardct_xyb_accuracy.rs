@@ -25,10 +25,9 @@
 //! implementation source is consulted.
 
 use std::io::Cursor;
-use std::sync::atomic::Ordering;
 
 use oxideav_jpegxl::metadata_fdis::{OpsinInverseMatrix, ToneMapping};
-use oxideav_jpegxl::{VARDCT_XYB_CAPTURE, VARDCT_XYB_CAPTURE_ARMED};
+use oxideav_jpegxl::{set_vardct_xyb_capture_armed, VARDCT_XYB_CAPTURE};
 
 const JXL: &[u8] = include_bytes!("fixtures/vardct_256x256_d1.jxl");
 const REF_PNG: &[u8] = include_bytes!("fixtures/vardct_256x256_d1_expected.png");
@@ -37,9 +36,9 @@ const REF_PNG: &[u8] = include_bytes!("fixtures/vardct_256x256_d1_expected.png")
 /// the cropped pre-§L.2.2 `[X, Y, B]` planes.
 fn decode_internal_xyb() -> [Vec<f32>; 3] {
     VARDCT_XYB_CAPTURE.with(|s| *s.borrow_mut() = None);
-    VARDCT_XYB_CAPTURE_ARMED.store(true, Ordering::Relaxed);
+    set_vardct_xyb_capture_armed(true);
     let r = oxideav_jpegxl::decode_vardct_frame_from_codestream(JXL, None);
-    VARDCT_XYB_CAPTURE_ARMED.store(false, Ordering::Relaxed);
+    set_vardct_xyb_capture_armed(false);
     r.expect("integrated VarDCT decode");
     VARDCT_XYB_CAPTURE
         .with(|s| s.borrow_mut().take())

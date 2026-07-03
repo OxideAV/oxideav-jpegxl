@@ -1566,17 +1566,22 @@ thread_local! {
     /// Diagnostic capture of the integrated VarDCT decode's cropped
     /// pre-§L.2.2 XYB planes (`[X, Y, B]`, row-major, logical frame
     /// extent). Populated by `finish_vardct_decode` when
-    /// [`VARDCT_XYB_CAPTURE_ARMED`] is set for the current process;
-    /// caller clears / reads around the decode call. Same test-hook
-    /// pattern as the `modular_fdis` trace statics.
+    /// [`set_vardct_xyb_capture_armed`] armed the **current thread**;
+    /// caller clears / reads around the decode call. Same per-thread
+    /// test-hook pattern as the `modular_fdis` rich-range statics — a
+    /// process-global arm flag would race between concurrently running
+    /// tests (one test disarming while another thread is mid-decode).
     pub static VARDCT_XYB_CAPTURE: std::cell::RefCell<Option<[Vec<f32>; 3]>> =
         const { std::cell::RefCell::new(None) };
+    /// Per-thread arm flag for [`VARDCT_XYB_CAPTURE`]. Off by default
+    /// so the capture costs nothing on the normal decode path.
+    static VARDCT_XYB_CAPTURE_ARMED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// Arm flag for [`VARDCT_XYB_CAPTURE`]. Off by default so the capture
-/// costs nothing on the normal decode path.
-pub static VARDCT_XYB_CAPTURE_ARMED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+/// Arm / disarm [`VARDCT_XYB_CAPTURE`] for the CURRENT thread.
+pub fn set_vardct_xyb_capture_armed(on: bool) {
+    VARDCT_XYB_CAPTURE_ARMED.with(|c| c.set(on));
+}
 
 /// Inputs the integrated single-pass VarDCT finish step (`finish_vardct_decode`)
 /// pulls together once the LfGlobal / LfGroup / HfGlobal sections have
@@ -1762,7 +1767,7 @@ fn finish_vardct_decode(
     // trace hooks in `modular_fdis`). Used by measurement tests that
     // compare the internal XYB domain against a reference decode without
     // the 8-bit RGB round-trip.
-    if VARDCT_XYB_CAPTURE_ARMED.load(std::sync::atomic::Ordering::Relaxed) {
+    if VARDCT_XYB_CAPTURE_ARMED.with(|c| c.get()) {
         VARDCT_XYB_CAPTURE.with(|s| {
             *s.borrow_mut() = Some([
                 cropped.planes[0].samples.clone(),
