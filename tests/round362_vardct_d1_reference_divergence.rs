@@ -22,18 +22,22 @@
 //!    X and B at the default bundle (measured independently on both
 //!    channels). See `chroma_from_luma::kx_kb_lf`.
 //!
-//! With those fixes the internal XYB frame-means match the reference's
+//! Two further round-385 fixes tightened this again: the §J restoration
+//! filters (Gaborish + per-block-sigma EPF) now run on the integrated
+//! path, and the Listing I.16 LLF normalisation was corrected (the LLF
+//! block is the plain §I.2.1-normalised forward DCT of the LF block —
+//! the literal `× ScaleF` reading left every LLF AC cell off by exactly
+//! `ScaleF(8, 64, u)` per axis; see `llf_from_lf`).
+//!
+//! With all fixes the internal XYB frame-means match the reference's
 //! forward-XYB means to ~4 decimal places (X 0.00014 vs 0.00016,
 //! Y 0.45788 vs 0.45807, B 0.47213 vs 0.47229) and the sRGB-domain
-//! per-channel MAD collapses to ≈ 10.9 / 10.5 / 7.5 with **zero** railed
-//! pixels. The residual error is HF-shaped: the reference applies the §J
-//! restoration filters (Gaborish + EPF), which this integrated path does
-//! not yet run, so the remaining gap is concentrated in the per-8×8
-//! high-frequency detail, not the DC.
+//! per-channel MAD collapses to ≈ 4.2 / 2.6 / 3.3 with **zero** railed
+//! pixels. The residual error is concentrated in the entropy-decoded HF
+//! coefficients (the §C.8.3 per-block stream — under active
+//! investigation), not the LF/LLF path.
 //!
-//! This suite is the tightened ratchet at the round-385 baseline. When
-//! the §J filters land in the integrated path the MAD bound should
-//! tighten again toward a true pixel-accuracy gate.
+//! This suite is the tightened ratchet at the round-385 baseline.
 //!
 //! Comparison domain note: this crate's decode output is documented as
 //! **linear** RGB (the §L.2.2 NOTE's "the transfer function is linear"
@@ -116,13 +120,14 @@ fn reference_is_a_normal_mid_tone_photo() {
     );
 }
 
-/// Round-385 accuracy ratchet: after the Listing C.1 multiplier fix +
-/// the Annex G CfL branch split + the LF-factor `-128` bias fix, the
+/// Round-385 accuracy ratchet: after the Listing C.1 multiplier fix,
+/// the Annex G CfL branch split, the LF-factor `-128` bias fix, the §J
+/// filter wiring, and the Listing I.16 LLF-normalisation fix, the
 /// integrated VarDCT reconstruction is a close match to the reference —
 /// zero railed pixels, per-channel means within ±4/255, per-channel MAD
-/// under 14/255 in the sRGB domain. The remaining gap is the §J
-/// restoration filters (not yet applied on this path); when they land,
-/// tighten these bounds further.
+/// under 6/255 in the sRGB domain (measured ≈ 4.2 / 2.6 / 3.3). The
+/// remaining gap is in the entropy-decoded HF coefficients; when that
+/// path is fixed, tighten these bounds further.
 #[test]
 fn vardct_output_tracks_reference_within_hf_filter_gap() {
     let frame = oxideav_jpegxl::decode_vardct_frame_from_codestream(VARDCT_D1_JXL, None)
@@ -172,10 +177,10 @@ fn vardct_output_tracks_reference_within_hf_filter_gap() {
         );
         let mad = total_abs_err[k] as f64 / n as f64;
         assert!(
-            mad < 14.0,
-            "channel {k} MAD {mad:.2} exceeds the round-385 baseline bound of 14 \
-             (measured ≈ 10.9 / 10.5 / 7.5; the residual is the not-yet-applied §J \
-             restoration filters). A regression pushed it up — investigate before \
+            mad < 6.0,
+            "channel {k} MAD {mad:.2} exceeds the round-385 baseline bound of 6 \
+             (measured ≈ 4.2 / 2.6 / 3.3; the residual is the entropy-decoded HF \
+             coefficient path). A regression pushed it up — investigate before \
              loosening this ratchet."
         );
     }

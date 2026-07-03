@@ -406,11 +406,12 @@ pub fn llf_dims(t: TransformType) -> (u32, u32) {
 /// `input` is `cy * cx` samples in row-major order. `t` selects the
 /// transform; the LF-block shape is taken from [`llf_dims`].
 ///
-/// For the 18 DCT-family transforms, the procedure is:
-///
-/// 1. `dc = DCT_2D(input)`.
-/// 2. `output(x, y) = dc(x, y) * ScaleF(cy, bheight, y) * ScaleF(cx,
-///    bwidth, x)`.
+/// For the 18 DCT-family transforms, the output is the §I.2.1-normalised
+/// forward 2-D DCT of the LF block: `output(x, y) = dc(x, y)` — the
+/// Listing I.16 `× ScaleF(cy, bheight, y) × ScaleF(cx, bwidth, x)`
+/// factors are NOT applied on top of this module's I.2.1-normalised
+/// [`dct_2d`]; see the in-function erratum note (round 385) for the
+/// reference-measured derivation.
 ///
 /// For the non-DCT transforms (single-8×8-block), the LF block is
 /// `1 × 1` and the output is the input unchanged.
@@ -496,23 +497,33 @@ pub fn llf_from_lf(input: &[f32], t: TransformType) -> Result<Vec<f32>> {
         t
     };
 
-    // Listing I.16: output(x, y) = dc(x, y) * ScaleF(cy, bheight, y)
-    //                              * ScaleF(cx, bwidth, x)
-    // where bwidth = 8 * cx and bheight = 8 * cy.
-    let bwidth = 8 * cx;
-    let bheight = 8 * cy;
-    // Precompute the per-axis ScaleF vectors so we don't recompute
-    // them for every (x, y) cell.
-    let scale_x: Vec<f32> = (0..cx).map(|x| scale_f(cx, bwidth, x)).collect();
-    let scale_y: Vec<f32> = (0..cy).map(|y| scale_f(cy, bheight, y)).collect();
-
-    let mut out = vec![0.0f32; cy_u * cx_u];
-    for y in 0..cy_u {
-        for x in 0..cx_u {
-            out[y * cx_u + x] = dc_yx[y * cx_u + x] * scale_y[y] * scale_x[x];
-        }
-    }
-    Ok(out)
+    // Listing I.16 — corrected normalisation (FDIS erratum candidate,
+    // round 385). The FDIS listing multiplies `dc(x, y)` by
+    // `ScaleF(cy, bheight, y) × ScaleF(cx, bwidth, x)`. Measured
+    // against the `vardct-256x256-d1` reference decode (per-cell
+    // least-squares over the 16 DCT64×64 varblocks), that literal
+    // reading leaves every LLF AC cell off by exactly
+    // `ScaleF(8, 64, u)` per axis — the required correction is its
+    // reciprocal at every AC index — while the swapped-argument
+    // reading (`ScaleF(bheight, cy, y)`, i.e. exactly the reciprocal
+    // per Listing I.15's identity `ScaleF(N, n, x) × ScaleF(n, N, x)
+    // = 1`) overshoots by the same factor in the other direction. The
+    // unique reading consistent with the reference is **no ScaleF
+    // factor at all** over the §I.2.1-normalised forward DCT this
+    // module implements: the LLF block is the plain I.2.1 DCT of the
+    // LF block (measured per-axis scale 1.00 on Y and B; X within
+    // 8-bit reference noise). I.e. Listing I.16's `DCT_2D` refers to a
+    // DCT normalisation for which the `× ScaleF` factors land at the
+    // I.2.1 normalisation — composing them with an I.2.1-normalised
+    // DCT double-applies the scale. At `x = 0` `ScaleF(·, ·, 0) = 1`
+    // under every reading (D(N,0)·I(n,0) = 1/sqrt(nN) on both
+    // branches), which is why the DC-exact invariant (round 367) held
+    // while every AC cell was off.
+    //
+    // The Listing I.15 helpers (`scale_i8` / `scale_d8` / `scale_c` /
+    // `scale_f`) remain exposed + tested for the record and for any
+    // future re-derivation against a second fixture.
+    Ok(dc_yx)
 }
 
 #[cfg(test)]
@@ -825,15 +836,11 @@ mod tests {
         // So all four DCT coefficients are 1/4 = 0.25 exactly.
         let block = [1.0f32, 0.0, 0.0, 0.0];
         let out = llf_from_lf(&block, TransformType::Dct16x16).unwrap();
-        let sf0 = scale_f(2, 16, 0);
-        let sf1 = scale_f(2, 16, 1);
-        // out[y*cx + x] = 0.25 * ScaleF_y * ScaleF_x.
-        let expected = [
-            0.25 * sf0 * sf0,
-            0.25 * sf0 * sf1,
-            0.25 * sf1 * sf0,
-            0.25 * sf1 * sf1,
-        ];
+        // Round-385 corrected normalisation: the LLF block is the plain
+        // §I.2.1-normalised forward DCT of the LF block — no ScaleF
+        // factors on top (see the in-function erratum note). All four
+        // DCT coefficients of this signal are exactly 0.25.
+        let expected = [0.25f32, 0.25, 0.25, 0.25];
         for (i, (got, want)) in out.iter().zip(expected.iter()).enumerate() {
             assert!(
                 (got - want).abs() < 1e-5,

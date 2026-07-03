@@ -133,22 +133,18 @@ fn llf_from_lf_non_dct_pass_through() {
 
 /// Byte-exact: for DCT16×16 with the 2×2 LF block `[1, 0, 0, 0]`
 /// (impulse at (x=0, y=0)), all four LLF coefficients evaluate to
-/// `0.25 * ScaleF(2, 16, y) * ScaleF(2, 16, x)`. We assert against
-/// the explicit per-cell expected values computed via ScaleF.
+/// `0.25` — the round-385 corrected Listing I.16 normalisation makes
+/// the LLF block the plain §I.2.1-normalised forward DCT of the LF
+/// block (no ScaleF factors on top; see `llf_from_lf`'s erratum note
+/// for the reference-measured derivation).
 #[test]
 fn llf_from_lf_dct16x16_impulse_byte_exact() {
     let block = [1.0f32, 0.0, 0.0, 0.0];
     let out = llf_from_lf(&block, TransformType::Dct16x16).unwrap();
-    let sf0 = scale_f(2, 16, 0);
-    let sf1 = scale_f(2, 16, 1);
     // out layout: (cy × cx) row-major = (2 × 2) row-major,
-    // out[y * 2 + x].
-    let expected = [
-        0.25 * sf0 * sf0, // (x=0,y=0)
-        0.25 * sf0 * sf1, // (x=1,y=0)
-        0.25 * sf1 * sf0, // (x=0,y=1)
-        0.25 * sf1 * sf1, // (x=1,y=1)
-    ];
+    // out[y * 2 + x]. All four I.2.1 DCT coefficients of the impulse
+    // are exactly 0.25.
+    let expected = [0.25f32, 0.25, 0.25, 0.25];
     for (i, (g, e)) in out.iter().zip(expected.iter()).enumerate() {
         assert!((g - e).abs() < 1e-6, "cell {i}: got {g}, expected {e}",);
     }
