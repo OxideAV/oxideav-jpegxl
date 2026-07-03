@@ -13,6 +13,7 @@ use oxideav_jpegxl::metadata_fdis::{ImageMetadataFdis, SizeHeaderFdis};
 use oxideav_jpegxl::toc::Toc;
 
 const JXL: &[u8] = include_bytes!("fixtures/large_1024x768_d2.jxl");
+const REF_PNG: &[u8] = include_bytes!("fixtures/large_1024x768_d2_expected.png");
 
 /// Parse the codestream prelude + FrameHeader + TOC of the raw-codestream
 /// fixture, returning `(frame_header, toc, frame_bytes)` where
@@ -131,4 +132,103 @@ fn hf_global_section_parses_within_33_bytes() {
         "HfGlobal section parse overran its 33-byte TOC slot: {} bits",
         hg_br.bits_read()
     );
+}
+
+/// End-to-end multi-group VarDCT decode accuracy, measured in the XYB
+/// domain (the pre-§L.2.2 planes via the `VARDCT_XYB_CAPTURE`
+/// diagnostic hook) against the reference decode's PNG inverted
+/// through the spec **forward** XYB transform. All 12 PassGroup
+/// sections decode with group-local coordinates (§C.8.1): per-group
+/// `hfp` headers, per-section ANS state init, group-local NonZeros
+/// grids, and the pasted-together frame matches the reference to
+/// per-pixel XYB MAD ≈ 7e-5 / 1.4e-3 / 9e-4 (X / Y / B) — measured
+/// values at landing; thresholds double them.
+///
+/// Clean-room: the reference values are the `djxl` validator's opaque
+/// output PNG inverted through the ISO/IEC 18181-1 forward XYB math
+/// (Annex L.2 + the default OpsinInverseMatrix).
+#[test]
+fn multi_group_decode_matches_reference_in_xyb() {
+    use oxideav_jpegxl::metadata_fdis::{OpsinInverseMatrix, ToneMapping};
+    use std::io::Cursor;
+
+    // Decode with the XYB capture hook armed.
+    oxideav_jpegxl::VARDCT_XYB_CAPTURE.with(|s| *s.borrow_mut() = None);
+    oxideav_jpegxl::set_vardct_xyb_capture_armed(true);
+    let r = oxideav_jpegxl::decode_vardct_frame_from_codestream(JXL, None);
+    oxideav_jpegxl::set_vardct_xyb_capture_armed(false);
+    let frame = r.expect("multi-group VarDCT decode runs end-to-end");
+    assert_eq!(frame.planes.len(), 3);
+    assert_eq!(frame.planes[0].stride, 1024);
+    assert_eq!(frame.planes[0].data.len(), 1024 * 768);
+    let ours = oxideav_jpegxl::VARDCT_XYB_CAPTURE
+        .with(|s| s.borrow_mut().take())
+        .expect("XYB capture populated");
+
+    // Invert the reference PNG through the spec forward XYB transform.
+    let oim = OpsinInverseMatrix::default();
+    let tm = ToneMapping::default();
+    let a = oim.inv_mat;
+    let det = a[0][0] * (a[1][1] * a[2][2] - a[1][2] * a[2][1])
+        - a[0][1] * (a[1][0] * a[2][2] - a[1][2] * a[2][0])
+        + a[0][2] * (a[1][0] * a[2][1] - a[1][1] * a[2][0]);
+    let fwd = [
+        [
+            (a[1][1] * a[2][2] - a[1][2] * a[2][1]) / det,
+            (a[0][2] * a[2][1] - a[0][1] * a[2][2]) / det,
+            (a[0][1] * a[1][2] - a[0][2] * a[1][1]) / det,
+        ],
+        [
+            (a[1][2] * a[2][0] - a[1][0] * a[2][2]) / det,
+            (a[0][0] * a[2][2] - a[0][2] * a[2][0]) / det,
+            (a[0][2] * a[1][0] - a[0][0] * a[1][2]) / det,
+        ],
+        [
+            (a[1][0] * a[2][1] - a[1][1] * a[2][0]) / det,
+            (a[0][1] * a[2][0] - a[0][0] * a[2][1]) / det,
+            (a[0][0] * a[1][1] - a[0][1] * a[1][0]) / det,
+        ],
+    ];
+    let itscale = 255.0 / tm.intensity_target;
+    let s2l = |c: f32| -> f32 {
+        if c <= 0.04045 {
+            c / 12.92
+        } else {
+            ((c + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    let dec = png::Decoder::new(Cursor::new(REF_PNG));
+    let mut reader = dec.read_info().expect("png read_info");
+    let mut buf = vec![0u8; reader.output_buffer_size().unwrap_or(0)];
+    let info = reader.next_frame(&mut buf).expect("png next_frame");
+    let ch = match info.color_type {
+        png::ColorType::Rgb => 3,
+        png::ColorType::Rgba => 4,
+        other => panic!("unexpected reference colour type {other:?}"),
+    };
+    assert_eq!((info.width, info.height), (1024, 768));
+
+    let n = 1024usize * 768;
+    let mut mads = [0f64; 3];
+    for i in 0..n {
+        let rl = s2l(buf[i * ch] as f32 / 255.0) / itscale;
+        let gl = s2l(buf[i * ch + 1] as f32 / 255.0) / itscale;
+        let bl = s2l(buf[i * ch + 2] as f32 / 255.0) / itscale;
+        let lm = fwd[0][0] * rl + fwd[0][1] * gl + fwd[0][2] * bl;
+        let mm = fwd[1][0] * rl + fwd[1][1] * gl + fwd[1][2] * bl;
+        let sm = fwd[2][0] * rl + fwd[2][1] * gl + fwd[2][2] * bl;
+        let gl_ = (lm - oim.opsin_bias[0]).cbrt() + oim.opsin_bias[0].cbrt();
+        let gm_ = (mm - oim.opsin_bias[1]).cbrt() + oim.opsin_bias[1].cbrt();
+        let gs_ = (sm - oim.opsin_bias[2]).cbrt() + oim.opsin_bias[2].cbrt();
+        mads[0] += (ours[0][i] as f64 - ((gl_ - gm_) * 0.5) as f64).abs();
+        mads[1] += (ours[1][i] as f64 - ((gl_ + gm_) * 0.5) as f64).abs();
+        mads[2] += (ours[2][i] as f64 - gs_ as f64).abs();
+    }
+    for (c, name, tol) in [(0usize, "X", 1.5e-4), (1, "Y", 3e-3), (2, "B", 2e-3)] {
+        let mad = mads[c] / n as f64;
+        assert!(
+            mad < tol,
+            "XYB {name}: per-pixel MAD {mad:.6} exceeds {tol} — multi-group framing regressed"
+        );
+    }
 }
