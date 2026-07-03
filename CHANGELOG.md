@@ -7,6 +7,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.12](https://github.com/OxideAV/oxideav-jpegxl/compare/v0.0.11...v0.0.12) - 2026-07-03
+
+### Other
+
+- round-385 README + CHANGELOG rollup
+- F.2 adaptive-LF-smoothing factor ramp corrected to clamp(4 x gap - 3, 0, 1)
+- Listing I.16 LLF normalisation — LLF is the plain I.2.1 DCT of the LF block
+- route the signalled sec C.7.1 coefficient orders into the HF decode
+- make the VarDCT XYB capture arm flag per-thread
+- wire Annex J filters into the integrated VarDCT path (Gaborish + per-block-sigma EPF)
+- Annex G CfL split into Figure 2 branches + LF-factor -128 bias fix
+- corrected Listing C.1 LF-multiplier reading — 65536/(m x global_scale x quant_lf)
+- splines end-to-end integration test + README/CHANGELOG
+- splines §C.4.6 codestream entropy parse (Listing C.3/C.4)
+- splines §K.1 Gaussian-brush splat + Spline render (erf)
+- splines §K.1 arc-length resampling into unit-spaced samples
+- splines §K.1 centripetal Catmull-Rom control-point upsampling
+- splines §C.4.6 coefficient math + §K.3 ContinuousIDCT
+- multi-frame codestream iteration — decode_all_frames + animation walk
+- decode 2024-edition RestorationFilter (Table J.1), unblock animation-3frame first frame
+- jpegxl r375: gate undrawn image features (noise/patches/splines) in Modular decode
+- jpegxl r375: wire §J restoration filters into the Modular XYB decode path
+- jpegxl r372: pin vardct-d1 LF-magnitude divergence as exact 4.0x measurement + HF-isolation localisation
+- jpegxl r367: correct vardct-d1 magnitude-bug localisation (DCT64x64, not DCT8x8) + LF→LLF→IDCT DC-preservation invariant
+- jpegxl r362: VarDCT reference-divergence harness + magnitude-bug localisation
+- jpegxl r355: README — accurate registered-codec decode status
+- jpegxl r355: fix LF channel-order swap in integrated VarDCT decode
+- jpegxl r355: integrated single-LfGroup VarDCT decode reaches pixels end-to-end
+- round-349 (parent-dispatch r349) against ISO/IEC FDIS 18181-1:2021 — wire HfGlobalSection into the integrated VarDCT decode: parse through the full §C.7 section on real bytes
+- round-349 (parent-dispatch r349) against ISO/IEC FDIS 18181-1:2021 — HfGlobalSection::decode_context: bridge parsed §C.7.2 histograms → HfHistogramDecodeContext
+- round-349 (parent-dispatch r349) against ISO/IEC FDIS 18181-1:2021 — §C.7 HfGlobalSection: chain HfGlobal + HfPass sequence + §C.7.2 histograms on one bit cursor
+- round-346 (parent-dispatch r346) against ISO/IEC FDIS 18181-1:2021 — histogram-backed multi-pass per-LfGroup VarDCT decode + reconstruction
+- round-343 (parent-dispatch r343) against ISO/IEC FDIS 18181-1:2021 — fused live-entropy per-LfGroup VarDCT reconstruction
+- end-to-end non-square VarDCT integration tests + README — six rectangular DCT families reconstruct to spatial samples through the cross-pass walk
+- §C.8.3+F.3+I.2 integration — one-call per-LfGroup non-square VarDCT reconstruction from cross-pass accumulated coefficients to spatial residual planes
+- round-340 (parent-dispatch r340) against ISO/IEC FDIS 18181-1:2021 — §C.8.3 cross-pass HF coefficient accumulation (per-pass shift[] left-shift + sum) for the multi-pass VarDCT decode walk
+- round-336 (parent-dispatch r336) against ISO/IEC FDIS 18181-1:2021 — §J.3.3 VarDCT per-block-sigma EPF driver + sigma<0.3 block-skip
+- §J.3.1 three-step EPF iteration driver (constant-sigma)
+- round-328 (parent-dispatch r328) against ISO/IEC FDIS 18181-1:2021 — §6.2 right/bottom crop of the padded VarDCT reconstruction (ResidualPlane::crop_to + ChannelResidualPlanes::crop_to)
+- round-322 (parent-dispatch r322) against ISO/IEC FDIS 18181-1:2021 — LF-aware per-LfGroup VarDCT three-channel residual-plane reconstruction (§I.2.4 LLF prefix → §I.2.3.2 IDCT, wired into §C.5.4 placement + Annex G CfL)
+- round-316 (parent-dispatch r316) against ISO/IEC FDIS 18181-1:2021 — per-block VarDCT LLF-coefficient placement (§I.2.4 natural-order LLF prefix → §I.2.3.2 IDCT)
+- refresh to current status, drop per-round changelog cruft
+
 ### Other
 
 - round-385 (parent-dispatch r385) against ISO/IEC FDIS 18181-1:2021 — **VarDCT reference divergence root-caused and fixed: four fixture-measured FDIS-reading corrections take `vardct-256x256-d1` from ~99.8 % railed (per-channel MAD ~105–129/255) to sRGB MAD ≈ 3.3 / 1.9 / 2.1 with zero railed pixels and reference-exact XYB frame-means.** Each correction was derived by regressing the in-crate decode against the `djxl` validator's opaque reference PNG inverted through the spec forward-XYB transform (no external implementation source consulted), and each is recorded as an FDIS erratum candidate in the corresponding module doc: **(1) Listing C.1 LF multipliers** — the literal `mXDC = m_x_lf_unscaled / (global_scale × quant_lf)` measures off by exactly `m²/65536` per channel (X 1/256, Y 1/4 exact, B 1 — the default B divisor 256 is the self-reciprocal point, which is why B alone ever validated); the unique three-channel-consistent reading is `mXDC = 65536 / (m_x_lf_unscaled × global_scale × quant_lf)` (`global_scale` is 16.16 fixed-point; the `m_*` F16 values are divisors) — `LfMultipliers::compute`. **(2) Annex G CfL split per Figure 2 + LF-factor bias** — CfL is a coefficient-domain step with distinct branches (`LF → DQ → CfL` with the frame-global `x_factor_lf`/`b_factor_lf` factors applied to the dequantised LF planes before the Listing I.16 LLF composition; `HF → DQ → CfL → IT` with the per-64×64-tile `XFromY`/`BFromY` factors applied to the F.3-dequantised HF grids before the LLF merge + IDCT — exact because every LLF prefix cell of a `DecodedHfBlock` is zero); the previous single spatial CfL applied the HF factors to the LF content, crushing B ~2× on d1 (`BFromY ≈ −40` → `kB_hf ≈ 0.52` vs `kB_lf ≈ 1.0`). The LF factor bias is `x_factor_lf − 128`, not the FDIS' `− 127` (both X and B independently measure one excess `Y/colour_factor` term at the default 128) — `chroma_from_luma::kx_kb_lf`. **(3) Listing I.16 LLF normalisation** — the LLF block is the plain §I.2.1-normalised forward DCT of the LF block; the literal `× ScaleF(cy,bheight,y) × ScaleF(cx,bwidth,x)` reading leaves every LLF AC cell off by exactly `ScaleF(8,64,u)` per axis (and the swapped-argument reading — the exact reciprocal via Listing I.15's identity `ScaleF(N,n,x) × ScaleF(n,N,x) = 1` — overshoots symmetrically); `ScaleF(·,·,0) = 1` under every reading, which is why the round-367 DC-exact invariant held while every AC cell was off — `llf_from_lf`. **(4) F.2 adaptive-LF-smoothing ramp** — the literal `max(0, 3 − 4·gap)` factor keeps a sample only at the `gap = 0.5` floor and fully averages everything with `gap ≥ 0.75`, i.e. smooths real content hardest; the internally-consistent denoiser ramp is `clamp(4·gap − 3, 0, 1)` (average only sub-quantisation-noise deviations, keep content) — measured: the literal reading strips ~8 % of the reference's LLF AC energy. Also landed: **§J filters wired into the integrated VarDCT path** (Gaborish §J.2 + EPF §J.3 with the Listing J.3 per-block sigma built from HfMul/Sharpness via new `epf::derive_vardct_sigma_grid` — HfMul fills each varblock's footprint from the walk); **§C.7.1 signalled coefficient orders routed into the HF decode** (`HfHistogramDecodeContext::set_pass_orders`, wired by `HfGlobalSection::decode_context` from the per-pass `hfp` selections; parsed since round 133 but never consulted — inert on d1, whose `used_orders == 0`); **`VARDCT_XYB_CAPTURE` per-thread diagnostic hook** exposing the cropped pre-§L.2.2 XYB planes. Ratchets: `round362` rewritten from divergence-pin to accuracy gate (railed < 1 %, per-channel mean ±4, MAD < 4.5); new `round385_vardct_xyb_accuracy` (XYB frame-means match reference to channel-scaled tolerances; LF block-mean LSQ scale = 1.0); `round372` rewritten from 4.0×-divergence-pin to fix-pin (Y ratio 1.0 + per-channel LSQ unity); `round12`/`round121`/`round138` closed-form pins updated to the corrected readings. **Remaining (documented) divergence: the entropy-decoded HF coefficient path** (§C.8.3) — per-8×8 HF detail correlates only ~0.1–0.7 with the reference at roughly matching energy; the public `decode_one_frame` continues to withhold VarDCT pixels until that is pinned. Docs-gap: a per-varblock HF-coefficient reference trace for `vardct-256x256-d1` (decoded quantised HF integers per varblock/channel against bit positions) plus a flat-content fixture with per-sample LF traces (to pin the exact F.2 ramp); the staged `trace.txt` carries only section-level totals.
