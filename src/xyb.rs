@@ -69,8 +69,12 @@
 //! `metadata_fdis::OpsinInverseMatrix::default()` constants
 //! independently transcribed from FDIS Table L.1.
 
+use oxideav_core::{Error, Result};
+
 use crate::lf_global::LfChannelDequantization;
-use crate::metadata_fdis::{OpsinInverseMatrix, ToneMapping};
+use crate::metadata_fdis::{
+    CustomTransferFunction, OpsinInverseMatrix, ToneMapping, TransferFunction,
+};
 
 /// Inverse XYB → linear RGB per §L.2.2. `(x, y, b)` are the
 /// post-rescale XYB samples (i.e. for `kModular` callers, the
@@ -171,21 +175,112 @@ pub fn inverse_ycbcr_to_rgb(cb: f32, y: f32, cr: f32) -> (f32, f32, f32) {
     (r, g, b)
 }
 
-/// Linear-domain RGB → unsigned 8-bit clamped. The output of
-/// [`inverse_xyb_to_rgb`] is display-referred linear in `[0, 1]`
-/// (under default `intensity_target == 255`); we clamp + round +
-/// scale to `0..=255` for 8-bit output.
+/// Encoded-domain sample → unsigned 8-bit clamped (clamp + scale by
+/// 255 + round). Used directly by the YCbCr output path (whose §L.3
+/// inverse yields samples already in the image's encoded space) and by
+/// [`TransferEncoder::encode_u8`] after the opto-electrical transfer.
 ///
-/// Round-11 ships this helper for the modular-XYB output path. Per
-/// §L.2.2 NOTE the spec output is "linear" — strict conformance
-/// would require gamma encoding before display; we accept the
-/// linear-output simplification and document it as an XYB output-
-/// gamma SPECGAP (cleanest conformance handoff is to a downstream
-/// colour-management consumer; this crate's job is decode, not
-/// display).
+/// NOTE (round 389): XYB output paths must NOT call this on the raw
+/// §L.2.2 linear RGB — the §L.2 closing paragraph says the decoder
+/// "converts the resulting RGB samples to the colour space described
+/// in the image metadata", i.e. the signalled transfer function
+/// (Table A.10) applies before integer quantisation. Rounds 11–385
+/// emitted linear bytes here (documented then as a SPECGAP); measured
+/// against the reference decodes that left every XYB fixture's RGB
+/// output uniformly dark (sRGB-vs-linear, MAD ≈ 70/255) even when the
+/// internal XYB planes were reference-exact. Use
+/// [`TransferEncoder::encode_u8`] instead.
 pub fn linear_rgb_to_u8(linear: f32) -> u8 {
     let scaled = (linear.clamp(0.0, 1.0) * 255.0).round();
     scaled as u8
+}
+
+/// Opto-electrical transfer encoding (Table A.10 / A.11), resolved once
+/// per frame from the signalled [`CustomTransferFunction`] and applied
+/// to every §L.2.2 linear RGB sample before integer quantisation.
+///
+/// Per the §L.2 closing paragraph the inverse-XYB output is *linear*
+/// sRGB-primary/D65 RGB; the decoder then "converts the resulting RGB
+/// samples to the colour space described in the image metadata" —
+/// for the transfer-function axis that is the Table A.10 OETF:
+///
+/// * `kLinear` — identity;
+/// * `kSRGB` — IEC 61966-2-1: `12.92·l` for `l ≤ 0.0031308`, else
+///   `1.055·l^(1/2.4) − 0.055`;
+/// * `k709` — Rec. ITU-R BT.709-6: `4.5·l` for `l < 0.018`, else
+///   `1.099·l^0.45 − 0.099`;
+/// * `have_gamma` — `l^(gamma / 10^7)` (Table A.11: "the
+///   opto-electrical transfer function is characterized by the
+///   exponent gamma / 10^7").
+///
+/// `kPQ` / `kDCI` / `kHLG` / `kUnknown` are rejected with a precise
+/// [`Error::Unsupported`] — emitting linear bytes for them would be a
+/// silent misparse.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum TransferEncoder {
+    /// `kLinear` (Table A.10 value 8).
+    Linear,
+    /// `kSRGB` (Table A.10 value 13).
+    SRgb,
+    /// `k709` (Table A.10 value 1).
+    Bt709,
+    /// `have_gamma == true`: exponent `gamma / 10^7` ∈ (0, 1].
+    Gamma(f32),
+}
+
+impl TransferEncoder {
+    /// Resolve the encoder for a signalled [`CustomTransferFunction`].
+    pub fn for_transfer(tf: &CustomTransferFunction) -> Result<Self> {
+        if tf.have_gamma {
+            let g = tf.gamma as f32 / 1e7;
+            if !(g > 0.0 && g <= 1.0) {
+                return Err(Error::InvalidData(format!(
+                    "JXL transfer encode: gamma {} / 1e7 outside (0, 1]",
+                    tf.gamma
+                )));
+            }
+            return Ok(Self::Gamma(g));
+        }
+        match tf.transfer_function {
+            TransferFunction::Linear => Ok(Self::Linear),
+            TransferFunction::SRgb => Ok(Self::SRgb),
+            TransferFunction::Bt709 => Ok(Self::Bt709),
+            other => Err(Error::Unsupported(format!(
+                "jxl transfer encode: {other:?} output transfer function not implemented \
+                 (PQ / DCI / HLG / Unknown)"
+            ))),
+        }
+    }
+
+    /// Encode one linear sample (clamped to `[0, 1]`) into the
+    /// signalled transfer domain, still in `[0, 1]`.
+    pub fn encode(self, linear: f32) -> f32 {
+        let l = linear.clamp(0.0, 1.0);
+        match self {
+            Self::Linear => l,
+            Self::SRgb => {
+                if l <= 0.003_130_8 {
+                    12.92 * l
+                } else {
+                    1.055 * l.powf(1.0 / 2.4) - 0.055
+                }
+            }
+            Self::Bt709 => {
+                if l < 0.018 {
+                    4.5 * l
+                } else {
+                    1.099 * l.powf(0.45) - 0.099
+                }
+            }
+            Self::Gamma(g) => l.powf(g),
+        }
+    }
+
+    /// [`Self::encode`] + 8-bit quantisation ([`linear_rgb_to_u8`] on
+    /// the encoded value).
+    pub fn encode_u8(self, linear: f32) -> u8 {
+        linear_rgb_to_u8(self.encode(linear))
+    }
 }
 
 #[cfg(test)]
@@ -397,5 +492,74 @@ mod tests {
             bp - bm,
             db_exp
         );
+    }
+
+    /// Table A.10 sRGB OETF: the IEC 61966-2-1 breakpoint and both
+    /// branch formulas, and the round-trip against the inverse curve
+    /// used by the reference-comparison tests.
+    #[test]
+    fn transfer_encoder_srgb_curve() {
+        let enc = TransferEncoder::SRgb;
+        assert_eq!(enc.encode(0.0), 0.0);
+        assert!(approx_eq(enc.encode(1.0), 1.0, 1e-6));
+        // Linear branch: l = 0.002 -> 12.92 * 0.002.
+        assert!(approx_eq(enc.encode(0.002), 12.92 * 0.002, 1e-6));
+        // Power branch: l = 0.5 -> 1.055 * 0.5^(1/2.4) - 0.055.
+        let expect = 1.055f32 * 0.5f32.powf(1.0 / 2.4) - 0.055;
+        assert!(approx_eq(enc.encode(0.5), expect, 1e-6));
+        // Round-trip through the inverse sRGB EOTF.
+        for l in [0.001f32, 0.01, 0.1, 0.25, 0.5, 0.9] {
+            let e = enc.encode(l);
+            let back = if e <= 0.04045 {
+                e / 12.92
+            } else {
+                ((e + 0.055) / 1.055).powf(2.4)
+            };
+            assert!(approx_eq(back, l, 1e-5), "round-trip {l} -> {e} -> {back}");
+        }
+    }
+
+    /// Resolution from the signalled CustomTransferFunction: defaults
+    /// to sRGB; `have_gamma` wins; Linear/BT.709 map through; PQ is
+    /// rejected precisely (emitting linear bytes for it would be a
+    /// silent misparse).
+    #[test]
+    fn transfer_encoder_resolution() {
+        let mut tf = CustomTransferFunction::default();
+        assert_eq!(
+            TransferEncoder::for_transfer(&tf).unwrap(),
+            TransferEncoder::SRgb
+        );
+
+        tf.transfer_function = TransferFunction::Linear;
+        assert_eq!(
+            TransferEncoder::for_transfer(&tf).unwrap(),
+            TransferEncoder::Linear
+        );
+
+        tf.transfer_function = TransferFunction::Bt709;
+        assert_eq!(
+            TransferEncoder::for_transfer(&tf).unwrap(),
+            TransferEncoder::Bt709
+        );
+
+        tf.have_gamma = true;
+        tf.gamma = 4_545_455; // ~0.4545 (1/2.2)
+        match TransferEncoder::for_transfer(&tf).unwrap() {
+            TransferEncoder::Gamma(g) => assert!(approx_eq(g, 0.454_545_5, 1e-6)),
+            other => panic!("expected Gamma, got {other:?}"),
+        }
+
+        tf.have_gamma = false;
+        tf.transfer_function = TransferFunction::Pq;
+        assert!(TransferEncoder::for_transfer(&tf).is_err());
+    }
+
+    /// `encode_u8` composes the OETF with the 8-bit quantiser: mid-grey
+    /// linear 0.5 encodes to the sRGB value 188, not the linear 128.
+    #[test]
+    fn transfer_encoder_encode_u8_srgb_midgrey() {
+        assert_eq!(TransferEncoder::SRgb.encode_u8(0.5), 188);
+        assert_eq!(TransferEncoder::Linear.encode_u8(0.5), 128);
     }
 }

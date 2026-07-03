@@ -39,11 +39,11 @@
 //!
 //! This suite is the tightened ratchet at the round-385 baseline.
 //!
-//! Comparison domain note: this crate's decode output is documented as
-//! **linear** RGB (the §L.2.2 NOTE's "the transfer function is linear"
-//! reading — see the crate README's plane-layout section), while the
-//! `djxl` reference PNG is sRGB-encoded. The comparison below therefore
-//! sRGB-encodes our linear output first.
+//! Comparison domain note (updated round 389): the decode output now
+//! carries the image's signalled Table A.10 transfer encoding (sRGB
+//! for this fixture) applied by `xyb::TransferEncoder` inside the
+//! decoder, so the comparison below is a DIRECT byte comparison
+//! against the sRGB-encoded reference PNG — no downstream re-encode.
 //!
 //! Clean-room: behaviour is derived from the ISO/IEC 18181 spec PDFs +
 //! the staged trace/errata material under `docs/image/jpegxl/`. The
@@ -73,18 +73,6 @@ fn ref_rgb() -> (u32, u32, Vec<[u8; 3]>) {
         px.push([c[0], c[1], c[2]]);
     }
     (info.width, info.height, px)
-}
-
-/// sRGB-encode one linear 8-bit sample (the crate's documented linear
-/// output) for comparison against the sRGB-encoded reference PNG.
-fn linear_u8_to_srgb_u8(v: u8) -> u8 {
-    let l = v as f64 / 255.0;
-    let s = if l <= 0.003_130_8 {
-        12.92 * l
-    } else {
-        1.055 * l.powf(1.0 / 2.4) - 0.055
-    };
-    (s * 255.0).round().clamp(0.0, 255.0) as u8
 }
 
 /// The `djxl` reference is an ordinary mid-tone photo: each channel's
@@ -134,12 +122,15 @@ fn vardct_output_tracks_reference_within_hf_filter_gap() {
         .expect("integrated VarDCT reconstruction runs end-to-end on vardct-d1");
     let (_w, _h, refpx) = ref_rgb();
     let n = refpx.len();
+    // Round 389: the decoder output is already sRGB-encoded (signalled
+    // Table A.10 transfer via `xyb::TransferEncoder`) — compare bytes
+    // directly.
     let srgb: Vec<[u8; 3]> = (0..n)
         .map(|i| {
             [
-                linear_u8_to_srgb_u8(frame.planes[0].data[i]),
-                linear_u8_to_srgb_u8(frame.planes[1].data[i]),
-                linear_u8_to_srgb_u8(frame.planes[2].data[i]),
+                frame.planes[0].data[i],
+                frame.planes[1].data[i],
+                frame.planes[2].data[i],
             ]
         })
         .collect();

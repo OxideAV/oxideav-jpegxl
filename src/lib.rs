@@ -453,11 +453,14 @@
 //! preserved for `xyb_encoded == false && do_ycbcr == false` modular
 //! frames so the five small lossless fixtures stay pixel-correct.
 //!
-//! Round-26 SPECGAP: §L.2.2 NOTE describes the output as
-//! linear-domain RGB but doesn't prescribe a gamma encoding step
-//! before display. [`xyb::linear_rgb_to_u8`] emits linear bytes
-//! (clamp + scale by 255 + round); callers that need sRGB-encoded
-//! bytes apply the sRGB transfer function downstream.
+//! Round-26 SPECGAP, RESOLVED round 389: the §L.2 closing paragraph
+//! has the decoder convert the linear §L.2.2 RGB "to the colour space
+//! described in the image metadata" — i.e. the signalled Table A.10
+//! transfer function applies before integer quantisation. The XYB
+//! output stages now route through [`xyb::TransferEncoder`]
+//! (sRGB / BT.709 / gamma / linear; PQ / DCI / HLG rejected
+//! precisely); the earlier linear-bytes reading left every XYB
+//! fixture uniformly dark (MAD ≈ 70/255) against reference decodes.
 //!
 //! ## Round-27 (2024-spec) — IDCT dispatch
 //!
@@ -1479,18 +1482,20 @@ fn build_rgb_planes_from_xyb(
     }
 
     // Step 3 — inverse XYB colour transform (§L.2.2) → linear RGB →
-    // 8-bit, per sample.
+    // signalled transfer encoding (Table A.10, round 389) → 8-bit,
+    // per sample.
     let mut r_bytes = Vec::with_capacity(n);
     let mut g_bytes = Vec::with_capacity(n);
     let mut b_bytes = Vec::with_capacity(n);
     let oim = &metadata.opsin_inverse_matrix;
     let tm = &metadata.tone_mapping;
+    let enc = crate::xyb::TransferEncoder::for_transfer(&metadata.colour_encoding.tf)?;
     for idx in 0..n {
         let (r_lin, g_lin, b_lin) =
             crate::xyb::inverse_xyb_to_rgb(x_plane[idx], y_plane[idx], b_plane[idx], oim, tm);
-        r_bytes.push(crate::xyb::linear_rgb_to_u8(r_lin));
-        g_bytes.push(crate::xyb::linear_rgb_to_u8(g_lin));
-        b_bytes.push(crate::xyb::linear_rgb_to_u8(b_lin));
+        r_bytes.push(enc.encode_u8(r_lin));
+        g_bytes.push(enc.encode_u8(g_lin));
+        b_bytes.push(enc.encode_u8(b_lin));
     }
     Ok(vec![
         VideoPlane {
@@ -1833,11 +1838,13 @@ fn finish_vardct_decode(
         });
     }
 
-    // §L.2.2 inverse XYB → linear RGB → 8-bit. The reconstructed XYB
-    // samples come straight out of the IDCT (no §L.2.2 kModular rescale
+    // §L.2.2 inverse XYB → linear RGB → signalled transfer encoding
+    // (Table A.10, round 389) → 8-bit. The reconstructed XYB samples
+    // come straight out of the IDCT (no §L.2.2 kModular rescale
     // preamble — that is the modular path's step).
     let oim = &metadata.opsin_inverse_matrix;
     let tone = &metadata.tone_mapping;
+    let enc = crate::xyb::TransferEncoder::for_transfer(&metadata.colour_encoding.tf)?;
     let w = frame_width as usize;
     let h = frame_height as usize;
     let x_plane = &cropped.planes[0];
@@ -1854,9 +1861,9 @@ fn finish_vardct_decode(
             oim,
             tone,
         );
-        r_bytes.push(crate::xyb::linear_rgb_to_u8(r));
-        g_bytes.push(crate::xyb::linear_rgb_to_u8(g));
-        b_bytes.push(crate::xyb::linear_rgb_to_u8(bb));
+        r_bytes.push(enc.encode_u8(r));
+        g_bytes.push(enc.encode_u8(g));
+        b_bytes.push(enc.encode_u8(bb));
     }
     Ok(VideoFrame {
         pts,
@@ -2453,9 +2460,13 @@ mod tests {
         let planes = build_rgb_planes_from_xyb(&img, &lf_dequant, &metadata, &rf_off).unwrap();
 
         // Independent recompute via the convenience wrapper used before
-        // the filter split.
+        // the filter split, plus the signalled (default = sRGB) Table
+        // A.10 transfer encoding applied by the output stage (round
+        // 389).
         let oim = &metadata.opsin_inverse_matrix;
         let tm = &metadata.tone_mapping;
+        let enc = xyb::TransferEncoder::for_transfer(&metadata.colour_encoding.tf).unwrap();
+        assert_eq!(enc, xyb::TransferEncoder::SRgb);
         for idx in 0..n {
             let (r, g, b) = xyb::modular_xyb_to_linear_rgb(
                 img.channels[0][idx],
@@ -2465,9 +2476,9 @@ mod tests {
                 oim,
                 tm,
             );
-            assert_eq!(planes[0].data[idx], xyb::linear_rgb_to_u8(r));
-            assert_eq!(planes[1].data[idx], xyb::linear_rgb_to_u8(g));
-            assert_eq!(planes[2].data[idx], xyb::linear_rgb_to_u8(b));
+            assert_eq!(planes[0].data[idx], enc.encode_u8(r));
+            assert_eq!(planes[1].data[idx], enc.encode_u8(g));
+            assert_eq!(planes[2].data[idx], enc.encode_u8(b));
         }
     }
 }

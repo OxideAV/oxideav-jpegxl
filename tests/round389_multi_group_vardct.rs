@@ -232,3 +232,43 @@ fn multi_group_decode_matches_reference_in_xyb() {
         );
     }
 }
+
+/// Direct 8-bit RGB comparison against the reference PNG — the decode
+/// output carries the signalled sRGB transfer encoding (round 389's
+/// Table A.10 `TransferEncoder`), so the bytes compare directly.
+/// Measured at landing: per-channel MAD 0.55 / 0.49 / 0.33 with max
+/// absolute difference 6 / 4 / 3. Ratchet at 1.5 MAD per channel.
+#[test]
+fn multi_group_decode_matches_reference_srgb_bytes() {
+    use std::io::Cursor;
+    let frame = oxideav_jpegxl::decode_vardct_frame_from_codestream(JXL, None)
+        .expect("multi-group VarDCT decode");
+    let dec = png::Decoder::new(Cursor::new(REF_PNG));
+    let mut reader = dec.read_info().expect("png read_info");
+    let mut buf = vec![0u8; reader.output_buffer_size().unwrap_or(0)];
+    let info = reader.next_frame(&mut buf).expect("png next_frame");
+    let ch = match info.color_type {
+        png::ColorType::Rgb => 3,
+        png::ColorType::Rgba => 4,
+        other => panic!("unexpected reference colour type {other:?}"),
+    };
+    let n = 1024usize * 768;
+    for c in 0..3usize {
+        let mut sum = 0u64;
+        let mut maxd = 0u8;
+        for i in 0..n {
+            let d = frame.planes[c].data[i].abs_diff(buf[i * ch + c]);
+            sum += d as u64;
+            maxd = maxd.max(d);
+        }
+        let mad = sum as f64 / n as f64;
+        assert!(
+            mad < 1.5,
+            "channel {c} sRGB MAD {mad:.3} exceeds 1.5 (measured 0.55/0.49/0.33 at landing)"
+        );
+        assert!(
+            maxd <= 16,
+            "channel {c} max sRGB diff {maxd} exceeds 16 (measured 6/4/3 at landing)"
+        );
+    }
+}
