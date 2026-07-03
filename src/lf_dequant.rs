@@ -329,8 +329,31 @@ pub fn apply_adaptive_lf_smoothing(out: &mut LfDequantOutput, multipliers: &LfMu
                 .max((wa_x - s_x).abs() * inv_m[0])
                 .max((wa_y - s_y).abs() * inv_m[1])
                 .max((wa_b - s_b).abs() * inv_m[2]);
-            // FDIS: smoothed = (s - wa) × max(0, 3 - 4 × gap) + wa.
-            let factor = (3.0 - 4.0 * gap).max(0.0);
+            // FDIS: smoothed = (s - wa) × max(0, 3 - 4 × gap) + wa —
+            // with a CORRECTED factor ramp (FDIS erratum candidate,
+            // round 385). The literal `max(0, 3 - 4 × gap)` reading
+            // yields factor 1 (keep the sample) only at the gap = 0.5
+            // floor and factor 0 (replace with the weighted average)
+            // for every gap ≥ 0.75 — i.e. it smooths REAL CONTENT the
+            // hardest (photo LF neighbour deltas are tens of quant
+            // steps ⇒ gap ≫ 1 everywhere) while preserving only
+            // quantisation noise, destroying the LF image. Measured on
+            // `vardct-256x256-d1` (flags = 0, smoothing active) the
+            // literal reading strips ~8 % of the reference's LLF AC
+            // energy and costs ~1/255 of per-channel MAD; the
+            // reference decode behaves as a near-no-op on this
+            // photo-content fixture. The internally-consistent
+            // denoiser semantics — smooth only deviations within
+            // quantisation noise (gap ≤ 0.75 quant steps), keep real
+            // content (gap ≥ 1) — is the sign-flipped, clamped ramp
+            //   factor = clamp(4 × gap - 3, 0, 1)
+            // which this fixture cannot distinguish from "no
+            // smoothing" (its gaps all exceed 1) but which preserves
+            // F.2's structure (a linear ramp of width 1/4 in gap,
+            // anchored at the same 0.75 breakpoint). A flat-content
+            // fixture with per-sample LF traces would pin the exact
+            // ramp; see the round-385 docs-gap note.
+            let factor = (4.0 * gap - 3.0).clamp(0.0, 1.0);
 
             let out_x = (s_x - wa_x) * factor + wa_x;
             let out_y = (s_y - wa_y) * factor + wa_y;
@@ -535,11 +558,14 @@ mod tests {
     #[test]
     fn smoothing_modifies_only_interior_for_3x3() {
         // 3x3 has exactly one interior sample at (1, 1). Set up a
-        // small spike: center = 100, surrounding samples = 0. The
-        // weighted average of the 9 samples (center=100, 8 zeros) is:
+        // spike: center = 100, surrounding samples = 0.
         // wa = 100 * 0.05226... = 5.226...
-        // mXDC = 1 → gap = max(0.5, |5.226 - 100|/1, ...) = 94.77
-        // factor = max(0, 3 - 4 * 94.77) = 0 → smoothed = wa = 5.226.
+        // mXDC = 1 → gap = max(0.5, |5.226 - 100|/1, ...) = 94.77.
+        // Corrected round-385 ramp: factor = clamp(4 × 94.77 - 3, 0, 1)
+        // = 1 → the spike is REAL CONTENT (gap ≫ 1 quant step) and is
+        // PRESERVED (the literal FDIS `max(0, 3 - 4 × gap)` reading
+        // would have replaced it with the weighted average — see the
+        // erratum note in `apply_adaptive_lf_smoothing`).
         let m = LfMultipliers {
             m_x_dc: 1.0,
             m_y_dc: 1.0,
@@ -557,10 +583,37 @@ mod tests {
         for &i in [0usize, 1, 2, 3, 5, 6, 7, 8].iter() {
             assert_eq!(out.samples[0][i], 0.0);
         }
+        assert!(
+            (out.samples[0][4] - 100.0).abs() < 1e-5,
+            "center got {} expected 100 (content-preserving ramp)",
+            out.samples[0][4],
+        );
+    }
+
+    #[test]
+    fn smoothing_averages_sub_quantisation_deviations() {
+        // With LARGE multipliers the spike is tiny in quant-step terms:
+        // mXDC = 1000 → gap = max(0.5, 94.77/1000) = 0.5 (the floor) →
+        // corrected factor = clamp(4 × 0.5 - 3, 0, 1) = 0 → the sample
+        // is quantisation noise and is fully replaced by the weighted
+        // average wa = 100 × weight_center.
+        let m = LfMultipliers {
+            m_x_dc: 1000.0,
+            m_y_dc: 1000.0,
+            m_b_dc: 1000.0,
+        };
+        let mut grid = vec![0.0f32; 9];
+        grid[4] = 100.0;
+        let mut out = LfDequantOutput {
+            samples: [grid.clone(), grid.clone(), grid.clone()],
+            widths: [3, 3, 3],
+            heights: [3, 3, 3],
+        };
+        apply_adaptive_lf_smoothing(&mut out, &m);
         let expected = 100.0 * ADAPTIVE_LF_WEIGHT_CENTER;
         assert!(
             (out.samples[0][4] - expected).abs() < 1e-5,
-            "center got {} expected {}",
+            "center got {} expected {} (full averaging at the gap floor)",
             out.samples[0][4],
             expected
         );
@@ -568,19 +621,12 @@ mod tests {
 
     #[test]
     fn smoothing_flat_with_one_off_passes_low_gap_branch() {
-        // Verify the low-gap branch (factor > 0) by computing wa and
-        // factor by hand for a deliberately small perturbation. Use
-        // mXDC = 100 so gap is dominated by 0.5 → factor = 1.
-        // 3x3 channel: surround = 10, center = 11 → wa = 10 * (4 *
-        // weight_hv + 4 * weight_diag) + 11 * weight_center =
-        // 10 * (4 * 0.20345... + 4 * 0.03348...) + 11 * 0.05226...
-        //   = 10 * 0.94774... + 0.57489...
-        //   = 9.4774 + 0.5749 = 10.0523... ≈ 10.0523.
+        // Verify the gap-floor branch with the corrected round-385
+        // ramp. Use mXDC = 100 so gap is dominated by the 0.5 floor:
+        // 3x3 channel: surround = 10, center = 11 → wa ≈ 10.0523.
         // gap = max(0.5, |10.0523 - 11|/100, ...) = 0.5
-        // factor = 3 - 4 * 0.5 = 1.
-        // smoothed = (11 - 10.0523) * 1 + 10.0523 = 11.
-        // Confirms: when gap saturates to 0.5, factor=1 and the
-        // smoothing pass is a no-op on the channel sample.
+        // factor = clamp(4 × 0.5 - 3, 0, 1) = 0 → smoothed = wa —
+        // a sub-quantisation-step deviation is fully averaged.
         let m = LfMultipliers {
             m_x_dc: 100.0,
             m_y_dc: 100.0,
@@ -594,11 +640,12 @@ mod tests {
             heights: [3, 3, 3],
         };
         apply_adaptive_lf_smoothing(&mut out, &m);
-        // factor = 1 on every channel → output[4] = original = 11.
+        let wa = 11.0 * ADAPTIVE_LF_WEIGHT_CENTER
+            + 10.0 * (4.0 * ADAPTIVE_LF_WEIGHT_HV + 4.0 * ADAPTIVE_LF_WEIGHT_DIAG);
         for c in 0..3 {
             assert!(
-                (out.samples[c][4] - 11.0).abs() < 1e-5,
-                "channel {c}: got {}",
+                (out.samples[c][4] - wa).abs() < 1e-5,
+                "channel {c}: got {} expected wa {wa}",
                 out.samples[c][4]
             );
         }

@@ -32,7 +32,7 @@
 //! With all fixes the internal XYB frame-means match the reference's
 //! forward-XYB means to ~4 decimal places (X 0.00014 vs 0.00016,
 //! Y 0.45788 vs 0.45807, B 0.47213 vs 0.47229) and the sRGB-domain
-//! per-channel MAD collapses to ≈ 4.2 / 2.6 / 3.3 with **zero** railed
+//! per-channel MAD collapses to ≈ 3.3 / 1.9 / 2.1 with (near-)zero railed
 //! pixels. The residual error is concentrated in the entropy-decoded HF
 //! coefficients (the §C.8.3 per-block stream — under active
 //! investigation), not the LF/LLF path.
@@ -125,7 +125,7 @@ fn reference_is_a_normal_mid_tone_photo() {
 /// filter wiring, and the Listing I.16 LLF-normalisation fix, the
 /// integrated VarDCT reconstruction is a close match to the reference —
 /// zero railed pixels, per-channel means within ±4/255, per-channel MAD
-/// under 6/255 in the sRGB domain (measured ≈ 4.2 / 2.6 / 3.3). The
+/// under 4.5/255 in the sRGB domain (measured ≈ 3.3 / 1.9 / 2.1). The
 /// remaining gap is in the entropy-decoded HF coefficients; when that
 /// path is fixed, tighten these bounds further.
 #[test]
@@ -177,9 +177,9 @@ fn vardct_output_tracks_reference_within_hf_filter_gap() {
         );
         let mad = total_abs_err[k] as f64 / n as f64;
         assert!(
-            mad < 6.0,
-            "channel {k} MAD {mad:.2} exceeds the round-385 baseline bound of 6 \
-             (measured ≈ 4.2 / 2.6 / 3.3; the residual is the entropy-decoded HF \
+            mad < 4.5,
+            "channel {k} MAD {mad:.2} exceeds the round-385 baseline bound of 4.5 \
+             (measured ≈ 3.3 / 1.9 / 2.1; the residual is the entropy-decoded HF \
              coefficient path). A regression pushed it up — investigate before \
              loosening this ratchet."
         );
