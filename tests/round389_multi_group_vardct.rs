@@ -1,0 +1,134 @@
+//! Round 389 — multi-group VarDCT framing on the `large-1024x768-d2`
+//! fixture (12 × 256×256 groups, one LfGroup, 15-entry TOC).
+//!
+//! Clean-room: behaviour is derived from the ISO/IEC 18181 spec PDFs +
+//! the staged trace/errata material under `docs/image/jpegxl/`. The
+//! fixture's `trace.txt` (an instrumented `djxl` black-box decode) pins
+//! the on-wire section sizes; `expected.png` is the reference decode.
+//! No external implementation source is consulted.
+
+use oxideav_jpegxl::bitreader::BitReader;
+use oxideav_jpegxl::frame_header::{Encoding, FrameDecodeParams, FrameHeader};
+use oxideav_jpegxl::metadata_fdis::{ImageMetadataFdis, SizeHeaderFdis};
+use oxideav_jpegxl::toc::Toc;
+
+const JXL: &[u8] = include_bytes!("fixtures/large_1024x768_d2.jxl");
+
+/// Parse the codestream prelude + FrameHeader + TOC of the raw-codestream
+/// fixture, returning `(frame_header, toc, frame_bytes)` where
+/// `frame_bytes` starts at the first (byte-aligned) TOC section.
+fn parse_to_sections(codestream: &[u8]) -> (FrameHeader, Toc, &[u8]) {
+    let mut br = BitReader::new(codestream);
+    let size = SizeHeaderFdis::read(&mut br).expect("SizeHeader");
+    let metadata = ImageMetadataFdis::read(&mut br).expect("ImageMetadata");
+    assert!(!metadata.colour_encoding.want_icc, "fixture carries no ICC");
+    br.pu0().expect("byte align");
+    let params = FrameDecodeParams {
+        xyb_encoded: metadata.xyb_encoded,
+        num_extra_channels: metadata.num_extra_channels,
+        have_animation: metadata.have_animation,
+        have_animation_timecodes: false,
+        image_width: size.width,
+        image_height: size.height,
+    };
+    let fh = FrameHeader::read(&mut br, &params).expect("FrameHeader");
+    let toc = Toc::read(&mut br, &fh).expect("TOC");
+    let start = br.bytes_consumed();
+    (fh, toc, &codestream[start..])
+}
+
+/// The frame geometry matches the fixture's documented shape: VarDCT,
+/// single pass, 12 groups (4×3 grid of 256×256), one LfGroup.
+#[test]
+fn frame_header_geometry_matches_fixture_notes() {
+    let (fh, _, _) = parse_to_sections(&JXL[2..]);
+    assert_eq!(fh.encoding, Encoding::VarDct);
+    assert_eq!(fh.passes.num_passes, 1);
+    assert_eq!((fh.width, fh.height), (1024, 768));
+    assert_eq!(fh.group_dim(), 256);
+    assert_eq!(fh.num_groups(), 12);
+    assert_eq!(fh.num_lf_groups(), 1);
+}
+
+/// The 15-entry TOC decodes to exactly the section sizes the fixture's
+/// black-box decode trace records (`TOC ... sizes=17,8840,33,20,18,16,
+/// 14,18,16,16,14,16,16,18,14`), unpermuted, summing to the remaining
+/// frame bytes.
+#[test]
+fn toc_matches_black_box_trace() {
+    let (_, toc, frame_bytes) = parse_to_sections(&JXL[2..]);
+    assert!(!toc.permuted);
+    assert_eq!(
+        toc.entries,
+        vec![17, 8840, 33, 20, 18, 16, 14, 18, 16, 16, 14, 16, 16, 18, 14],
+        "TOC section sizes must match the fixture trace"
+    );
+    let total: u64 = toc.entries.iter().map(|&e| e as u64).sum();
+    assert_eq!(total, frame_bytes.len() as u64);
+}
+
+/// Regression pin for the round-389 D.3.5 general-clustering fix: the
+/// §C.7 HfGlobal section of this fixture cluster-maps
+/// `495 × 1 × nb_block_ctx(5) = 2475` HF-coefficient contexts inside a
+/// 33-byte section (the fixture trace records the same stream as
+/// `num_contexts=2475 num_histograms=4 ... bits=250`). An ANS-coded
+/// cluster index costs far less than one bit amortised, so a
+/// `num_distributions ≤ bits_remaining` heuristic must NOT reject it.
+#[test]
+fn hf_global_section_parses_within_33_bytes() {
+    let (fh, toc, frame_bytes) = parse_to_sections(&JXL[2..]);
+
+    // Slice sections: LfGlobal(0), LfGroup(1), HfGlobal(2).
+    let mut starts = Vec::new();
+    let mut acc = 0usize;
+    for &e in &toc.entries {
+        starts.push(acc);
+        acc += e as usize;
+    }
+    let sect = |i: usize| -> &[u8] { &frame_bytes[starts[i]..starts[i] + toc.entries[i] as usize] };
+
+    let mut lf_br = BitReader::new_section(sect(0));
+    let metadata = {
+        // Re-parse metadata (parse_to_sections drops it); cheap.
+        let mut br = BitReader::new(&JXL[2..]);
+        SizeHeaderFdis::read(&mut br).unwrap();
+        ImageMetadataFdis::read(&mut br).unwrap()
+    };
+    let lf_global = oxideav_jpegxl::lf_global::LfGlobal::read(&mut lf_br, &fh, &metadata)
+        .expect("LfGlobal parses");
+    let hbc = lf_global
+        .hf_block_context
+        .as_ref()
+        .expect("VarDCT LfGlobal carries HfBlockContext");
+    assert_eq!(
+        hbc.nb_block_ctx, 5,
+        "fixture uses the default block-context map"
+    );
+
+    let mut hg_br = BitReader::new_section(sect(2));
+    let hg = oxideav_jpegxl::hf_global::HfGlobal::read(&mut hg_br, fh.num_groups())
+        .expect("HfGlobal (dequant + num_hf_presets) parses");
+    assert_eq!(hg.num_hf_presets, 1);
+    let hf_passes = oxideav_jpegxl::hf_pass::read_hf_pass_sequence(
+        &mut hg_br,
+        hg.num_hf_presets,
+        hbc.nb_block_ctx,
+    )
+    .expect("§C.7.1 coefficient orders parse");
+    assert_eq!(hf_passes.len(), 1);
+    let histos =
+        oxideav_jpegxl::hf_coefficient_histograms::HfCoefficientHistograms::read_after_hf_pass_sequence(
+            &mut hg_br,
+            hg.num_hf_presets,
+            hbc.nb_block_ctx,
+        )
+        .expect("§C.7.2 histograms (2475 contexts) parse inside the 33-byte section");
+    assert_eq!(histos.num_distributions(), 2475);
+    // The whole section is 33 bytes = 264 bits; everything read so far
+    // must have come from real section bits (no zero-padding reads).
+    assert!(
+        hg_br.bits_read() <= 264,
+        "HfGlobal section parse overran its 33-byte TOC slot: {} bits",
+        hg_br.bits_read()
+    );
+}

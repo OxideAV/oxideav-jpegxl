@@ -127,13 +127,19 @@ pub fn read_general_clustering(
             "JXL clustering: num_distributions absurdly large".into(),
         ));
     }
-    if num_distributions > br.bits_remaining() {
-        // Each cluster-index decode reads at least one bit; refuse if
-        // the input could not even supply trivial reads.
-        return Err(Error::InvalidData(
-            "JXL clustering: num_distributions exceeds remaining input".into(),
-        ));
-    }
+    // NOTE (round 389): there is deliberately NO `num_distributions ≤
+    // bits_remaining` heuristic here. An ANS-coded cluster index only
+    // consumes input bits on state renormalisation (D.3.3: `if (state <
+    // (1 << 16)) state = (state << 16) | u(16)`), so a strongly-skewed
+    // one-distribution sub-stream costs far *less* than one bit per
+    // index amortised. Measured on the `large-1024x768-d2` fixture: the
+    // §C.7.2 HF-coefficient clustering maps 2475 contexts onto 4
+    // histograms inside a 33-byte HfGlobal section — an earlier
+    // `num_distributions > br.bits_remaining()` guard mis-rejected that
+    // valid stream. DoS exposure is bounded without the guard: the loop
+    // count is capped by `ALPHABET_SIZE_MAX` above and a truncated
+    // stream surfaces as a `BitReader` end-of-input error inside the
+    // symbol decode.
 
     let use_mtf = br.read_bit()? == 1;
 
