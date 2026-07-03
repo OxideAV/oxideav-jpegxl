@@ -25,16 +25,20 @@ use oxideav_jpegxl::chroma_from_luma::{
 };
 use oxideav_jpegxl::lf_global::LfChannelCorrelation;
 
-/// FDIS Annex G — at the `all_default` `LfChannelCorrelation` bundle
+/// Annex G — at the `all_default` `LfChannelCorrelation` bundle
 /// (`colour_factor = 84`, `base_correlation_x = 0.0`,
 /// `base_correlation_b = 1.0`, `x_factor_lf = b_factor_lf = 128`),
-/// the LF derivation yields `(kX, kB) = (1/84, 1 + 1/84)`.
+/// the LF derivation with the round-385 corrected `-128` bias (see
+/// `chroma_from_luma::kx_kb_lf` — the FDIS `-127` adds one excess
+/// `Y / colour_factor` term, measured independently on the X and B
+/// channels of the `vardct-256x256-d1` reference) yields
+/// `(kX, kB) = (0.0, 1.0)` — exactly the base-correlation pair.
 #[test]
 fn annex_g_lf_default_bundle() {
     let cfl = LfChannelCorrelation::default();
     let (kx, kb) = kx_kb_lf(&cfl).unwrap();
-    assert!((kx - 1.0_f32 / 84.0).abs() < 1e-7);
-    assert!((kb - (1.0_f32 + 1.0_f32 / 84.0)).abs() < 1e-7);
+    assert_eq!(kx, 0.0);
+    assert_eq!(kb, 1.0);
 }
 
 /// FDIS Annex G — Listing G.1 line 3 (`Y = dY`) is the identity on

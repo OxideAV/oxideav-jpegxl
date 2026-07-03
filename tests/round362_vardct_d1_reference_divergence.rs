@@ -1,56 +1,45 @@
-//! Round 362 — VarDCT `vardct-256x256-d1` decode vs. a black-box
-//! reference, with the divergence pinned numerically.
+//! Round 362 committed the VarDCT `vardct-256x256-d1` reference
+//! measurement (a `djxl` black-box reference PNG + a divergence
+//! ratchet). At that baseline the reconstruction railed ~99.8 % of
+//! samples to 0/255 (per-channel MAD ~105–129/255) because the internal
+//! XYB magnitudes were far too large.
 //!
-//! Rounds 343..355 built the integrated single-LfGroup VarDCT decode so
-//! it runs the whole §C.8.3 → §L.2.2 chain end-to-end and produces a
-//! shaped 256×256×3 RGB frame. Round 355's caveat was that "the per-block
-//! HF coefficient scaling is not yet validated bit-exact against a
-//! reference decode", so the public [`oxideav_jpegxl::decode_one_frame`]
-//! path withholds the reconstructed pixels.
+//! Round 385 root-caused and fixed the divergence in three pieces:
 //!
-//! This round commits the missing **measurement**: a committed reference
-//! PNG (decoded once, offline, by the `djxl` black-box validator from the
-//! exact same `vardct_256x256_d1.jxl` fixture — its *source* is never
-//! consulted, only its output bytes) and a test that quantifies how far
-//! our reconstruction is from it, at the RGB output level.
+//! 1. **Corrected Listing C.1 LF-multiplier reading** —
+//!    `mXDC = 65536 / (m_x_lf_unscaled × global_scale × quant_lf)`
+//!    (`global_scale` is 16.16 fixed-point; the `m_*_lf_unscaled` F16
+//!    values are divisors). See `LfMultipliers::compute`.
+//! 2. **Annex G CfL split into its Figure 2 branches** — the LF branch
+//!    uses the frame-global `x_factor_lf / b_factor_lf` factors on the
+//!    dequantised LF planes before the Listing I.16 LLF composition; the
+//!    HF branch uses the per-64×64-tile `XFromY / BFromY` factors on the
+//!    dequantised HF coefficients before the IDCT. (Previously one
+//!    spatial CfL applied the HF factors to everything, crushing B by
+//!    ~2× whenever `BFromY` differed from the LF factor.)
+//! 3. **Annex G LF-factor bias corrected to `x_factor_lf - 128`** — the
+//!    FDIS' `- 127` adds one excess `Y / colour_factor` term on both
+//!    X and B at the default bundle (measured independently on both
+//!    channels). See `chroma_from_luma::kx_kb_lf`.
 //!
-//! ## What the measurement shows (round 362 baseline)
+//! With those fixes the internal XYB frame-means match the reference's
+//! forward-XYB means to ~4 decimal places (X 0.00014 vs 0.00016,
+//! Y 0.45788 vs 0.45807, B 0.47213 vs 0.47229) and the sRGB-domain
+//! per-channel MAD collapses to ≈ 10.9 / 10.5 / 7.5 with **zero** railed
+//! pixels. The residual error is HF-shaped: the reference applies the §J
+//! restoration filters (Gaborish + EPF), which this integrated path does
+//! not yet run, so the remaining gap is concentrated in the per-8×8
+//! high-frequency detail, not the DC.
 //!
-//! * The reference is an ordinary mid-tone photo: per-channel frame-means
-//!   R ≈ 127, G ≈ 129, B ≈ 139, with a smooth spread of values.
-//! * Our reconstruction **saturates ~99.8 % of samples** to 0 or 255: the
-//!   internal XYB magnitudes are several times too large, so the
-//!   non-linear XYB→RGB step (Listing L.1) clips almost everything to the
-//!   `[0, 1]` rail. Mean absolute per-channel error is ~105–129 / 255.
+//! This suite is the tightened ratchet at the round-385 baseline. When
+//! the §J filters land in the integrated path the MAD bound should
+//! tighten again toward a true pixel-accuracy gate.
 //!
-//! Diagnosis recorded for the next round (derived this round by tracing
-//! the intermediate XYB planes against the reference inverted through the
-//! default `OpsinInverseMatrix`):
-//!
-//! * The **Y (luma) plane** is ≈ 4.0× too large in the XYB domain (our
-//!   frame-mean Y ≈ 1.83, reference ≈ 0.46). Y carries no
-//!   chroma-from-luma term (Annex G: `Y = dY`) and its DC passes the spec
-//!   IDCT with unit gain (Annex I.2.1: `in[k] = out[0] + …`), so this is
-//!   a clean LF-coefficient *magnitude* error upstream of the IDCT — in
-//!   the LfQuant modular decode or the Listing F.1 dequant — independent
-//!   of every HF / CfL stage. The Listing F.1 dequant, the Table C.12
-//!   Quantizer parse (`global_scale`, `quant_lf`), and the Table C.11
-//!   `m_*_lf_unscaled` were each verified spec-conformant this round, so
-//!   the ≈4× factor most likely originates in the LfQuant modular
-//!   sub-bitstream decode (a missing/duplicated inverse transform — a
-//!   power-of-two factor — is consistent with the clean 4×).
-//! * The **X (red-green chroma) plane** swings far wider than it should
-//!   (reference X ≈ 0; ours spans roughly ±2.6). For this fixture
-//!   `x_from_y` is all-zero and `base_correlation_x == 0`, so the Annex G
-//!   HF chroma-from-luma multiplier `kX` is exactly 0 — the X swing is
-//!   therefore entirely the X HF AC coefficients, mis-scaled in the same
-//!   family as the Y error, not a CfL artefact.
-//!
-//! These facts localise the remaining VarDCT divergence to the
-//! coefficient-magnitude path (LfQuant decode + F.1/F.3 dequant), not to
-//! the IDCT, placement, crop, or XYB→RGB transform. The next round's fix
-//! has a concrete, reproducible target: drive the saturation fraction
-//! asserted below toward zero.
+//! Comparison domain note: this crate's decode output is documented as
+//! **linear** RGB (the §L.2.2 NOTE's "the transfer function is linear"
+//! reading — see the crate README's plane-layout section), while the
+//! `djxl` reference PNG is sRGB-encoded. The comparison below therefore
+//! sRGB-encodes our linear output first.
 //!
 //! Clean-room: behaviour is derived from the ISO/IEC 18181 spec PDFs +
 //! the staged trace/errata material under `docs/image/jpegxl/`. The
@@ -80,6 +69,18 @@ fn ref_rgb() -> (u32, u32, Vec<[u8; 3]>) {
         px.push([c[0], c[1], c[2]]);
     }
     (info.width, info.height, px)
+}
+
+/// sRGB-encode one linear 8-bit sample (the crate's documented linear
+/// output) for comparison against the sRGB-encoded reference PNG.
+fn linear_u8_to_srgb_u8(v: u8) -> u8 {
+    let l = v as f64 / 255.0;
+    let s = if l <= 0.003_130_8 {
+        12.92 * l
+    } else {
+        1.055 * l.powf(1.0 / 2.4) - 0.055
+    };
+    (s * 255.0).round().clamp(0.0, 255.0) as u8
 }
 
 /// The `djxl` reference is an ordinary mid-tone photo: each channel's
@@ -115,57 +116,67 @@ fn reference_is_a_normal_mid_tone_photo() {
     );
 }
 
-/// Pin the **current** VarDCT reconstruction divergence as a ratchet:
-/// the integrated decode currently rails almost every sample to 0/255
-/// because the internal XYB magnitude is far too large. When the
-/// coefficient-magnitude fix lands, the saturation fraction will collapse
-/// and this assertion will (correctly) demand an update — at which point
-/// it becomes a true pixel-accuracy gate. A regression that makes the
-/// output worse also trips it.
+/// Round-385 accuracy ratchet: after the Listing C.1 multiplier fix +
+/// the Annex G CfL branch split + the LF-factor `-128` bias fix, the
+/// integrated VarDCT reconstruction is a close match to the reference —
+/// zero railed pixels, per-channel means within ±4/255, per-channel MAD
+/// under 14/255 in the sRGB domain. The remaining gap is the §J
+/// restoration filters (not yet applied on this path); when they land,
+/// tighten these bounds further.
 #[test]
-fn current_vardct_output_is_oversaturated() {
+fn vardct_output_tracks_reference_within_hf_filter_gap() {
     let frame = oxideav_jpegxl::decode_vardct_frame_from_codestream(VARDCT_D1_JXL, None)
         .expect("integrated VarDCT reconstruction runs end-to-end on vardct-d1");
     let (_w, _h, refpx) = ref_rgb();
-    let r = &frame.planes[0].data;
-    let g = &frame.planes[1].data;
-    let b = &frame.planes[2].data;
-    let n = r.len();
-    assert_eq!(n, refpx.len(), "frame and reference are the same size");
+    let n = refpx.len();
+    let srgb: Vec<[u8; 3]> = (0..n)
+        .map(|i| {
+            [
+                linear_u8_to_srgb_u8(frame.planes[0].data[i]),
+                linear_u8_to_srgb_u8(frame.planes[1].data[i]),
+                linear_u8_to_srgb_u8(frame.planes[2].data[i]),
+            ]
+        })
+        .collect();
 
     let mut railed = 0u64;
     let mut total_abs_err = [0u64; 3];
+    let mut our_sum = [0u64; 3];
+    let mut ref_sum = [0u64; 3];
     for i in 0..n {
-        let ours = [r[i], g[i], b[i]];
-        if ours.iter().all(|&v| v == 0 || v == 255) {
+        if srgb[i].iter().all(|&v| v == 0 || v == 255) {
             railed += 1;
         }
         for k in 0..3 {
-            total_abs_err[k] += ours[k].abs_diff(refpx[i][k]) as u64;
+            total_abs_err[k] += srgb[i][k].abs_diff(refpx[i][k]) as u64;
+            our_sum[k] += srgb[i][k] as u64;
+            ref_sum[k] += refpx[i][k] as u64;
         }
     }
-    let railed_frac = railed as f64 / n as f64;
 
-    // Round-362 baseline: ~99.8% of pixels are fully railed. Assert a
-    // generous floor so the test is stable, yet still catches the fix
-    // (which drops this dramatically). Documented divergence, not a
-    // pass — the public `decode_one_frame` correctly withholds pixels.
+    let railed_frac = railed as f64 / n as f64;
     assert!(
-        railed_frac > 0.80,
-        "round-362 baseline expects heavy saturation (got {:.1}% railed). \
-         If a coefficient-magnitude fix dropped this, update the ratchet \
-         and tighten toward a real pixel-accuracy assertion.",
+        railed_frac < 0.01,
+        "railed fraction should be ~0 after the round-385 magnitude fixes \
+         (got {:.2}%)",
         railed_frac * 100.0
     );
 
-    // The mean absolute error per channel is large at this baseline; pin
-    // it is non-trivial so a future fix's improvement is visible.
-    for (k, &e) in total_abs_err.iter().enumerate() {
-        let mad = e as f64 / n as f64;
+    for k in 0..3 {
+        let our_mean = our_sum[k] as f64 / n as f64;
+        let ref_mean = ref_sum[k] as f64 / n as f64;
         assert!(
-            mad > 20.0,
-            "channel {k} MAD {mad:.1} unexpectedly small at the round-362 \
-             baseline — did the magnitude fix land? Tighten this ratchet."
+            (our_mean - ref_mean).abs() < 4.0,
+            "channel {k} frame-mean {our_mean:.1} should track reference {ref_mean:.1} \
+             within ±4 (DC path is validated; a drift here is a MULTIPLIER regression)"
+        );
+        let mad = total_abs_err[k] as f64 / n as f64;
+        assert!(
+            mad < 14.0,
+            "channel {k} MAD {mad:.2} exceeds the round-385 baseline bound of 14 \
+             (measured ≈ 10.9 / 10.5 / 7.5; the residual is the not-yet-applied §J \
+             restoration filters). A regression pushed it up — investigate before \
+             loosening this ratchet."
         );
     }
 }

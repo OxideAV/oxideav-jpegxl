@@ -134,21 +134,31 @@ pub fn kx_kb_raw(
 }
 
 /// Compute `(kX, kB)` for **LF coefficients** per the second-to-last
-/// paragraph of Annex G:
+/// paragraph of Annex G, with a **corrected bias** (FDIS erratum
+/// candidate):
 ///
 /// > For LF coefficients, `x_factor` and `b_factor` correspond to
 /// > `x_factor_lf - 127` and `b_factor_lf - 127`, respectively.
 ///
-/// The `x_factor_lf` / `b_factor_lf` u(8) fields default to `128`
-/// (so the default LF `x_factor = b_factor = 1`).
+/// The `-127` bias in that sentence is off by one: with the default
+/// bundle (`x_factor_lf = b_factor_lf = 128`, `base_correlation_x = 0`,
+/// `base_correlation_b = 1`, `colour_factor = 84`) the reference decode
+/// of `vardct-256x256-d1` measures a final X-plane mean equal to our
+/// **pre-CfL** `dX` mean (0.00016, i.e. `kX_lf = 0`), and a B-plane
+/// mean equal to `dB + 1.0 × Y` (i.e. `kB_lf = 1.0` exactly) — both
+/// channels independently show the literal `-127` reading adding one
+/// excess `Y / colour_factor` term (`≈ 0.0119 × Y`). The consistent
+/// reading is a `-128` bias, making the default LF factors
+/// `x_factor = b_factor = 0` (so the default LF CfL is exactly the
+/// `base_correlation_*` pair).
 pub fn kx_kb_lf(cfl: &LfChannelCorrelation) -> Result<(f32, f32)> {
     if cfl.colour_factor == 0 {
         return Err(Error::InvalidData(
             "JXL CfL: colour_factor == 0 (LfChannelCorrelation invariant violated)".into(),
         ));
     }
-    let x_factor = cfl.x_factor_lf as i32 - 127;
-    let b_factor = cfl.b_factor_lf as i32 - 127;
+    let x_factor = cfl.x_factor_lf as i32 - 128;
+    let b_factor = cfl.b_factor_lf as i32 - 128;
     Ok(kx_kb_raw(
         cfl.base_correlation_x,
         cfl.base_correlation_b,
@@ -382,16 +392,16 @@ mod tests {
     /// Default `LfChannelCorrelation` per §C.4.4 (the `all_default`
     /// branch): `colour_factor = 84`, `base_correlation_x = 0.0`,
     /// `base_correlation_b = 1.0`, `x_factor_lf = b_factor_lf = 128`.
-    /// With the LF derivation `x_factor = b_factor = 1`, so
-    /// `kX = 0 + 1/84 ≈ 0.01190`, `kB = 1 + 1/84 ≈ 1.01190`.
+    /// With the corrected `-128` LF bias (see [`kx_kb_lf`]) the default
+    /// LF derivation gives `x_factor = b_factor = 0`, so the default LF
+    /// CfL is exactly the base pair: `kX = 0.0`, `kB = 1.0` — matching
+    /// the reference-measured default behaviour on `vardct-256x256-d1`.
     #[test]
     fn lf_default_kx_kb() {
         let cfl = LfChannelCorrelation::default();
         let (kx, kb) = kx_kb_lf(&cfl).unwrap();
-        let expected_kx = 1.0_f32 / 84.0;
-        let expected_kb = 1.0_f32 + 1.0_f32 / 84.0;
-        assert!((kx - expected_kx).abs() < 1e-7, "kX = {kx}");
-        assert!((kb - expected_kb).abs() < 1e-7, "kB = {kb}");
+        assert_eq!(kx, 0.0, "kX = {kx}");
+        assert_eq!(kb, 1.0, "kB = {kb}");
     }
 
     /// Default HF factors (`x_factor_hf = b_factor_hf = 0`) collapse
@@ -671,9 +681,9 @@ mod tests {
     }
 
     /// Non-default `LfChannelCorrelation` with `x_factor_lf = 130`
-    /// (so derived `x_factor = 3`) and `colour_factor = 256`
-    /// gives `kX = 0.0 + 3/256 = 0.01171875` exactly (representable
-    /// in f32).
+    /// (so derived `x_factor = 130 - 128 = 2` under the corrected
+    /// bias) and `colour_factor = 256` gives `kX = 0.0 + 2/256`
+    /// exactly (representable in f32).
     #[test]
     fn kx_kb_lf_non_default_bundle() {
         let cfl = LfChannelCorrelation {
@@ -682,10 +692,10 @@ mod tests {
             base_correlation_x: 0.0,
             base_correlation_b: 1.0,
             x_factor_lf: 130,
-            b_factor_lf: 125, // → b_factor = -2 → kB = 1.0 + (-2)/256 = 0.9921875
+            b_factor_lf: 125, // → b_factor = -3 → kB = 1.0 - 3/256
         };
         let (kx, kb) = kx_kb_lf(&cfl).unwrap();
-        assert_eq!(kx, 3.0_f32 / 256.0);
-        assert_eq!(kb, 1.0 + (-2.0_f32) / 256.0);
+        assert_eq!(kx, 2.0_f32 / 256.0);
+        assert_eq!(kb, 1.0 + (-3.0_f32) / 256.0);
     }
 }

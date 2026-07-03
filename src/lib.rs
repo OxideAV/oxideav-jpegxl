@@ -1562,6 +1562,22 @@ fn build_rgb_planes_from_ycbcr(img: &crate::modular_fdis::ModularImage) -> Resul
     ])
 }
 
+thread_local! {
+    /// Diagnostic capture of the integrated VarDCT decode's cropped
+    /// pre-§L.2.2 XYB planes (`[X, Y, B]`, row-major, logical frame
+    /// extent). Populated by `finish_vardct_decode` when
+    /// [`VARDCT_XYB_CAPTURE_ARMED`] is set for the current process;
+    /// caller clears / reads around the decode call. Same test-hook
+    /// pattern as the `modular_fdis` trace statics.
+    pub static VARDCT_XYB_CAPTURE: std::cell::RefCell<Option<[Vec<f32>; 3]>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Arm flag for [`VARDCT_XYB_CAPTURE`]. Off by default so the capture
+/// costs nothing on the normal decode path.
+pub static VARDCT_XYB_CAPTURE_ARMED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Inputs the integrated single-pass VarDCT finish step (`finish_vardct_decode`)
 /// pulls together once the LfGlobal / LfGroup / HfGlobal sections have
 /// been parsed and the LF image dequantised. Grouped into one struct so
@@ -1694,6 +1710,21 @@ fn finish_vardct_decode(
     // §6.2 crop the padded block-grid reconstruction to the logical
     // frame extent.
     let cropped = planes_xyb.crop_to(frame_width as usize, frame_height as usize)?;
+
+    // Diagnostic capture: when armed, snapshot the cropped pre-§L.2.2
+    // XYB planes for the current thread (same pattern as the modular
+    // trace hooks in `modular_fdis`). Used by measurement tests that
+    // compare the internal XYB domain against a reference decode without
+    // the 8-bit RGB round-trip.
+    if VARDCT_XYB_CAPTURE_ARMED.load(std::sync::atomic::Ordering::Relaxed) {
+        VARDCT_XYB_CAPTURE.with(|s| {
+            *s.borrow_mut() = Some([
+                cropped.planes[0].samples.clone(),
+                cropped.planes[1].samples.clone(),
+                cropped.planes[2].samples.clone(),
+            ]);
+        });
+    }
 
     // §L.2.2 inverse XYB → linear RGB → 8-bit. The reconstructed XYB
     // samples come straight out of the IDCT (no §L.2.2 kModular rescale

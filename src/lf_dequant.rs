@@ -188,6 +188,49 @@ pub fn dequant_lf(
     }
 }
 
+/// Annex G **LF-branch** chroma-from-luma (Figure 2's `LF → DQ (F) →
+/// CfL (G)` path): restore the X / B LF planes from the Y LF plane in
+/// place, using the frame-global LF factors
+/// (`kX = base_correlation_x + (x_factor_lf - 127) / colour_factor`,
+/// and likewise for B — [`crate::chroma_from_luma::kx_kb_lf`]).
+///
+/// Ordering: this runs AFTER the F.2 adaptive smoothing (whose `gap`
+/// thresholds are stated on the pre-CfL residuals `dX / dB` against
+/// `mXDC / mBDC`) and BEFORE the Listing I.16 LLF composition, matching
+/// Figure 2's placement of CfL between Annex F and Annex I on the LF
+/// branch.
+///
+/// Per Annex G's first paragraph ("This annex is skipped if any channel
+/// is subsampled"), the call is a **no-op** when the three LF channels
+/// do not share dimensions.
+///
+/// Errors: `colour_factor == 0` (via [`crate::chroma_from_luma::kx_kb_lf`]).
+pub fn apply_lf_chroma_from_luma(
+    out: &mut LfDequantOutput,
+    cfl: &crate::lf_global::LfChannelCorrelation,
+) -> oxideav_core::Result<()> {
+    if out.widths[0] != out.widths[1]
+        || out.widths[2] != out.widths[1]
+        || out.heights[0] != out.heights[1]
+        || out.heights[2] != out.heights[1]
+    {
+        // Annex G is skipped when any channel is subsampled.
+        return Ok(());
+    }
+    let (kx, kb) = crate::chroma_from_luma::kx_kb_lf(cfl)?;
+    let n = (out.widths[1] as usize) * (out.heights[1] as usize);
+    for i in 0..n
+        .min(out.samples[0].len())
+        .min(out.samples[1].len())
+        .min(out.samples[2].len())
+    {
+        let yv = out.samples[1][i];
+        out.samples[0][i] += kx * yv;
+        out.samples[2][i] += kb * yv;
+    }
+    Ok(())
+}
+
 /// FDIS Annex F.2 weights for the 3×3 weighted-average kernel used in
 /// adaptive LF smoothing. Order: center, horizontal/vertical adjacent,
 /// diagonal adjacent — verbatim from the spec text.

@@ -44,7 +44,6 @@ use oxideav_core::{Error, Result};
 
 use crate::bitreader::BitReader;
 use crate::block_context_resolver::BlockContextResolver;
-use crate::block_dequant::decode_block_to_residual_with_llf;
 use crate::cross_pass::accumulate_three_channel_multi_pass;
 use crate::dct_quant_weights::DequantMatrixSet;
 use crate::dct_select::DctSelectGrid;
@@ -59,9 +58,7 @@ use crate::multi_pass_decode::{
 use crate::multi_pass_hf_histogram_decoder::HfHistogramDecodeContext;
 use crate::pass_group_hf::DecodedHfBlock;
 use crate::per_pass_non_zeros::PerPassNonZerosGrids;
-use crate::residual_plane::{
-    apply_chroma_from_luma, assemble_three_channel_planes_with_lf, ChannelResidualPlanes,
-};
+use crate::residual_plane::{assemble_three_channel_planes_with_lf, ChannelResidualPlanes};
 use crate::varblock_walk::Varblock;
 
 /// F.3 dequantisation inputs shared by every varblock of an LfGroup: the
@@ -137,15 +134,100 @@ pub fn reconstruct_lf_group_cross_pass(
         )));
     }
 
+    // ── Annex G chroma-from-luma, split per Figure 2 into its two
+    // coefficient-domain branches. The FDIS decoder block diagram is
+    // `LF → DQ (F) → CfL (G)` and `HF → DQ (F) → CfL (G) → IT (I)`:
+    // CfL runs on *dequantised coefficients* before the inverse
+    // transform, with **distinct factors** per branch — the frame-global
+    // `x_factor_lf / b_factor_lf` pair on the LF branch, the
+    // per-64×64-tile `XFromY / BFromY` samples on the HF branch. A
+    // single spatial-domain CfL over the assembled planes (the shape
+    // this driver used through round 382) applies the HF factors to the
+    // LF content too, which mis-restores the B plane whenever the two
+    // factor sets differ (e.g. `BFromY ≈ -40` ⇒ `kB_hf ≈ 0.52` against
+    // `kB_lf ≈ 1.01` on `vardct-256x256-d1` — a ~2× B undershoot).
+
+    // LF branch: `X_lf += kX_lf · Y_lf`, `B_lf += kB_lf · Y_lf` on a
+    // copy of the dequantised (+smoothed) LF image, BEFORE the Listing
+    // I.16 LLF composition seeds each varblock's LLF prefix from it.
+    let mut lf_cfl = lf.clone();
+    crate::lf_dequant::apply_lf_chroma_from_luma(&mut lf_cfl, cfl)?;
+
+    // HF branch: per-varblock, F.3-dequant the three channels' HF
+    // coefficient grids, then apply `X += kX(tile) · Y`,
+    // `B += kB(tile) · Y` cell-wise across the whole grid. Every LLF
+    // prefix cell of a `DecodedHfBlock` is zero by construction (the
+    // §C.8.3 loop never reads symbols for `k < cx·cy`), so whole-grid
+    // application touches only HF cells — the LLF prefix stays zero and
+    // is overwritten by the (already LF-CfL'd) LLF merge afterwards.
+    //
+    // Tile lookup: the HF factor is Annex G's "value at the coordinates
+    // of the 64×64 rectangle containing the current sample". In the
+    // coefficient domain a varblock no larger than 64×64 (every type up
+    // to DCT64×64) lies inside exactly one tile, so the factor is a
+    // per-block constant and coefficient-domain CfL is exactly
+    // equivalent to the spatial statement (the IDCT is linear). For the
+    // larger DCT128/DCT256 families the per-sample tile lookup is not
+    // representable per-coefficient; this driver uses the varblock's
+    // top-left tile factor for the whole block — the only
+    // coefficient-domain-representable reading of Figure 2's CfL-
+    // before-IT ordering (documented choice; no committed fixture
+    // exercises a >64×64 varblock with non-uniform factors).
+    let tile_w = (grid.width_blocks as usize).div_ceil(8).max(1);
+    let tile_h = (grid.height_blocks as usize).div_ceil(8).max(1);
+    if x_from_y.len() != tile_w * tile_h || b_from_y.len() != tile_w * tile_h {
+        return Err(Error::InvalidData(format!(
+            "JXL vardct_reconstruct: CfL factor-plane size (XFromY={}, BFromY={}) != \
+             tile grid {tile_w}×{tile_h}",
+            x_from_y.len(),
+            b_from_y.len()
+        )));
+    }
+    let mut cfl_grids: Vec<[Vec<f32>; 3]> = Vec::with_capacity(accumulated.len());
+    for (vb, acc_channels) in &accumulated {
+        let dequant_channel = |c: usize| -> Result<Vec<f32>> {
+            // Wrap the accumulated quantised grid in a DecodedHfBlock so
+            // the existing F.3 dequant primitive consumes it unchanged.
+            // The remaining_non_zeros / coeffs_read fields are
+            // decode-side bookkeeping the dequant ignores.
+            let decoded = DecodedHfBlock {
+                coeffs: acc_channels[c].clone(),
+                remaining_non_zeros: 0,
+                coeffs_read: 0,
+            };
+            crate::block_dequant::dequant_block_for_transform(
+                &decoded,
+                vb.transform,
+                c,
+                vb.hf_mul,
+                dq.set,
+                dq.oim,
+                dq.qm,
+            )
+        };
+        let mut dq_x = dequant_channel(0)?;
+        let dq_y = dequant_channel(1)?;
+        let mut dq_b = dequant_channel(2)?;
+        let tx = ((vb.x as usize) / 8).min(tile_w - 1);
+        let ty = ((vb.y as usize) / 8).min(tile_h - 1);
+        let tile = ty * tile_w + tx;
+        let (kx, kb) = crate::chroma_from_luma::kx_kb_hf(cfl, x_from_y[tile], b_from_y[tile])?;
+        for i in 0..dq_y.len() {
+            dq_x[i] += kx * dq_y[i];
+            dq_b[i] += kb * dq_y[i];
+        }
+        cfl_grids.push([dq_x, dq_y, dq_b]);
+    }
+
     // The placement driver walks the grid once per channel, invoking the
-    // closure in raster order each time. We index the accumulated list by
-    // a per-channel walk counter; because every channel walks the same
-    // grid in the same order, the counter advances in lockstep with the
-    // accumulated list's order. We also cross-check that the closure's
-    // varblock matches the accumulated entry's recorded placement (defence
-    // against a future placement-order change).
+    // closure in raster order each time. We index the pre-dequantised
+    // list by a per-channel walk counter; because every channel walks
+    // the same grid in the same order, the counter advances in lockstep
+    // with the accumulated list's order. We also cross-check that the
+    // closure's varblock matches the accumulated entry's recorded
+    // placement (defence against a future placement-order change).
     let mut counters = [0usize; 3];
-    assemble_three_channel_planes_with_lf(grid, lf, |c, vb: &Varblock, llf: &[f32]| {
+    assemble_three_channel_planes_with_lf(grid, &lf_cfl, |c, vb: &Varblock, llf: &[f32]| {
         let idx = counters[c];
         if idx >= accumulated.len() {
             return Err(Error::InvalidData(format!(
@@ -154,7 +236,7 @@ pub fn reconstruct_lf_group_cross_pass(
                 accumulated.len()
             )));
         }
-        let (acc_vb, acc_channels) = &accumulated[idx];
+        let (acc_vb, _) = &accumulated[idx];
         if acc_vb.x != vb.x || acc_vb.y != vb.y || acc_vb.transform != vb.transform {
             return Err(Error::InvalidData(format!(
                 "JXL vardct_reconstruct: channel {c} varblock {idx} placement \
@@ -164,29 +246,11 @@ pub fn reconstruct_lf_group_cross_pass(
         }
         counters[c] += 1;
 
-        // Wrap the accumulated quantised grid in a DecodedHfBlock so the
-        // existing F.3 dequant primitive consumes it unchanged. The
-        // remaining_non_zeros / coeffs_read fields are decode-side
-        // bookkeeping the dequant ignores.
-        let decoded = DecodedHfBlock {
-            coeffs: acc_channels[c].clone(),
-            remaining_non_zeros: 0,
-            coeffs_read: 0,
-        };
-        decode_block_to_residual_with_llf(
-            &decoded,
-            vb.transform,
-            c,
-            vb.hf_mul,
-            dq.set,
-            dq.oim,
-            dq.qm,
-            llf,
-        )
-    })
-    .and_then(|mut planes| {
-        apply_chroma_from_luma(&mut planes, x_from_y, b_from_y, cfl)?;
-        Ok(planes)
+        // §I.2.4 LLF merge (from the LF-CfL'd LF image) + §I.2.3.2
+        // inverse DCT on the CfL'd dequantised grid.
+        let mut block = cfl_grids[idx][c].clone();
+        crate::block_dequant::merge_llf_into_block(&mut block, vb.transform, llf)?;
+        crate::idct::idct_for_transform(vb.transform, &block)
     })
 }
 
