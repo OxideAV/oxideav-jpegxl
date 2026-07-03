@@ -1593,6 +1593,9 @@ struct VarDctFinishInputs<'a> {
     /// Per-64×64-tile chroma-from-luma factor channels (HfMetadata).
     x_from_y: &'a [i32],
     b_from_y: &'a [i32],
+    /// Per-8×8-cell Sharpness channel (HfMetadata) — drives the §J.3.3
+    /// VarDCT per-block EPF sigma (Listing J.3) together with HfMul.
+    sharpness: &'a [i32],
     /// LfGlobal §I.2.7 colour-correlation base/colour factors.
     cfl: crate::lf_global::LfChannelCorrelation,
     /// LfGlobal §I.2.2 block-context bundle (drives the resolver).
@@ -1638,6 +1641,7 @@ fn finish_vardct_decode(
         grid,
         x_from_y,
         b_from_y,
+        sharpness,
         cfl,
         hf_block_context,
         frame_width,
@@ -1709,7 +1713,49 @@ fn finish_vardct_decode(
 
     // §6.2 crop the padded block-grid reconstruction to the logical
     // frame extent.
-    let cropped = planes_xyb.crop_to(frame_width as usize, frame_height as usize)?;
+    let mut cropped = planes_xyb.crop_to(frame_width as usize, frame_height as usize)?;
+
+    // §J restoration filters, in spec order (§J.1): the Gabor-like
+    // transform (§J.2) first, then the edge-preserving filter (§J.3)
+    // with the §J.3.3 VarDCT per-block sigma (Listing J.3, from the
+    // §C.5.4 HfMul + Sharpness fields via `derive_vardct_sigma_grid`).
+    // Both are gated on the frame's RestorationFilter flags and operate
+    // on the XYB planes before the §L.2.2 colour transform, matching
+    // the §5.2 decode order (IT → RF → features → CT).
+    {
+        let w = frame_width as usize;
+        let h = frame_height as usize;
+        let rf = &fh.restoration_filter;
+        if rf.gab || rf.epf_iters > 0 {
+            let sigma_grid = if rf.epf_iters > 0 {
+                Some(crate::epf::derive_vardct_sigma_grid(&grid, sharpness, rf)?)
+            } else {
+                None
+            };
+            let [x_plane, y_plane, b_plane] = &mut cropped.planes;
+            if rf.gab {
+                crate::gaborish::apply_xyb_planes_in_place(
+                    &mut x_plane.samples,
+                    &mut y_plane.samples,
+                    &mut b_plane.samples,
+                    w,
+                    h,
+                    rf,
+                )?;
+            }
+            if let Some(sigma_grid) = sigma_grid {
+                crate::epf::apply_epf_iterations_per_block_sigma(
+                    &mut x_plane.samples,
+                    &mut y_plane.samples,
+                    &mut b_plane.samples,
+                    w,
+                    h,
+                    &sigma_grid,
+                    rf,
+                )?;
+            }
+        }
+    }
 
     // Diagnostic capture: when armed, snapshot the cropped pre-§L.2.2
     // XYB planes for the current thread (same pattern as the modular
@@ -2060,6 +2106,7 @@ pub fn decode_vardct_frame(
         grid: dct_grid,
         x_from_y: &hf_meta.x_from_y,
         b_from_y: &hf_meta.b_from_y,
+        sharpness: &hf_meta.sharpness,
         cfl,
         hf_block_context: hbc,
         frame_width: scaffold.width,

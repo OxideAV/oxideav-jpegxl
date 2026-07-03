@@ -489,6 +489,79 @@ pub fn vardct_sigma_from_listing_j3(
     Ok(sigma.max(1e-4_f32))
 }
 
+/// Build the per-8×8-block [`SigmaGrid`] for a VarDCT LfGroup from its
+/// §C.5.4 metadata (§J.3.3 + Listing J.3).
+///
+/// §J.3.3: "Let `quantization_width` and `sharpness` denote the values
+/// in HfMul and Sharpness (C.5.4) at the coordinates of the 8×8
+/// rectangle containing the reference pixel."
+///
+/// * `Sharpness` is a native per-8×8-cell channel
+///   (`ceil(h/8) × ceil(w/8)` row-major, from
+///   [`crate::lf_group::HfMetadata`]); each cell indexes
+///   `rf.epf_sharp_lut` directly (out-of-range values are rejected by
+///   [`vardct_sigma_from_listing_j3`]).
+/// * `HfMul` is stored at each varblock's **top-left** cell only
+///   (§C.5.4 "The HfMul sample is stored at the same position"); the
+///   value is the varblock's quantisation multiplier, so every 8×8
+///   cell of the varblock's footprint carries that varblock's HfMul —
+///   this walker fills the footprint from
+///   [`crate::varblock_walk::VarblockWalk`].
+///
+/// Returns a `grid.width_blocks × grid.height_blocks` [`SigmaGrid`]
+/// ready for [`apply_epf_iterations_per_block_sigma`].
+///
+/// `Err(InvalidData)` on a sharpness-plane size mismatch, an
+/// out-of-range sharpness value, or a grid walk error (residual
+/// `Empty` cell / footprint spill).
+pub fn derive_vardct_sigma_grid(
+    grid: &crate::dct_select::DctSelectGrid,
+    sharpness: &[i32],
+    rf: &RestorationFilter,
+) -> Result<SigmaGrid> {
+    let bw = grid.width_blocks as usize;
+    let bh = grid.height_blocks as usize;
+    if sharpness.len() != bw * bh {
+        return Err(Error::InvalidData(format!(
+            "JXL EPF: Sharpness plane length {} != block grid {bw}×{bh}",
+            sharpness.len()
+        )));
+    }
+    let mut sigma = vec![0.0_f32; bw * bh];
+    let mut filled = vec![false; bw * bh];
+    let mut walk = crate::varblock_walk::VarblockWalk::new(grid);
+    while let Some(vb) = walk.next()? {
+        let (cols, rows) = vb.transform.block_dims();
+        for dy in 0..rows as usize {
+            for dx in 0..cols as usize {
+                let bx = vb.x as usize + dx;
+                let by = vb.y as usize + dy;
+                if bx >= bw || by >= bh {
+                    return Err(Error::InvalidData(format!(
+                        "JXL EPF: varblock at ({},{}) {:?} spills the {bw}×{bh} block grid",
+                        vb.x, vb.y, vb.transform
+                    )));
+                }
+                let idx = by * bw + bx;
+                let sh = sharpness[idx];
+                if sh < 0 {
+                    return Err(Error::InvalidData(format!(
+                        "JXL EPF: negative Sharpness {sh} at block ({bx},{by})"
+                    )));
+                }
+                sigma[idx] = vardct_sigma_from_listing_j3(vb.hf_mul as f32, sh as usize, rf)?;
+                filled[idx] = true;
+            }
+        }
+    }
+    if let Some(missing) = filled.iter().position(|&f| !f) {
+        return Err(Error::InvalidData(format!(
+            "JXL EPF: block {missing} not covered by any varblock — DctSelect grid incomplete"
+        )));
+    }
+    SigmaGrid::new(sigma, bw, bh)
+}
+
 /// Listing J.2 — "either coordinate of the reference sample is 0
 /// or 7 IMod 8".
 ///
