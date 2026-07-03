@@ -13,16 +13,19 @@ This crate is a **decoder under active construction**. The Modular path
 decodes end to end (grey / RGB / RGBA, 1–16-bit integer, XYB / YCbCr
 inverse colour) for the small lossless fixtures; the **VarDCT** path now
 runs the full per-LfGroup reconstruction chain (§C.8.3 HF-entropy decode
-→ F.3 dequant → §I.2.3.2 IDCT → Annex G chroma-from-luma → §6.2 crop →
-§L.2.2 XYB→RGB) end to end on a real single-LfGroup single-pass
-codestream (`vardct-256x256-d1.jxl`) — producing a shaped RGB frame.
-That VarDCT output is **not yet exposed from the public decode path**:
-the per-block HF coefficient scaling is not yet validated bit-exact
-against a reference decode, so a registered `make_decoder` /
-`decode_one_frame` on a VarDCT codestream returns a precise "runs
-end-to-end but pixels not yet validated" `Error::Unsupported` rather
-than risk a silent misparse. The reconstruction is reachable for tooling
-via `decode_vardct_frame_from_codestream`. Programs that only need
+→ F.3 dequant → Annex G coefficient-domain chroma-from-luma → §I.2.3.2
+IDCT → §6.2 crop → §J restoration filters → §L.2.2 XYB→RGB) end to end
+on a real single-LfGroup single-pass codestream
+(`vardct-256x256-d1.jxl`), matching the reference decode to per-channel
+sRGB MAD ≈ 3.3 / 1.9 / 2.1 after round 385's four fixture-measured
+FDIS-reading corrections (see below). The DC/LF path is
+reference-exact; the residual divergence sits in the entropy-decoded HF
+coefficients, so that VarDCT output is **not yet exposed from the
+public decode path**: a registered `make_decoder` / `decode_one_frame`
+on a VarDCT codestream returns a precise "pixels not yet validated"
+`Error::Unsupported` rather than risk a silent misparse. The
+reconstruction is reachable for tooling via
+`decode_vardct_frame_from_codestream`. Programs that only need
 probe-level information should call `probe(...)` directly.
 
 What is implemented and tested today:
@@ -139,65 +142,44 @@ What is implemented and tested today:
 
 ### Not yet implemented
 
-- **VarDCT pixel validation + public exposure.** The integrated
-  single-LfGroup single-pass VarDCT decode (`decode_vardct_frame`) now
-  assembles every input — the §C.8.3 per-pass `hfp` header
-  (`PerPassHfHeaders::read`), the `HfHistogramDecodeContext`
-  (`HfGlobalSection::decode_context`), the `PerPassNonZerosGrids`, the
-  `BlockContextResolver`, the F.3 `DequantContext`, the LfGroup LF image,
-  the CfL factor channels — and drives
-  `reconstruct_lf_group_from_histogram` → §6.2 crop → §L.2.2 XYB→RGB to a
-  shaped frame on `vardct-256x256-d1.jxl`. The per-block coefficient
-  scaling is **not yet validated bit-exact** against a reference decode,
-  so the public `decode_one_frame` path withholds the pixels (precise
+- **VarDCT pixel-exactness + public exposure.** Round 385 root-caused
+  and fixed the long-pinned reference divergence with four
+  fixture-measured FDIS-reading corrections (each recorded as an
+  erratum candidate in the corresponding module doc): (1) **Listing
+  C.1** — `mXDC = 65536 / (m_x_lf_unscaled × global_scale × quant_lf)`
+  (`global_scale` is 16.16 fixed-point; the `m_*_lf_unscaled` F16
+  values are divisors — the literal formula was off by `m²/65536` per
+  channel: X 256×, Y 4×, B 1×); (2) **Annex G / Figure 2** — CfL is a
+  coefficient-domain step with distinct branches (frame-global LF
+  factors on the dequantised LF planes before Listing I.16; per-64×64
+  `XFromY`/`BFromY` on the F.3-dequantised HF grids before the IDCT),
+  plus the LF factor bias is `x_factor_lf - 128`, not `- 127`;
+  (3) **Listing I.16** — the LLF block is the plain §I.2.1-normalised
+  forward DCT of the LF block (the literal `× ScaleF` reading left
+  every LLF AC cell off by exactly `ScaleF(8,64,u)` per axis);
+  (4) **F.2 adaptive smoothing** — the factor ramp is
+  `clamp(4·gap − 3, 0, 1)` (the literal ramp smooths real content
+  hardest and preserves only quantisation noise). With those fixes plus
+  the §J filters wired into the integrated path (Gaborish + per-block
+  Listing J.3 EPF sigma from HfMul/Sharpness) the `vardct-256x256-d1`
+  reconstruction matches the reference decode to per-channel sRGB MAD
+  ≈ 3.3 / 1.9 / 2.1 (from ~105–129 railed at round 362), zero railed
+  pixels, XYB frame-means equal to ~4 decimals
+  (`round362_vardct_d1_reference_divergence` +
+  `round385_vardct_xyb_accuracy` ratchets; internal XYB planes
+  observable via the `VARDCT_XYB_CAPTURE` per-thread hook). The
+  **remaining divergence is the entropy-decoded HF coefficient path**
+  (§C.8.3): per-8×8 HF detail correlates only ~0.1–0.7 with the
+  reference at roughly matching energy, so the public
+  `decode_one_frame` path still withholds VarDCT pixels (precise
   `Error::Unsupported`); `decode_vardct_frame_from_codestream` returns
-  them for tooling. Round 362 commits the missing **measurement**: a
-  `djxl`-decoded reference PNG (`vardct_256x256_d1_expected.png`, the
-  validator's opaque output — never its source) plus
-  `round362_vardct_d1_reference_divergence` pinning the divergence
-  (currently ~99.8 % of samples rail to 0/255 because the internal XYB
-  magnitude is several times too large). The error localises to the
-  **coefficient-magnitude path**, not the IDCT / placement / crop /
-  XYB→RGB. Round 367 corrected a round-362 assumption: every one of
-  d1's 16 varblocks is **DCT64×64** (Table C.16 value 18 — 8×8 LF-block
-  units tiling the 32×32 LF grid), *not* DCT8×8, so the LF→spatial path
-  is the non-trivial §I.2.5 Listing I.16 chain (forward `DCT_2D` ×
-  `ScaleF(8,64,·)` → §I.2.4 LLF merge → §I.2.3.2 IDCT64×64). The
-  `round367_lf_to_llf_dc_preservation` test pins that this longer chain
-  still preserves DC magnitude exactly (flat LF `V` → flat spatial `V`
-  for DCT8×8 .. DCT256×256), so — together with the round-362-confirmed
-  spec-correct Listing F.1 dequant, Table C.12 Quantizer parse and
-  Table C.11 `m_*_lf_unscaled` — the §I.2.5/§I.2.3.2/§C.5.4/§6.2/§L.2.2
-  stages are all ruled out, leaving the **LfQuant modular sub-bitstream
-  decode** (the decoded `qX/qY/qB` integers, ≈ 4× too large) as the sole
-  suspect, consistent with the round-17 bit-over-consumption record.
-  Round 372 **measures** what rounds 362/367 inferred:
-  `round372_vardct_lf_magnitude_ratio` decodes the real LfGroup through
-  the public LF primitives, dequantises it (Listing C.1 / F.1), and
-  inverts the reference PNG through the spec forward-XYB transform — the
-  ratio of our dequantised LF Y-mean to the reference's forward-XYB Y-mean
-  is **exactly 4.0** (`global_scale = 5111`, `quant_lf = 17`,
-  `extra_precision = 1`, `m_y_lf_unscaled = 512` → `m_y_dc = 0.005893`;
-  decoded `qY` mean ≈ 622 → dequant Y mean ≈ 1.832 vs reference 0.458).
-  The same test pins that the Y plane is **shape-correct** (its `/4`-scaled
-  values form a smooth luma-DC field, monotone gradients, not entropy
-  garbage), which rules out a structural mis-decode and isolates the
-  divergence to a scalar 4× on the modular-decoded LF quantities. A
-  controlled HF-isolation experiment (this round, not committed) further
-  showed that even with the HF AC coefficients zeroed and Y scaled by the
-  measured 4×, the reconstruction still rails: the residual railing comes
-  from the **X chroma DC plane** (a ±0.5 XYB swing where the reference X is
-  ≈ 0) and a **B plane that under-shoots ≈ 2×** — both the same
-  modular-magnitude family as Y, not an IDCT/CfL artefact (`x_from_y`/`kX`
-  are all-zero for this fixture, so the existing spatial HF chroma-from-luma
-  is a no-op on X). Pinning the exact per-token divergence needs a
-  per-sample LF reference trace for `vardct-256x256-d1` (a docs gap). The
-  integrated `qdc_at` supplies a zero
-  quantised-LF DC triple — exact for any `HfBlockContext` with empty
-  `lf_thresholds`; a bundle with non-empty `lf_thresholds` is rejected
-  precisely until the per-varblock LF-DC lookup feeding the resolver is
-  wired. Multi-pass / multi-group / multi-LfGroup VarDCT framing is also
-  still pending.
+  them for tooling. The §C.7.1 signalled coefficient-order permutations
+  are now routed into the decode (d1 itself signals none). The
+  integrated `qdc_at` supplies a zero quantised-LF DC triple — exact
+  for any `HfBlockContext` with empty `lf_thresholds`; a bundle with
+  non-empty `lf_thresholds` is rejected precisely until the
+  per-varblock LF-DC lookup feeding the resolver is wired. Multi-pass /
+  multi-group / multi-LfGroup VarDCT framing is also still pending.
 - ColorEncoding / ToneMapping fuller decode, preview / animation /
   intrinsic-size sub-bundles (parsing stops cleanly at the `have_*`
   flags).
