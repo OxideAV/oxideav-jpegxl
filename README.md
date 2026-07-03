@@ -1,5 +1,7 @@
 # oxideav-jpegxl
 
+[![CI](https://github.com/OxideAV/oxideav-jpegxl/actions/workflows/ci.yml/badge.svg)](https://github.com/OxideAV/oxideav-jpegxl/actions/workflows/ci.yml) [![crates.io](https://img.shields.io/crates/v/oxideav-jpegxl.svg)](https://crates.io/crates/oxideav-jpegxl) [![docs.rs](https://docs.rs/oxideav-jpegxl/badge.svg)](https://docs.rs/oxideav-jpegxl) [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 Pure-Rust **JPEG XL** (JXL, ISO/IEC 18181-1) decoder for the
 [oxideav](https://github.com/OxideAV/oxideav-workspace) framework. Built
 clean-room from the published core specification and the conformance /
