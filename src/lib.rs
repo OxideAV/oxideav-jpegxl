@@ -1580,6 +1580,14 @@ struct VarDctFinishInputs<'a> {
     cfl: crate::lf_global::LfChannelCorrelation,
     /// LfGlobal §I.2.2 block-context bundle (drives the resolver).
     hf_block_context: crate::lf_global::HfBlockContext,
+    /// Quantised LF samples in `[X, Y, B]` channel order (the §C.8.3
+    /// `qdc[3]` source — the Listing C.13 `lf_thresholds` ladder reads
+    /// the *quantised* LF value at each varblock's top-left 8×8 cell).
+    /// Each channel is `lf_quant_width × lf_quant_height` row-major
+    /// (the non-subsampled case: same dims as the block grid).
+    lf_quant: [Vec<i32>; 3],
+    lf_quant_width: u32,
+    lf_quant_height: u32,
     /// Logical frame extent the padded block grid is cropped to (§6.2).
     frame_width: u32,
     frame_height: u32,
@@ -1628,6 +1636,9 @@ fn finish_vardct_decode(
         sharpness,
         cfl,
         hf_block_context,
+        lf_quant,
+        lf_quant_width,
+        lf_quant_height,
         frame_width,
         frame_height,
     } = inputs;
@@ -1647,15 +1658,25 @@ fn finish_vardct_decode(
         qm: &qm,
     };
 
-    // qdc_at: the quantised LF DC triple at each varblock's top-left 8×8
-    // cell. The §I.2.2 *default* HfBlockContext (the only case this path
-    // accepts — see caller gate) has empty `lf_thresholds`, so the
-    // resolver never consults `qdc`; a zero triple is therefore exact
-    // for the default-context fixtures. Non-default contexts are gated
-    // out by the caller, so this never silently mis-derives a block
-    // context.
-    let qdc_at =
-        |_p: u32, _vb: &crate::varblock_walk::Varblock| -> Result<[i32; 3]> { Ok([0, 0, 0]) };
+    // qdc_at: the quantised LF DC triple at each varblock's top-left
+    // 8×8 cell (§C.8.3: "qdc[3] are the quantized LF values of (the
+    // top-left 8x8 block within) the current varblock"), read from the
+    // LfCoefficients' quantised samples in `[X, Y, B]` order. Only the
+    // Listing C.13 `lf_thresholds` ladder consumes these; bundles with
+    // empty thresholds (the common case) never read them, but the
+    // lookup is exact either way — the round-355..388 zero-triple
+    // stand-in and its non-empty-`lf_thresholds` reject gate are gone.
+    if lf_quant
+        .iter()
+        .any(|c| c.len() != (lf_quant_width as usize) * (lf_quant_height as usize))
+    {
+        return Err(Error::InvalidData(format!(
+            "jxl VarDCT integrated decode: lf_quant channel sizes {:?} != {}×{}",
+            [lf_quant[0].len(), lf_quant[1].len(), lf_quant[2].len()],
+            lf_quant_width,
+            lf_quant_height
+        )));
+    }
 
     // Frame-level XYB residual planes on the padded block grid; each
     // group's reconstruction is pasted in at its pixel offset.
@@ -1694,6 +1715,22 @@ fn finish_vardct_decode(
                 fh.passes.num_passes
             )));
         }
+
+        // Group-local qdc lookup: varblock coordinates are
+        // group-relative (§C.8.1), so offset by the group rect into
+        // the LfGroup-level quantised-LF planes.
+        let qdc_at = |_p: u32, vb: &crate::varblock_walk::Varblock| -> Result<[i32; 3]> {
+            let bx = rect.bx0 + vb.x;
+            let by = rect.by0 + vb.y;
+            if bx >= lf_quant_width || by >= lf_quant_height {
+                return Err(Error::InvalidData(format!(
+                    "jxl VarDCT integrated decode: qdc lookup ({bx}, {by}) outside \
+                     quantised-LF plane {lf_quant_width}×{lf_quant_height}"
+                )));
+            }
+            let idx = (by as usize) * (lf_quant_width as usize) + bx as usize;
+            Ok([lf_quant[0][idx], lf_quant[1][idx], lf_quant[2][idx]])
+        };
 
         // §C.8.3 per-(pass, group) decode: each PassGroup section is
         // its own entropy stream — read the section's `hfp` header,
@@ -2132,18 +2169,12 @@ pub fn decode_vardct_frame(
         crate::lf_dequant::apply_adaptive_lf_smoothing(&mut dequant, &multipliers);
     }
 
-    // Integrated finish: §C.8.3 per-pass HF header + histogram-backed HF
-    // decode + F.3 dequant + LLF merge + IDCT + CfL → XYB residual
-    // planes → §6.2 crop → §L.2.2 XYB→RGB. The integrated `qdc_at`
-    // supplies a zero quantised-LF DC triple, which the §C.13
-    // `block_context` derivation consumes ONLY through the
-    // `lf_thresholds` ladder. A bundle with empty `lf_thresholds` (the
-    // common case, including the default §I.2.2 bundle and many custom
-    // bundles that only override `qf_thresholds` / `block_ctx_map`)
-    // therefore never reads `qdc`, so the zero triple is exact. A bundle
-    // with non-empty `lf_thresholds` would mis-derive the context, so
-    // reject it precisely — wiring the per-varblock LF-DC lookup is the
-    // next step.
+    // Integrated finish: per-(pass, group) §C.8.3 HF decode + F.3
+    // dequant + LLF merge + IDCT + CfL → XYB residual planes → §6.2
+    // crop + §J filters + §L.2.2 XYB→RGB. The `qdc_at` lookup feeding
+    // the Listing C.13 `lf_thresholds` ladder reads the real quantised
+    // LF samples (`lf_quant`, swapped to `[X, Y, B]` above), so
+    // non-empty-`lf_thresholds` block-context bundles resolve exactly.
     let hbc = lf_global
         .hf_block_context
         .clone()
@@ -2151,17 +2182,6 @@ pub fn decode_vardct_frame(
     let cfl = lf_global.lf_channel_correlation.ok_or_else(|| {
         Error::InvalidData("JXL VarDCT round 13: LfChannelCorrelation missing".into())
     })?;
-    let lf_thresholds_present = hbc.lf_thresholds.iter().any(|t| !t.is_empty());
-    if lf_thresholds_present {
-        return Err(Error::Unsupported(format!(
-            "jxl VarDCT integrated decode: HfBlockContext carries non-empty lf_thresholds \
-             (nb_block_ctx={}) — the integrated qdc_at LF-DC lookup feeding the \
-             BlockContextResolver is the next wiring step; bundles with empty lf_thresholds \
-             decode end-to-end",
-            hbc.nb_block_ctx
-        )));
-    }
-
     // Pair each PassGroup reader with its §C.3.1 raster-order group
     // rectangle (in the LfGroup's block coordinates).
     let group_rects = crate::group_rect::group_rects_in_blocks(lf_w, lf_h, fh.group_dim())?;
@@ -2185,6 +2205,9 @@ pub fn decode_vardct_frame(
         sharpness: &hf_meta.sharpness,
         cfl,
         hf_block_context: hbc,
+        lf_quant_width: lf_quant_widths[0],
+        lf_quant_height: lf_quant_heights[0],
+        lf_quant,
         frame_width: scaffold.width,
         frame_height: scaffold.height,
     };
