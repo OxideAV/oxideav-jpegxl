@@ -500,6 +500,7 @@ pub mod dct_quant_weights;
 pub mod dct_select;
 pub mod epf;
 pub mod extensions;
+pub mod frame_compose;
 pub mod frame_header;
 pub mod gaborish;
 pub mod global_modular;
@@ -741,6 +742,10 @@ fn decode_all_frames_from_codestream(
     // This guards against a malformed `is_last`-never-set stream.
     let max_frames = codestream.len().max(1);
     let mut frame_pts = pts;
+    // §C.2 composition state: the Reference[…] slots + image-sized
+    // canvas the per-frame BlendingInfo composes against.
+    let mut compose_state =
+        frame_compose::ComposeState::new(size.width as usize, size.height as usize)?;
     loop {
         if offset >= codestream.len() {
             return Err(Error::InvalidData(
@@ -756,7 +761,23 @@ fn decode_all_frames_from_codestream(
         let decoded = decode_frame_body(&mut br, frame_slice, &size, &metadata, frame_pts)?;
         let is_last = decoded.is_last;
         let next_rel = decoded.next_frame_offset;
-        frames.push(decoded.frame);
+        // §C.2 composition: blend the decoded frame over
+        // Reference[source] (crop rectangles update the source frame's
+        // rect; full-frame kReplace passes through) and record
+        // Reference[save_as_reference] when requested. Non-3-plane
+        // frames (extra channels) bypass composition — their blending
+        // is a documented follow-up and the raw frame is what rounds
+        // ≤ 388 emitted.
+        let composed = if decoded.frame.planes.len() == 3 {
+            compose_state.compose(&decoded.frame, &decoded.compose)?
+        } else {
+            decoded.frame
+        };
+        // Presentation rule (§C.2): a zero-duration non-last frame is
+        // composed but not presented.
+        if decoded.compose.duration > 0 || is_last {
+            frames.push(composed);
+        }
         frame_pts = None;
         if is_last {
             break;
@@ -879,6 +900,9 @@ struct DecodedFrame {
     frame: VideoFrame,
     is_last: bool,
     next_frame_offset: usize,
+    /// §C.2 composition fields the multi-frame walk feeds to
+    /// [`frame_compose::ComposeState::compose`].
+    compose: frame_compose::FrameComposeMeta,
 }
 
 /// Read the codestream prelude that precedes the frame array: SizeHeader
@@ -966,6 +990,19 @@ fn decode_frame_body(
     let total_frame_len: usize = toc.entries.iter().map(|&e| e as usize).sum();
     let next_frame_offset = frame_start_byte.saturating_add(total_frame_len);
 
+    // §C.2 composition fields for the multi-frame walk (Table C.7
+    // blending + crop offsets + reference recording + presentation).
+    let compose_meta = frame_compose::FrameComposeMeta {
+        x0: fh.x0.max(0) as u32,
+        y0: fh.y0.max(0) as u32,
+        mode: fh.blending_info.mode,
+        source: fh.blending_info.source,
+        save_as_reference: fh.save_as_reference,
+        save_before_ct: fh.save_before_ct,
+        duration: fh.duration,
+        is_last,
+    };
+
     // 7. Single-group frames have a single TOC entry containing all
     //    frame data. Round 6 only handled that case; round 7 wires
     //    multi-group via per-section bit readers, with inverse
@@ -1011,6 +1048,7 @@ fn decode_frame_body(
             frame,
             is_last,
             next_frame_offset,
+            compose: compose_meta,
         });
     }
     if fh.encoding != crate::frame_header::Encoding::Modular {
@@ -1245,6 +1283,7 @@ fn decode_frame_body(
             frame: VideoFrame { pts, planes },
             is_last,
             next_frame_offset,
+            compose: compose_meta,
         });
     }
     if expected_chans == 3 && fh.do_ycbcr {
@@ -1259,6 +1298,7 @@ fn decode_frame_body(
             frame: VideoFrame { pts, planes },
             is_last,
             next_frame_offset,
+            compose: compose_meta,
         });
     }
 
@@ -1314,6 +1354,7 @@ fn decode_frame_body(
         frame: VideoFrame { pts, planes },
         is_last,
         next_frame_offset,
+        compose: compose_meta,
     })
 }
 
