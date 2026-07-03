@@ -169,11 +169,36 @@ impl HfGlobalSection {
     /// The returned context borrows `self.histograms` mutably (it owns
     /// the per-symbol ANS decode state), so the section is borrowed for
     /// the lifetime of the decode.
+    ///
+    /// The context also carries the per-pass §C.7.1 coefficient-order
+    /// sources: for each pass `p`, the `headers.hfp(p)`-selected
+    /// [`crate::hf_pass::HfPass`] bundle from this section, so the
+    /// §C.8.3 Listing C.14 `coeffs[order[k]]` placement uses the
+    /// signalled (possibly permuted) order rather than the bare natural
+    /// order.
     pub fn decode_context<'a>(
         &'a mut self,
         headers: &PerPassHfHeaders,
     ) -> Result<HfHistogramDecodeContext<'a>> {
-        HfHistogramDecodeContext::new(&mut self.histograms, headers)
+        let Self {
+            hf_passes,
+            histograms,
+            ..
+        } = self;
+        let mut ctx = HfHistogramDecodeContext::new(histograms, headers)?;
+        let mut orders = Vec::with_capacity(headers.num_passes() as usize);
+        for p in 0..headers.num_passes() {
+            let hfp = headers.hfp(p)? as usize;
+            let hf_pass = hf_passes.get(hfp).ok_or_else(|| {
+                Error::InvalidData(format!(
+                    "JXL HfGlobalSection: pass {p} hfp {hfp} out of {} HfPass bundles",
+                    hf_passes.len()
+                ))
+            })?;
+            orders.push(hf_pass);
+        }
+        ctx.set_pass_orders(orders)?;
+        Ok(ctx)
     }
 }
 

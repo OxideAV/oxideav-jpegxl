@@ -237,6 +237,19 @@ pub struct HfHistogramDecodeContext<'a> {
     /// so the per-symbol path is a single array indexing — no header
     /// dereference per decode.
     per_pass_offsets: Vec<u64>,
+    /// Per-pass §C.7.1 coefficient-order source: the `hfp(p)`-selected
+    /// [`crate::hf_pass::HfPass`] bundle for each pass. When set (via
+    /// [`Self::set_pass_orders`], done automatically by
+    /// [`crate::hf_global_section::HfGlobalSection::decode_context`]),
+    /// [`Self::decode_block_for_pass_transform`] places each decoded
+    /// coefficient through `order[k]` — the §C.8.3 Listing C.14
+    /// `coeffs[order[k]] = unpack_signed(ucoeff)` line, where `order`
+    /// is the HfPass' final per-OrderId order (natural, or the §C.3.2
+    /// permutation applied to natural when the `used_orders` bit is
+    /// set). When `None`, the natural order is used for every pass —
+    /// the pre-round-385 behaviour, kept for order-agnostic unit tests
+    /// that construct the context directly from a histogram stream.
+    per_pass_orders: Option<Vec<&'a crate::hf_pass::HfPass>>,
 }
 
 impl<'a> HfHistogramDecodeContext<'a> {
@@ -294,7 +307,31 @@ impl<'a> HfHistogramDecodeContext<'a> {
         Ok(Self {
             histograms,
             per_pass_offsets,
+            per_pass_orders: None,
         })
+    }
+
+    /// Attach the per-pass §C.7.1 coefficient-order sources (the
+    /// `hfp(p)`-selected [`crate::hf_pass::HfPass`] per pass, in pass
+    /// order). After this call
+    /// [`Self::decode_block_for_pass_transform`] resolves each
+    /// transform's coefficient order through the pass' HfPass bundle
+    /// instead of the bare natural order — the signalled §C.3.2
+    /// permutations (Listing C.12 `order[i] =
+    /// natural_coeff_order[nat_ord_perm[i]]`) take effect.
+    ///
+    /// `Err(InvalidData)` when `orders.len()` disagrees with the
+    /// context's pass count.
+    pub fn set_pass_orders(&mut self, orders: Vec<&'a crate::hf_pass::HfPass>) -> Result<()> {
+        if orders.len() != self.per_pass_offsets.len() {
+            return Err(Error::InvalidData(format!(
+                "JXL HfHistogramDecodeContext: per-pass order count {} != num_passes {}",
+                orders.len(),
+                self.per_pass_offsets.len()
+            )));
+        }
+        self.per_pass_orders = Some(orders);
+        Ok(())
     }
 
     /// Decode a §C.7.2 symbol for pass `p` against context `ctx`,
@@ -488,12 +525,35 @@ impl<'a> HfHistogramDecodeContext<'a> {
             )));
         }
         let oid = order_id_for_transform(t);
-        let natural_order = natural_coeff_order(oid);
-        if natural_order.len() != size as usize {
+        // §C.8.3 Listing C.14 places each decoded coefficient through
+        // `order[k]`, where `order` is the §C.7.1 per-pass per-OrderId
+        // coefficient order — the natural order, or the signalled
+        // §C.3.2 permutation of it when the pass' HfPass has the
+        // corresponding `used_orders` bit set. When no per-pass order
+        // source is attached (order-agnostic unit-test constructions),
+        // fall back to the natural order.
+        let natural_fallback;
+        let order: &[u32] = match &self.per_pass_orders {
+            Some(po) => {
+                let hf_pass = po.get(p as usize).ok_or_else(|| {
+                    Error::InvalidData(format!(
+                        "JXL HfHistogramDecodeContext::decode_block_for_pass_transform: \
+                         pass {p} out of range for per-pass orders ({})",
+                        po.len()
+                    ))
+                })?;
+                hf_pass.order_for(oid)
+            }
+            None => {
+                natural_fallback = natural_coeff_order(oid);
+                &natural_fallback
+            }
+        };
+        if order.len() != size as usize {
             return Err(Error::InvalidData(format!(
                 "JXL HfHistogramDecodeContext::decode_block_for_pass_transform: \
-                 natural_order len {} != size {size} for {t:?}",
-                natural_order.len()
+                 coefficient-order len {} != size {size} for {t:?}",
+                order.len()
             )));
         }
 
@@ -535,15 +595,16 @@ impl<'a> HfHistogramDecodeContext<'a> {
             )?;
             coeffs_read += 1;
             let signed = unpack_signed(ucoeff);
-            let pos = natural_order[k as usize] as usize;
-            // natural_order entries are guaranteed in [0, size) by
-            // construction of natural_coeff_order; we still defensively
-            // guard for the (impossible-by-spec) out-of-range case to
-            // mirror round-90's belt-and-braces shape.
+            let pos = order[k as usize] as usize;
+            // Order entries are guaranteed in [0, size) by construction
+            // (natural_coeff_order, or a §C.3.2 permutation of it); we
+            // still defensively guard for the (impossible-by-spec)
+            // out-of-range case to mirror round-90's belt-and-braces
+            // shape.
             if pos >= size as usize {
                 return Err(Error::InvalidData(format!(
                     "JXL HfHistogramDecodeContext::decode_block_for_pass_transform: \
-                     natural_order entry {pos} >= size {size} for {t:?}"
+                     coefficient-order entry {pos} >= size {size} for {t:?}"
                 )));
             }
             coeffs[pos] = signed;
