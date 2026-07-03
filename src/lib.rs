@@ -500,6 +500,7 @@ pub mod extensions;
 pub mod frame_header;
 pub mod gaborish;
 pub mod global_modular;
+pub mod group_rect;
 pub mod hf_coeff_histogram_size;
 pub mod hf_coefficient_histograms;
 pub mod hf_dequant;
