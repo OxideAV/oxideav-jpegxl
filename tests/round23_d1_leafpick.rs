@@ -106,7 +106,12 @@ fn decode_with_target_and_bias(
         image_width: size.width,
         image_height: size.height,
     };
-    let fh = FrameHeader::read(&mut br, &fh_params).expect("FrameHeader");
+    let fh = FrameHeader::read_with_edition(
+        &mut br,
+        &fh_params,
+        oxideav_jpegxl::frame_header::RfEdition::V2024,
+    )
+    .expect("FrameHeader");
     assert_eq!(fh.encoding, Encoding::VarDct);
     let toc = Toc::read(&mut br, &fh).expect("TOC");
     let frame_data_start = br.bytes_consumed();
@@ -345,7 +350,12 @@ fn d1_ma_tree_topology_round_23() {
         image_width: size.width,
         image_height: size.height,
     };
-    let fh = FrameHeader::read(&mut br, &fh_params).unwrap();
+    let fh = FrameHeader::read_with_edition(
+        &mut br,
+        &fh_params,
+        oxideav_jpegxl::frame_header::RfEdition::V2024,
+    )
+    .unwrap();
     let toc = Toc::read(&mut br, &fh).unwrap();
     let frame_data_start = br.bytes_consumed();
     let frame_bytes = &br.data()[frame_data_start..];
@@ -523,7 +533,12 @@ fn decode_with_log_and_bias(bias: i32) -> (u32, usize, LeafLog) {
         image_width: size.width,
         image_height: size.height,
     };
-    let fh = FrameHeader::read(&mut br, &fh_params).unwrap();
+    let fh = FrameHeader::read_with_edition(
+        &mut br,
+        &fh_params,
+        oxideav_jpegxl::frame_header::RfEdition::V2024,
+    )
+    .unwrap();
     let toc = Toc::read(&mut br, &fh).unwrap();
     let frame_data_start = br.bytes_consumed();
     let frame_bytes = &br.data()[frame_data_start..];

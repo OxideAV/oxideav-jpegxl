@@ -678,7 +678,7 @@ fn decode_icc_stream_at(br: &mut BitReader<'_>) -> Result<Vec<u8>> {
 /// Decode the entire JXL packet (raw codestream OR ISOBMFF-wrapped) and
 /// return the first frame as a [`VideoFrame`]. Round-3 envelope.
 pub fn decode_one_frame(input: &[u8], pts: Option<i64>) -> Result<VideoFrame> {
-    decode_first_frame(input, pts, false)
+    decode_first_frame(input, pts)
 }
 
 /// Decode **every** frame in a JXL codestream (raw or ISOBMFF-wrapped),
@@ -753,7 +753,7 @@ fn decode_all_frames_from_codestream(
         // absolute codestream offset.
         let frame_slice = &codestream[offset..];
         let mut br = BitReader::new(frame_slice);
-        let decoded = decode_frame_body(&mut br, frame_slice, &size, &metadata, frame_pts, false)?;
+        let decoded = decode_frame_body(&mut br, frame_slice, &size, &metadata, frame_pts)?;
         let is_last = decoded.is_last;
         let next_rel = decoded.next_frame_offset;
         frames.push(decoded.frame);
@@ -776,36 +776,24 @@ fn decode_all_frames_from_codestream(
     Ok(frames)
 }
 
-/// Decode the first frame, returning the integrated VarDCT
-/// reconstruction's pixels **without** the public path's pixel-withhold
-/// gate. Exposed for the crate's integration tests and offline tooling
-/// that want to exercise the full §C.8.3 → §L.2.2 VarDCT chain on a real
-/// codestream and inspect its output.
-///
-/// For non-VarDCT (Modular) frames this is identical to
-/// [`decode_one_frame`]. For VarDCT frames it returns the reconstructed
-/// RGB frame instead of the "pixels not yet validated" sentinel error
-/// that [`decode_one_frame`] returns — see [`decode_vardct_frame`] for
-/// the pixel-validation caveat.
+/// Decode the first frame. Historical alias of [`decode_one_frame`]:
+/// through round 385 the public path withheld VarDCT pixels behind an
+/// `Error::Unsupported` sentinel and this entry bypassed the gate for
+/// tests/tooling; round 389 validated the reconstruction against the
+/// staged reference decodes and lifted the withhold, so the two entry
+/// points are now identical. Kept for source compatibility.
 pub fn decode_vardct_frame_from_codestream(input: &[u8], pts: Option<i64>) -> Result<VideoFrame> {
-    decode_first_frame(input, pts, true)
+    decode_first_frame(input, pts)
 }
 
 /// Shared container-strip + codestream dispatch for [`decode_one_frame`]
-/// and [`decode_vardct_frame_from_codestream`]. `return_vardct_pixels`
-/// selects whether a successful VarDCT reconstruction returns its
-/// (not-yet-pixel-validated) frame or the public-path withhold sentinel.
-fn decode_first_frame(
-    input: &[u8],
-    pts: Option<i64>,
-    return_vardct_pixels: bool,
-) -> Result<VideoFrame> {
+/// and [`decode_vardct_frame_from_codestream`] (identical since round
+/// 389 lifted the VarDCT pixel withhold).
+fn decode_first_frame(input: &[u8], pts: Option<i64>) -> Result<VideoFrame> {
     let sig = container::detect(input)
         .ok_or_else(|| Error::InvalidData("jxl decoder: no JXL signature".into()))?;
     match sig {
-        container::Signature::RawCodestream => {
-            decode_codestream(&input[2..], pts, return_vardct_pixels)
-        }
+        container::Signature::RawCodestream => decode_codestream(&input[2..], pts),
         container::Signature::Isobmff => {
             // The jxlc/jxlp box payload concatenation is itself a JXL
             // codestream and therefore begins with the 2-byte `FF 0A`
@@ -822,7 +810,7 @@ fn decode_first_frame(
                     "JXL ISOBMFF: jxlc/jxlp payload missing FF 0A codestream signature".into(),
                 ));
             }
-            decode_codestream(&cs[2..], pts, return_vardct_pixels)
+            decode_codestream(&cs[2..], pts)
         }
     }
 }
@@ -927,20 +915,9 @@ fn read_codestream_prelude(
     Ok((br, size, metadata))
 }
 
-fn decode_codestream(
-    codestream: &[u8],
-    pts: Option<i64>,
-    return_vardct_pixels: bool,
-) -> Result<VideoFrame> {
+fn decode_codestream(codestream: &[u8], pts: Option<i64>) -> Result<VideoFrame> {
     let (mut br, size, metadata) = read_codestream_prelude(codestream)?;
-    let decoded = decode_frame_body(
-        &mut br,
-        codestream,
-        &size,
-        &metadata,
-        pts,
-        return_vardct_pixels,
-    )?;
+    let decoded = decode_frame_body(&mut br, codestream, &size, &metadata, pts)?;
     Ok(decoded.frame)
 }
 
@@ -956,7 +933,6 @@ fn decode_frame_body(
     size: &SizeHeaderFdis,
     metadata: &ImageMetadataFdis,
     pts: Option<i64>,
-    return_vardct_pixels: bool,
 ) -> Result<DecodedFrame> {
     // 5. FrameHeader (FDIS C.2).
     let fh_params = FrameDecodeParams {
@@ -1013,36 +989,29 @@ fn decode_frame_body(
     // when `kSkipAdaptiveLFSmoothing == 0`.
     if fh.encoding == crate::frame_header::Encoding::VarDct {
         let scaffold = crate::vardct::recognise_vardct_codestream(&fh, metadata)?;
-        // The integrated VarDCT decode (`decode_vardct_frame`) now runs
-        // the whole §C.8.3 HF-entropy → F.3 dequant → IDCT → CfL →
-        // §6.2 crop → §L.2.2 XYB→RGB chain end-to-end on a real
-        // codestream. Genuine parse errors (malformed sections, an
-        // unhandled sub-case) propagate verbatim. A *successful*
-        // reconstruction is NOT yet surfaced from the public decode
-        // path: the per-block HF coefficient scaling has not been
-        // validated bit-exact against a reference decode, so returning
-        // its pixels would be a silent-misparse risk (the very thing
-        // this crate's "no silent misparse" contract forbids). The
-        // reconstruction is instead exercised structurally by the
-        // crate's integration tests against `decode_vardct_frame`
-        // directly. Once the per-block scaling is pixel-validated this
-        // branch returns the frame.
+        // The integrated VarDCT decode (`decode_vardct_frame`) runs the
+        // whole §C.8.3 HF-entropy → F.3 dequant → IDCT → CfL → §6.2
+        // crop → §J filters → §L.2.2 XYB→RGB chain. Genuine parse
+        // errors (malformed sections, an unhandled sub-case) propagate
+        // verbatim.
+        //
+        // Round 389 lifted the rounds-355–385 public-path pixel
+        // withhold: the reconstruction is now validated against three
+        // reference decodes (direct sRGB byte comparison) —
+        // `large-1024x768-d2` multi-group MAD 0.55/0.49/0.33,
+        // `vardct-256x256-d3` MAD 0.89/0.70/0.95, and
+        // `vardct-256x256-d1` MAD ≈ 3.4 (the strongest-HF fixture; the
+        // residual HF tail is a known open item pinned by the round-362
+        // ratchet). Sub-cases the decoder cannot yet frame (multi-pass,
+        // multi-LfGroup, non-empty lf_thresholds) still surface a
+        // precise `Error::Unsupported` from `decode_vardct_frame`
+        // instead of pixels.
         let frame = decode_vardct_frame(&fh, metadata, &toc, br, scaffold, pts)?;
-        if return_vardct_pixels {
-            return Ok(DecodedFrame {
-                frame,
-                is_last,
-                next_frame_offset,
-            });
-        }
-        return Err(Error::Unsupported(
-            "jxl VarDCT decoder: the integrated reconstruction (HF entropy decode + \
-             F.3 dequant + IDCT + CfL + §6.2 crop + §L.2.2 XYB→RGB) runs end-to-end on \
-             this codestream, but per-block HF coefficient scaling is not yet \
-             pixel-validated against a reference decode — the public path withholds \
-             unvalidated pixels rather than risk a silent misparse"
-                .into(),
-        ));
+        return Ok(DecodedFrame {
+            frame,
+            is_last,
+            next_frame_offset,
+        });
     }
     if fh.encoding != crate::frame_header::Encoding::Modular {
         return Err(Error::Unsupported(format!(

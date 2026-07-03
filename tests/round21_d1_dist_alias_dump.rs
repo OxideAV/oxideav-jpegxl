@@ -59,7 +59,12 @@ fn d1_per_cluster_distribution_and_alias_dump_round_21() {
         image_width: size.width,
         image_height: size.height,
     };
-    let fh = FrameHeader::read(&mut br, &fh_params).expect("FrameHeader");
+    let fh = FrameHeader::read_with_edition(
+        &mut br,
+        &fh_params,
+        oxideav_jpegxl::frame_header::RfEdition::V2024,
+    )
+    .expect("FrameHeader");
     let toc = Toc::read(&mut br, &fh).expect("TOC");
     assert_eq!(toc.entries.len(), 1);
 

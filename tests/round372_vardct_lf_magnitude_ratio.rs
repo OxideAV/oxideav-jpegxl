@@ -75,7 +75,12 @@ fn decode_dequant_lf() -> ([Vec<f32>; 3], (f32, f32), usize, usize) {
         image_width: size.width,
         image_height: size.height,
     };
-    let fh = FrameHeader::read(&mut br, &fhp).expect("frame header");
+    let fh = FrameHeader::read_with_edition(
+        &mut br,
+        &fhp,
+        oxideav_jpegxl::frame_header::RfEdition::V2024,
+    )
+    .expect("frame header");
     let toc = Toc::read(&mut br, &fh).expect("toc");
     assert_eq!(toc.entries.len(), 1, "single-TOC single-group frame");
 

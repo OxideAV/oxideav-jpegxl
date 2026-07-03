@@ -87,7 +87,16 @@ fn d1_bit_position_walk_round_17() {
         image_width: size.width,
         image_height: size.height,
     };
-    let fh = FrameHeader::read(&mut br, &fh_params).expect("FrameHeader");
+    // Round 389: d1 is a cjxl 2024-IS stream — parse with the 2024
+    // RestorationFilter table (the integrated path picks it by trial;
+    // `FrameHeader::read` defaults to the 2021 layout for its legacy
+    // unit pins, which mis-frames d1's custom RF bits).
+    let fh = FrameHeader::read_with_edition(
+        &mut br,
+        &fh_params,
+        oxideav_jpegxl::frame_header::RfEdition::V2024,
+    )
+    .expect("FrameHeader");
     eprintln!(
         "[r17-trace] after FrameHeader     = {} bits (encoding={:?}, group_dim={})",
         br.bits_read(),

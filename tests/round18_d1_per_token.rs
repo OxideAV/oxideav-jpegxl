@@ -50,7 +50,14 @@ fn d1_per_token_trace_round_18() {
         image_width: size.width,
         image_height: size.height,
     };
-    let fh = FrameHeader::read(&mut br, &fh_params).expect("FrameHeader");
+    // Round 389: parse with the 2024 RestorationFilter table (see
+    // round17_d1_bit_trace.rs — the V2021 default mis-frames d1's RF).
+    let fh = FrameHeader::read_with_edition(
+        &mut br,
+        &fh_params,
+        oxideav_jpegxl::frame_header::RfEdition::V2024,
+    )
+    .expect("FrameHeader");
     assert_eq!(fh.encoding, Encoding::VarDct, "d1 must be VarDCT");
     let toc = Toc::read(&mut br, &fh).expect("TOC");
     assert_eq!(toc.entries.len(), 1);

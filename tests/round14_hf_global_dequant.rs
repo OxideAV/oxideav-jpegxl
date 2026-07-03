@@ -8,7 +8,6 @@
 //! per-slot encoding modes are recognised, parameters captured, and
 //! Table I.5 valid-index constraints enforced.
 
-use oxideav_core::Error;
 use oxideav_jpegxl::decode_one_frame;
 
 const PIXEL_1X1_JXL: &[u8] = include_bytes!("fixtures/pixel_1x1.jxl");
@@ -42,36 +41,23 @@ fn five_small_lossless_fixtures_still_decode_round_14() {
     }
 }
 
-/// Round-14 acceptance: the d1 fixture is no longer blocked at
-/// `HfBlockContext non-default-table branch (...) not yet supported
-/// (round 12+)`. Either it progresses past LfGlobal entirely (next
-/// downstream blocker) or it errors with a different precise message —
-/// but NEVER the round-12-vintage HfBlockContext message.
+/// Round-14 acceptance, upgraded round 389: the d1 fixture parses
+/// through the HfBlockContext / HfGlobal work this suite pinned and —
+/// since the integrated decode was reference-validated — decodes to
+/// pixels on the public path.
 #[test]
 fn vardct_d1_fixture_is_past_hf_block_context_round_14() {
-    let r = decode_one_frame(VARDCT_D1_JXL, None);
-    let err = r.expect_err("VarDCT d1 still defers (no HF decode yet)");
-    let msg = format!("{err:?}");
-    assert!(
-        !msg.contains("HfBlockContext non-default-table branch"),
-        "round-14 should bypass the round-11/12 HfBlockContext gate; got {msg}"
-    );
-    assert!(
-        matches!(err, Error::Unsupported(_) | Error::InvalidData(_)),
-        "round-14 should yield Unsupported or InvalidData; got {msg}"
-    );
+    let frame = decode_one_frame(VARDCT_D1_JXL, None)
+        .expect("d1 decodes on the public path since round 389");
+    assert_eq!(frame.planes.len(), 3);
 }
 
-/// Round-14 sentinel: d3 fixture still hits its FrameHeader UTF-8 issue
-/// (independent of the HfBlockContext / HfGlobal work). Documenting it
-/// here so a regression in either direction is visible.
+/// Round-14 sentinel, upgraded round 389: d3's then-blocker (the
+/// FrameHeader `save_before_ct` over-read that surfaced as a bogus
+/// "name is not valid UTF-8") was root-caused and fixed; it decodes.
 #[test]
 fn vardct_d3_fixture_still_errors_in_round_14() {
-    let r = decode_one_frame(VARDCT_D3_JXL, None);
-    let err = r.expect_err("VarDCT d3 still has its own (separate) blocker");
-    let msg = format!("{err:?}");
-    assert!(
-        !msg.contains("HfBlockContext non-default-table branch"),
-        "round-14: HfBlockContext gate should not be the d3 blocker; got {msg}"
-    );
+    let frame = decode_one_frame(VARDCT_D3_JXL, None)
+        .expect("d3 decodes on the public path since round 389");
+    assert_eq!(frame.planes.len(), 3);
 }

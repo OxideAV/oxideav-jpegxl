@@ -23,35 +23,24 @@
 //! completion. So this test no longer asserts a stop *at* §C.7; it
 //! asserts the §C.7 section is consumed cleanly (no error inside the
 //! HfPass / histogram reads) by confirming the public path reaches the
-//! round-355 "runs end-to-end" sentinel, and that the reconstruction
-//! itself succeeds when driven via the test entry.
-
-use oxideav_core::Error;
+//! reconstruction succeeding on the public path (round 389 lifted the
+//! rounds-355–385 pixel withhold once the output was validated against
+//! the staged reference decodes).
 
 /// `vardct_256x256_d1.jxl` is consumed cleanly through the §C.7 HfGlobal
 /// section: the integrated decode reads HfGlobal + the §C.7.1 HfPass
-/// sequence + the §C.7.2 HF-coefficient histograms + the ANS-state init
-/// without error, then proceeds through the full §C.8.3 → §L.2.2 chain.
-///
-/// The *public* path still returns `Error::Unsupported` (pixels are
-/// withheld until reference-validated), but the message is now the
-/// round-355 "runs end-to-end" sentinel — proving the §C.7 reads, and
-/// everything after them, completed. A regression inside the HfPass /
-/// histogram reads (or earlier) surfaces as a different error here.
+/// sequence + the §C.7.2 HF-coefficient histograms without error, then
+/// proceeds through the full §C.8.3 → §L.2.2 chain. Since round 389 the
+/// public path returns the reconstructed pixels; a regression inside
+/// the HfPass / histogram reads (or anywhere after) surfaces as an
+/// error here.
 #[test]
 fn vardct_d1_parses_through_hf_global_section() {
     const FIXTURE: &[u8] = include_bytes!("fixtures/vardct_256x256_d1.jxl");
-    let r = oxideav_jpegxl::decode_one_frame(FIXTURE, None);
-    match r {
-        Err(Error::Unsupported(msg)) => {
-            assert!(
-                msg.contains("runs end-to-end"),
-                "expected the round-355 end-to-end sentinel (proving §C.7 + the rest of the \
-                 chain were consumed cleanly), got: {msg}"
-            );
-        }
-        other => panic!("expected Err(Unsupported) round-355 end-to-end sentinel, got {other:?}"),
-    }
+    let frame = oxideav_jpegxl::decode_one_frame(FIXTURE, None)
+        .expect("public VarDCT decode succeeds (round 389 lifted the pixel withhold)");
+    assert_eq!(frame.planes.len(), 3);
+    assert_eq!(frame.planes[0].data.len(), 256 * 256);
 }
 
 /// Driving the integrated reconstruction directly confirms the §C.7

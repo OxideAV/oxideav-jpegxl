@@ -14,48 +14,39 @@
 //! The whole chain now *executes* end-to-end (the entry point
 //! [`oxideav_jpegxl::decode_vardct_frame`] returns a 3-plane RGB
 //! [`oxideav_core::VideoFrame`] at the logical frame extent), which it
-//! never did before. The per-block HF coefficient scaling is not yet
-//! validated bit-exact against a reference decode, so the *public*
-//! [`oxideav_jpegxl::decode_one_frame`] path still withholds the
-//! reconstructed pixels (returning a precise "runs end-to-end but
-//! pixels not yet validated" `Error::Unsupported`) rather than risk a
-//! silent misparse. These tests therefore pin the structural
-//! invariants of the integrated pipeline, not pixel values.
+//! never did before. Round 389 validated the output against the staged
+//! reference decodes (see `round389_multi_group_vardct.rs` and the
+//! round-362 ratchet) and lifted the public-path pixel withhold; these
+//! tests pin the structural invariants of the integrated pipeline.
 //!
 //! Clean-room: behaviour is derived from the ISO/IEC 18181 spec PDFs +
 //! the staged trace/errata material under `docs/image/jpegxl/`. No
 //! external implementation source is consulted.
 
-use oxideav_core::Error;
 use oxideav_jpegxl::decode_one_frame;
 
 const VARDCT_D1_JXL: &[u8] = include_bytes!("fixtures/vardct_256x256_d1.jxl");
 
-/// The public decode path now reaches the integrated reconstruction on
-/// the `vardct-256x256-d1` fixture: the error is the round-355
-/// "runs end-to-end" sentinel, proving the §C.8.3 → §L.2.2 chain
-/// executed without aborting (rather than the older "remaining: …
-/// per-pass header reads" deferral, or a sub-component parse error).
+/// The public decode path returns the integrated reconstruction's
+/// pixels on the `vardct-256x256-d1` fixture (round 389 lifted the
+/// rounds-355–385 withhold sentinel once the output was
+/// reference-validated), and is byte-identical to the historical
+/// tests/tooling entry `decode_vardct_frame_from_codestream`.
 #[test]
 fn vardct_d1_reaches_integrated_reconstruction() {
-    let err = decode_one_frame(VARDCT_D1_JXL, None)
-        .expect_err("public path withholds unvalidated VarDCT pixels");
-    let msg = format!("{err}");
-    assert!(
-        matches!(err, Error::Unsupported(_)),
-        "expected Unsupported sentinel; got {msg}"
-    );
-    assert!(
-        msg.contains("runs end-to-end"),
-        "expected the round-355 end-to-end sentinel (the integrated HF decode + IDCT + CfL + \
-         crop + XYB→RGB chain ran to completion); got: {msg}"
-    );
+    let public =
+        decode_one_frame(VARDCT_D1_JXL, None).expect("public VarDCT decode succeeds (round 389)");
+    let alias = oxideav_jpegxl::decode_vardct_frame_from_codestream(VARDCT_D1_JXL, None)
+        .expect("historical alias decodes");
+    assert_eq!(public.planes.len(), 3);
+    for (c, (p, a)) in public.planes.iter().zip(alias.planes.iter()).enumerate() {
+        assert_eq!(p.data, a.data, "channel {c} public/alias byte-identical");
+    }
 }
 
 /// Driving the integrated decoder via
-/// [`oxideav_jpegxl::decode_vardct_frame_from_codestream`] (the test/tool
-/// entry that returns the reconstruction's pixels instead of the public
-/// withhold sentinel) produces a correctly-*shaped* 3-plane RGB frame at
+/// [`oxideav_jpegxl::decode_vardct_frame_from_codestream`] produces a
+/// correctly-*shaped* 3-plane RGB frame at
 /// the 256×256 logical extent. This pins the pipeline's structural
 /// invariants — three planes, each `256 × 256` bytes, stride 256 — with
 /// the whole §C.8.3 → §L.2.2 chain having run to completion. (Pixel

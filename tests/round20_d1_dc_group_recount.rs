@@ -82,7 +82,12 @@ fn d1_dc_group_recount_round_20() {
         image_width: size.width,
         image_height: size.height,
     };
-    let fh = FrameHeader::read(&mut br, &fh_params).expect("FrameHeader");
+    let fh = FrameHeader::read_with_edition(
+        &mut br,
+        &fh_params,
+        oxideav_jpegxl::frame_header::RfEdition::V2024,
+    )
+    .expect("FrameHeader");
     assert_eq!(fh.encoding, Encoding::VarDct);
     let toc = Toc::read(&mut br, &fh).expect("TOC");
     assert_eq!(toc.entries.len(), 1);

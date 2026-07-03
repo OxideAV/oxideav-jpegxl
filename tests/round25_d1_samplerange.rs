@@ -114,7 +114,12 @@ fn decode_with_rich_range(
         image_width: size.width,
         image_height: size.height,
     };
-    let fh = FrameHeader::read(&mut br, &fh_params).unwrap();
+    let fh = FrameHeader::read_with_edition(
+        &mut br,
+        &fh_params,
+        oxideav_jpegxl::frame_header::RfEdition::V2024,
+    )
+    .unwrap();
     assert_eq!(fh.encoding, Encoding::VarDct);
     let toc = Toc::read(&mut br, &fh).unwrap();
     let frame_data_start = br.bytes_consumed();

@@ -19,7 +19,6 @@
 //! returns `Error::Unsupported` with a "round 14+" message AFTER the
 //! round-13 pipeline has parsed and dequantised all the LF data.
 
-use oxideav_core::Error;
 use oxideav_jpegxl::dct_select::{derive_dct_select, DctSelectCell, TransformType};
 use oxideav_jpegxl::decode_one_frame;
 use oxideav_jpegxl::lf_group::HfMetadata;
@@ -68,38 +67,23 @@ fn five_small_lossless_fixtures_still_decode_round_13() {
 /// HfBlockContext, non-default HfGlobal, > 1 LfGroup) — but NEVER with
 /// the older "round 8 scaffold" or generic "encoding not supported"
 /// error.
+// Rounds 13–385 pinned these fixtures to a precise Unsupported /
+// InvalidData deferral; round 389 completed and reference-validated the
+// integrated decode, so the public path now returns pixels for both.
 #[test]
 fn vardct_d3_fixture_reaches_round_13_pipeline() {
-    let r = decode_one_frame(VARDCT_D3_JXL, None);
-    let err = r.expect_err("VarDCT codestream should error in round 13 (no IDCT+CfL yet)");
-    let msg = format!("{err:?}");
-    // Must NOT be the legacy round-8 scaffold message.
-    assert!(
-        !msg.contains("round 8 scaffold"),
-        "round-13 should bypass the round-8 scaffold gate; got {msg}"
-    );
-    // Must be an Unsupported (or a precise InvalidData from a sub-
-    // component like HfBlockContext non-default, HfGlobal non-default,
-    // >1 LfGroup, or modular sub-bitstream limit).
-    assert!(
-        matches!(err, Error::Unsupported(_) | Error::InvalidData(_)),
-        "round-13 should yield Unsupported or InvalidData; got {msg}"
-    );
+    let frame = decode_one_frame(VARDCT_D3_JXL, None)
+        .expect("d3 decodes on the public path since round 389");
+    assert_eq!(frame.planes.len(), 3);
+    assert_eq!(frame.planes[0].data.len(), 256 * 256);
 }
 
 #[test]
 fn vardct_d1_fixture_reaches_round_13_pipeline() {
-    let r = decode_one_frame(VARDCT_D1_JXL, None);
-    let err = r.expect_err("VarDCT codestream should error in round 13 (no IDCT+CfL yet)");
-    let msg = format!("{err:?}");
-    assert!(
-        !msg.contains("round 8 scaffold"),
-        "round-13 should bypass the round-8 scaffold gate; got {msg}"
-    );
-    assert!(
-        matches!(err, Error::Unsupported(_) | Error::InvalidData(_)),
-        "round-13 should yield Unsupported or InvalidData; got {msg}"
-    );
+    let frame = decode_one_frame(VARDCT_D1_JXL, None)
+        .expect("d1 decodes on the public path since round 389");
+    assert_eq!(frame.planes.len(), 3);
+    assert_eq!(frame.planes[0].data.len(), 256 * 256);
 }
 
 /// Acceptance test for `derive_dct_select` covering a handful of

@@ -20,7 +20,6 @@
 //! wrong for the single-entry case. Fix: chain the section reads on a
 //! shared `BitReader` when `toc.entries.len() == 1`.
 
-use oxideav_core::Error;
 use oxideav_jpegxl::decode_one_frame;
 
 const PIXEL_1X1_JXL: &[u8] = include_bytes!("fixtures/pixel_1x1.jxl");
@@ -60,19 +59,10 @@ fn five_small_lossless_fixtures_still_decode_round_15() {
 /// downstream HfMetadata round-13+ deferral message.
 #[test]
 fn vardct_d1_fixture_is_past_global_modular_round_15() {
-    let r = decode_one_frame(VARDCT_D1_JXL, None);
-    let err = r.expect_err("VarDCT d1 still defers (HfMetadata transforms not yet supported)");
-    let msg = format!("{err:?}");
-    assert!(
-        !msg.contains("TransformId: invalid value 3"),
-        "round-15 should bypass the round-14 TransformId=3 blocker; got {msg}"
-    );
-    assert!(
-        !msg.contains("TOC slot 1 out of range"),
-        "round-15 should bypass the single-TOC-entry slot-out-of-range blocker; got {msg}"
-    );
-    assert!(
-        matches!(err, Error::Unsupported(_) | Error::InvalidData(_)),
-        "round-15 should yield Unsupported or InvalidData; got {msg}"
-    );
+    // Rounds 15–385 pinned a precise deferral here; round 389
+    // reference-validated the integrated decode and lifted the public
+    // pixel withhold, so being "past GlobalModular" now means pixels.
+    let frame = decode_one_frame(VARDCT_D1_JXL, None)
+        .expect("d1 decodes on the public path since round 389");
+    assert_eq!(frame.planes.len(), 3);
 }

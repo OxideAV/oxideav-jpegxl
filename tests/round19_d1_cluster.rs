@@ -59,7 +59,12 @@ fn d1_cluster_and_refill_trace_round_19() {
         image_width: size.width,
         image_height: size.height,
     };
-    let fh = FrameHeader::read(&mut br, &fh_params).expect("FrameHeader");
+    let fh = FrameHeader::read_with_edition(
+        &mut br,
+        &fh_params,
+        oxideav_jpegxl::frame_header::RfEdition::V2024,
+    )
+    .expect("FrameHeader");
     assert_eq!(fh.encoding, Encoding::VarDct, "d1 must be VarDCT");
     let toc = Toc::read(&mut br, &fh).expect("TOC");
     assert_eq!(toc.entries.len(), 1);

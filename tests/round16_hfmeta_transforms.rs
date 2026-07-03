@@ -25,7 +25,6 @@
 //! still errors, but **at a strictly later point** than round 15. The
 //! new error is the next round-17 candidate.
 
-use oxideav_core::Error;
 use oxideav_jpegxl::decode_one_frame;
 
 const PIXEL_1X1_JXL: &[u8] = include_bytes!("fixtures/pixel_1x1.jxl");
@@ -62,25 +61,10 @@ fn five_small_lossless_fixtures_still_decode_round_16() {
 /// MUST come from a strictly later point in the pipeline.
 #[test]
 fn vardct_d1_fixture_is_past_hf_metadata_transform_parse_round_16() {
-    let r = decode_one_frame(VARDCT_D1_JXL, None);
-    let err = r.expect_err("VarDCT d1 still defers (HfMetadata transform values out of range)");
-    let msg = format!("{err:?}");
-    // Round-12/13 deferral message must NOT be the surface error any more.
-    assert!(
-        !msg.contains("transforms inside HF metadata sub-bitstream not yet"),
-        "round-16 should bypass the round-12 HfMetadata transforms deferral; got {msg}"
-    );
-    // Round-15 sentinels must continue to hold.
-    assert!(
-        !msg.contains("TransformId: invalid value 3"),
-        "round-16 should still bypass the round-14 TransformId=3 blocker; got {msg}"
-    );
-    assert!(
-        !msg.contains("TOC slot 1 out of range"),
-        "round-16 should still bypass the round-15 single-TOC-entry blocker; got {msg}"
-    );
-    assert!(
-        matches!(err, Error::Unsupported(_) | Error::InvalidData(_)),
-        "round-16 should yield Unsupported or InvalidData; got {msg}"
-    );
+    // Rounds 16–385 pinned a precise deferral past the HfMetadata
+    // transform parse; round 389 reference-validated the integrated
+    // decode and lifted the public pixel withhold.
+    let frame = decode_one_frame(VARDCT_D1_JXL, None)
+        .expect("d1 decodes on the public path since round 389");
+    assert_eq!(frame.planes.len(), 3);
 }
