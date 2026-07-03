@@ -272,3 +272,59 @@ fn multi_group_decode_matches_reference_srgb_bytes() {
         );
     }
 }
+
+/// Round-389 FrameHeader fix pin: `save_before_ct` shares
+/// `save_as_reference`'s `!is_last` presence condition (fixture-measured
+/// against the 2021 FDIS Table C.2, whose bare `frame_type != kLFFrame`
+/// condition shifts `name_len` onto a garbage 16-byte "name" on
+/// `vardct-256x256-d3`). With the corrected read, d3's header matches
+/// its black-box trace (`FRAME_HEADER ... bits=25`) and the frame
+/// decodes end-to-end to reference-accurate sRGB (measured MAD
+/// 0.89 / 0.70 / 0.95, max 9 / 4 / 9).
+#[test]
+fn d3_header_parses_and_decodes_to_reference() {
+    const D3_JXL: &[u8] = include_bytes!("fixtures/vardct_256x256_d3.jxl");
+    const D3_PNG: &[u8] = include_bytes!("fixtures/vardct_256x256_d3_expected.png");
+    use std::io::Cursor;
+
+    let (fh, toc, _) = parse_to_sections(&D3_JXL[2..]);
+    assert_eq!(fh.encoding, Encoding::VarDct);
+    assert!(fh.is_last);
+    assert_eq!(fh.x_qm_scale, 4, "d3 signals x_qm_scale 4");
+    assert_eq!(fh.b_qm_scale, 2);
+    assert!(fh.name.is_empty(), "no frame name on the wire");
+    assert_eq!(
+        toc.entries,
+        vec![1476],
+        "single-entry TOC of 1476 bytes per the fixture trace"
+    );
+
+    let frame = oxideav_jpegxl::decode_vardct_frame_from_codestream(D3_JXL, None)
+        .expect("d3 decodes end-to-end after the save_before_ct fix");
+    let dec = png::Decoder::new(Cursor::new(D3_PNG));
+    let mut reader = dec.read_info().expect("png read_info");
+    let mut buf = vec![0u8; reader.output_buffer_size().unwrap_or(0)];
+    let info = reader.next_frame(&mut buf).expect("png next_frame");
+    let ch = match info.color_type {
+        png::ColorType::Rgb => 3,
+        png::ColorType::Rgba => 4,
+        other => panic!("unexpected reference colour type {other:?}"),
+    };
+    assert_eq!((info.width, info.height), (256, 256));
+    let n = 256usize * 256;
+    for c in 0..3usize {
+        let mut sum = 0u64;
+        let mut maxd = 0u8;
+        for i in 0..n {
+            let d = frame.planes[c].data[i].abs_diff(buf[i * ch + c]);
+            sum += d as u64;
+            maxd = maxd.max(d);
+        }
+        let mad = sum as f64 / n as f64;
+        assert!(
+            mad < 2.0,
+            "d3 channel {c} sRGB MAD {mad:.3} exceeds 2.0 (measured 0.89/0.70/0.95)"
+        );
+        assert!(maxd <= 20, "d3 channel {c} max diff {maxd} exceeds 20");
+    }
+}

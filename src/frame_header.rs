@@ -721,7 +721,30 @@ impl FrameHeader {
             && blending_info.mode == BlendMode::Replace
             && (duration == 0 || save_as_reference != 0)
             && !is_last);
-        let save_before_ct = if frame_type != FrameType::LfFrame {
+        // Presence condition (round 389, empirical): `save_before_ct`
+        // shares `save_as_reference`'s `frame_type != kLFFrame &&
+        // !is_last` condition, NOT the bare `frame_type != kLFFrame`
+        // the 2021 FDIS Table C.2 prints. Measured on the staged
+        // fixtures (all cjxl v0.12 / 2024-IS streams):
+        //
+        // * `vardct-256x256-d3` (is_last = 1): reading the extra bit
+        //   shifts `name_len` onto a `BitsOffset(5, 16)` selector →
+        //   16 bytes of garbage "name"; skipping it reproduces the
+        //   black-box trace's FrameHeader/TOC bit counts (25 / 23) and
+        //   the TOC size 1476 exactly.
+        // * `vardct-256x256-d1` (is_last = 1): with the extra bit the
+        //   RestorationFilter parses as all_default (epf_iters = 2);
+        //   without it, gab = 1 / epf_iters = 1 — confirmed against
+        //   the reference decode (the residual MAD halves).
+        // * `animation-3frame`: the two is_last = 0 frames carry 3
+        //   more header bits than the is_last = 1 frame (= 2-bit
+        //   `save_as_reference` + 1-bit `save_before_ct`), matching
+        //   this shared condition.
+        //
+        // The in-repo 2024 IS PDF is an image-only scan, so the
+        // changed table row cannot be cross-quoted textually; the
+        // reading above is fixture-measured.
+        let save_before_ct = if frame_type != FrameType::LfFrame && !is_last {
             br.read_bool()?
         } else {
             d_sbct
@@ -897,7 +920,9 @@ mod tests {
         // is_last = bool = 1 → true.
         // is_last=true and frame_type != LfFrame, but !is_last is false →
         //   save_as_reference NOT read (gated on `!is_last`).
-        // frame_type != LfFrame → save_before_ct = bool = 0.
+        // save_before_ct NOT read either (round 389: it shares the
+        //   `!is_last` gate — fixture-measured, see the reader) →
+        //   defaults to d_sbct = !(… && !is_last) = true.
         // name_len: sel=0 → 0.
         // restoration_filter: gab = bool = 1 (default), gab_custom = bool = 0,
         //   epf_iters = u(2) = 0; encoding==Modular but epf_iters==0 so no
@@ -919,7 +944,6 @@ mod tests {
             (0, 1), // have_crop = false
             (0, 2), // blending_info.mode = 0 (kReplace), source skipped
             (1, 1), // is_last = true
-            (0, 1), // save_before_ct = false
             (0, 2), // name_len selector = 0 → 0
             (1, 1), // restoration_filter.gab = true
             (0, 1), // gab_custom = false
@@ -939,7 +963,8 @@ mod tests {
         assert_eq!(fh.passes.num_passes, 1);
         assert!(!fh.have_crop);
         assert!(fh.is_last);
-        assert!(!fh.save_before_ct);
+        // Not on the wire for an is_last frame; default d_sbct = true.
+        assert!(fh.save_before_ct);
         assert!(fh.name.is_empty());
         assert!(fh.restoration_filter.gab);
         assert_eq!(fh.restoration_filter.epf_iters, 0);
