@@ -1608,7 +1608,7 @@ struct VarDctFinishInputs<'a> {
 fn finish_vardct_decode(
     inputs: VarDctFinishInputs<'_>,
     hf_section: &mut crate::hf_global_section::HfGlobalSection,
-    group_readers: Vec<(crate::group_rect::GroupRect, BitReader<'_>)>,
+    group_readers: Vec<(crate::group_rect::GroupRect, Vec<BitReader<'_>>)>,
     pts: Option<i64>,
 ) -> Result<VideoFrame> {
     use crate::block_context_resolver::BlockContextResolver;
@@ -1616,7 +1616,7 @@ fn finish_vardct_decode(
     use crate::multi_pass_hf_header::PerPassHfHeaders;
     use crate::per_pass_non_zeros::PerPassNonZerosGrids;
     use crate::residual_plane::{ChannelResidualPlanes, ResidualPlane};
-    use crate::vardct_reconstruct::{reconstruct_lf_group_from_histogram, DequantContext};
+    use crate::vardct_reconstruct::{reconstruct_lf_group_cross_pass, DequantContext};
 
     let VarDctFinishInputs {
         fh,
@@ -1631,20 +1631,6 @@ fn finish_vardct_decode(
         frame_width,
         frame_height,
     } = inputs;
-
-    // Single-pass only: the §C.8.3 cross-pass accumulation is exercised
-    // by the reconstruction driver's unit tests, but the integrated
-    // multi-pass PassGroup framing (per-pass §C.7 HfPass sets + the
-    // pass-major section order) is a separate wiring step. Reject here
-    // so a multi-pass frame surfaces precisely rather than mis-reading
-    // the section layout.
-    if fh.passes.num_passes != 1 {
-        return Err(Error::Unsupported(format!(
-            "jxl VarDCT integrated decode: num_passes={} — only single-pass frames \
-             are wired end-to-end (multi-pass cross-pass framing is the next step)",
-            fh.passes.num_passes
-        )));
-    }
 
     let num_hf_presets = hf_section.num_hf_presets();
     let nb_block_ctx = hf_block_context.nb_block_ctx;
@@ -1681,7 +1667,7 @@ fn finish_vardct_decode(
         ],
     };
 
-    for (rect, mut gbr) in group_readers {
+    for (rect, per_pass_readers) in group_readers {
         // Group-local views (§C.8.1: all PassGroup coordinates are
         // relative to the group's top-left corner).
         let sub_grid = crate::group_rect::slice_dct_select_rect(&grid, &rect)?;
@@ -1699,35 +1685,53 @@ fn finish_vardct_decode(
             &rect,
         )?;
 
-        // §C.8.3 per-pass HF header (`hfp` selector + derived
-        // histogram_offset) at the head of this group's PassGroup
-        // section.
-        let headers =
-            PerPassHfHeaders::read(&mut gbr, fh.passes.num_passes, num_hf_presets, nb_block_ctx)?;
+        if per_pass_readers.len() != fh.passes.num_passes as usize {
+            return Err(Error::InvalidData(format!(
+                "jxl VarDCT integrated decode: group {} has {} PassGroup readers for \
+                 {} passes",
+                rect.index,
+                per_pass_readers.len(),
+                fh.passes.num_passes
+            )));
+        }
 
-        // D.3.3: each PassGroup section is its own entropy stream, so
-        // its ANS state initialiser (`u(32)`, a no-op for prefix-coded
-        // histograms) is read from the section reader immediately after
-        // the `hfp` header and before the first symbol decode.
-        hf_section.histograms_mut().read_ans_state_init(&mut gbr)?;
+        // §C.8.3 per-(pass, group) decode: each PassGroup section is
+        // its own entropy stream — read the section's `hfp` header,
+        // re-init the ANS state on the section reader (D.3.3), bind
+        // pass `p`'s §C.7 orders + histograms
+        // (`HfPassData::single_pass_context`), and walk the group's
+        // varblocks with a fresh group-local NonZeros grid (§C.8.1:
+        // the PredictedNonZeros neighbours reset at the group's
+        // top-left). The per-pass coefficient stacks are then folded
+        // by the §C.8.3 cross-pass accumulation (Table C.6 shifts:
+        // "If this is not the first pass, the decoder adds decoded HF
+        // coefficients to previously-decoded ones").
+        let mut stacks: crate::multi_pass_decode::MultiPassThreeChannelOutput =
+            Vec::with_capacity(per_pass_readers.len());
+        for (p, mut gbr) in per_pass_readers.into_iter().enumerate() {
+            let headers = PerPassHfHeaders::read(&mut gbr, 1, num_hf_presets, nb_block_ctx)?;
+            let pass_data = hf_section.pass_data_mut(p as u32)?;
+            pass_data.histograms.read_ans_state_init(&mut gbr)?;
+            let mut ctx = pass_data.single_pass_context(&headers)?;
+            let mut nz = PerPassNonZerosGrids::new_uniform(
+                1,
+                3,
+                sub_grid.width_blocks,
+                sub_grid.height_blocks,
+            )?;
+            let mut out = ctx.decode_lf_group_multi_pass_three_channels(
+                &mut gbr, &sub_grid, &mut nz, &resolver, qdc_at,
+            )?;
+            debug_assert_eq!(out.len(), 1);
+            stacks.push(out.pop().ok_or_else(|| {
+                Error::InvalidData(
+                    "jxl VarDCT integrated decode: empty per-pass decode output".into(),
+                )
+            })?);
+        }
 
-        // Bind the §C.7.2 histograms to the group's per-pass headers →
-        // the histogram-backed decode context (fresh per section).
-        let mut ctx = hf_section.decode_context(&headers)?;
-
-        // Group-local per-pass per-channel NonZeros grids — the
-        // PredictedNonZeros neighbour lookups reset at the group's
-        // top-left per §C.8.1 / §C.8.3 (`x == y == 0 → 32`).
-        let mut nz = PerPassNonZerosGrids::new_uniform(
-            fh.passes.num_passes,
-            3,
-            sub_grid.width_blocks,
-            sub_grid.height_blocks,
-        )?;
-
-        let group_planes = reconstruct_lf_group_from_histogram(
-            &fh.passes, &sub_grid, &mut nz, &resolver, &mut ctx, &mut gbr, &sub_lf, &dq, &sub_xfy,
-            &sub_bfy, &cfl, qdc_at,
+        let group_planes = reconstruct_lf_group_cross_pass(
+            &fh.passes, &sub_grid, &sub_lf, &dq, &sub_xfy, &sub_bfy, &cfl, &stacks,
         )?;
 
         // Paste the group's padded planes into the frame-level planes
@@ -1884,12 +1888,10 @@ pub fn decode_vardct_frame(
 ) -> Result<VideoFrame> {
     let num_groups = fh.num_groups();
     let num_lf_groups = fh.num_lf_groups();
-    if num_lf_groups != 1 || fh.passes.num_passes != 1 {
+    if num_lf_groups != 1 {
         return Err(Error::Unsupported(format!(
-            "jxl VarDCT decoder: num_lf_groups={num_lf_groups} num_passes={} \
-             — multi-LfGroup / multi-pass VarDCT framing is not wired yet \
-             (single-LfGroup multi-group landed round 389)",
-            fh.passes.num_passes
+            "jxl VarDCT decoder: num_lf_groups={num_lf_groups} — multi-LfGroup VarDCT \
+             framing is not wired yet (multi-group + multi-pass landed round 389)"
         )));
     }
 
@@ -1999,9 +2001,15 @@ pub fn decode_vardct_frame(
             &mut shared_br,
             num_groups,
             nb_block_ctx,
+            fh.passes.num_passes,
         )?;
         // PassGroup continues on the same cursor (no byte alignment).
-        (lf_global, lf_group, hf_global_section, vec![shared_br])
+        (
+            lf_global,
+            lf_group,
+            hf_global_section,
+            vec![vec![shared_br]],
+        )
     } else {
         // Multi-TOC-entry path: slice each section into its own byte
         // range and read against a fresh BitReader.
@@ -2030,15 +2038,24 @@ pub fn decode_vardct_frame(
             .nb_block_ctx;
         let hf_global_bytes = section_byte_range(hf_global_slot)?;
         let mut hg_br = BitReader::new_section(hf_global_bytes);
-        let hf_global_section =
-            crate::hf_global_section::HfGlobalSection::read(&mut hg_br, num_groups, nb_block_ctx)?;
-        // Each PassGroup is its own byte-aligned section slot; pass 0's
-        // groups in raster order (the single-pass gate below rejects
-        // multi-pass frames before these readers are consumed).
+        let hf_global_section = crate::hf_global_section::HfGlobalSection::read(
+            &mut hg_br,
+            num_groups,
+            nb_block_ctx,
+            fh.passes.num_passes,
+        )?;
+        // Each PassGroup is its own byte-aligned section slot, laid out
+        // pass-major on the wire (§C.3.1); collect them per GROUP (one
+        // Vec of per-pass readers per group) for the per-group decode
+        // loop.
         let mut readers = Vec::with_capacity(num_groups as usize);
         for g in 0..num_groups {
-            let pg_bytes = section_byte_range(pass_group_slot(0, g))?;
-            readers.push(BitReader::new_section(pg_bytes));
+            let mut per_pass = Vec::with_capacity(fh.passes.num_passes as usize);
+            for p in 0..fh.passes.num_passes {
+                let pg_bytes = section_byte_range(pass_group_slot(p, g))?;
+                per_pass.push(BitReader::new_section(pg_bytes));
+            }
+            readers.push(per_pass);
         }
         (lf_global, lf_group, hf_global_section, readers)
     };
@@ -2155,7 +2172,7 @@ pub fn decode_vardct_frame(
             pass_group_readers.len()
         )));
     }
-    let group_readers: Vec<(crate::group_rect::GroupRect, BitReader<'_>)> =
+    let group_readers: Vec<(crate::group_rect::GroupRect, Vec<BitReader<'_>>)> =
         group_rects.into_iter().zip(pass_group_readers).collect();
 
     let finish_inputs = VarDctFinishInputs {

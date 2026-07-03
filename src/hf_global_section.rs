@@ -63,27 +63,74 @@ use crate::hf_pass::{read_hf_pass_sequence, HfPass};
 use crate::multi_pass_hf_header::PerPassHfHeaders;
 use crate::multi_pass_hf_histogram_decoder::HfHistogramDecodeContext;
 
+/// One pass's slice of the HfGlobal section (Table C.1 lists `HfPass
+/// hf_pass[num_passes]` after HfGlobal): the §C.7.1 per-preset
+/// coefficient-order bundles (Listing C.12, read `num_hf_presets`
+/// times) followed by that pass's §C.7.2 HF-coefficient histogram
+/// block (`495 × num_hf_presets × nb_block_ctx` clustered
+/// distributions).
+#[derive(Debug)]
+pub struct HfPassData {
+    /// §C.7.1 per-preset coefficient-order bundles. Length =
+    /// `num_hf_presets`.
+    pub presets: Vec<HfPass>,
+    /// §C.7.2 HF-coefficient histogram entropy block for this pass.
+    /// The per-stream ANS state initialiser is **not** yet read — each
+    /// PassGroup section is its own entropy stream, so the caller
+    /// invokes [`HfCoefficientHistograms::read_ans_state_init`] on
+    /// that section's reader (after its `hfp` header) before the
+    /// first symbol decode.
+    pub histograms: HfCoefficientHistograms,
+}
+
+impl HfPassData {
+    /// Build the single-pass histogram decode context a `(pass,
+    /// group)` PassGroup section decodes against: this pass's §C.7.2
+    /// histograms bound to the section's `hfp` selection, with the
+    /// `hfp`-selected §C.7.1 coefficient orders attached. The caller
+    /// has already read the section's ANS state init.
+    pub fn single_pass_context<'a>(
+        &'a mut self,
+        headers: &PerPassHfHeaders,
+    ) -> Result<HfHistogramDecodeContext<'a>> {
+        if headers.num_passes() != 1 {
+            return Err(Error::InvalidData(format!(
+                "JXL HfPassData::single_pass_context: expected a single-pass header \
+                 (one hfp per PassGroup section), got {} passes",
+                headers.num_passes()
+            )));
+        }
+        let Self {
+            presets,
+            histograms,
+        } = self;
+        let mut ctx = HfHistogramDecodeContext::new(histograms, headers)?;
+        let hfp = headers.hfp(0)? as usize;
+        let preset = presets.get(hfp).ok_or_else(|| {
+            Error::InvalidData(format!(
+                "JXL HfPassData: hfp {hfp} out of {} preset bundles",
+                presets.len()
+            ))
+        })?;
+        ctx.set_pass_orders(vec![preset])?;
+        Ok(ctx)
+    }
+}
+
 /// The fully-read HfGlobal TOC section of a VarDCT frame: the §I.2.4 /
-/// §I.2.6 [`HfGlobal`] bundle, the §C.7.1 per-preset [`HfPass`]
-/// sequence, and the §C.7.2 [`HfCoefficientHistograms`] entropy block
-/// (ANS state initialised per PassGroup stream by the caller).
+/// §I.2.6 [`HfGlobal`] bundle followed by `num_passes` [`HfPassData`]
+/// slices (§C.7.1 orders + §C.7.2 histograms per pass — Table C.1's
+/// `hf_pass[num_passes]`, carried in the HfGlobal TOC slot per §C.3.1
+/// "one for HfGlobal followed by HfPass data for all the passes").
 ///
-/// Construct with [`Self::read`], which performs all three reads on a
+/// Construct with [`Self::read`], which performs every read on a
 /// single contiguous bit cursor in spec order.
 #[derive(Debug)]
 pub struct HfGlobalSection {
     /// §I.2.4 dequant-matrix bundle + §I.2.6 `num_hf_presets`.
     pub hf_global: HfGlobal,
-    /// §C.7.1 per-preset coefficient-order bundles. Length =
-    /// `hf_global.num_hf_presets`.
-    pub hf_passes: Vec<HfPass>,
-    /// §C.7.2 HF-coefficient histogram entropy block. The per-stream
-    /// ANS state initialiser is **not** yet read — each PassGroup
-    /// section is its own entropy stream, so the caller invokes
-    /// [`HfCoefficientHistograms::read_ans_state_init`] on that
-    /// section's reader (after its `hfp` header) before the first
-    /// symbol decode.
-    pub histograms: HfCoefficientHistograms,
+    /// Per-pass §C.7 data, length = `num_passes`.
+    pub passes: Vec<HfPassData>,
 }
 
 impl HfGlobalSection {
@@ -107,10 +154,20 @@ impl HfGlobalSection {
     /// Returns [`Error::InvalidData`] when any of the three sub-reads
     /// rejects (e.g. a §C.7.1 `used_orders` cap violation, or a
     /// §C.7.2 distribution-count overflow on a 32-bit target).
-    pub fn read(br: &mut BitReader<'_>, num_groups: u64, nb_block_ctx: u32) -> Result<Self> {
+    pub fn read(
+        br: &mut BitReader<'_>,
+        num_groups: u64,
+        nb_block_ctx: u32,
+        num_passes: u32,
+    ) -> Result<Self> {
         if nb_block_ctx == 0 {
             return Err(Error::InvalidData(
                 "JXL HfGlobalSection: nb_block_ctx must be ≥ 1".into(),
+            ));
+        }
+        if num_passes == 0 {
+            return Err(Error::InvalidData(
+                "JXL HfGlobalSection: num_passes must be ≥ 1".into(),
             ));
         }
 
@@ -118,63 +175,81 @@ impl HfGlobalSection {
         let hf_global = HfGlobal::read(br, num_groups)?;
         let num_hf_presets = hf_global.num_hf_presets;
 
-        // Step 2 — §C.7.1 HfPass sequence (num_hf_presets bundles).
-        let hf_passes = read_hf_pass_sequence(br, num_hf_presets, nb_block_ctx)?;
-
-        // Step 3 — §C.7.2 histogram block on the same contiguous bit
-        // cursor (no byte alignment).
+        // Step 2 — Table C.1 `hf_pass[num_passes]`: for each pass, the
+        // §C.7.1 order-bundle sequence (`num_hf_presets` bundles) then
+        // that pass's §C.7.2 histogram block, all on the same
+        // contiguous bit cursor (no byte alignment).
         //
-        // Round 389: the ANS-state initialiser is NOT read here. Per
-        // D.3.3 the `u(32)` state init is read "immediately before
-        // reading the first symbol from a new ANS stream" — and the
-        // symbols routed through these histograms are read from the
-        // **PassGroup** sections (§C.8.3), each of which is its own
-        // entropy stream with its own state init on its own section
-        // reader (after that section's `hfp` header). Reading the init
-        // here (a) consumed 32 bits past the real end of a multi-entry
-        // TOC's HfGlobal slot, and (b) left the multi-group PassGroup
-        // decode without its per-section re-init. The single-TOC
-        // single-group case was unaffected only because `hfp` is a
-        // 0-bit read there (num_hf_presets == 1), so "after HfGlobal"
-        // and "after hfp" were the same cursor position.
-        let histograms =
-            HfCoefficientHistograms::read_after_hf_pass_sequence(br, num_hf_presets, nb_block_ctx)?;
+        // The ANS-state initialiser is NOT read here. Per D.3.3 the
+        // `u(32)` state init is read "immediately before reading the
+        // first symbol from a new ANS stream" — and the symbols routed
+        // through these histograms are read from the **PassGroup**
+        // sections (§C.8.3), each of which is its own entropy stream
+        // with its own state init on its own section reader (after
+        // that section's `hfp` header). Reading the init here (a)
+        // consumed 32 bits past the real end of a multi-entry TOC's
+        // HfGlobal slot, and (b) left the multi-group PassGroup decode
+        // without its per-section re-init. The single-TOC single-group
+        // case was unaffected only because `hfp` is a 0-bit read there
+        // (num_hf_presets == 1), so "after HfGlobal" and "after hfp"
+        // were the same cursor position.
+        let mut passes = Vec::with_capacity(num_passes as usize);
+        for _ in 0..num_passes {
+            let presets = read_hf_pass_sequence(br, num_hf_presets, nb_block_ctx)?;
+            let histograms = HfCoefficientHistograms::read_after_hf_pass_sequence(
+                br,
+                num_hf_presets,
+                nb_block_ctx,
+            )?;
+            passes.push(HfPassData {
+                presets,
+                histograms,
+            });
+        }
 
-        Ok(Self {
-            hf_global,
-            hf_passes,
-            histograms,
-        })
+        Ok(Self { hf_global, passes })
     }
 
-    /// `num_hf_presets` (§I.2.6) — also the length of [`Self::hf_passes`].
+    /// `num_hf_presets` (§I.2.6) — also the length of every pass's
+    /// preset list.
     pub fn num_hf_presets(&self) -> u32 {
         self.hf_global.num_hf_presets
     }
 
-    /// `nb_block_ctx` (§I.2.2) recovered from the histogram sizing
-    /// descriptor — equals the value passed to [`Self::read`].
+    /// `nb_block_ctx` (§I.2.2) recovered from the pass-0 histogram
+    /// sizing descriptor — equals the value passed to [`Self::read`].
     pub fn nb_block_ctx(&self) -> u32 {
-        self.histograms.nb_block_ctx()
+        self.passes[0].histograms.nb_block_ctx()
     }
 
-    /// Per-preset [`HfPass`] lookup. Returns [`Error::InvalidData`]
-    /// when `preset >= num_hf_presets`.
-    pub fn hf_pass(&self, preset: u32) -> Result<&HfPass> {
-        self.hf_passes.get(preset as usize).ok_or_else(|| {
+    /// Per-pass [`HfPassData`] lookup (mutable — the decode context
+    /// borrows the pass's histograms mutably for the ANS state).
+    pub fn pass_data_mut(&mut self, p: u32) -> Result<&mut HfPassData> {
+        let n = self.passes.len();
+        self.passes.get_mut(p as usize).ok_or_else(|| {
             Error::InvalidData(format!(
-                "JXL HfGlobalSection: preset index {preset} out of {} HfPass bundles",
-                self.hf_passes.len()
+                "JXL HfGlobalSection: pass index {p} out of {n} HfPass slices"
             ))
         })
     }
 
-    /// Borrow the §C.7.2 histogram block. Mutable so the caller can
-    /// run the per-PassGroup-stream `read_ans_state_init` and construct
-    /// a [`HfHistogramDecodeContext`] (which borrows the histograms
-    /// mutably for the ANS decode state).
+    /// Pass-0 per-preset [`HfPass`] lookup. Returns
+    /// [`Error::InvalidData`] when `preset >= num_hf_presets`.
+    pub fn hf_pass(&self, preset: u32) -> Result<&HfPass> {
+        self.passes[0].presets.get(preset as usize).ok_or_else(|| {
+            Error::InvalidData(format!(
+                "JXL HfGlobalSection: preset index {preset} out of {} HfPass bundles",
+                self.passes[0].presets.len()
+            ))
+        })
+    }
+
+    /// Borrow the pass-0 §C.7.2 histogram block. Mutable so the caller
+    /// can run the per-PassGroup-stream `read_ans_state_init` and
+    /// construct a [`HfHistogramDecodeContext`] (which borrows the
+    /// histograms mutably for the ANS decode state).
     pub fn histograms_mut(&mut self) -> &mut HfCoefficientHistograms {
-        &mut self.histograms
+        &mut self.passes[0].histograms
     }
 
     /// Bind this section's §C.7.2 histograms to a per-frame §C.8.3
@@ -202,23 +277,38 @@ impl HfGlobalSection {
     /// §C.8.3 Listing C.14 `coeffs[order[k]]` placement uses the
     /// signalled (possibly permuted) order rather than the bare natural
     /// order.
+    /// NOTE: this binding routes every header pass through the
+    /// **pass-0** histogram block, which is only correct for
+    /// single-pass frames (each pass owns its own §C.7.2 block —
+    /// multi-pass callers use [`HfPassData::single_pass_context`] per
+    /// PassGroup section instead). Rejected when this section carries
+    /// more than one pass and the headers claim more than one.
     pub fn decode_context<'a>(
         &'a mut self,
         headers: &PerPassHfHeaders,
     ) -> Result<HfHistogramDecodeContext<'a>> {
-        let Self {
-            hf_passes,
+        if self.passes.len() != 1 && headers.num_passes() != 1 {
+            return Err(Error::InvalidData(format!(
+                "JXL HfGlobalSection::decode_context: {}-pass section with {}-pass \
+                 headers — multi-pass decodes bind per-pass contexts via \
+                 HfPassData::single_pass_context",
+                self.passes.len(),
+                headers.num_passes()
+            )));
+        }
+        let pass0 = &mut self.passes[0];
+        let HfPassData {
+            presets,
             histograms,
-            ..
-        } = self;
+        } = pass0;
         let mut ctx = HfHistogramDecodeContext::new(histograms, headers)?;
         let mut orders = Vec::with_capacity(headers.num_passes() as usize);
         for p in 0..headers.num_passes() {
             let hfp = headers.hfp(p)? as usize;
-            let hf_pass = hf_passes.get(hfp).ok_or_else(|| {
+            let hf_pass = presets.get(hfp).ok_or_else(|| {
                 Error::InvalidData(format!(
                     "JXL HfGlobalSection: pass {p} hfp {hfp} out of {} HfPass bundles",
-                    hf_passes.len()
+                    presets.len()
                 ))
             })?;
             orders.push(hf_pass);
@@ -275,7 +365,7 @@ mod tests {
         let bytes = pack_lsb(&parts);
         let mut br = BitReader::new(&bytes);
 
-        let section = HfGlobalSection::read(&mut br, 1, 1).unwrap();
+        let section = HfGlobalSection::read(&mut br, 1, 1, 1).unwrap();
 
         // HfGlobal: default encoding, one preset.
         assert!(section.hf_global.dequant_default);
@@ -283,16 +373,17 @@ mod tests {
         assert!(section.hf_global.dequant_matrices.is_empty());
 
         // HfPass[0]: used_orders == 0 → every order is the natural order.
-        assert_eq!(section.hf_passes.len(), 1);
+        assert_eq!(section.passes.len(), 1);
+        assert_eq!(section.passes[0].presets.len(), 1);
         assert_eq!(section.hf_pass(0).unwrap().used_orders, 0);
         assert!(section.hf_pass(1).is_err());
 
         // §C.7.2 histograms: 495 × 1 × 1 distributions, single cluster.
-        assert_eq!(section.histograms.num_distributions(), 495);
+        assert_eq!(section.passes[0].histograms.num_distributions(), 495);
         assert_eq!(section.nb_block_ctx(), 1);
-        assert!(section.histograms.entropy.use_prefix_code);
-        assert_eq!(section.histograms.entropy.cluster_map.len(), 495);
-        assert_eq!(section.histograms.entropy.entropies.len(), 1);
+        assert!(section.passes[0].histograms.entropy.use_prefix_code);
+        assert_eq!(section.passes[0].histograms.entropy.cluster_map.len(), 495);
+        assert_eq!(section.passes[0].histograms.entropy.entropies.len(), 1);
     }
 
     /// The cursor position after [`HfGlobalSection::read`] is exactly
@@ -311,7 +402,7 @@ mod tests {
 
         // Bundled read.
         let mut br_bundle = BitReader::new(&bytes);
-        let _section = HfGlobalSection::read(&mut br_bundle, 1, 1).unwrap();
+        let _section = HfGlobalSection::read(&mut br_bundle, 1, 1, 1).unwrap();
         let bundle_bits = br_bundle.bits_read();
 
         // Piecewise read of the same three pieces in the same order.
@@ -340,7 +431,7 @@ mod tests {
         parts.extend(histogram_prelude_parts());
         let bytes = pack_lsb(&parts);
         let mut br = BitReader::new(&bytes);
-        let mut section = HfGlobalSection::read(&mut br, 1, 1).unwrap();
+        let mut section = HfGlobalSection::read(&mut br, 1, 1, 1).unwrap();
 
         // Single pass, hfp = 0 → histogram_offset = 0.
         let headers = PerPassHfHeaders::from_headers(vec![PassGroupHfHeader {
@@ -364,7 +455,7 @@ mod tests {
         parts.extend(histogram_prelude_parts());
         let bytes = pack_lsb(&parts);
         let mut br = BitReader::new(&bytes);
-        let mut section = HfGlobalSection::read(&mut br, 1, 1).unwrap();
+        let mut section = HfGlobalSection::read(&mut br, 1, 1, 1).unwrap();
         assert_eq!(section.num_hf_presets(), 1);
 
         // hfp = 1 ≥ num_hf_presets = 1 → rejected.
@@ -381,9 +472,96 @@ mod tests {
         let bytes = pack_lsb(&[(1, 1)]);
         let mut br = BitReader::new(&bytes);
         let bits_before = br.bits_read();
-        let r = HfGlobalSection::read(&mut br, 1, 0);
+        let r = HfGlobalSection::read(&mut br, 1, 0, 1);
         assert!(matches!(r, Err(Error::InvalidData(_))));
         // The guard runs before any HfGlobal bits are consumed.
         assert_eq!(br.bits_read(), bits_before);
+    }
+
+    /// Table C.1 `hf_pass[num_passes]`: a two-pass section carries TWO
+    /// (§C.7.1 orders + §C.7.2 histograms) slices after the shared
+    /// HfGlobal bundle, on one contiguous cursor — and the cursor lands
+    /// exactly where a piecewise re-read of the same five pieces does.
+    #[test]
+    fn two_pass_section_reads_two_hf_pass_slices() {
+        use crate::hf_coefficient_histograms::HfCoefficientHistograms;
+        use crate::hf_global::HfGlobal;
+        use crate::hf_pass::read_hf_pass_sequence;
+
+        let mut parts: Vec<(u32, u32)> = vec![
+            (1, 1), // HfGlobal: dequant_default = 1; num_groups == 1 → 0 preset bits
+        ];
+        // Pass 0: used_orders = Val(0) + minimal histogram block.
+        parts.push((2, 2));
+        parts.extend(histogram_prelude_parts());
+        // Pass 1: same shape.
+        parts.push((2, 2));
+        parts.extend(histogram_prelude_parts());
+        let bytes = pack_lsb(&parts);
+
+        let mut br = BitReader::new(&bytes);
+        let section = HfGlobalSection::read(&mut br, 1, 1, 2).unwrap();
+        assert_eq!(section.passes.len(), 2);
+        for p in &section.passes {
+            assert_eq!(p.presets.len(), 1);
+            assert_eq!(p.histograms.num_distributions(), 495);
+        }
+        let bundle_bits = br.bits_read();
+
+        // Piecewise.
+        let mut br2 = BitReader::new(&bytes);
+        let hg = HfGlobal::read(&mut br2, 1).unwrap();
+        for _ in 0..2 {
+            let _ = read_hf_pass_sequence(&mut br2, hg.num_hf_presets, 1).unwrap();
+            let _ = HfCoefficientHistograms::read_after_hf_pass_sequence(&mut br2, 1, 1).unwrap();
+        }
+        assert_eq!(bundle_bits, br2.bits_read());
+    }
+
+    /// `HfPassData::single_pass_context` binds one pass's histograms +
+    /// the hfp-selected orders; a multi-pass header is rejected.
+    #[test]
+    fn single_pass_context_binds_one_pass() {
+        use crate::multi_pass_hf_header::PerPassHfHeaders;
+        use crate::pass_group_hf::PassGroupHfHeader;
+
+        let mut parts: Vec<(u32, u32)> = vec![(1, 1), (2, 2)];
+        parts.extend(histogram_prelude_parts());
+        parts.push((2, 2));
+        parts.extend(histogram_prelude_parts());
+        let bytes = pack_lsb(&parts);
+        let mut br = BitReader::new(&bytes);
+        let mut section = HfGlobalSection::read(&mut br, 1, 1, 2).unwrap();
+
+        let one = PerPassHfHeaders::from_headers(vec![PassGroupHfHeader {
+            hfp: 0,
+            histogram_offset: 0,
+        }]);
+        for p in 0..2 {
+            let ctx = section
+                .pass_data_mut(p)
+                .unwrap()
+                .single_pass_context(&one)
+                .unwrap();
+            assert_eq!(ctx.num_passes(), 1);
+            assert_eq!(ctx.histogram_offset(0).unwrap(), 0);
+        }
+        assert!(section.pass_data_mut(2).is_err());
+
+        let two = PerPassHfHeaders::from_headers(vec![
+            PassGroupHfHeader {
+                hfp: 0,
+                histogram_offset: 0,
+            };
+            2
+        ]);
+        let r = section.pass_data_mut(0).unwrap().single_pass_context(&two);
+        assert!(matches!(r, Err(Error::InvalidData(_))));
+
+        // decode_context on a multi-pass section with multi-pass
+        // headers is likewise rejected (that binding routes through
+        // pass 0's histograms only).
+        let r = section.decode_context(&two);
+        assert!(matches!(r, Err(Error::InvalidData(_))));
     }
 }
