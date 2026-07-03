@@ -1675,6 +1675,12 @@ fn finish_vardct_decode(
     // at the head of the PassGroup payload.
     let headers = PerPassHfHeaders::read(br, fh.passes.num_passes, num_hf_presets, nb_block_ctx)?;
 
+    // D.3.3: the PassGroup section is its own entropy stream, so its
+    // ANS state initialiser (`u(32)`, a no-op for prefix-coded
+    // histograms) is read from the section reader immediately after the
+    // `hfp` header and before the first symbol decode.
+    hf_section.histograms_mut().read_ans_state_init(br)?;
+
     // Bind the §C.7.2 histograms to the per-pass headers → the
     // histogram-backed decode context.
     let mut ctx = hf_section.decode_context(&headers)?;

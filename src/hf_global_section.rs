@@ -15,19 +15,16 @@
 //!    [`read_hf_pass_sequence`].
 //! 3. **§C.7.2 HF-coefficient histograms** — the
 //!    `495 × num_hf_presets × nb_block_ctx` clustered-distribution
-//!    entropy block ([`HfCoefficientHistograms::read`]), followed by
-//!    the ANS-state initialiser (`u(32)`, a no-op for prefix streams)
-//!    read via [`HfCoefficientHistograms::read_ans_state_init`].
+//!    entropy block ([`HfCoefficientHistograms::read`]).
 //!
 //! Prior rounds built each of those three primitives but never tied
 //! them together: [`HfGlobal::read`] returned after step 1, and the
 //! integrated VarDCT decode path (`decode_vardct_round13` in `lib.rs`)
 //! bailed with `Error::Unsupported` before steps 2 + 3 ran. This module
 //! is the bundle that performs all three reads in spec order, so the
-//! frame-level VarDCT decode can hand a ready-to-decode
-//! [`HfCoefficientHistograms`] (post-`read_ans_state_init`) plus the
-//! per-preset coefficient orders to
-//! [`crate::multi_pass_hf_histogram_decoder::HfHistogramDecodeContext`].
+//! frame-level VarDCT decode can hand the parsed
+//! [`HfCoefficientHistograms`] plus the per-preset coefficient orders
+//! to [`crate::multi_pass_hf_histogram_decoder::HfHistogramDecodeContext`].
 //!
 //! ## Read order is fixed (no byte alignment between pieces)
 //!
@@ -35,9 +32,19 @@
 //! inside the HfGlobal section: HfGlobal (dequant + presets), then the
 //! HfPass sequence, then the histogram block. There is **no** byte
 //! alignment between them — the caller passes one [`BitReader`] through
-//! all three reads. The ANS-state init is part of the §C.7.2 read (it
-//! immediately follows the clustered distributions, per §C.3.2), so it
-//! is performed here rather than deferred to the first symbol decode.
+//! all three reads.
+//!
+//! ## The ANS-state init is per PassGroup stream, NOT part of this read
+//!
+//! Per D.3.3 the `u(32)` ANS state initialiser is read "immediately
+//! before reading the first symbol from a new ANS stream". The symbols
+//! routed through the §C.7.2 histograms live in the **PassGroup**
+//! sections (§C.8.3) — one entropy stream per section — so the state
+//! init belongs to each PassGroup's own reader, right after that
+//! section's `hfp` header. Rounds 349–385 read one state init at the
+//! end of this section instead; that was invisible on single-TOC
+//! single-group frames (0-bit `hfp`, shared cursor) but wrong for
+//! multi-entry TOCs. Round 389 moved it to the PassGroup decode.
 //!
 //! ## `nb_block_ctx` provenance
 //!
@@ -59,7 +66,7 @@ use crate::multi_pass_hf_histogram_decoder::HfHistogramDecodeContext;
 /// The fully-read HfGlobal TOC section of a VarDCT frame: the §I.2.4 /
 /// §I.2.6 [`HfGlobal`] bundle, the §C.7.1 per-preset [`HfPass`]
 /// sequence, and the §C.7.2 [`HfCoefficientHistograms`] entropy block
-/// (with its ANS state already initialised).
+/// (ANS state initialised per PassGroup stream by the caller).
 ///
 /// Construct with [`Self::read`], which performs all three reads on a
 /// single contiguous bit cursor in spec order.
@@ -70,9 +77,12 @@ pub struct HfGlobalSection {
     /// §C.7.1 per-preset coefficient-order bundles. Length =
     /// `hf_global.num_hf_presets`.
     pub hf_passes: Vec<HfPass>,
-    /// §C.7.2 HF-coefficient histogram entropy block, with
-    /// `read_ans_state_init` already applied. Ready to back a
-    /// [`crate::multi_pass_hf_histogram_decoder::HfHistogramDecodeContext`].
+    /// §C.7.2 HF-coefficient histogram entropy block. The per-stream
+    /// ANS state initialiser is **not** yet read — each PassGroup
+    /// section is its own entropy stream, so the caller invokes
+    /// [`HfCoefficientHistograms::read_ans_state_init`] on that
+    /// section's reader (after its `hfp` header) before the first
+    /// symbol decode.
     pub histograms: HfCoefficientHistograms,
 }
 
@@ -90,7 +100,9 @@ impl HfGlobalSection {
     ///   total (`495 × num_hf_presets × nb_block_ctx`).
     ///
     /// On return `br` is positioned immediately after the §C.7.2
-    /// ANS-state initialiser — i.e. at the end of the HfGlobal section.
+    /// histogram block — i.e. at the end of the HfGlobal section's
+    /// defined bits. (The per-stream ANS state init is read later, on
+    /// each PassGroup section's own reader — see the module notes.)
     ///
     /// Returns [`Error::InvalidData`] when any of the three sub-reads
     /// rejects (e.g. a §C.7.1 `used_orders` cap violation, or a
@@ -109,11 +121,24 @@ impl HfGlobalSection {
         // Step 2 — §C.7.1 HfPass sequence (num_hf_presets bundles).
         let hf_passes = read_hf_pass_sequence(br, num_hf_presets, nb_block_ctx)?;
 
-        // Step 3 — §C.7.2 histogram block + ANS-state init, on the same
-        // contiguous bit cursor (no byte alignment).
-        let mut histograms =
+        // Step 3 — §C.7.2 histogram block on the same contiguous bit
+        // cursor (no byte alignment).
+        //
+        // Round 389: the ANS-state initialiser is NOT read here. Per
+        // D.3.3 the `u(32)` state init is read "immediately before
+        // reading the first symbol from a new ANS stream" — and the
+        // symbols routed through these histograms are read from the
+        // **PassGroup** sections (§C.8.3), each of which is its own
+        // entropy stream with its own state init on its own section
+        // reader (after that section's `hfp` header). Reading the init
+        // here (a) consumed 32 bits past the real end of a multi-entry
+        // TOC's HfGlobal slot, and (b) left the multi-group PassGroup
+        // decode without its per-section re-init. The single-TOC
+        // single-group case was unaffected only because `hfp` is a
+        // 0-bit read there (num_hf_presets == 1), so "after HfGlobal"
+        // and "after hfp" were the same cursor position.
+        let histograms =
             HfCoefficientHistograms::read_after_hf_pass_sequence(br, num_hf_presets, nb_block_ctx)?;
-        histograms.read_ans_state_init(br)?;
 
         Ok(Self {
             hf_global,
@@ -144,9 +169,9 @@ impl HfGlobalSection {
         })
     }
 
-    /// Borrow the §C.7.2 histogram block (post-`read_ans_state_init`).
-    /// Mutable so the caller can construct a
-    /// [`HfHistogramDecodeContext`] (which borrows the histograms
+    /// Borrow the §C.7.2 histogram block. Mutable so the caller can
+    /// run the per-PassGroup-stream `read_ans_state_init` and construct
+    /// a [`HfHistogramDecodeContext`] (which borrows the histograms
     /// mutably for the ANS decode state).
     pub fn histograms_mut(&mut self) -> &mut HfCoefficientHistograms {
         &mut self.histograms
@@ -159,9 +184,10 @@ impl HfGlobalSection {
     /// decode walks against.
     ///
     /// This is the bridge from the parsed HfGlobal section to the
-    /// histogram-backed decode: the §C.7.2 stream + its ANS-state init
-    /// live in `self.histograms` (already read by [`Self::read`]); the
-    /// per-pass `histogram_offset` routing lives in `headers`.
+    /// histogram-backed decode: the §C.7.2 distributions live in
+    /// `self.histograms` (read by [`Self::read`]; the caller runs the
+    /// per-PassGroup-stream ANS state init separately); the per-pass
+    /// `histogram_offset` routing lives in `headers`.
     /// [`HfHistogramDecodeContext::new`] cross-validates every
     /// `headers.hfp(p) < num_hf_presets` against this section's
     /// authoritative `num_hf_presets`.
@@ -289,12 +315,13 @@ mod tests {
         let bundle_bits = br_bundle.bits_read();
 
         // Piecewise read of the same three pieces in the same order.
+        // (No ANS-state init: that is a per-PassGroup-stream read, not
+        // part of the HfGlobal section — see the module notes.)
         let mut br_pieces = BitReader::new(&bytes);
         let hg = HfGlobal::read(&mut br_pieces, 1).unwrap();
         let _passes = read_hf_pass_sequence(&mut br_pieces, hg.num_hf_presets, 1).unwrap();
-        let mut histos =
+        let _histos =
             HfCoefficientHistograms::read_after_hf_pass_sequence(&mut br_pieces, 1, 1).unwrap();
-        histos.read_ans_state_init(&mut br_pieces).unwrap();
         let pieces_bits = br_pieces.bits_read();
 
         assert_eq!(bundle_bits, pieces_bits);
