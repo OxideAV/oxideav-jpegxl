@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Round 389 — VarDCT frame-level framing to public exposure:
+  - multi-group PassGroup framing (sec C.3.1 pass-major slot map,
+    sec C.8.1 group-local coordinates via the new `group_rect` views,
+    per-section hfp + D.3.3 ANS state re-init) — 12-group
+    `large-1024x768-d2` lands at per-pixel XYB MAD 7e-5/1.4e-3/9e-4;
+  - multi-pass framing (Table C.1 `hf_pass[num_passes]` slices in the
+    HfGlobal slot; per-(pass, group) entropy streams folded by the
+    sec C.8.3 cross-pass accumulator);
+  - Table A.10 transfer encoding on XYB output (`xyb::TransferEncoder`,
+    sRGB/BT.709/gamma/linear) — reference decodes now match by direct
+    byte comparison (large-d2 MAD 0.55/0.49/0.33, d3 0.89/0.70/0.95,
+    d1 ~3.4);
+  - sec C.2 frame composition in `decode_all_frames` (`frame_compose`:
+    Reference slots, crop-rect kReplace/kAdd/kMul blending,
+    zero-duration presentation rule);
+  - real sec C.8.3 `qdc[3]` quantised-LF lookup (lf_thresholds gate
+    removed);
+  - public-path VarDCT pixels: the rounds-355..385 withhold sentinel is
+    retired.
+
+### Fixed
+
+- Round 389 — D.3.5 general clustering no longer mis-rejects valid
+  streams via a `num_distributions <= bits_remaining` heuristic.
+- Round 389 — the ANS state initialiser is read per PassGroup stream
+  (D.3.3), not at the end of the HfGlobal slot.
+- Round 389 — FrameHeader `save_before_ct` shares `save_as_reference`'s
+  `!is_last` presence gate (fixture-measured; the 2021 FDIS prints a
+  bare `frame_type != kLFFrame` condition). Unblocks
+  `vardct-256x256-d3`, which previously failed with a bogus
+  "name is not valid UTF-8".
+
 ## [0.0.12](https://github.com/OxideAV/oxideav-jpegxl/compare/v0.0.11...v0.0.12) - 2026-07-03
 
 ### Other

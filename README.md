@@ -11,21 +11,22 @@ zero `*-sys`.
 
 This crate is a **decoder under active construction**. The Modular path
 decodes end to end (grey / RGB / RGBA, 1–16-bit integer, XYB / YCbCr
-inverse colour) for the small lossless fixtures; the **VarDCT** path now
-runs the full per-LfGroup reconstruction chain (§C.8.3 HF-entropy decode
-→ F.3 dequant → Annex G coefficient-domain chroma-from-luma → §I.2.3.2
-IDCT → §6.2 crop → §J restoration filters → §L.2.2 XYB→RGB) end to end
-on a real single-LfGroup single-pass codestream
-(`vardct-256x256-d1.jxl`), matching the reference decode to per-channel
-sRGB MAD ≈ 3.3 / 1.9 / 2.1 after round 385's four fixture-measured
-FDIS-reading corrections (see below). The DC/LF path is
-reference-exact; the residual divergence sits in the entropy-decoded HF
-coefficients, so that VarDCT output is **not yet exposed from the
-public decode path**: a registered `make_decoder` / `decode_one_frame`
-on a VarDCT codestream returns a precise "pixels not yet validated"
-`Error::Unsupported` rather than risk a silent misparse. The
-reconstruction is reachable for tooling via
-`decode_vardct_frame_from_codestream`. Programs that only need
+inverse colour) for the small lossless fixtures; the **VarDCT** path
+decodes **on the public path** (round 389): the full chain — §C.8.3
+per-(pass, group) HF-entropy decode → F.3 dequant → Annex G
+coefficient-domain chroma-from-luma → §I.2.3.2 IDCT → §C.2 group
+assembly → §6.2 crop → §J restoration filters → §L.2.2 XYB→RGB →
+Table A.10 transfer encoding — is validated by direct sRGB byte
+comparison against three reference decodes:
+`large-1024x768-d2` (12-group multi-group frame) per-channel MAD
+0.55 / 0.49 / 0.33, `vardct-256x256-d3` 0.89 / 0.70 / 0.95, and
+`vardct-256x256-d1` ≈ 3.4 (the strongest-HF fixture; the residual HF
+tail is the one open accuracy item, ratcheted by
+`round362_vardct_d1_reference_divergence`). Single-LfGroup frames of
+any group count decode; multi-LfGroup (> 2048 px) framing is the
+remaining structural gap and surfaces a precise `Error::Unsupported`.
+Multi-frame codestreams compose per §C.2 (Reference slots +
+Table C.8 blending) in `decode_all_frames`. Programs that only need
 probe-level information should call `probe(...)` directly.
 
 What is implemented and tested today:
@@ -140,9 +141,44 @@ What is implemented and tested today:
   section plus a spline conformance fixture; the `lf_global.rs` splines
   rejection is the integration hook.
 
+### Round 389 — multi-group / multi-pass framing, sRGB output, public exposure
+
+- **Multi-group VarDCT framing** (§C.3.1 / §C.8.1): one PassGroup
+  section per `(pass, group)` off the pass-major TOC slot map; per
+  group the §C.8.1 group-local views (`group_rect` module: sub-grid
+  slice with the §C.5.4 no-straddle invariant, LF rect, 64×64-aligned
+  CfL tiles), the section's own `hfp` header + D.3.3 ANS state
+  re-init, group-local NonZeros grids, pasted at the group offset.
+  Landed reference-exact on first measure: per-pixel XYB MAD 7e-5 /
+  1.4e-3 / 9e-4 on the 12-group fixture.
+- **Multi-pass framing** (Table C.1 `hf_pass[num_passes]`): the
+  HfGlobal slot reads one §C.7.1-orders + §C.7.2-histograms slice per
+  pass; each `(pass, group)` section decodes as its own entropy
+  stream and the per-pass stacks fold through the §C.8.3 cross-pass
+  accumulator. (No multi-pass fixture is staged yet — unit-pinned.)
+- **Table A.10 transfer encoding** (`xyb::TransferEncoder`): the
+  §L.2.2 linear RGB is encoded with the signalled transfer function
+  (sRGB / BT.709 / gamma / linear; PQ/DCI/HLG rejected precisely)
+  before 8-bit quantisation — the rounds-11–385 linear-bytes SPECGAP
+  left every XYB fixture uniformly dark (MAD ≈ 70/255).
+- **FrameHeader `save_before_ct` presence** shares
+  `save_as_reference`'s `!is_last` gate (fixture-measured against the
+  2021 FDIS text; unblocked `vardct-256x256-d3`).
+- **§C.2 frame composition** (`frame_compose`): Reference[1..=3]
+  recording, `Reference[source]` lookup (zeros when unstored),
+  crop-rect blending (kReplace / kAdd / kMul; alpha modes +
+  pre-CT recording surface precisely), zero-duration frames composed
+  but not presented.
+- **D.3.5 clustering fix**: dropped the `num_distributions ≤
+  bits_remaining` heuristic (ANS cluster indices cost ≪ 1 bit
+  amortised; 2475 contexts in a 33-byte section are valid).
+- **Real §C.8.3 `qdc[3]`**: the Listing C.13 `lf_thresholds` ladder
+  reads the actual quantised-LF samples; the non-empty-`lf_thresholds`
+  reject gate is gone.
+
 ### Not yet implemented
 
-- **VarDCT pixel-exactness + public exposure.** Round 385 root-caused
+- **VarDCT HF accuracy tail on d1-quality streams.** Round 385 root-caused
   and fixed the long-pinned reference divergence with four
   fixture-measured FDIS-reading corrections (each recorded as an
   erratum candidate in the corresponding module doc): (1) **Listing
@@ -167,19 +203,18 @@ What is implemented and tested today:
   pixels, XYB frame-means equal to ~4 decimals
   (`round362_vardct_d1_reference_divergence` +
   `round385_vardct_xyb_accuracy` ratchets; internal XYB planes
-  observable via the `VARDCT_XYB_CAPTURE` per-thread hook). The
-  **remaining divergence is the entropy-decoded HF coefficient path**
-  (§C.8.3): per-8×8 HF detail correlates only ~0.1–0.7 with the
-  reference at roughly matching energy, so the public
-  `decode_one_frame` path still withholds VarDCT pixels (precise
-  `Error::Unsupported`); `decode_vardct_frame_from_codestream` returns
-  them for tooling. The §C.7.1 signalled coefficient-order permutations
-  are now routed into the decode (d1 itself signals none). The
-  integrated `qdc_at` supplies a zero quantised-LF DC triple — exact
-  for any `HfBlockContext` with empty `lf_thresholds`; a bundle with
-  non-empty `lf_thresholds` is rejected precisely until the
-  per-varblock LF-DC lookup feeding the resolver is wired. Multi-pass /
-  multi-group / multi-LfGroup VarDCT framing is also still pending.
+  observable via the `VARDCT_XYB_CAPTURE` per-thread hook). Round 389
+  narrowed the residual: d2-quality streams land at sRGB MAD < 1, and
+  the remaining d1 divergence (post-filter XYB MAD ≈ 0.005 on Y,
+  scaling with HF energy) sits in the strong-HF decode/filter tail —
+  isolating it needs the still-pending per-coefficient trace (#168),
+  since the reference PNG includes the §J filters. The §C.7.1
+  signalled coefficient-order permutations are routed (all staged
+  fixtures signal natural orders). Multi-LfGroup framing (frames
+  wider/taller than 2048 px) is still pending, as are the alpha blend
+  modes + `save_before_ct` reference recording in the §C.2 composer,
+  and a progressive-AC (true multi-pass) fixture to pin the
+  round-389 multi-pass framing end-to-end.
 - ColorEncoding / ToneMapping fuller decode, preview / animation /
   intrinsic-size sub-bundles (parsing stops cleanly at the `have_*`
   flags).
@@ -241,9 +276,8 @@ println!("{} bits/sample, float={}",
 
 - Codec `"jpegxl"` — decoder slot registered; no encoder slot. The
   registered decoder handles the Modular path (grey / RGB / RGBA, 1–16-bit
-  integer); a VarDCT codestream runs the full reconstruction but the
-  public path returns `Error::Unsupported` while its pixels await
-  reference validation (see Status).
+  integer) and the VarDCT path (single-LfGroup frames of any group
+  count, reference-validated; see Status).
 - No demuxer is registered: a JXL file is treated as a single
   codestream buffer fed directly to `probe(...)`.
 
