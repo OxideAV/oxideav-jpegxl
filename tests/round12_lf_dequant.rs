@@ -5,8 +5,9 @@
 //!
 //! * Implementing Listing F.1 LF dequantisation
 //!   `dX = mXDC × qX / (1 << extra_precision)` (and Y, B) where
-//!   `mXDC = m_x_lf_unscaled / (global_scale × quant_lf)` is the
-//!   per-channel LF multiplier from C.4.3.
+//!   `mXDC = 65536 / (m_x_lf_unscaled × global_scale × quant_lf)` is
+//!   the per-channel LF multiplier from C.4.3 (corrected Listing C.1
+//!   reading — see `LfMultipliers::compute`).
 //! * Implementing the F.2 adaptive LF smoothing pass over interior
 //!   samples of a non-subsampled LF channel.
 //! * Wiring `HfMetadata` (G.2.4 / FDIS C.5.4) — the 4-channel modular
@@ -54,9 +55,12 @@ fn five_small_lossless_fixtures_still_decode_round_12() {
 }
 
 /// Listing F.1 closed-form check: with default LfChannelDequantization
-/// (mX=4096, mY=512, mB=256), default Quantizer (global_scale=1,
-/// quant_lf=16), and extra_precision=0, the per-sample dequant is
-/// equivalent to multiplying qX by 256, qY by 32, qB by 16.
+/// divisors (mX=4096, mY=512, mB=256), default Quantizer
+/// (global_scale=1 in 16.16 fixed-point, quant_lf=16), and
+/// extra_precision=0, the per-sample dequant is equivalent to
+/// multiplying qX by 65536/(4096·16) = 1, qY by 65536/(512·16) = 8,
+/// qB by 65536/(256·16) = 16 (the corrected Listing C.1 reading — see
+/// `LfMultipliers::compute`).
 #[test]
 fn lf_dequant_default_quantizer_listing_f1() {
     let lfd = LfChannelDequantization::default();
@@ -70,9 +74,9 @@ fn lf_dequant_default_quantizer_listing_f1() {
     let widths = [1, 1, 1];
     let heights = [1, 1, 1];
     let out = dequant_lf(&lf_quant, widths, heights, 0, &m);
-    // dX = 256 * 2 = 512, dY = 32 * 3 = 96, dB = 16 * 5 = 80.
-    assert_eq!(out.samples[0][0], 512.0);
-    assert_eq!(out.samples[1][0], 96.0);
+    // dX = 1 * 2 = 2, dY = 8 * 3 = 24, dB = 16 * 5 = 80.
+    assert_eq!(out.samples[0][0], 2.0);
+    assert_eq!(out.samples[1][0], 24.0);
     assert_eq!(out.samples[2][0], 80.0);
 }
 
@@ -89,10 +93,11 @@ fn lf_dequant_extra_precision_shifts() {
     let lf_quant = [vec![16i32], vec![16i32], vec![16i32]];
     let widths = [1, 1, 1];
     let heights = [1, 1, 1];
-    // extra_precision=2 → divide by 4.
+    // extra_precision=2 → divide by 4. m = (1, 8, 16) per the
+    // corrected Listing C.1 reading with the default divisors.
     let out = dequant_lf(&lf_quant, widths, heights, 2, &m);
-    assert_eq!(out.samples[0][0], 256.0 * 16.0 / 4.0); // 1024
-    assert_eq!(out.samples[1][0], 32.0 * 16.0 / 4.0); // 128
+    assert_eq!(out.samples[0][0], 1.0 * 16.0 / 4.0); // 4
+    assert_eq!(out.samples[1][0], 8.0 * 16.0 / 4.0); // 32
     assert_eq!(out.samples[2][0], 16.0 * 16.0 / 4.0); // 64
 }
 

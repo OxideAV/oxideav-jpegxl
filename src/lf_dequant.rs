@@ -11,13 +11,17 @@
 //!    coefficients `qX, qY, qB` (decoded by [`crate::lf_group`]) into
 //!    real-valued LF samples `dX, dY, dB` per Listing F.1:
 //!    ```text
-//!    mXDC = m_x_lf_unscaled / (global_scale × quant_lf);   // C.4.3
-//!    mYDC = m_y_lf_unscaled / (global_scale × quant_lf);
-//!    mBDC = m_b_lf_unscaled / (global_scale × quant_lf);
+//!    mXDC = 65536 / (m_x_lf_unscaled × global_scale × quant_lf);  // C.4.3, corrected
+//!    mYDC = 65536 / (m_y_lf_unscaled × global_scale × quant_lf);
+//!    mBDC = 65536 / (m_b_lf_unscaled × global_scale × quant_lf);
 //!    dX = mXDC × qX / (1 << extra_precision);
 //!    dY = mYDC × qY / (1 << extra_precision);
 //!    dB = mBDC × qB / (1 << extra_precision);
 //!    ```
+//!    The `mXDC` formulas correct the FDIS Listing C.1 "unscaled"
+//!    semantics — `global_scale` is 16.16 fixed-point and the
+//!    `m_*_lf_unscaled` values are divisors; see
+//!    [`LfMultipliers::compute`] for the fixture-measured derivation.
 //! 2. **Adaptive LF smoothing** — when
 //!    `flags & kSkipAdaptiveLFSmoothing == 0` AND no LF channel is
 //!    subsampled (`jpeg_upsampling[c] == 0` for `c ∈ 0..3`), the spec
@@ -72,23 +76,61 @@ pub struct LfMultipliers {
 }
 
 impl LfMultipliers {
-    /// Compute the three per-channel LF multipliers per Listing F.1's
-    /// preamble. These are shared across every LfGroup of the frame
-    /// (they depend only on LfGlobal contents).
+    /// Fixed-point denominator of the `global_scale` field: the Table
+    /// C.12 integer is a 16.16 fixed-point scale factor, so the
+    /// effective scale is `global_scale / 65536` (see [`Self::compute`]).
+    pub const GLOBAL_SCALE_FIXED_ONE: f32 = 65536.0;
+
+    /// Compute the three per-channel LF multipliers (Listing C.1,
+    /// consumed by Listing F.1). These are shared across every LfGroup
+    /// of the frame (they depend only on LfGlobal contents).
     ///
-    /// Spec: `mXDC = m_x_lf_unscaled / (global_scale × quant_lf)` and
-    /// similarly for Y / B.
+    /// ## Corrected reading of Listing C.1 (FDIS erratum candidate)
+    ///
+    /// The FDIS listing reads `mXDC = m_x_lf_unscaled / (global_scale ×
+    /// quant_lf)` (and similarly for Y / B), i.e. it treats the
+    /// `m_*_lf_unscaled` F16 values as *numerators*. Taken literally
+    /// that formula is inconsistent with real codestreams: on the
+    /// `vardct-256x256-d1` fixture (default `m = 4096 / 512 / 256`,
+    /// `global_scale = 5111`, `quant_lf = 17`) the per-channel
+    /// least-squares scale between the literal-formula dequantised LF
+    /// and the reference decode's forward-XYB LF is X ≈ 1/256,
+    /// Y = 1/4 (exact), B ≈ 1 — that is, the literal formula is wrong
+    /// by exactly `m² / 65536` per channel. The unique reading
+    /// consistent with all three channels at once is
+    ///
+    /// ```text
+    /// mXDC = 65536 / (m_x_lf_unscaled × global_scale × quant_lf)
+    /// mYDC = 65536 / (m_y_lf_unscaled × global_scale × quant_lf)
+    /// mBDC = 65536 / (m_b_lf_unscaled × global_scale × quant_lf)
+    /// ```
+    ///
+    /// i.e. `global_scale` is a **16.16 fixed-point** scale factor
+    /// (effective scale `global_scale / 65536` — consistent with its
+    /// Table C.12 U32 range topping out near 73728 ≈ 1.125 × 65536) and
+    /// the `m_*_lf_unscaled` values are per-channel quantisation
+    /// **divisors**, not multipliers. The default B value is the
+    /// self-reciprocal point of this correction (`65536 / 256 = 256`),
+    /// which is why a literal implementation appears to validate on the
+    /// B channel while being 4× off on Y and 256× off on X.
     pub fn compute(lf_dequant: &LfChannelDequantization, quantizer: &Quantizer) -> Self {
-        let denom = (quantizer.global_scale as f32) * (quantizer.quant_lf as f32);
+        let scale_qlf = (quantizer.global_scale as f32) * (quantizer.quant_lf as f32);
         // The spec asserts both global_scale and quant_lf are at least 1
         // (their U32 distributions either start at 1 or have an offset
-        // of 1 — see C.4.3). But guard anyway in the floating-point
-        // domain.
-        let inv = if denom > 0.0 { 1.0 / denom } else { 0.0 };
+        // of 1 — see C.4.3). Guard the per-channel divisors anyway in
+        // the floating-point domain.
+        let m_dc = |m_unscaled: f32| -> f32 {
+            let denom = m_unscaled * scale_qlf;
+            if denom > 0.0 {
+                Self::GLOBAL_SCALE_FIXED_ONE / denom
+            } else {
+                0.0
+            }
+        };
         Self {
-            m_x_dc: lf_dequant.m_x_lf_unscaled * inv,
-            m_y_dc: lf_dequant.m_y_lf_unscaled * inv,
-            m_b_dc: lf_dequant.m_b_lf_unscaled * inv,
+            m_x_dc: m_dc(lf_dequant.m_x_lf_unscaled),
+            m_y_dc: m_dc(lf_dequant.m_y_lf_unscaled),
+            m_b_dc: m_dc(lf_dequant.m_b_lf_unscaled),
         }
     }
 }
@@ -207,9 +249,8 @@ pub fn apply_adaptive_lf_smoothing(out: &mut LfDequantOutput, multipliers: &LfMu
 
     // Reciprocals so the smoothing inner loop avoids division on the
     // hot path. Per spec the multipliers are positive (`m_x/y/b_lf`
-    // are positive F16 values in the O(10^2)..O(10^3) range, and
-    // `global_scale + quant_lf` are at least 1). Defensively guard
-    // against zero.
+    // are positive F16 divisors and `global_scale` / `quant_lf` are at
+    // least 1, so `m_*_dc > 0`). Defensively guard against zero.
     let inv_m = [
         if multipliers.m_x_dc != 0.0 {
             1.0 / multipliers.m_x_dc
@@ -303,17 +344,21 @@ mod tests {
 
     #[test]
     fn multipliers_with_default_quantizer_compute_per_spec() {
-        // Default lf_dequant: 4096 / 512 / 256.
-        // Default quantizer: global_scale = 1, quant_lf = 16.
-        // mXDC = 4096 / (1 * 16) = 256. Y: 32. B: 16.
+        // Default lf_dequant divisors: 4096 / 512 / 256.
+        // Quantizer: global_scale = 1 (16.16 fixed-point → scale
+        // 1/65536), quant_lf = 16.
+        // mXDC = 65536 / (4096 × 1 × 16) = 1. Y: 8. B: 16.
+        // Note the B channel is the self-reciprocal point of the
+        // corrected Listing C.1 reading: 65536 / 256 = 256, so the B
+        // value matches what the literal (pre-correction) formula gave.
         let lfd = LfChannelDequantization::default();
         let q = Quantizer {
             global_scale: 1,
             quant_lf: 16,
         };
         let m = LfMultipliers::compute(&lfd, &q);
-        assert_eq!(m.m_x_dc, 256.0);
-        assert_eq!(m.m_y_dc, 32.0);
+        assert_eq!(m.m_x_dc, 1.0);
+        assert_eq!(m.m_y_dc, 8.0);
         assert_eq!(m.m_b_dc, 16.0);
     }
 
