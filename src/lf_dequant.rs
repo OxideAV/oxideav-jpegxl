@@ -66,6 +66,60 @@
 use crate::frame_header::{flags, FrameHeader};
 use crate::lf_global::{LfChannelDequantization, Quantizer};
 
+thread_local! {
+    /// Diagnostic per-thread override forcing the LITERAL FDIS §F.2 ramp
+    /// `max(0, 3 − 4·gap)` instead of the fixture-arbitrated corrected
+    /// ramp `clamp(4·gap − 3, 0, 1)` (erratum candidate 4). Exists so the
+    /// `flat-content-lf-smoothing` arbitration test can decode the same
+    /// stream under BOTH readings and pin which one matches the
+    /// reference decode. Same per-thread pattern as the
+    /// `VARDCT_XYB_CAPTURE` hook — a process-global flag would race
+    /// between concurrently running tests.
+    static LF_SMOOTHING_LITERAL_RAMP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Force (or stop forcing) the literal FDIS §F.2 smoothing ramp on the
+/// CURRENT thread. Diagnostic hook for the erratum-candidate-4
+/// arbitration test only; the shipped default (`false`) is the
+/// fixture-arbitrated corrected ramp.
+pub fn set_lf_smoothing_literal_ramp(on: bool) {
+    LF_SMOOTHING_LITERAL_RAMP.with(|c| c.set(on));
+}
+
+/// Per-sample §F.2 smoothing trace — the "crate's own LF
+/// instrumentation" the `flat-content-lf-smoothing` fixture notes call
+/// for: the pre-smoothing LF samples, the post-smoothing LF samples,
+/// and the per-interior-sample `gap` / applied `factor`. Emitted only
+/// when armed (see [`set_lf_smooth_trace_armed`]).
+#[derive(Debug, Clone)]
+pub struct LfSmoothTrace {
+    /// LF-grid width in samples.
+    pub width: u32,
+    /// LF-grid height in samples.
+    pub height: u32,
+    /// Pre-smoothing LF samples, `[X, Y, B]`, row-major.
+    pub pre: [Vec<f32>; 3],
+    /// Post-smoothing LF samples, `[X, Y, B]`, row-major.
+    pub post: [Vec<f32>; 3],
+    /// Per-sample §F.2 `gap` (edge samples carry 0, never computed).
+    pub gap: Vec<f32>,
+    /// Per-sample applied ramp factor (edge samples carry 1 — kept).
+    pub factor: Vec<f32>,
+}
+
+thread_local! {
+    /// Captured [`LfSmoothTrace`] for the most recent
+    /// [`apply_adaptive_lf_smoothing`] call on this thread, when armed.
+    pub static LF_SMOOTH_TRACE: std::cell::RefCell<Option<LfSmoothTrace>> =
+        const { std::cell::RefCell::new(None) };
+    static LF_SMOOTH_TRACE_ARMED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Arm / disarm [`LF_SMOOTH_TRACE`] for the CURRENT thread.
+pub fn set_lf_smooth_trace_armed(on: bool) {
+    LF_SMOOTH_TRACE_ARMED.with(|c| c.set(on));
+}
+
 /// Per-channel LF multipliers `mXDC, mYDC, mBDC` per FDIS C.4.3 +
 /// Listing F.1, indexed `[X=0, Y=1, B=2]`.
 #[derive(Debug, Clone, Copy)]
@@ -312,6 +366,19 @@ pub fn apply_adaptive_lf_smoothing(out: &mut LfDequantOutput, multipliers: &LfMu
         },
     ];
 
+    let literal_ramp = LF_SMOOTHING_LITERAL_RAMP.with(|c| c.get());
+    let trace_armed = LF_SMOOTH_TRACE_ARMED.with(|c| c.get());
+    let mut trace_gap = if trace_armed {
+        vec![0.0f32; w * h]
+    } else {
+        Vec::new()
+    };
+    let mut trace_factor = if trace_armed {
+        vec![1.0f32; w * h]
+    } else {
+        Vec::new()
+    };
+
     for y in 1..(h - 1) {
         for x in 1..(w - 1) {
             // 3×3 weighted average per channel.
@@ -330,30 +397,39 @@ pub fn apply_adaptive_lf_smoothing(out: &mut LfDequantOutput, multipliers: &LfMu
                 .max((wa_y - s_y).abs() * inv_m[1])
                 .max((wa_b - s_b).abs() * inv_m[2]);
             // FDIS: smoothed = (s - wa) × max(0, 3 - 4 × gap) + wa —
-            // with a CORRECTED factor ramp (FDIS erratum candidate,
-            // round 385). The literal `max(0, 3 - 4 × gap)` reading
-            // yields factor 1 (keep the sample) only at the gap = 0.5
-            // floor and factor 0 (replace with the weighted average)
-            // for every gap ≥ 0.75 — i.e. it smooths REAL CONTENT the
-            // hardest (photo LF neighbour deltas are tens of quant
-            // steps ⇒ gap ≫ 1 everywhere) while preserving only
-            // quantisation noise, destroying the LF image. Measured on
-            // `vardct-256x256-d1` (flags = 0, smoothing active) the
-            // literal reading strips ~8 % of the reference's LLF AC
-            // energy and costs ~1/255 of per-channel MAD; the
-            // reference decode behaves as a near-no-op on this
-            // photo-content fixture. The internally-consistent
-            // denoiser semantics — smooth only deviations within
-            // quantisation noise (gap ≤ 0.75 quant steps), keep real
-            // content (gap ≥ 1) — is the sign-flipped, clamped ramp
+            // with a CORRECTED factor ramp (FDIS erratum candidate 4,
+            // proposed round 385, RESOLVED round 393). The literal
+            // `max(0, 3 - 4 × gap)` reading yields factor 1 (keep the
+            // sample) only at the gap = 0.5 floor and factor 0
+            // (replace with the weighted average) for every gap ≥
+            // 0.75 — i.e. it smooths REAL CONTENT the hardest while
+            // preserving only quantisation noise. The
+            // internally-consistent denoiser semantics — smooth only
+            // deviations within quantisation noise, keep real content
+            // — is the sign-flipped, clamped ramp
             //   factor = clamp(4 × gap - 3, 0, 1)
-            // which this fixture cannot distinguish from "no
-            // smoothing" (its gaps all exceed 1) but which preserves
-            // F.2's structure (a linear ramp of width 1/4 in gap,
-            // anchored at the same 0.75 breakpoint). A flat-content
-            // fixture with per-sample LF traces would pin the exact
-            // ramp; see the round-385 docs-gap note.
-            let factor = (4.0 * gap - 3.0).clamp(0.0, 1.0);
+            // Round 393 pinned this externally on the purpose-built
+            // `flat-content-lf-smoothing` fixture (674/900 interior LF
+            // samples at the gap = 0.5 floor, where the two readings
+            // take opposite values): the corrected ramp beats the
+            // literal reading on every channel (sRGB MAD
+            // 0.2045/0.2044/0.2036 vs 0.2290/0.2287/0.2276) and
+            // matches ~740 more reference pixels exactly. CI-gated by
+            // `round393_flat_lf_smoothing`; the literal ramp stays
+            // reachable only through the per-thread
+            // `set_lf_smoothing_literal_ramp` arbitration hook.
+            let factor = if literal_ramp {
+                // Literal FDIS reading — kept selectable ONLY for the
+                // erratum-candidate-4 arbitration test.
+                (3.0 - 4.0 * gap).max(0.0)
+            } else {
+                (4.0 * gap - 3.0).clamp(0.0, 1.0)
+            };
+
+            if trace_armed {
+                trace_gap[y * w + x] = gap;
+                trace_factor[y * w + x] = factor;
+            }
 
             let out_x = (s_x - wa_x) * factor + wa_x;
             let out_y = (s_y - wa_y) * factor + wa_y;
@@ -362,6 +438,22 @@ pub fn apply_adaptive_lf_smoothing(out: &mut LfDequantOutput, multipliers: &LfMu
             out.samples[1][y * w + x] = out_y;
             out.samples[2][y * w + x] = out_b;
         }
+    }
+
+    if trace_armed {
+        let trace = LfSmoothTrace {
+            width: w as u32,
+            height: h as u32,
+            pre: [snap_x, snap_y, snap_b],
+            post: [
+                out.samples[0].clone(),
+                out.samples[1].clone(),
+                out.samples[2].clone(),
+            ],
+            gap: trace_gap,
+            factor: trace_factor,
+        };
+        LF_SMOOTH_TRACE.with(|s| *s.borrow_mut() = Some(trace));
     }
 }
 

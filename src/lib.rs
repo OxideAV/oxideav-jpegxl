@@ -1592,6 +1592,24 @@ thread_local! {
     /// Per-thread arm flag for [`VARDCT_XYB_CAPTURE`]. Off by default
     /// so the capture costs nothing on the normal decode path.
     static VARDCT_XYB_CAPTURE_ARMED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Diagnostic capture of the integrated VarDCT decode's per-group
+    /// decoded quantised HF-coefficient stacks — the per-varblock HF
+    /// trace #168 records as the clean-room crate's own instrumentation
+    /// job. Each entry is `(group_index, per-pass ThreeChannelVarblock
+    /// stack)` exactly as fed to the §C.8.3 cross-pass reconstruction.
+    /// Populated when [`set_vardct_hf_coeff_capture_armed`] armed the
+    /// current thread.
+    pub static VARDCT_HF_COEFF_CAPTURE: std::cell::RefCell<
+        Option<Vec<(u32, crate::multi_pass_decode::MultiPassThreeChannelOutput)>>,
+    > = const { std::cell::RefCell::new(None) };
+    /// Per-thread arm flag for [`VARDCT_HF_COEFF_CAPTURE`].
+    static VARDCT_HF_COEFF_CAPTURE_ARMED: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// Arm / disarm [`VARDCT_HF_COEFF_CAPTURE`] for the CURRENT thread.
+pub fn set_vardct_hf_coeff_capture_armed(on: bool) {
+    VARDCT_HF_COEFF_CAPTURE_ARMED.with(|c| c.set(on));
 }
 
 /// Arm / disarm [`VARDCT_XYB_CAPTURE`] for the CURRENT thread.
@@ -1806,6 +1824,17 @@ fn finish_vardct_decode(
                     "jxl VarDCT integrated decode: empty per-pass decode output".into(),
                 )
             })?);
+        }
+
+        // Diagnostic capture: when armed, snapshot this group's decoded
+        // quantised HF-coefficient stacks (the crate-side per-varblock
+        // HF trace of #168) before reconstruction consumes them.
+        if VARDCT_HF_COEFF_CAPTURE_ARMED.with(|c| c.get()) {
+            VARDCT_HF_COEFF_CAPTURE.with(|s| {
+                s.borrow_mut()
+                    .get_or_insert_with(Vec::new)
+                    .push((rect.index, stacks.clone()));
+            });
         }
 
         let group_planes = reconstruct_lf_group_cross_pass(
