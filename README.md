@@ -19,17 +19,26 @@ per-(pass, group) HF-entropy decode → F.3 dequant → Annex G
 coefficient-domain chroma-from-luma → §I.2.3.2 IDCT → §C.2 group
 assembly → §6.2 crop → §J restoration filters → §L.2.2 XYB→RGB →
 Table A.10 transfer encoding — is validated by direct sRGB byte
-comparison against three reference decodes:
-`large-1024x768-d2` (12-group multi-group frame) per-channel MAD
-0.55 / 0.49 / 0.33, `vardct-256x256-d3` 0.89 / 0.70 / 0.95, and
-`vardct-256x256-d1` ≈ 3.4 (the strongest-HF fixture; the residual HF
-tail is the one open accuracy item, ratcheted by
-`round362_vardct_d1_reference_divergence`). Single-LfGroup frames of
-any group count decode; multi-LfGroup (> 2048 px) framing is the
-remaining structural gap and surfaces a precise `Error::Unsupported`.
-Multi-frame codestreams compose per §C.2 (Reference slots +
-Table C.8 blending) in `decode_all_frames`. Programs that only need
-probe-level information should call `probe(...)` directly.
+comparison against four reference decodes. Round 393's **§F.3 HfMul
+erratum fix** (HfMul is the per-varblock quantisation-precision
+multiplier and *divides* on dequant, arbitrated externally on the
+purpose-built `flat-content-lf-smoothing` fixture) collapsed every
+VarDCT baseline: `vardct-256x256-d1` per-channel sRGB MAD
+0.66 / 0.47 / 0.61 (was ≈ 3.4 — the round-385 "d1 HF accuracy tail"
+is closed), `vardct-256x256-d3` 0.76 / 0.51 / 0.81, `large-1024x768-d2`
+(12-group) 0.44 / 0.37 / 0.32, flat-content 0.20 / 0.20 / 0.20. The
+same fixture resolved **§F.2 erratum candidate 4**: the corrected
+`clamp(4·gap − 3, 0, 1)` smoothing ramp is the conformant reading
+(CI-gated arbitration). Single-LfGroup frames of any group count
+decode; §C.5 multi-LfGroup (> 2048 px) framing + LZ77 TOC permutations
+landed round 393 and are pinned on `large-3072x2048-multigroup` up to
+the §C.7.1 `used_orders != 0` custom-coefficient-order boundary (a
+docs-gap: the C.3.2 permutation sub-stream's `end`/context reading
+needs an external trace; the decode errors loudly there). Multi-frame
+codestreams compose per §C.2 (Reference slots + Table C.8 blending,
+incl. round-393 kBlend / kAlphaWeightedAdd alpha modes) in
+`decode_all_frames`. Programs that only need probe-level information
+should call `probe(...)` directly.
 
 What is implemented and tested today:
 
@@ -178,45 +187,62 @@ What is implemented and tested today:
   reads the actual quantised-LF samples; the non-empty-`lf_thresholds`
   reject gate is gone.
 
+### Round 393 — flat-content fixture arbitration, alpha blending, multi-LfGroup
+
+- **§F.3 HfMul erratum (the "d1 HF accuracy tail" closed).** The FDIS
+  prose says the bias-adjusted quant "is then multiplied by … the
+  value of HfMul" — but HfMul is the per-varblock
+  quantisation-precision multiplier (§C.8.3 `qf`), so the decoder must
+  DIVIDE. Arbitrated externally on the `flat-content-lf-smoothing`
+  fixture (uniform HfMul = 13, near-empty HF band: the literal multiply
+  produced ±30-code low-frequency garbage, MAD 2.67 → 0.20 with the
+  division) and confirmed on every staged VarDCT fixture (d1
+  3.42/1.99/2.10 → 0.66/0.47/0.61). Same divisor-vs-multiplier shape
+  as the round-385 Listing C.1 erratum. Ratchets tightened
+  (`round362…` 4.5 → 1.0/255; new flat-content 0.35/255 bound). The
+  earlier round-385 corrections (Listing C.1 multipliers, Annex G CfL
+  branch split + `-128` bias, Listing I.16 LLF normalisation) stand.
+- **§F.2 erratum candidate 4 RESOLVED.** On the flat fixture (674/900
+  interior LF samples at the `gap = 0.5` floor, where the two candidate
+  ramps take opposite values) the corrected `clamp(4·gap − 3, 0, 1)`
+  ramp beats the literal `max(0, 3 − 4·gap)` on every channel and
+  matches ~740 more reference pixels exactly. CI-gated; the literal
+  ramp stays reachable only through the per-thread arbitration hook.
+- **Crate-side instrumentation** (the #168 fixture-notes deliverables):
+  per-sample §F.2 LF trace (`lf_dequant::LF_SMOOTH_TRACE` — pre/post
+  planes + per-sample gap/factor), the literal-ramp override, and the
+  per-varblock decoded quantised HF-coefficient capture
+  (`VARDCT_HF_COEFF_CAPTURE`).
+- **§C.2 alpha blending**: kBlend (premultiplied + straight branches,
+  0-alpha guard) and kAlphaWeightedAdd (post-blend alpha per the §C.2
+  definitions paragraph) land in the composer; the alpha plane itself
+  blends `oa + na·(1 − oa)`; Reference slots store the full plane
+  stack; the multi-frame walk threads `alpha_plane` /
+  `alpha_associated` / `ec_blending_info`.
+- **§C.5 multi-LfGroup framing + §C.3.2 LZ77 TOC permutations**:
+  permuted TOCs decode over the shared full-D.3 reader (cjxl
+  large-image TOC permutations are LZ77-enabled) with §C.3.3
+  permutation-aware offsets; §D.3.5 clustering accepts LZ77 nested
+  sub-streams (depth-capped); per-LfGroup structures assemble into
+  frame-level canvases and §F.2 smoothing runs frame-level. Pinned on
+  `large-3072x2048-multigroup` (2×1 LF groups, 96 groups, permuted
+  100-entry TOC) up to the §C.7.1 boundary below.
+
 ### Not yet implemented
 
-- **VarDCT HF accuracy tail on d1-quality streams.** Round 385 root-caused
-  and fixed the long-pinned reference divergence with four
-  fixture-measured FDIS-reading corrections (each recorded as an
-  erratum candidate in the corresponding module doc): (1) **Listing
-  C.1** — `mXDC = 65536 / (m_x_lf_unscaled × global_scale × quant_lf)`
-  (`global_scale` is 16.16 fixed-point; the `m_*_lf_unscaled` F16
-  values are divisors — the literal formula was off by `m²/65536` per
-  channel: X 256×, Y 4×, B 1×); (2) **Annex G / Figure 2** — CfL is a
-  coefficient-domain step with distinct branches (frame-global LF
-  factors on the dequantised LF planes before Listing I.16; per-64×64
-  `XFromY`/`BFromY` on the F.3-dequantised HF grids before the IDCT),
-  plus the LF factor bias is `x_factor_lf - 128`, not `- 127`;
-  (3) **Listing I.16** — the LLF block is the plain §I.2.1-normalised
-  forward DCT of the LF block (the literal `× ScaleF` reading left
-  every LLF AC cell off by exactly `ScaleF(8,64,u)` per axis);
-  (4) **F.2 adaptive smoothing** — the factor ramp is
-  `clamp(4·gap − 3, 0, 1)` (the literal ramp smooths real content
-  hardest and preserves only quantisation noise). With those fixes plus
-  the §J filters wired into the integrated path (Gaborish + per-block
-  Listing J.3 EPF sigma from HfMul/Sharpness) the `vardct-256x256-d1`
-  reconstruction matches the reference decode to per-channel sRGB MAD
-  ≈ 3.3 / 1.9 / 2.1 (from ~105–129 railed at round 362), zero railed
-  pixels, XYB frame-means equal to ~4 decimals
-  (`round362_vardct_d1_reference_divergence` +
-  `round385_vardct_xyb_accuracy` ratchets; internal XYB planes
-  observable via the `VARDCT_XYB_CAPTURE` per-thread hook). Round 389
-  narrowed the residual: d2-quality streams land at sRGB MAD < 1, and
-  the remaining d1 divergence (post-filter XYB MAD ≈ 0.005 on Y,
-  scaling with HF energy) sits in the strong-HF decode/filter tail —
-  isolating it needs the still-pending per-coefficient trace (#168),
-  since the reference PNG includes the §J filters. The §C.7.1
-  signalled coefficient-order permutations are routed (all staged
-  fixtures signal natural orders). Multi-LfGroup framing (frames
-  wider/taller than 2048 px) is still pending, as are the alpha blend
-  modes + `save_before_ct` reference recording in the §C.2 composer,
-  and a progressive-AC (true multi-pass) fixture to pin the
-  round-389 multi-pass framing end-to-end.
+- **§C.7.1 `used_orders != 0` custom coefficient orders.** The C.3.2
+  permutation sub-stream reading is underdetermined by the FDIS text
+  (`end` endpoint-vs-count; `D[prev_elem]` literal vs
+  `D[GetContext(prev_elem)]`) and no staged trace covers a
+  `used_orders != 0` stream — every cjxl `-d 1 -e ≥ 5` stream and the
+  multi-LfGroup fixture signal `0x5F`/`0x13` and stop there with a
+  loud error (never a silent misparse). Needs a per-symbol §C.7.1
+  trace (end + lehmer values + contexts) from a small custom-orders
+  stream — docs-gap filed round 393.
+- The residual sub-1/255 VarDCT accuracy tail (float rounding + §J
+  filter differences), a progressive-AC (true multi-pass) fixture to
+  pin the round-389 multi-pass framing end-to-end, and
+  `save_before_ct` pre-CT reference recording in the §C.2 composer.
 - ColorEncoding / ToneMapping fuller decode, preview / animation /
   intrinsic-size sub-bundles (parsing stops cleanly at the `have_*`
   flags).

@@ -9,6 +9,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Round 393 — flat-content fixture arbitration + alpha blending +
+  multi-LfGroup framing:
+  - **sec F.3 HfMul erratum candidate (major accuracy fix)**: HfMul is
+    the per-varblock quantisation-precision multiplier (sec C.8.3 `qf`)
+    and DIVIDES on dequant — the FDIS' literal "multiplied by" blows
+    the decoded HF by HfMul^2. Arbitrated externally on the new
+    `flat-content-lf-smoothing` fixture (uniform HfMul = 13: MAD
+    2.67/2.39/2.42 -> 0.20/0.20/0.20) and confirmed on every staged
+    VarDCT fixture — `vardct-256x256-d1` collapses 3.42/1.99/2.10 ->
+    0.66/0.47/0.61, closing the long-pinned round-385 "d1 HF accuracy
+    tail" (the residual was never in the entropy decode);
+  - **sec F.2 adaptive-LF-smoothing ramp (erratum candidate 4)
+    RESOLVED**: the corrected `clamp(4*gap - 3, 0, 1)` ramp beats the
+    literal `max(0, 3 - 4*gap)` on every channel of the flat-content
+    fixture (674/900 interior LF samples at the gap = 0.5 floor where
+    the two readings are opposite) and matches ~740 more reference
+    pixels exactly; CI-gated by `round393_flat_lf_smoothing`;
+  - crate-side instrumentation the #168 fixture notes prescribe:
+    per-sample sec F.2 LF trace (`lf_dequant::LF_SMOOTH_TRACE`),
+    per-thread literal-ramp arbitration override, and the per-varblock
+    decoded quantised HF-coefficient capture
+    (`VARDCT_HF_COEFF_CAPTURE`);
+  - sec C.2 kBlend / kAlphaWeightedAdd alpha blending in the frame
+    composer (premultiplied + straight-alpha branches, post-blend
+    alpha semantics, the alpha channel's own `oa + na*(1-oa)` formula,
+    full plane-stack Reference slots); the multi-frame walk threads
+    `alpha_plane` / `alpha_associated` / `ec_blending_info` through;
+  - sec C.3.2 TOC permutations decode over the shared full-D.3 reader
+    (cjxl large-image TOC permutations are LZ77-enabled) and sec C.3.3
+    offsets follow the permutation-aware `group_offsets`;
+  - sec D.3.5 general clustering accepts LZ77-enabled sub-streams
+    (nested one-distribution D.3 read, depth-capped);
+  - sec C.5 multi-LfGroup VarDCT framing: per-LfGroup LF / DctSelect /
+    CfL-tile / Sharpness canvases assemble at frame level, sec F.2
+    smoothing runs on the frame-level LF image, group rects tile the
+    frame — pinned on the new `large-3072x2048-multigroup` fixture
+    (2x1 LF groups, 96 AC groups, permuted TOC) up to the sec C.7.1
+    `used_orders != 0` boundary (docs-gap: the C.3.2 permutation
+    sub-stream's `end` / context reading needs an external trace).
+
+### Fixed
+
+- Round 393 — sec F.3 HfMul divides (see Added; ratchets tightened:
+  round-362 d1 bound 4.5 -> 1.0/255, new flat-content 0.35/255 bound).
+
 - Round 389 — VarDCT frame-level framing to public exposure:
   - multi-group PassGroup framing (sec C.3.1 pass-major slot map,
     sec C.8.1 group-local coordinates via the new `group_rect` views,
