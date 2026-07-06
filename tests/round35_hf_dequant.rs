@@ -108,13 +108,14 @@ fn round95_pipeline_against_default_dequant_set_slot_0() {
     let matrix_entry = set.matrices[slot as usize][channel][0] as f32;
     let d = dequant_hf_coefficient(13, channel, 7, matrix_entry, &oim, &qm);
 
-    // Hand computation:
+    // Hand computation (HfMul DIVIDES per the round-393 erratum —
+    // see `hf_dequant::dequant_hf_coefficient`):
     //   bias-adjust(13, Y) = 13 - 0.145 / 13   ≈ 12.98885
-    //   × HfMul (7)         ≈ 90.92193
-    //   × Y qm factor (1.0) ≈ 90.92193
+    //   ÷ HfMul (7)         ≈ 1.85555
+    //   × Y qm factor (1.0) ≈ 1.85555
     //   × matrix entry      = the corner of slot-0 channel-1 dequant matrix.
     let pre = bias_adjust(13, channel, &oim);
-    let expected = pre * 7.0 * 1.0 * matrix_entry;
+    let expected = pre / 7.0 * 1.0 * matrix_entry;
     assert!((d - expected).abs() < 1e-5, "got {d}, expected {expected}");
 }
 
@@ -132,7 +133,8 @@ fn round95_pipeline_x_channel_picks_up_zero_eight_factor() {
     };
     let d = dequant_hf_coefficient(13, 0, 7, matrix_entry, &oim, &qm);
     let pre = bias_adjust(13, 0, &oim);
-    let expected = pre * 7.0 * 0.8 * matrix_entry;
+    // HfMul divides per the round-393 erratum.
+    let expected = pre / 7.0 * 0.8 * matrix_entry;
     assert!((d - expected).abs() < 1e-5, "got {d}, expected {expected}");
 }
 

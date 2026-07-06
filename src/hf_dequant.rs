@@ -41,11 +41,18 @@
 //! > rectangle containing the current sample, and, for the X and B
 //! > channels, by `0.8^(frame_header.x_qm_scale - 2)` and
 //! > `0.8^(frame_header.b_qm_scale - 2)`, respectively.
-//! >
+//!
 //! > The final dequantized value is obtained by multiplying the
 //! > result by a multiplier defined by the channel, the transform
 //! > type and the coefficient index inside the varblock, as specified
 //! > in C.6.2.
+//!
+//! **Round-393 erratum candidate:** the HfMul step above is inverted —
+//! HfMul is the per-varblock quantisation-precision multiplier (§C.8.3
+//! `qf`), so the decoder must **divide** by it, not multiply.
+//! Fixture-measured on `flat-content-lf-smoothing` (uniform HfMul = 13)
+//! and confirmed on every other staged VarDCT fixture; see
+//! [`dequant_hf_coefficient`].
 //!
 //! ## Implementation notes
 //!
@@ -163,10 +170,14 @@ impl QmScaleFactors {
 
 /// Full per-sample F.3 HF dequantisation.
 ///
-/// Pipeline order (FDIS p. 72, line-by-line):
+/// Pipeline order (FDIS p. 72, line-by-line, with the round-393
+/// HfMul-role erratum applied at step 2):
 ///
 /// 1. `bias_adjust` (Listing F.2 on the raw integer `quant`).
-/// 2. Multiply by `hf_mul` (the per-block `HfMul` value).
+/// 2. **Divide** by `hf_mul` (the per-block `HfMul` value) — the FDIS
+///    literally says "multiplied by", but HfMul is the per-varblock
+///    quantisation-precision multiplier and must divide on the decode
+///    side; see the erratum note in the function body.
 /// 3. For X and B channels only, multiply by
 ///    `0.8^(frame_header.x_qm_scale - 2)` or
 ///    `0.8^(frame_header.b_qm_scale - 2)`.
@@ -193,10 +204,24 @@ pub fn dequant_hf_coefficient(
     qm: &QmScaleFactors,
 ) -> f32 {
     let mut q = bias_adjust(quant, channel, oim);
-    // Per-block multiplier (HfMul) — the integer-valued field from
-    // I.2.7 / C.5.4. The product is taken in f32 to match the
-    // spec's mixed-type expression.
-    q *= hf_mul as f32;
+    // Per-block HfMul — with a CORRECTED role (FDIS erratum candidate,
+    // round 393): the F.3 prose says the bias-adjusted quant "is then
+    // multiplied by a per-block multiplier, the value of HfMul", but
+    // HfMul is the per-varblock quantisation-PRECISION multiplier (the
+    // §C.8.3 `qf`): the encoder quantised with a step `1/HfMul` finer,
+    // so the decoder must DIVIDE the dequantised value by HfMul to
+    // invert it. Measured externally on the flat-content-lf-smoothing
+    // fixture (uniform HfMul = 13, near-empty HF): the literal multiply
+    // blows the decoded HF ~169× (13² vs 1/13) past the reference —
+    // per-channel sRGB MAD 2.67/2.39/2.42 with ±30-code low-frequency
+    // garbage in exactly the varblocks holding |quant| 5..8 — while the
+    // division lands MAD 0.20 on all three channels. Re-measured on
+    // every staged VarDCT fixture: vardct-256x256-d1 3.42/1.99/2.10 →
+    // 0.66/0.47/0.61 (closing the long-pinned round-385 "d1 HF tail"),
+    // d3 0.89/0.70/0.95 → 0.76/0.51/0.81, large-1024x768-d2
+    // 0.55/0.49/0.33 → 0.44/0.37/0.32. Same divisor-vs-multiplier shape
+    // as the Listing C.1 LF-multiplier erratum (round 385).
+    q /= hf_mul as f32;
     // X and B channels carry the `0.8^(qm_scale - 2)` factor; Y is
     // exempt.
     q *= qm.for_channel(channel);
@@ -218,7 +243,8 @@ pub fn dequant_hf_pre_matrix(
     qm: &QmScaleFactors,
 ) -> f32 {
     let q = bias_adjust(quant, channel, oim);
-    q * (hf_mul as f32) * qm.for_channel(channel)
+    // HfMul divides — see the erratum note in `dequant_hf_coefficient`.
+    q / (hf_mul as f32) * qm.for_channel(channel)
 }
 
 #[cfg(test)]
@@ -342,13 +368,14 @@ mod tests {
     #[test]
     fn dequant_hf_coefficient_y_channel_skips_qm_factor() {
         // For Y channel the qm-scale factor is 1.0 by spec; the
-        // result should equal bias_adjust(quant) × hf_mul × matrix.
+        // result should equal bias_adjust(quant) / hf_mul × matrix
+        // (HfMul divides per the round-393 erratum).
         let oim = OpsinInverseMatrix::default();
         let fh = frame_header_with_qm_scales(7, 7);
         let qm = QmScaleFactors::for_frame(&fh);
         let d = dequant_hf_coefficient(5, 1, 100, 0.001, &oim, &qm);
         let pre = bias_adjust(5, 1, &oim);
-        let expected = pre * 100.0 * 1.0 * 0.001;
+        let expected = pre / 100.0 * 1.0 * 0.001;
         assert!((d - expected).abs() < 1e-6, "got {d}, expected {expected}");
     }
 
@@ -360,7 +387,7 @@ mod tests {
         let qm = QmScaleFactors::for_frame(&fh);
         let d = dequant_hf_coefficient(5, 0, 100, 0.001, &oim, &qm);
         let pre = bias_adjust(5, 0, &oim);
-        let expected = pre * 100.0 * 0.64 * 0.001;
+        let expected = pre / 100.0 * 0.64 * 0.001;
         assert!((d - expected).abs() < 1e-6, "got {d}, expected {expected}");
     }
 
@@ -372,7 +399,7 @@ mod tests {
         let qm = QmScaleFactors::for_frame(&fh);
         let d = dequant_hf_coefficient(5, 2, 100, 0.001, &oim, &qm);
         let pre = bias_adjust(5, 2, &oim);
-        let expected = pre * 100.0 * 0.8 * 0.001;
+        let expected = pre / 100.0 * 0.8 * 0.001;
         assert!((d - expected).abs() < 1e-6, "got {d}, expected {expected}");
     }
 

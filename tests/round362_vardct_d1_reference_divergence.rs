@@ -113,9 +113,14 @@ fn reference_is_a_normal_mid_tone_photo() {
 /// filter wiring, and the Listing I.16 LLF-normalisation fix, the
 /// integrated VarDCT reconstruction is a close match to the reference —
 /// zero railed pixels, per-channel means within ±4/255, per-channel MAD
-/// under 4.5/255 in the sRGB domain (measured ≈ 3.3 / 1.9 / 2.1). The
-/// remaining gap is in the entropy-decoded HF coefficients; when that
-/// path is fixed, tighten these bounds further.
+/// under 4.5/255 in the sRGB domain (measured ≈ 3.3 / 1.9 / 2.1 at the
+/// round-385 baseline). Round 393 root-caused that residual: the §F.3
+/// HfMul role is inverted (HfMul is the per-varblock
+/// quantisation-precision multiplier and must DIVIDE on dequant — see
+/// the erratum note in `hf_dequant::dequant_hf_coefficient`,
+/// arbitrated externally on the `flat-content-lf-smoothing` fixture).
+/// With the division the d1 MAD collapses to ≈ 0.66 / 0.47 / 0.61;
+/// the ratchet below is tightened to 1.0/255 accordingly.
 #[test]
 fn vardct_output_tracks_reference_within_hf_filter_gap() {
     let frame = oxideav_jpegxl::decode_vardct_frame_from_codestream(VARDCT_D1_JXL, None)
@@ -168,11 +173,11 @@ fn vardct_output_tracks_reference_within_hf_filter_gap() {
         );
         let mad = total_abs_err[k] as f64 / n as f64;
         assert!(
-            mad < 4.5,
-            "channel {k} MAD {mad:.2} exceeds the round-385 baseline bound of 4.5 \
-             (measured ≈ 3.3 / 1.9 / 2.1; the residual is the entropy-decoded HF \
-             coefficient path). A regression pushed it up — investigate before \
-             loosening this ratchet."
+            mad < 1.0,
+            "channel {k} MAD {mad:.2} exceeds the round-393 baseline bound of 1.0 \
+             (measured ≈ 0.66 / 0.47 / 0.61 after the §F.3 HfMul-divides erratum \
+             fix). A regression pushed it up — investigate before loosening this \
+             ratchet."
         );
     }
 }
