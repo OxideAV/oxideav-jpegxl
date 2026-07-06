@@ -20,12 +20,7 @@
 
 use oxideav_core::{Error, Result};
 
-use crate::ans::alias::AliasTable;
-use crate::ans::distribution::read_distribution;
-use crate::ans::hybrid::{HybridUintState, Lz77Params};
-use crate::ans::hybrid_config::HybridUintConfig;
-use crate::ans::prefix::read_prefix_code;
-use crate::ans::symbol::AnsDecoder;
+use crate::ans::hybrid::HybridUintState;
 use crate::bitreader::BitReader;
 
 /// `MTF(v[256], index)` per FDIS Listing D.5.
@@ -143,99 +138,51 @@ pub fn read_general_clustering(
 
     let use_mtf = br.read_bit()? == 1;
 
-    // D.3.5 sub-stream is a one-distribution ANS stream. Per D.3.1, the
-    // sub-stream itself begins with LZ77Params; if that signals
-    // lz77.enabled then num_dist becomes 2 and D.3.5 would be invoked
-    // recursively — a hostile-input attack vector. Reject the recursive
-    // case rather than risk an unbounded recursion.
-    let lz77_enabled = br.read_bit()? == 1;
-    if lz77_enabled {
-        return Err(Error::InvalidData(
-            "JXL D.3.5 general clustering: LZ77-enabled sub-stream not supported (recursive clustering disallowed)".into(),
-        ));
+    // D.3.5 sub-stream is a one-distribution D.3 entropy stream. Round
+    // 393: it is read through the shared full-D.3 reader
+    // (`EntropyStream`) so an LZ77-enabled sub-stream — which cjxl
+    // emits for large clustering maps (e.g. the §C.7.2 HF-coefficient
+    // maps of multi-LfGroup frames) — decodes too. With LZ77 on, the
+    // sub-stream's `num_dist` becomes 2 (the dedicated distance
+    // context), which itself requires a (tiny) nested D.3.5 clustering
+    // read — a bounded recursion we guard with a per-thread depth cap
+    // so a crafted stream cannot wind the stack.
+    struct DepthGuard;
+    thread_local! {
+        static CLUSTER_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    }
+    impl Drop for DepthGuard {
+        fn drop(&mut self) {
+            CLUSTER_DEPTH.with(|d| d.set(d.get() - 1));
+        }
+    }
+    const MAX_CLUSTER_DEPTH: u32 = 8;
+    let depth = CLUSTER_DEPTH.with(|d| {
+        let v = d.get() + 1;
+        d.set(v);
+        v
+    });
+    let _guard = DepthGuard;
+    if depth > MAX_CLUSTER_DEPTH {
+        return Err(Error::InvalidData(format!(
+            "JXL D.3.5 general clustering: nested-stream recursion exceeds depth cap \
+             {MAX_CLUSTER_DEPTH}"
+        )));
     }
 
-    // num_dist == 1 → D.3.5 is skipped for the sub-stream. Proceed
-    // straight to use_prefix_code + HybridUintConfig + distribution.
-    //
-    // 2024-spec C.2.1: use_prefix_code=1 → log_alpha=15, =0 → 5+u(2).
-    // The FDIS-2021 listing (D.3.1) had the two branches swapped (typo
-    // #5); the 2024 published edition's authoritative reading matches
-    // the trace bit counts seen against `cjxl` fixtures.
-    let use_prefix_code = br.read_bit()? == 1;
-    let log_alphabet_size = if use_prefix_code {
-        15
-    } else {
-        5 + br.read_bits(2)?
-    };
-
-    let cfg = HybridUintConfig::read(br, log_alphabet_size)?;
-
-    let mut state = HybridUintState::new(
-        Lz77Params {
-            enabled: false,
-            min_symbol: 224,
-            min_length: 3,
-        },
-        cfg,
-    );
-
-    let mut clusters = if use_prefix_code {
-        // Sub-stream uses prefix codes (D.2). Per C.2.1 / C.2.4 with
-        // exactly one cluster:
-        //   count_bit (1 bit) | (n + (1<<n) + u(n)) → prefix code histogram.
-        let count = if br.read_bit()? == 0 {
-            1u32
-        } else {
-            let n = br.read_bits(4)?;
-            if n > 14 {
-                return Err(Error::InvalidData(format!(
-                    "JXL D.3.5 prefix sub-stream: count n {n} > 14"
-                )));
-            }
-            1 + (1u32 << n) + br.read_bits(n)?
-        };
-        if count > (1 << 15) {
-            return Err(Error::InvalidData(format!(
-                "JXL D.3.5 prefix sub-stream: count {count} > 1<<15"
-            )));
-        }
-        let code = read_prefix_code(br, count)?;
-        let mut clusters = Vec::with_capacity(num_distributions);
-        for _ in 0..num_distributions {
-            let value = state.decode(
-                br,
-                0,
-                0,
-                0,
-                |br_inner, _ctx| code.decode(br_inner),
-                |_ctx| cfg,
-            )?;
-            clusters.push(value);
-        }
-        clusters
-    } else {
-        // ANS sub-stream: read one distribution, build alias table, init
-        // state, decode num_distributions integers. Round-8 SPECGAP:
-        // the distribution's effective log_alphabet_size is returned
-        // separately and used for alias-table sizing.
-        let (dist, log_eff) = read_distribution(br, log_alphabet_size)?;
-        let alias = AliasTable::build(&dist, log_eff)?;
-        let mut ans = AnsDecoder::new(br)?;
-        let mut clusters = Vec::with_capacity(num_distributions);
-        for _ in 0..num_distributions {
-            let value = state.decode(
-                br,
-                0,
-                0,
-                0,
-                |br_inner, _ctx| Ok(ans.decode_symbol(br_inner, &dist, &alias)? as u32),
-                |_ctx| cfg,
-            )?;
-            clusters.push(value);
-        }
-        clusters
-    };
+    let mut stream = crate::modular_fdis::EntropyStream::read(br, 1)?;
+    stream.read_ans_state_init(br)?;
+    let mut hybrid = HybridUintState::new(stream.lz77, stream.lz_len_conf);
+    let mut clusters = Vec::with_capacity(num_distributions);
+    for _ in 0..num_distributions {
+        clusters.push(crate::modular_fdis::decode_uint_in_with_dist_pub(
+            &mut hybrid,
+            &mut stream,
+            br,
+            0,
+            0,
+        )?);
+    }
 
     if use_mtf {
         inverse_mtf(&mut clusters);

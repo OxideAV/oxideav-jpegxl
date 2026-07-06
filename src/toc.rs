@@ -22,13 +22,10 @@
 
 use oxideav_core::{Error, Result};
 
-use crate::ans::alias::AliasTable;
-use crate::ans::cluster::{num_clusters, read_clustering};
-use crate::ans::distribution::read_distribution;
-use crate::ans::hybrid_config::HybridUintConfig;
-use crate::ans::symbol::AnsDecoder;
+use crate::ans::hybrid::HybridUintState;
 use crate::bitreader::{BitReader, U32Dist};
 use crate::frame_header::{Encoding, FrameHeader};
+use crate::modular_fdis::{decode_uint_in_with_dist_pub, EntropyStream};
 
 /// Decoded `TOC` per FDIS C.3.
 #[derive(Debug, Clone)]
@@ -214,10 +211,16 @@ fn get_context(x: u32) -> u32 {
 
 /// FDIS C.3.2 Lehmer-code permutation decoder.
 ///
-/// Reads the integer `end` from the 8-cluster ANS sub-stream using
+/// Reads the integer `end` from the 8-cluster D.3 sub-stream using
 /// distribution `D[GetContext(size)]`, then `(end - skip)` further
 /// integers (skip = 0 for TOC), then turns the resulting Lehmer
 /// sequence into the final permutation array.
+///
+/// Round 393: the sub-stream is a FULL D.3 entropy stream — cjxl's
+/// large-image progressive TOC permutations ship with LZ77 enabled —
+/// so the hand-rolled ANS-only prelude was replaced by the shared
+/// [`EntropyStream`] + [`HybridUintState`] pipeline (LZ77 window,
+/// prefix-or-ANS, dedicated distance context and all).
 fn decode_permutation(br: &mut BitReader<'_>, size: usize) -> Result<Vec<u32>> {
     if size == 0 {
         return Ok(Vec::new());
@@ -237,98 +240,17 @@ fn decode_permutation(br: &mut BitReader<'_>, size: usize) -> Result<Vec<u32>> {
         return Ok(vec![0]);
     }
 
-    // Set up an 8-cluster ANS context per C.3.1's "8 clustered
-    // distributions" prescription. The full D.3 setup runs:
-    //   1. LZ77Params (we expect lz77.enabled = false for the TOC
-    //      sub-stream — TOC permutations don't repeat),
-    //   2. read clustering map for num_dist = 8 (read_clustering),
-    //   3. use_prefix_code u(1) + log_alphabet_size,
-    //   4. one HybridUintConfig per cluster (3.7),
-    //   5. one ANS distribution per cluster,
-    //   6. AnsDecoder::new() → state = u(32),
-    //   7. `size` decode_symbol calls via DecodeHybridVarLenUint.
-    //
-    // We implement the full pipeline inline here so the decoder is
-    // self-contained.
-    let lz77_enabled = br.read_bit()? == 1;
-    if lz77_enabled {
-        // FDIS allows it but TOC permutations never need it; reject
-        // to keep the implementation simple and avoid the recursive
-        // clustering attack.
-        return Err(Error::InvalidData(
-            "JXL permutation: LZ77-enabled TOC sub-stream not supported".into(),
-        ));
-    }
-
-    // num_dist = 8 (as fixed by C.3.1). Since num_dist > 1, we read the
-    // clustering map per D.3.5.
-    let num_dist: usize = 8;
-    let cluster_map = read_clustering(br, num_dist)?;
-    if cluster_map.len() != num_dist {
-        return Err(Error::InvalidData(
-            "JXL permutation: cluster map length mismatch".into(),
-        ));
-    }
-    let n_clusters = num_clusters(&cluster_map) as usize;
-    if n_clusters == 0 || n_clusters > num_dist {
-        return Err(Error::InvalidData(
-            "JXL permutation: invalid cluster count".into(),
-        ));
-    }
-
-    let use_prefix_code = br.read_bit()? == 1;
-    if use_prefix_code {
-        return Err(Error::Unsupported(
-            "JXL permutation: prefix-coded TOC sub-stream not yet supported".into(),
-        ));
-    }
-    let log_alphabet_size = 15u32;
-
-    let mut configs: Vec<HybridUintConfig> = Vec::with_capacity(n_clusters);
-    for _ in 0..n_clusters {
-        configs.push(HybridUintConfig::read(br, log_alphabet_size)?);
-    }
-    let mut dists: Vec<Vec<u16>> = Vec::with_capacity(n_clusters);
-    let mut aliases: Vec<AliasTable> = Vec::with_capacity(n_clusters);
-    for _ in 0..n_clusters {
-        // Round-8 SPECGAP: read_distribution may return a D larger
-        // than `1 << log_alphabet_size` when alphabet_size exceeds
-        // table_size; the effective log_alphabet_size is returned for
-        // alias-table sizing.
-        let (d, log_eff) = read_distribution(br, log_alphabet_size)?;
-        let a = AliasTable::build(&d, log_eff)?;
-        dists.push(d);
-        aliases.push(a);
-    }
-
-    // ANS state init.
-    let mut ans = AnsDecoder::new(br)?;
-
-    // Helper: decode one integer using the cluster mapped from
-    // distribution context `ctx_dist`. We do NOT route through
-    // [`HybridUintState`] here because LZ77 is disabled for the TOC
-    // sub-stream — there is no copy state to maintain — and threading
-    // `HybridUintState` through a mutable `decode_one` while keeping
-    // borrows of `dists` / `aliases` requires extra unsafe-ish
-    // gymnastics. Per D.3.6 the hybrid var-len read with LZ77 disabled
-    // collapses to `cfg.read_uint(br, token)` which is what we do.
+    // C.3.1: "a single entropy coded stream with 8 clustered
+    // distributions, as specified in D.3". The full D.3 prelude —
+    // LZ77Params (+1 distance context when enabled), clustering,
+    // use_prefix_code, per-cluster configs + distributions — then the
+    // ANS state init (u(32), a no-op for prefix streams) directly
+    // before the first symbol.
+    let mut stream = EntropyStream::read(br, 8)?;
+    stream.read_ans_state_init(br)?;
+    let mut hybrid = HybridUintState::new(stream.lz77, stream.lz_len_conf);
     let mut decode_one = |br: &mut BitReader<'_>, ctx_dist: u32| -> Result<u32> {
-        let cluster = cluster_map
-            .get(ctx_dist as usize)
-            .copied()
-            .ok_or_else(|| Error::InvalidData("JXL permutation: ctx out of range".into()))?
-            as usize;
-        if cluster >= n_clusters {
-            return Err(Error::InvalidData(
-                "JXL permutation: cluster index out of range".into(),
-            ));
-        }
-        // Borrow individually for the closure body.
-        let dist_ref = &dists[cluster];
-        let alias_ref = &aliases[cluster];
-        let cfg = configs[cluster];
-        let token = ans.decode_symbol(br, dist_ref, alias_ref)? as u32;
-        cfg.read_uint(br, token)
+        decode_uint_in_with_dist_pub(&mut hybrid, &mut stream, br, ctx_dist, 0)
     };
 
     // FDIS: end = decode using D[GetContext(size)]; we pass the

@@ -125,12 +125,8 @@ pub fn recognise_vardct_codestream(
     fh: &FrameHeader,
     metadata: &ImageMetadataFdis,
 ) -> std::result::Result<VarDctScaffold, Error> {
-    if fh.num_lf_groups() > 1 {
-        return Err(Error::Unsupported(format!(
-            "jxl VarDCT (round 8 scaffold): num_lf_groups = {} > 1 not yet supported",
-            fh.num_lf_groups()
-        )));
-    }
+    // Round 393: multi-LfGroup frames are assembled at the frame level
+    // by `decode_vardct_frame` (§C.5 tiling) — no LF-group-count gate.
     if fh.passes.num_passes > 1 {
         return Err(Error::Unsupported(format!(
             "jxl VarDCT (round 8 scaffold): num_passes = {} > 1 not yet supported",

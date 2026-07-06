@@ -133,6 +133,18 @@ impl HfPass {
             // to subclause D.3". The same 8-distribution stream + ANS
             // state is shared by EVERY DecodePermutation() call in the
             // per-bit loop below — it is read ONCE here.
+            //
+            // KNOWN GAP (round 393): this path has never decoded a REAL
+            // cjxl `used_orders != 0` stream to a verified position —
+            // the C.3.2 `end` semantics (endpoint vs count) and the
+            // per-element lehmer context (`D[prev_elem]` literal vs
+            // `D[GetContext(prev_elem)]`) are underdetermined by the
+            // FDIS text and no staged trace pins them (docs-gap filed
+            // round 393; the multi-LfGroup `large-3072x2048-multigroup`
+            // fixture and every cjxl `-d 1 -e >= 5` stream signal
+            // 0x5F/0x13 and stall here). A wrong reading surfaces as a
+            // loud InvalidData from the range guards below or from the
+            // §C.7.2 parse that follows — never as silent misdecode.
             let mut entropy = EntropyStream::read(br, 8)?;
             entropy.read_ans_state_init(br)?;
             let mut hybrid = HybridUintState::new(entropy.lz77, entropy.lz_len_conf);

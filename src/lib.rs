@@ -1038,7 +1038,10 @@ fn decode_frame_body(
     //    transforms applied AFTER all PassGroups complete (G.4.2).
     let num_groups = fh.num_groups();
     let num_lf_groups = fh.num_lf_groups();
-    if num_lf_groups > 1 {
+    // Round 393: the VarDCT path assembles multi-LfGroup frames at the
+    // frame level (§C.5 tiling in `decode_vardct_frame`); only the
+    // Modular per-LfGroup walk still requires a single LF group.
+    if num_lf_groups > 1 && fh.encoding != crate::frame_header::Encoding::VarDct {
         return Err(crate::lf_group::unsupported_multi_lf_group_error(
             num_lf_groups,
             fh.encoding,
@@ -2024,12 +2027,6 @@ pub fn decode_vardct_frame(
 ) -> Result<VideoFrame> {
     let num_groups = fh.num_groups();
     let num_lf_groups = fh.num_lf_groups();
-    if num_lf_groups != 1 {
-        return Err(Error::Unsupported(format!(
-            "jxl VarDCT decoder: num_lf_groups={num_lf_groups} — multi-LfGroup VarDCT \
-             framing is not wired yet (multi-group + multi-pass landed round 389)"
-        )));
-    }
 
     let frame_data_start = br.bytes_consumed();
     let codestream_data = br.data();
@@ -2047,12 +2044,10 @@ pub fn decode_vardct_frame(
             frame_bytes.len()
         )));
     }
-    let mut section_starts: Vec<usize> = Vec::with_capacity(toc.entries.len());
-    let mut acc: u64 = 0;
-    for &e in &toc.entries {
-        section_starts.push(acc as usize);
-        acc = acc.saturating_add(e as u64);
-    }
+    // §C.3.3 byte offsets: `toc.group_offsets[i]` is the on-wire byte
+    // offset of canonical section `i` — the permutation (large-image
+    // progressive group ordering) is already folded in by `Toc::read`,
+    // so a permuted TOC's offsets are NOT a running sum of `entries`.
     let section_byte_range = |idx: usize| -> Result<&[u8]> {
         if idx >= toc.entries.len() {
             return Err(Error::InvalidData(format!(
@@ -2060,7 +2055,7 @@ pub fn decode_vardct_frame(
                 toc.entries.len()
             )));
         }
-        let start = section_starts[idx];
+        let start = toc.group_offsets[idx] as usize;
         let len = toc.entries[idx] as usize;
         let end = start + len;
         if end > frame_bytes.len() {
@@ -2106,7 +2101,7 @@ pub fn decode_vardct_frame(
     // The per-group bit readers positioned at each PassGroup start.
     // Single-TOC: one reader sharing the whole frame buffer, advanced
     // past HfGlobal. Multi-TOC: fresh section readers per PassGroup slot.
-    let (lf_global, lf_group, mut hf_global_section, pass_group_readers) = if single_toc {
+    let (lf_global, lf_groups, mut hf_global_section, pass_group_readers) = if single_toc {
         // Single-TOC-entry path: chain section reads on the same bit
         // reader, no byte-aligned slicing between sections.
         let lf_global_bytes = section_byte_range(lf_global_slot)?;
@@ -2142,7 +2137,7 @@ pub fn decode_vardct_frame(
         // PassGroup continues on the same cursor (no byte alignment).
         (
             lf_global,
-            lf_group,
+            vec![lf_group],
             hf_global_section,
             vec![vec![shared_br]],
         )
@@ -2162,9 +2157,15 @@ pub fn decode_vardct_frame(
             Error::InvalidData("JXL VarDCT round 13: LfChannelCorrelation missing".into())
         })?;
 
-        let lf_group_bytes = section_byte_range(lf_group_slot(0))?;
-        let mut lg_br = BitReader::new_section(lf_group_bytes);
-        let lf_group = crate::lf_group::LfGroup::read(&mut lg_br, fh, &lf_global, metadata, 0)?;
+        // §C.5: one LfGroup section per LF (DC) group, raster order.
+        let mut lf_groups = Vec::with_capacity(num_lf_groups as usize);
+        for lg in 0..num_lf_groups {
+            let lf_group_bytes = section_byte_range(lf_group_slot(lg))?;
+            let mut lg_br = BitReader::new_section(lf_group_bytes);
+            lf_groups.push(crate::lf_group::LfGroup::read(
+                &mut lg_br, fh, &lf_global, metadata, lg as u32,
+            )?);
+        }
 
         // §C.7 full HfGlobal section (see single-TOC branch comment).
         let nb_block_ctx = lf_global
@@ -2193,7 +2194,7 @@ pub fn decode_vardct_frame(
             }
             readers.push(per_pass);
         }
-        (lf_global, lf_group, hf_global_section, readers)
+        (lf_global, lf_groups, hf_global_section, readers)
     };
 
     // Re-extract Quantizer for the dequant path below (it was already
@@ -2202,68 +2203,153 @@ pub fn decode_vardct_frame(
         .quantizer
         .ok_or_else(|| Error::InvalidData("JXL VarDCT round 13: Quantizer missing".into()))?;
 
-    let lf_coeff = lf_group.lf_coeff.ok_or_else(|| {
-        Error::InvalidData("JXL VarDCT round 13: LfCoefficients missing on VarDCT LfGroup".into())
-    })?;
-    let hf_meta = lf_group.hf_meta.ok_or_else(|| {
-        Error::InvalidData("JXL VarDCT round 13: HfMetadata missing on VarDCT LfGroup".into())
-    })?;
+    // §C.5 frame-level assembly: LfGroups tile the frame in raster
+    // order at `group_dim × 8` pixels. Every per-LfGroup structure
+    // (quantised LF, dequantised LF, DctSelect/HfMul grid, CfL tile
+    // factors, Sharpness) is pasted at its LfGroup's offset so the
+    // finish step below operates on ONE frame-level view regardless of
+    // the LF-group count — and the §F.2 adaptive smoothing runs on
+    // "each LF sample of the image" (frame-level, per the F.2 prose),
+    // not per LfGroup.
+    let fbw = fh.width.div_ceil(8) as usize; // blocks == LF samples
+    let fbh = fh.height.div_ceil(8) as usize;
+    let ftw = fh.width.div_ceil(64) as usize; // 64×64 CfL tiles
+    let fth = fh.height.div_ceil(64) as usize;
 
-    // Derive DctSelect / HfMul from BlockInfo per FDIS C.5.4 prose.
-    // The grid covers the LfGroup's pixel rectangle; for a single-
-    // LfGroup frame that's the full frame.
-    let lf_w = lf_group.mlf_group.lf_group_width;
-    let lf_h = lf_group.mlf_group.lf_group_height;
-    let dct_grid = crate::dct_select::derive_dct_select(&hf_meta, lf_w, lf_h)?;
-
-    // F.1 LF dequantisation (Listing F.1) over the per-LfGroup
-    // LfCoefficients. Unwrap the lf_quant Vec into a fixed-size [3]
-    // array as expected by `dequant_lf`.
-    if lf_coeff.lf_quant.len() != 3 {
-        return Err(Error::InvalidData(format!(
-            "JXL VarDCT round 13: LfCoefficients has {} channels, expected 3",
-            lf_coeff.lf_quant.len()
-        )));
-    }
-    // Channel-order reindex: the LfCoefficients modular sub-bitstream
-    // stores the three LF channels in JXL's native XYB **modular** order
-    // `(Y, X, B)` — the same "first three channels are Y', X', B'"
-    // convention §L.2.2 documents for the kModular path (see
-    // `xyb::modular_xyb_rescale`). `dequant_lf` / `LfDequantOutput`, by
-    // contrast, are contractually `[X, Y, B]` (Listing F.1 applies
-    // `m_x_dc` to channel 0, `m_y_dc` to channel 1). So map modular
-    // index 1 → X-slot 0 and modular index 0 → Y-slot 1; B (index 2) is
-    // unchanged. Without this swap the large-magnitude luma (Y) plane is
-    // dequantised with the X multiplier and fed to `inverse_xyb_to_rgb`
-    // as the chroma channel, collapsing the whole frame to a constant
-    // colour (the X↔Y swap was latent because no integrated VarDCT path
-    // reached the XYB→RGB step before round 355).
-    let lf_quant: [Vec<i32>; 3] = [
-        lf_coeff.lf_quant[1].clone(),
-        lf_coeff.lf_quant[0].clone(),
-        lf_coeff.lf_quant[2].clone(),
-    ];
-    let lf_quant_widths = [
-        lf_coeff.lf_quant_widths[1],
-        lf_coeff.lf_quant_widths[0],
-        lf_coeff.lf_quant_widths[2],
-    ];
-    let lf_quant_heights = [
-        lf_coeff.lf_quant_heights[1],
-        lf_coeff.lf_quant_heights[0],
-        lf_coeff.lf_quant_heights[2],
-    ];
     let multipliers = crate::lf_dequant::LfMultipliers::compute(&lf_global.lf_dequant, &quantizer);
-    let mut dequant = crate::lf_dequant::dequant_lf(
-        &lf_quant,
-        lf_quant_widths,
-        lf_quant_heights,
-        lf_coeff.extra_precision,
-        &multipliers,
-    );
+
+    let mut lf_quant: [Vec<i32>; 3] = [
+        vec![0i32; fbw * fbh],
+        vec![0i32; fbw * fbh],
+        vec![0i32; fbw * fbh],
+    ];
+    let mut lf_samples: [Vec<f32>; 3] = [
+        vec![0f32; fbw * fbh],
+        vec![0f32; fbw * fbh],
+        vec![0f32; fbw * fbh],
+    ];
+    let mut cells = vec![crate::dct_select::DctSelectCell::Empty; fbw * fbh];
+    let mut hf_mul_grid = vec![0i32; fbw * fbh];
+    let mut x_from_y = vec![0i32; ftw * fth];
+    let mut b_from_y = vec![0i32; ftw * fth];
+    let mut sharpness = vec![0i32; fbw * fbh];
+
+    for lf_group in &lf_groups {
+        let lg_idx = lf_group.mlf_group.lf_group_index;
+        let (px0, py0, lf_w, lf_h) = crate::lf_group::ModularLfGroup::rect_for_index(fh, lg_idx)?;
+        let bx0 = (px0 / 8) as usize;
+        let by0 = (py0 / 8) as usize;
+        let tx0 = (px0 / 64) as usize;
+        let ty0 = (py0 / 64) as usize;
+        let gbw = lf_w.div_ceil(8) as usize;
+        let gbh = lf_h.div_ceil(8) as usize;
+        let gtw = lf_w.div_ceil(64) as usize;
+        let gth = lf_h.div_ceil(64) as usize;
+
+        let lf_coeff = lf_group.lf_coeff.as_ref().ok_or_else(|| {
+            Error::InvalidData(
+                "JXL VarDCT round 13: LfCoefficients missing on VarDCT LfGroup".into(),
+            )
+        })?;
+        let hf_meta = lf_group.hf_meta.as_ref().ok_or_else(|| {
+            Error::InvalidData("JXL VarDCT round 13: HfMetadata missing on VarDCT LfGroup".into())
+        })?;
+        if lf_coeff.lf_quant.len() != 3 {
+            return Err(Error::InvalidData(format!(
+                "JXL VarDCT round 13: LfCoefficients has {} channels, expected 3",
+                lf_coeff.lf_quant.len()
+            )));
+        }
+        // The frame-level canvases assume unsubsampled LF channels
+        // (jpeg_upsampling == 0 — the only case §F.2 smoothing runs on
+        // anyway); a subsampled channel would need per-channel canvas
+        // geometry.
+        if lf_coeff.lf_quant_widths != [gbw as u32; 3]
+            || lf_coeff.lf_quant_heights != [gbh as u32; 3]
+        {
+            return Err(Error::Unsupported(format!(
+                "jxl VarDCT decoder: subsampled LF channels ({:?}×{:?} vs {gbw}×{gbh}) in \
+                 frame-level LF assembly",
+                lf_coeff.lf_quant_widths, lf_coeff.lf_quant_heights
+            )));
+        }
+
+        // Channel-order reindex: the LfCoefficients modular
+        // sub-bitstream stores the three LF channels in JXL's native
+        // XYB **modular** order `(Y, X, B)` — the same "first three
+        // channels are Y', X', B'" convention §L.2.2 documents for the
+        // kModular path. `dequant_lf` / `LfDequantOutput`, by contrast,
+        // are contractually `[X, Y, B]` (Listing F.1 applies `m_x_dc`
+        // to channel 0, `m_y_dc` to channel 1). So map modular index
+        // 1 → X-slot 0 and modular index 0 → Y-slot 1; B is unchanged.
+        let g_quant: [Vec<i32>; 3] = [
+            lf_coeff.lf_quant[1].clone(),
+            lf_coeff.lf_quant[0].clone(),
+            lf_coeff.lf_quant[2].clone(),
+        ];
+        // F.1 LF dequantisation (Listing F.1) with this LfGroup's own
+        // `extra_precision` (C.5.2 — per-LfGroup on the wire).
+        let g_dequant = crate::lf_dequant::dequant_lf(
+            &g_quant,
+            [gbw as u32; 3],
+            [gbh as u32; 3],
+            lf_coeff.extra_precision,
+            &multipliers,
+        );
+
+        // DctSelect / HfMul from BlockInfo per FDIS C.5.4 prose — the
+        // placement grid covers the LfGroup's pixel rectangle.
+        let g_grid = crate::dct_select::derive_dct_select(hf_meta, lf_w, lf_h)?;
+
+        if hf_meta.sharpness.len() != gbw * gbh {
+            return Err(Error::InvalidData(format!(
+                "JXL VarDCT: Sharpness plane size {} != {gbw}×{gbh}",
+                hf_meta.sharpness.len()
+            )));
+        }
+
+        // Paste the per-LfGroup planes at the LfGroup offset.
+        for gy in 0..gbh {
+            let src = gy * gbw;
+            let dst = (by0 + gy) * fbw + bx0;
+            for c in 0..3 {
+                lf_quant[c][dst..dst + gbw].copy_from_slice(&g_quant[c][src..src + gbw]);
+                lf_samples[c][dst..dst + gbw]
+                    .copy_from_slice(&g_dequant.samples[c][src..src + gbw]);
+            }
+            cells[dst..dst + gbw].copy_from_slice(&g_grid.cells[src..src + gbw]);
+            hf_mul_grid[dst..dst + gbw].copy_from_slice(&g_grid.hf_mul[src..src + gbw]);
+            sharpness[dst..dst + gbw].copy_from_slice(&hf_meta.sharpness[src..src + gbw]);
+        }
+        if hf_meta.x_from_y.len() != gtw * gth || hf_meta.b_from_y.len() != gtw * gth {
+            return Err(Error::InvalidData(format!(
+                "JXL VarDCT: CfL tile plane sizes (XFromY={}, BFromY={}) != {gtw}×{gth}",
+                hf_meta.x_from_y.len(),
+                hf_meta.b_from_y.len()
+            )));
+        }
+        for gy in 0..gth {
+            let src = gy * gtw;
+            let dst = (ty0 + gy) * ftw + tx0;
+            x_from_y[dst..dst + gtw].copy_from_slice(&hf_meta.x_from_y[src..src + gtw]);
+            b_from_y[dst..dst + gtw].copy_from_slice(&hf_meta.b_from_y[src..src + gtw]);
+        }
+    }
+
+    let mut dequant = crate::lf_dequant::LfDequantOutput {
+        samples: lf_samples,
+        widths: [fbw as u32; 3],
+        heights: [fbh as u32; 3],
+    };
+    let dct_grid = crate::dct_select::DctSelectGrid {
+        cells,
+        hf_mul: hf_mul_grid,
+        width_blocks: fbw as u32,
+        height_blocks: fbh as u32,
+    };
 
     // F.2 adaptive LF smoothing (gated by kSkipAdaptiveLFSmoothing flag
-    // + no channel subsampled).
+    // + no channel subsampled) — on the assembled frame-level LF image.
     if crate::lf_dequant::should_apply_adaptive_lf_smoothing(fh) {
         crate::lf_dequant::apply_adaptive_lf_smoothing(&mut dequant, &multipliers);
     }
@@ -2282,8 +2368,10 @@ pub fn decode_vardct_frame(
         Error::InvalidData("JXL VarDCT round 13: LfChannelCorrelation missing".into())
     })?;
     // Pair each PassGroup reader with its §C.3.1 raster-order group
-    // rectangle (in the LfGroup's block coordinates).
-    let group_rects = crate::group_rect::group_rects_in_blocks(lf_w, lf_h, fh.group_dim())?;
+    // rectangle (in FRAME block coordinates — the group grid tiles the
+    // frame, not the LfGroup).
+    let group_rects =
+        crate::group_rect::group_rects_in_blocks(fh.width, fh.height, fh.group_dim())?;
     if group_rects.len() != pass_group_readers.len() {
         return Err(Error::InvalidData(format!(
             "jxl VarDCT integrated decode: {} group rects vs {} PassGroup sections",
@@ -2299,13 +2387,13 @@ pub fn decode_vardct_frame(
         metadata,
         lf: dequant,
         grid: dct_grid,
-        x_from_y: &hf_meta.x_from_y,
-        b_from_y: &hf_meta.b_from_y,
-        sharpness: &hf_meta.sharpness,
+        x_from_y: &x_from_y,
+        b_from_y: &b_from_y,
+        sharpness: &sharpness,
         cfl,
         hf_block_context: hbc,
-        lf_quant_width: lf_quant_widths[0],
-        lf_quant_height: lf_quant_heights[0],
+        lf_quant_width: fbw as u32,
+        lf_quant_height: fbh as u32,
         lf_quant,
         frame_width: scaffold.width,
         frame_height: scaffold.height,
