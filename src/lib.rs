@@ -763,13 +763,23 @@ fn decode_all_frames_from_codestream(
         let next_rel = decoded.next_frame_offset;
         // §C.2 composition: blend the decoded frame over
         // Reference[source] (crop rectangles update the source frame's
-        // rect; full-frame kReplace passes through) and record
-        // Reference[save_as_reference] when requested. Non-3-plane
-        // frames (extra channels) bypass composition — their blending
-        // is a documented follow-up and the raw frame is what rounds
-        // ≤ 388 emitted.
-        let composed = if decoded.frame.planes.len() == 3 {
-            compose_state.compose(&decoded.frame, &decoded.compose)?
+        // rect; full-frame kReplace passes through; kBlend /
+        // kAlphaWeightedAdd consume the frame's alpha plane) and
+        // record Reference[save_as_reference] when requested. Frames
+        // with fewer than 3 planes (grey Modular images) bypass
+        // composition — the raw frame is what rounds ≤ 388 emitted.
+        let composed = if decoded.frame.planes.len() >= 3 {
+            let mut meta = decoded.compose;
+            // The header may declare an alpha extra channel the
+            // decoded frame doesn't carry as a plane (e.g. a plane
+            // count trimmed by the colour transform) — clear the
+            // dangling index so alpha-less modes still compose.
+            if let Some(a) = meta.alpha_plane {
+                if a >= decoded.frame.planes.len() {
+                    meta.alpha_plane = None;
+                }
+            }
+            compose_state.compose(&decoded.frame, &meta)?
         } else {
             decoded.frame
         };
@@ -992,6 +1002,18 @@ fn decode_frame_body(
 
     // §C.2 composition fields for the multi-frame walk (Table C.7
     // blending + crop offsets + reference recording + presentation).
+    // The alpha channel for kBlend / kAlphaWeightedAdd is the extra
+    // channel with index `blending_info.alpha_channel` (Table C.7;
+    // defaults to 0 when only one extra channel exists). Extra
+    // channels follow the three colour planes in the decoded frame
+    // (Annex G.1.3 channel order), so its plane index is
+    // `3 + alpha_channel`; the multi-frame walk clears the field when
+    // the decoded frame doesn't actually carry that plane.
+    let alpha_ec = fh.blending_info.alpha_channel as usize;
+    let alpha_info = metadata
+        .extra_channel_info
+        .get(alpha_ec)
+        .filter(|ec| matches!(ec.kind, crate::metadata_fdis::ExtraChannelType::Alpha));
     let compose_meta = frame_compose::FrameComposeMeta {
         x0: fh.x0.max(0) as u32,
         y0: fh.y0.max(0) as u32,
@@ -1001,6 +1023,13 @@ fn decode_frame_body(
         save_before_ct: fh.save_before_ct,
         duration: fh.duration,
         is_last,
+        alpha_plane: alpha_info.map(|_| 3 + alpha_ec),
+        alpha_associated: alpha_info.map(|ec| ec.alpha_associated).unwrap_or(false),
+        alpha_mode: fh
+            .ec_blending_info
+            .get(alpha_ec)
+            .map(|b| b.mode)
+            .unwrap_or(frame_header::BlendMode::Replace),
     };
 
     // 7. Single-group frames have a single TOC entry containing all
