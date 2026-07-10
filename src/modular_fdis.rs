@@ -762,6 +762,29 @@ impl MaTreeFdis {
     /// zero, the decoder takes no action."). The returned shell has no
     /// nodes; [`decode_channels_at_stream`] short-circuits before
     /// touching it when `descs.is_empty()`.
+    /// One-line structural summary for debugging (nodes as
+    /// `prop<val` decisions and `L(ctx,pred,off,mul)` leaves).
+    pub fn debug_summary(&self) -> String {
+        let mut out = String::new();
+        for (i, n) in self.nodes.iter().enumerate() {
+            match n {
+                MaNode::Decision {
+                    property,
+                    value,
+                    left_child,
+                    right_child,
+                } => out.push_str(&format!(
+                    "[{i}]p{property}>{value}?{left_child}:{right_child} "
+                )),
+                MaNode::Leaf(l) => out.push_str(&format!(
+                    "[{i}]L(c{},p{},o{},m{}) ",
+                    l.ctx, l.predictor, l.offset, l.multiplier
+                )),
+            }
+        }
+        out
+    }
+
     pub fn empty_shell() -> Self {
         let lz_len_conf = crate::ans::hybrid_config::HybridUintConfig {
             split_exponent: 8,
@@ -1508,7 +1531,13 @@ fn predict(
         0 => 0, // Zero
         1 => nb.w,
         2 => nb.n,
-        3 => nb.w.wrapping_add(nb.n).wrapping_div_euclid(2), // Avg(W, N)
+        // Listing C.16 uses Idiv (sec 5.2: "rounded towards zero") for
+        // the averaging predictors — NOT floor division. The two agree
+        // on non-negative sums, but generative streams (18181-3
+        // sunset_logo) drive the neighbourhood negative, where
+        // Idiv(-61, 2) = -30 vs floor -31; the first divergent sample
+        // of the sunset frame pins Idiv exactly.
+        3 => ((nb.w as i64 + nb.n as i64) / 2) as i32, // Avg(W, N)
         4 => {
             // Select: |N - NW| < |W - NW| ? W : N
             // Spec text: abs(N - NW) < abs(W - NW)
@@ -1542,12 +1571,12 @@ fn predict(
             let v = (pred8.wrapping_add(bias)) >> 3;
             return Ok((v, preds, max_err));
         }
-        7 => nb.ne,                                            // NorthEast
-        8 => nb.nw,                                            // NorthWest
-        9 => nb.ww,                                            // WestWest
-        10 => nb.w.wrapping_add(nb.nw).wrapping_div_euclid(2), // Avg(W, NW)
-        11 => nb.n.wrapping_add(nb.nw).wrapping_div_euclid(2), // Avg(N, NW)
-        12 => nb.n.wrapping_add(nb.ne).wrapping_div_euclid(2), // Avg(N, NE)
+        7 => nb.ne,                                      // NorthEast
+        8 => nb.nw,                                      // NorthWest
+        9 => nb.ww,                                      // WestWest
+        10 => ((nb.w as i64 + nb.nw as i64) / 2) as i32, // Avg(W, NW), Idiv
+        11 => ((nb.nw as i64 + nb.n as i64) / 2) as i32, // Avg(NW, N), Idiv
+        12 => ((nb.n as i64 + nb.ne as i64) / 2) as i32, // Avg(N, NE), Idiv
         13 => {
             // AvgAll: (6*N - 2*NN + 7*W + WW + NEE + 3*NE + 8) Idiv 16
             let s = 6i64 * nb.n as i64 - 2 * nb.nn as i64
@@ -1556,7 +1585,8 @@ fn predict(
                 + nb.nee as i64
                 + 3 * nb.ne as i64
                 + 8;
-            s.div_euclid(16) as i32
+            // Idiv per Listing C.16 (round toward zero).
+            (s / 16) as i32
         }
         _ => {
             return Err(Error::InvalidData(format!(
@@ -2512,7 +2542,11 @@ pub fn inverse_palette(
 
 /// 2024-spec Annex H.6.2 — Tendency function.
 fn squeeze_tendency(a: i32, b: i32, c: i32) -> i32 {
-    let mut x = (4i64 * a as i64 - 3 * c as i64 - b as i64 + 6).div_euclid(12) as i32;
+    // `Idiv 12` per the listing — sec 5.2 Idiv rounds towards zero
+    // (round 406: floor division diverges when the numerator is
+    // negative; same Idiv-vs-floor class as the Listing C.16
+    // averaging predictors pinned by the sunset_logo stream).
+    let mut x = ((4i64 * a as i64 - 3 * c as i64 - b as i64 + 6) / 12) as i32;
     if a >= b && b >= c {
         if x.wrapping_sub(x & 1) > 2i32.wrapping_mul(a.wrapping_sub(b)) {
             x = 2i32.wrapping_mul(a.wrapping_sub(b)).wrapping_add(1);

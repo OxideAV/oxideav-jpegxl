@@ -57,7 +57,10 @@ impl Predictor {
     pub fn predict(self, left: i32, top: i32, topleft: i32, ch_zero: i32) -> i32 {
         match self {
             Self::Zero => ch_zero,
-            Self::Average => (left + top).div_euclid(2),
+            // Idiv per sec 5.2 / Listing C.16: rounded towards zero
+            // (round 406 — floor division diverges on negative sums;
+            // pinned by the 18181-3 sunset_logo generative stream).
+            Self::Average => ((left as i64 + top as i64) / 2) as i32,
             Self::Gradient => median3(left + top - topleft, left, top),
             Self::Left => left,
             Self::Top => top,
@@ -124,11 +127,15 @@ mod tests {
     }
 
     #[test]
-    fn predict_average_rounds_floor() {
-        // (3 + 8) / 2 = 5 (floor div), not 5.5 → 5.
+    fn predict_average_rounds_toward_zero() {
+        // (3 + 8) Idiv 2 = 5.
         assert_eq!(Predictor::Average.predict(3, 8, 0, 0), 5);
-        // Negative values: (-1 + -3) / 2 = -2.
+        // Even negative sum: (-1 + -3) Idiv 2 = -2.
         assert_eq!(Predictor::Average.predict(-1, -3, 0, 0), -2);
+        // Odd negative sum truncates toward zero: (-20 + -41) Idiv 2
+        // = -30 (floor would give -31) — sec 5.2 Idiv, pinned by the
+        // sunset_logo conformance stream's first divergent sample.
+        assert_eq!(Predictor::Average.predict(-20, -41, 0, 0), -30);
     }
 
     #[test]

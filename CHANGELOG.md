@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Round 406 (second block) — `sunset_logo` conformance stream now
+  decodes **bit-exact** on all four channels (was: sub-RMS-40 colour
+  deviation), closing the Modular sky-region item the first block
+  ratcheted:
+  - **sec 5.2 Idiv fix**: the Listing C.16 averaging predictors
+    (3 / 10 / 11 / 12 / 13) and the Listing I.21 Squeeze tendency
+    function divide with Idiv — "rounded towards zero" — not floor
+    division. The two agree on non-negative sums, which is why every
+    photographic fixture passed; the generative `sunset_logo` stream
+    drives the predictor neighbourhood negative (its sky is a
+    procedurally-predicted gradient with near-empty residual
+    sections), where `Idiv(-61, 2) = -30` vs floor's `-31`, and its
+    MA tree switches predictors on WP `max_error`, so a single 1-code
+    slip cascades across the frame. Root-caused by splicing the
+    frame's section bytes under a crafted crop-less full-frame header
+    (black-box reference decode of the spliced stream as oracle) and
+    locating the first divergent sample in decode order.
+
 - Round 406 — ISO/IEC 18181-3 conformance corpus: the Modular
   blending / layering test cases decode end-to-end, four of them
   pinned in CI against black-box reference decodes

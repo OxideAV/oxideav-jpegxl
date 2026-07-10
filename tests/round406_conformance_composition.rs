@@ -34,7 +34,10 @@
 //!   over-range intermediates must survive across blend stages;
 //! * kAlphaWeightedAdd weights by the frame's own alpha and leaves the
 //!   alpha channel unchanged;
-//! * §A.6 Table A.17 orientation at presentation.
+//! * §A.6 Table A.17 orientation at presentation;
+//! * Listing C.16 averaging predictors (3/10/11/12/13) and the
+//!   Listing I.21 tendency function divide with Idiv (round towards
+//!   zero, §5.2), not floor.
 
 use oxideav_jpegxl::decode_all_frames;
 use png::ColorType;
@@ -159,13 +162,16 @@ fn blendmodes_chain_composes_within_one_code() {
 }
 
 /// Two RCT layers with signed out-of-canvas crops, kBlend, and
-/// orientation 7 (presented transposed: 924×1386). The alpha plane is
-/// bit-exact; the colour channels carry a known sub-RMS-40 (of 1023)
-/// deviation in the smooth sky region — an open Modular-decode item
-/// tracked by this ratchet, NOT a composition/orientation issue (both
-/// pinned exact by the alpha plane and the other three streams).
+/// orientation 7 (presented transposed: 924x1386) — bit-exact against
+/// the native-depth reference decode after the round-406 Idiv fix
+/// (Listing C.16 averaging predictors round towards zero; this
+/// generative stream drives the neighbourhood negative where floor
+/// division diverges, and its MA tree switches predictors on WP
+/// max_error so a single 1-code slip cascades). Against the 16-bit
+/// PNG oracle, composed (non-integer) samples may sit +-1 native code
+/// on quantisation boundaries, exactly as in the blendmodes test.
 #[test]
-fn sunset_logo_orientation_and_alpha_exact_colour_ratchet() {
+fn sunset_logo_two_layers_bit_exact() {
     let jxl = include_bytes!("fixtures/conformance_sunset_logo.jxl");
     let png = include_bytes!("fixtures/conformance_sunset_logo_expected.png");
     let frames = decode_all_frames(jxl, None).expect("decode");
@@ -174,28 +180,16 @@ fn sunset_logo_orientation_and_alpha_exact_colour_ratchet() {
     assert_eq!(
         (oracle.0, oracle.1),
         (924, 1386),
-        "orientation 7 transposes the 1386×924 sample grid"
+        "orientation 7 transposes the 1386x924 sample grid"
     );
-    let (w, h, ref samples) = oracle;
-    let f = &frames[0];
-    assert_eq!(f.planes.len(), 4);
-    assert_eq!(f.planes[0].stride, w * 2);
-    // Alpha: bit-exact.
-    let per_ch = compare(f, &oracle, 10);
-    assert_eq!(per_ch[3], (0, 0), "alpha plane must be bit-exact");
-    // Colour ratchet: RMS (in 10-bit codes) per channel.
-    for c in 0..3 {
-        let mut sum_sq = 0f64;
-        for i in 0..w * h {
-            let ours = plane_sample(&f.planes[c], i) as f64;
-            let want = native_from_16(samples[i * 4 + c] as u32, 10) as f64;
-            let d = ours - want;
-            sum_sq += d * d;
-        }
-        let rms = (sum_sq / (w * h) as f64).sqrt();
+    for (c, (max_d, nd)) in compare(&frames[0], &oracle, 10).into_iter().enumerate() {
         assert!(
-            rms <= 45.0,
-            "channel {c}: RMS {rms:.2}/1023 exceeds the round-406 ratchet"
+            max_d <= 1,
+            "channel {c}: max diff {max_d}/1023 exceeds one 10-bit code"
+        );
+        assert!(
+            nd <= 30_000,
+            "channel {c}: {nd} differing samples (quantisation-boundary population only)"
         );
     }
 }
