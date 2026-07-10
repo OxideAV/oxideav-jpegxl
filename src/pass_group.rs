@@ -150,13 +150,20 @@ pub fn decode_modular_group_into(
         if !((minshift as i32) <= m && m < (maxshift as i32)) {
             continue;
         }
-        // Compute group rect in this channel's coordinates.
+        // Compute group rect in this channel's coordinates. The
+        // trailing group clamps to the channel's own extent (see the
+        // LfGroup sibling below for why neither floor- nor
+        // ceil-shifting the frame-pixel remainder is right for
+        // Squeeze channels).
         let hs = d.hshift.max(0) as u32;
         let vs = d.vshift.max(0) as u32;
         let x0 = rect.x_origin >> hs;
         let y0 = rect.y_origin >> vs;
-        let w = rect.width >> hs;
-        let h = rect.height >> vs;
+        if x0 >= d.width || y0 >= d.height {
+            continue;
+        }
+        let w = (group_dim >> hs).min(d.width - x0);
+        let h = (group_dim >> vs).min(d.height - y0);
         if w == 0 || h == 0 {
             continue;
         }
@@ -227,7 +234,7 @@ pub fn decode_modular_group_into(
     // apply the inverse transforms LOCALLY before copying samples
     // back to the parent image.
     if !transforms.is_empty() {
-        base_descs = apply_transforms_to_channel_layout(base_descs, &transforms)?;
+        base_descs = apply_transforms_to_channel_layout(base_descs, &mut transforms)?;
     }
 
     // stream_index per Table H.4 last paragraph.
@@ -267,6 +274,163 @@ pub fn decode_modular_group_into(
     // rectangle (x0, y0, w, h). Per spec: "The decoded modular group
     // data is then copied into the partially decoded GlobalModular
     // image in the corresponding positions."
+    copy_group_into_parent(&group_image, contributing.as_slice(), lf_global)?;
+    Ok(())
+}
+
+/// Decode a single ModularLfGroup sub-bitstream (§C.5.2) and copy the
+/// decoded samples into `lf_global.global_modular.image` — the
+/// LfGroup-scoped sibling of [`decode_modular_group_into`].
+///
+/// Per §C.5.2: for every remaining (not already decoded) channel of
+/// the partially decoded GlobalModular image with `hshift >= 3 &&
+/// vshift >= 3`, a channel covering the LF-group rectangle is added,
+/// with the rectangle's offsets and dimensions right-shifted by
+/// `hshift` / `vshift`. The LF-group grid cell is `8 × group_dim`
+/// square (so per-LfGroup channel slices are at most
+/// `group_dim × group_dim`). Squeeze streams on > 2048 px images are
+/// the main producers of such channels.
+///
+/// `br` is positioned at the start of this LfGroup's TOC slot. For
+/// `encoding == kModular` the ModularLfGroup is the whole LfGroup
+/// section (Table C.14's VarDCT-only members are absent).
+pub fn decode_modular_lf_group_into(
+    br: &mut BitReader<'_>,
+    fh: &FrameHeader,
+    lf_global: &mut LfGlobal,
+    lf_group_index: u32,
+) -> Result<()> {
+    let num_lf_groups = fh.num_lf_groups();
+    if lf_group_index as u64 >= num_lf_groups {
+        return Err(Error::InvalidData(format!(
+            "JXL ModularLfGroup: lf_group {lf_group_index} >= num_lf_groups {num_lf_groups}"
+        )));
+    }
+    let group_dim = fh.group_dim();
+    let lf_dim = group_dim * 8;
+    let num_lf_x = fh.width.div_ceil(lf_dim);
+    let grid_x = lf_group_index % num_lf_x;
+    let grid_y = lf_group_index / num_lf_x;
+    let x_origin = grid_x * lf_dim;
+    let y_origin = grid_y * lf_dim;
+
+    let descs_full = lf_global.global_modular.image.descs.clone();
+    let nb_meta = lf_global.global_modular.nb_meta_channels;
+
+    let mut contributing: Vec<PerGroupChannel> = Vec::new();
+    for (full_idx, d) in descs_full.iter().enumerate() {
+        if full_idx < nb_meta {
+            continue;
+        }
+        // Channel was fully decoded in GlobalModular — skip.
+        if d.width <= group_dim && d.height <= group_dim {
+            continue;
+        }
+        // §C.5.2 criterion: hshift AND vshift both >= 3.
+        if !(d.hshift >= 3 && d.vshift >= 3) {
+            continue;
+        }
+        let hs = d.hshift.max(0) as u32;
+        let vs = d.vshift.max(0) as u32;
+        // Offsets shift exactly (LF-group origins are multiples of
+        // 8 × group_dim, divisible by any in-range 1 << shift). The
+        // trailing group's slice clamps to the channel's OWN
+        // dimensions rather than shifting the frame-pixel remainder:
+        // Squeeze produces sibling channels whose widths differ by
+        // one at the same shift (the averages channel ceil-halves,
+        // the residual channel floor-halves), so neither a plain
+        // floor-shift nor a ceil-shift of the group rectangle matches
+        // both — the channel extent itself is authoritative.
+        let x0 = x_origin >> hs;
+        let y0 = y_origin >> vs;
+        if x0 >= d.width || y0 >= d.height {
+            continue;
+        }
+        let w = (lf_dim >> hs).min(d.width - x0);
+        let h = (lf_dim >> vs).min(d.height - y0);
+        if w == 0 || h == 0 {
+            continue;
+        }
+        contributing.push(PerGroupChannel {
+            full_idx,
+            x0,
+            y0,
+            desc: ChannelDesc {
+                width: w,
+                height: h,
+                hshift: d.hshift,
+                vshift: d.vshift,
+            },
+        });
+    }
+
+    if contributing.is_empty() {
+        return Ok(());
+    }
+
+    // Inner ModularHeader (Table H.1) — same wire layout as the
+    // PassGroup sub-bitstream.
+    let inner_use_global_tree = br.read_bool()?;
+    let wp_header = WpHeader::read(br)?;
+    let nb_transforms = br.read_u32([
+        U32Dist::Val(0),
+        U32Dist::Val(1),
+        U32Dist::BitsOffset(4, 2),
+        U32Dist::BitsOffset(8, 18),
+    ])?;
+    const MAX_TRANSFORMS: u32 = 274;
+    if nb_transforms > MAX_TRANSFORMS {
+        return Err(Error::InvalidData(format!(
+            "JXL ModularLfGroup: nb_transforms {nb_transforms} exceeds {MAX_TRANSFORMS}"
+        )));
+    }
+    let mut transforms: Vec<TransformInfo> = Vec::with_capacity(nb_transforms as usize);
+    for _ in 0..nb_transforms {
+        transforms.push(TransformInfo::read(br)?);
+    }
+
+    let mut tree = if inner_use_global_tree {
+        lf_global
+            .global_modular
+            .global_tree
+            .as_ref()
+            .ok_or_else(|| {
+                Error::InvalidData(
+                    "JXL ModularLfGroup: inner sub-bitstream wants global tree but none was \
+                     decoded in GlobalModular"
+                        .into(),
+                )
+            })?
+            .cloned_with_fresh_state()
+    } else {
+        MaTreeFdis::read(br)?
+    };
+
+    let mut base_descs: Vec<ChannelDesc> = contributing.iter().map(|c| c.desc).collect();
+    if !transforms.is_empty() {
+        base_descs = apply_transforms_to_channel_layout(base_descs, &mut transforms)?;
+    }
+
+    // stream_index per Table D.2 property 1:
+    // "for ModularLfGroup: 1 + number of LF groups + LF group index".
+    let stream_index = (1 + num_lf_groups + lf_group_index as u64) as i32;
+
+    let mut group_image =
+        decode_channels_at_stream(br, &base_descs, &mut tree, &wp_header, stream_index)?;
+
+    if !transforms.is_empty() {
+        let bit_depth = 8u32;
+        apply_inverse_transforms(&mut group_image, &transforms, bit_depth)?;
+    }
+
+    if group_image.channels.len() != contributing.len() {
+        return Err(Error::InvalidData(format!(
+            "JXL ModularLfGroup: post-inverse channel count {} != contributing {}",
+            group_image.channels.len(),
+            contributing.len()
+        )));
+    }
+
     copy_group_into_parent(&group_image, contributing.as_slice(), lf_global)?;
     Ok(())
 }

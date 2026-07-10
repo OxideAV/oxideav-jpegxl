@@ -1101,14 +1101,10 @@ fn decode_frame_body(
     let num_groups = fh.num_groups();
     let num_lf_groups = fh.num_lf_groups();
     // Round 393: the VarDCT path assembles multi-LfGroup frames at the
-    // frame level (§C.5 tiling in `decode_vardct_frame`); only the
-    // Modular per-LfGroup walk still requires a single LF group.
-    if num_lf_groups > 1 && fh.encoding != crate::frame_header::Encoding::VarDct {
-        return Err(crate::lf_group::unsupported_multi_lf_group_error(
-            num_lf_groups,
-            fh.encoding,
-        ));
-    }
+    // frame level (§C.5 tiling in `decode_vardct_frame`); round 408
+    // adds the Modular per-LfGroup walk (§C.5.2 ModularLfGroup) so
+    // multi-LfGroup Modular frames (> 2048 px, e.g. the
+    // grayscale_public_university conformance stream) decode too.
     // Diagnostic on unhandled features. Round 13 wires LfGlobal +
     // LfGroup (incl. LfCoefficients + HfMetadata) + HfGlobal + F.1 LF
     // dequant + F.2 adaptive smoothing into the VarDCT pipeline. End-
@@ -1249,14 +1245,26 @@ fn decode_frame_body(
         LfGlobal::read(&mut lf_br, &fh, metadata)?
     };
 
-    // 8b. LfGroups (slots 1..1+num_lf_groups) — round 7 only handles
-    //     num_lf_groups <= 1 (gated above). For num_lf_groups == 1 with
-    //     a fully-decoded GlobalModular image (small-image case), the
-    //     LfGroup section is empty (no channel has hshift>=3, vshift>=3
-    //     by default for round-7 lossless fixtures). We still consume
-    //     the slot bytes by reading the empty ModularLfGroup
-    //     sub-bitstream — for round 7 the slot is allowed to be
-    //     ignored when no channel matches the LfGroup criterion.
+    // 8b. LfGroups (slots 1..1+num_lf_groups) — §C.5.2 ModularLfGroup:
+    //     channels of the partially decoded GlobalModular image with
+    //     hshift >= 3 && vshift >= 3 (Squeeze residue on > 2048 px
+    //     images) decode per-LfGroup, each slice covering the LF-group
+    //     rectangle right-shifted by the channel's shifts. When no
+    //     channel matches (every staged single-LfGroup fixture) the
+    //     sub-bitstream is empty and the slot is skipped.
+    if !lf_global.global_modular.fully_decoded || num_lf_groups > 1 {
+        for lf_group_idx in 0..(num_lf_groups as u32) {
+            let slot = lf_group_slot(lf_group_idx as u64);
+            let lg_bytes = section_byte_range(slot)?;
+            let mut lg_br = BitReader::new_section(lg_bytes);
+            crate::pass_group::decode_modular_lf_group_into(
+                &mut lg_br,
+                &fh,
+                &mut lf_global,
+                lf_group_idx,
+            )?;
+        }
+    }
 
     // 8c. PassGroups (slots 1+num_lf_groups + p*num_groups + g) —
     //     decode each per-pass per-group modular sub-bitstream and
@@ -1287,7 +1295,6 @@ fn decode_frame_body(
             bit_depth,
         )?;
     }
-    let _ = lf_group_slot; // currently only used by round-8 multi-LfGroup
     let _ = hf_global_slot; // round-10+ VarDCT consumer; for kModular the slot is 0-byte
 
     // 9. Map the decoded modular image to a VideoFrame.
