@@ -255,7 +255,21 @@ the blend mode alone (not `multi_extra`), §A.6 Table A.17 orientation
 semantics (round toward zero) in the Listing C.16 averaging predictors
 and the Listing I.21 Squeeze tendency function.
 
-### Round 408 — ImageMetadata tail, ICC decode, §C.7.1 half-resolution
+### Round 408 — ImageMetadata tail, ICC decode, §C.7.1 half-resolution, Squeeze + multi-LfGroup
+
+- **Squeeze decodes end-to-end** (second block): the Listing I.19
+  default-parameter sequence (derived at transform-application time;
+  the printed `count` formula has a sign typo), the Listing I.21
+  tendency **floor-division erratum** (the printed `Idiv` breaks every
+  negative-numerator case; pinned by solving real streams' coded
+  residuals — 255k+ samples), and the Listing D.8 `rleft = 0` column-0
+  rule. Single-group Squeeze is **bit-exact**
+  (`round408_squeeze_multilf`).
+- **§C.5.2 ModularLfGroup**: multi-LfGroup Modular frames decode — the
+  `grayscale_public_university` conformance stream (2880×1620, 2 LF
+  groups, Squeeze) went from hard-`Unsupported` to a full decode
+  (MAD 1.68 vs the reference; the residual tail is a pre-existing
+  multi-group Squeeze divergence, ratcheted).
 
 - **The ImageMetadata-tail SPECGAP is resolved** (Table A.16): the
   `default_transform` Bool() is unconditional — present even when
@@ -316,10 +330,15 @@ and the Listing I.21 Squeeze tendency function.
   samples (the `grayscale` stream's image output currently uses the
   signalled/default transfer, sRGB, rather than the profile's
   gamma-2.2-class `kTRC` curve).
-- Modular multi-LfGroup frames (> 2048 px, e.g. the
-  `grayscale_public_university` conformance case), the kNoise /
-  kPatches image features, JPEG reconstruction, and the LfFrame
-  (`lf_level > 0`) dimension scaling `progressive-dc` needs.
+- The multi-GROUP Squeeze residual tail: sporadic per-sample
+  residual-channel decode divergences (~2 % of samples, scattered)
+  keep `sq_512` / `grayscale_public_university` at MAD 0.27 / 1.68
+  instead of bit-exact — single-group Squeeze is sample-exact, so the
+  divergence lives in the group-scoped decode of shift ≥ 1 channels
+  (predictor/property mismatch, not entropy desync; ratcheted in
+  `round408_squeeze_multilf`).
+- The kNoise / kPatches image features, JPEG reconstruction, and the
+  LfFrame (`lf_level > 0`) dimension scaling `progressive-dc` needs.
 - The encoder (not registered).
 
 Unsupported inputs surface as `Error::Unsupported` rather than a silent

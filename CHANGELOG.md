@@ -54,6 +54,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   locally generated `used_orders` streams), so custom-order streams
   remain refused rather than silently misdecoded.
 
+- Round 408 (second block) — Squeeze end-to-end + §C.5.2
+  ModularLfGroup: the `grayscale_public_university` conformance stream
+  (2880×1620 Modular Squeeze, 2 LF groups) decodes end-to-end (was: a
+  hard `Unsupported` at the multi-LfGroup gate), and single-group
+  Squeeze streams decode **bit-exact** (`round408_squeeze_multilf`):
+  - **§C.5.2 ModularLfGroup**: channels of the partially decoded
+    GlobalModular image with `hshift >= 3 && vshift >= 3` decode per
+    LF group (8 × group_dim grid), MA-tree stream index
+    `1 + num_lf_groups + lf_group_index` (Table D.2), slices copied
+    back at the shifted offsets. Group/LF-group channel slices now
+    clamp to the channel's own extent (Squeeze sibling channels at
+    the same shift differ by one column/row — ceil- vs floor-halved —
+    so neither floor- nor ceil-shifting the frame-pixel remainder is
+    right for both).
+  - **Listing I.19 default Squeeze parameters** (`num_sq == 0`)
+    derived from the channel list at transform-application time and
+    materialised into the transform (the listing's
+    `count = first - last + 1` is a sign typo for `last - first + 1`).
+  - **Listing I.21 tendency erratum**: the division is FLOOR, not the
+    printed `Idiv` — solving real Squeeze streams' coded residuals
+    for the encoder's tendency values pins floor with bias +6 exactly
+    (255k+ samples); Idiv agreed on non-negative numerators only,
+    which is how the round-406 Idiv reading survived every
+    non-Squeeze fixture. Single-group Squeeze is now sample-exact.
+  - **Listing D.8 `rleft`**: hard zero in column 0 (not the Listing
+    C.15 top fallback used by the main W neighbour).
+  - Known remaining tail: multi-GROUP Squeeze streams keep a sporadic
+    per-sample residual-decode divergence (~2 % of samples in
+    group-scoped residual channels, scattered, not
+    boundary-aligned; PRE-EXISTING — round 408 improved the 512×512
+    reproducer from MAD 1.02 to 0.27 and the conformance stream from
+    undecodable to MAD 1.68). Pinned by MAD/max ratchets.
+
 - Round 406 (second block) — `sunset_logo` conformance stream now
   decodes **bit-exact** on all four channels (was: sub-RMS-40 colour
   deviation), closing the Modular sky-region item the first block
