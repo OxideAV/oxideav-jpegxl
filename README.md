@@ -255,17 +255,45 @@ the blend mode alone (not `multi_extra`), §A.6 Table A.17 orientation
 semantics (round toward zero) in the Listing C.16 averaging predictors
 and the Listing I.21 Squeeze tendency function.
 
+### Round 408 — ImageMetadata tail, ICC decode, §C.7.1 half-resolution
+
+- **The ImageMetadata-tail SPECGAP is resolved** (Table A.16): the
+  `default_transform` Bool() is unconditional — present even when
+  `all_default` — and its printed gating is inverted (bit set =
+  "defaults, nothing follows"; bit clear reads `opsin_inverse_matrix`
+  / `cw_mask` / the custom upsampling-weight arrays). A per-field
+  metadata-tail gating trace (`metadata_fdis::METADATA_TAIL_TRACE`)
+  pins the layout on every staged fixture.
+- **ICC-bearing streams decode.** `enc_size = U64()` follows the end
+  of ImageMetadata at the very next bit (no ZeroPadToByte(), despite
+  the §B.2 "byte aligned" opener); Listing B.1's `IccContext` gained
+  its missing ASCII-digit class; and the D.2.1 simple prefix code
+  assigns the short code to the FIRST symbol as transmitted (only
+  equal-length symbols sort). The 18181-3 `grayscale` stream's
+  embedded 912-byte GRAY/ADBE profile decodes with every header field
+  matching the reference tooling, and a synthesised digit-heavy
+  profile embedded by a real encoder round-trips **byte-exactly**
+  (`round408_icc_grayscale`).
+- **§C.7.1 half-resolved**: the §C.3.2 `end` field is a Lehmer-entry
+  count, not an endpoint (pinned: the grayscale stream codes
+  `end = 0, skip = 4`, impossible under the endpoint reading). The
+  decode advances past `DecodePermutation()` and now stops loudly in
+  §C.7.2 — the permutation stream's exact end position is still
+  underdetermined (the ANS final-state invariant fails on locally
+  generated `used_orders` streams), so the grayscale frame itself
+  remains refused, one boundary later than round 393.
+
 ### Not yet implemented
 
-- **§C.7.1 `used_orders != 0` custom coefficient orders.** The C.3.2
-  permutation sub-stream reading is underdetermined by the FDIS text
-  (`end` endpoint-vs-count; `D[prev_elem]` literal vs
-  `D[GetContext(prev_elem)]`) and no staged trace covers a
-  `used_orders != 0` stream — every cjxl `-d 1 -e ≥ 5` stream and the
-  multi-LfGroup fixture signal `0x5F`/`0x13` and stop there with a
-  loud error (never a silent misparse). Needs a per-symbol §C.7.1
-  trace (end + lehmer values + contexts) from a small custom-orders
-  stream — docs-gap filed round 393.
+- **§C.7.1 `used_orders != 0` custom coefficient orders** (remaining
+  half). Round 408 pinned the §C.3.2 `end` field as a count (see
+  above), but the permutation stream's exact bit consumption is still
+  wrong somewhere — on locally generated `used_orders` streams the
+  shared stream's ANS final state misses the D.3.3 `0x130000`
+  invariant, and §C.7.2 misparses loudly right after. Needs a
+  per-symbol §C.3.2 trace (end token + per-entry context / token /
+  renormalisation bits) from a small custom-orders stream — docs-gap
+  refined round 408 (was round 393).
 - The residual sub-1/255 VarDCT accuracy tail (float rounding + §J
   filter differences), a progressive-AC (true multi-pass) fixture to
   pin the round-389 multi-pass framing end-to-end, and
@@ -282,12 +310,12 @@ and the Listing I.21 Squeeze tendency function.
   feeding them into that driver in the registered path is the
   remaining wiring step.
 - Floating-point samples and `bps > 16`; high-bit-depth XYB / YCbCr.
-- **ICC-bearing streams** (`want_icc = 1`, e.g. the `grayscale`
-  conformance case): the ImageMetadata tail (`default_transform` /
-  opsin / `cw_mask` — exact 2024 gating still a SPECGAP) shifts the
-  byte-aligned ICC stream start, and the Annex B entropy decode
-  mis-parses real encoder ICC streams (complex D.3.5 clustering path);
-  reproducible with locally generated `-x icc_pathname=…` fixtures.
+- Surfacing the decoded ICC profile to callers (the Annex B decode
+  runs and validates, but `oxideav_core::VideoFrame` has no ICC slot)
+  and applying an embedded profile's transfer curve to the decoded
+  samples (the `grayscale` stream's image output currently uses the
+  signalled/default transfer, sRGB, rather than the profile's
+  gamma-2.2-class `kTRC` curve).
 - Modular multi-LfGroup frames (> 2048 px, e.g. the
   `grayscale_public_university` conformance case), the kNoise /
   kPatches image features, JPEG reconstruction, and the LfFrame

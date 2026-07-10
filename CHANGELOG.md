@@ -9,6 +9,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Round 408 — ICC-bearing streams unblocked end-to-end through the
+  Annex B decode; the 18181-3 `grayscale` conformance stream's
+  embedded 912-byte GRAY/ADBE profile now decodes with every header
+  field matching the reference tooling's report, and a locally
+  synthesised digit-heavy profile round-trips **byte-exactly** through
+  a real encoder embedding (`round408_icc_grayscale`):
+  - **ImageMetadata-tail SPECGAP resolved** (Table A.16): the
+    `default_transform` Bool() is unconditional (present even when
+    `all_default`), and its printed gating is **inverted** — the bit
+    set means "defaults, nothing follows"; `opsin_inverse_matrix` /
+    `cw_mask` / the custom upsampling-weight arrays are read when the
+    bit is CLEAR. Pinned on every staged fixture (the pre-408 parser
+    stopped at `extensions`, mis-framing every `want_icc` stream).
+  - **ICC stream start**: `enc_size = U64()` is coded at the very next
+    bit after the end of ImageMetadata — there is NO ZeroPadToByte()
+    before the ICC stream despite the §B.2 "byte aligned" opener
+    (bit 25 on the grayscale conformance stream, an unaligned
+    position; the byte-aligned reading mis-frames the stream).
+  - **Listing B.1 `IccContext` digit class**: ASCII digits classify
+    with '.' and ',' (p = 1); the missing rows sent digits to the
+    catch-all class and derailed the entropy decode of any profile
+    whose text tags carry digit runs ("Copyright 2000 ...").
+  - **Simple prefix code (D.2.1) symbol-length assignment**: with 3
+    (and 4, tree-select) symbols, the short code belongs to the FIRST
+    symbol as transmitted; only equal-length symbols sort. The old
+    sort-all assignment mis-coded any stream whose most-frequent
+    symbol was not the numerically smallest.
+  - Diagnostics: the metadata-tail gating trace
+    (`metadata_fdis::METADATA_TAIL_TRACE`) and the ICC-start trace
+    (`icc::ICC_START_TRACE`) — per-field bit accounting across the
+    ImageMetadata→ICC boundary.
+
+- Round 408 — §C.7.1 custom coefficient orders (`used_orders != 0`):
+  the §C.3.2 `end` field is the **count** of coded Lehmer entries
+  (indices `[skip, skip + end)`), not an endpoint — the grayscale
+  conformance stream's first permutation codes `end = 0` with
+  `skip = 4` ("identity beyond the skipped prefix"), which no
+  endpoint reading admits (the two readings coincide at `skip == 0`,
+  the only case previously exercised). The frame decode now advances
+  past `DecodePermutation()` into §C.7.2, where it still stops with a
+  loud error: the permutation stream's exact end position is
+  unresolved (the shared-stream ANS final-state invariant fails on
+  locally generated `used_orders` streams), so custom-order streams
+  remain refused rather than silently misdecoded.
+
 - Round 406 (second block) — `sunset_logo` conformance stream now
   decodes **bit-exact** on all four channels (was: sub-RMS-40 colour
   deviation), closing the Modular sky-region item the first block
