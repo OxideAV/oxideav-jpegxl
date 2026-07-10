@@ -123,7 +123,7 @@ impl GlobalModular {
         // ModularHeader (use_global_tree + WPHeader + nb_transforms +
         // TransformInfo[]) is gated by N>0.
         let prelim_descs = derive_channel_descs(fh, metadata)?;
-        let (inner_use_global_tree, wp_header, nb_transforms, transforms) =
+        let (inner_use_global_tree, wp_header, nb_transforms, mut transforms) =
             if prelim_descs.is_empty() {
                 (
                     false,
@@ -175,7 +175,7 @@ impl GlobalModular {
         //     THE TIME OF DECODE — i.e. with transform bookkeeping
         //     applied so the decoder reads the correct number of
         //     channels at the correct dimensions.
-        let descs = apply_transforms_to_channel_layout(descs, &transforms)?;
+        let descs = apply_transforms_to_channel_layout(descs, &mut transforms)?;
 
         // Count meta-channels at the head of the descs list. Per H.1
         // these are the channels with hshift=-1, vshift=-1 (Palette
@@ -342,14 +342,17 @@ pub fn apply_inverse_transforms(
 /// step in `squeeze_params`, in reverse order. This implements Listing
 /// I.18 from FDIS / Annex H.6.2 from the 2024 edition.
 ///
-/// Empty `squeeze_params` is the "default parameters" path; round 2
-/// only handles the explicit-params case (the small fixtures don't
-/// trigger default-param Squeeze; if they did the encoder would not
-/// have emitted an explicit kSqueeze transform).
+/// Empty `squeeze_params` cannot reach this point: the default
+/// (Listing I.19) sequence is materialised into the `TransformInfo`
+/// when the channel layout is derived
+/// (`apply_transforms_to_channel_layout`), because the defaults are a
+/// function of the PRE-squeeze channel list, which no longer exists by
+/// inverse time. The guard below is defensive.
 fn apply_inverse_squeeze(image: &mut ModularImage, squeeze_params: &[SqueezeParam]) -> Result<()> {
     if squeeze_params.is_empty() {
-        return Err(Error::Unsupported(
-            "JXL Modular Squeeze: default-params (empty) sequence not yet supported (round 2)"
+        return Err(Error::InvalidData(
+            "JXL Modular Squeeze: empty squeeze_params reached the inverse (default sequence \
+             was not materialised at layout time — decoder bug)"
                 .into(),
         ));
     }
@@ -437,6 +440,74 @@ fn apply_inverse_squeeze(image: &mut ModularImage, squeeze_params: &[SqueezePara
     Ok(())
 }
 
+/// Derive the DEFAULT Squeeze parameter sequence (Listing I.19) from
+/// the channel list as it stands when the kSqueeze transform applies.
+///
+/// `first` is the number of leading meta-channels (hshift < 0). The
+/// listing's `count = first - last + 1` is a sign typo for
+/// `last - first + 1` (the straight reading is non-positive for any
+/// real channel list).
+///
+/// The sequence: an optional 4:2:0-style horizontal + vertical squeeze
+/// of channels `first+1 .. first+2` (when at least 3 same-sized
+/// non-meta channels exist), then alternating in-place steps over all
+/// non-meta channels — starting vertical iff `h >= w` — halving until
+/// the first channel fits in 8 × 8.
+fn default_squeeze_params(descs: &[ChannelDesc]) -> Result<Vec<SqueezeParam>> {
+    let first = descs.iter().take_while(|d| d.hshift < 0).count();
+    if first >= descs.len() {
+        return Err(Error::InvalidData(
+            "JXL Modular Squeeze: default-params derivation with no non-meta channels".into(),
+        ));
+    }
+    let count = descs.len() - first;
+    let mut w = descs[first].width;
+    let mut h = descs[first].height;
+    let mut sp: Vec<SqueezeParam> = Vec::new();
+    if count > 2 && descs[first + 1].width == w && descs[first + 1].height == h {
+        for horizontal in [true, false] {
+            sp.push(SqueezeParam {
+                horizontal,
+                in_place: false,
+                begin_c: (first + 1) as u32,
+                num_c: 2,
+            });
+        }
+    }
+    let begin_c = first as u32;
+    let num_c = count as u32;
+    if h >= w && h > 8 {
+        sp.push(SqueezeParam {
+            horizontal: false,
+            in_place: true,
+            begin_c,
+            num_c,
+        });
+        h = h.div_ceil(2);
+    }
+    while w > 8 || h > 8 {
+        if w > 8 {
+            sp.push(SqueezeParam {
+                horizontal: true,
+                in_place: true,
+                begin_c,
+                num_c,
+            });
+            w = w.div_ceil(2);
+        }
+        if h > 8 {
+            sp.push(SqueezeParam {
+                horizontal: false,
+                in_place: true,
+                begin_c,
+                num_c,
+            });
+            h = h.div_ceil(2);
+        }
+    }
+    Ok(sp)
+}
+
 /// Apply transform metadata to the channel layout so the decoded
 /// channel data has the correct shape per H.6:
 ///
@@ -455,9 +526,9 @@ fn apply_inverse_squeeze(image: &mut ModularImage, squeeze_params: &[SqueezePara
 /// reverse step.
 pub fn apply_transforms_to_channel_layout(
     mut descs: Vec<ChannelDesc>,
-    transforms: &[TransformInfo],
+    transforms: &mut [TransformInfo],
 ) -> Result<Vec<ChannelDesc>> {
-    for t in transforms {
+    for t in transforms.iter_mut() {
         match t.tr {
             TransformId::Palette => {
                 // Per H.6.4: channels begin_c+1 .. begin_c+num_c-1 are
@@ -503,13 +574,18 @@ pub fn apply_transforms_to_channel_layout(
                 // step, halve one dim (round-up) of channels [begin..end]
                 // and insert a residu channel for each at position
                 // `r + c - begin` where `r = in_place ? end+1 : len`.
-                let params = &t.squeeze_params;
-                if params.is_empty() {
-                    return Err(Error::Unsupported(
-                        "JXL Modular Squeeze: default-params (empty) sequence not yet supported"
-                            .into(),
-                    ));
+                //
+                // Round 408: `num_sq == 0` means the DEFAULT parameter
+                // sequence (Listing I.19), derived from the channel
+                // list as it stands when this transform applies. The
+                // derived steps are materialised INTO the TransformInfo
+                // so the later inverse application (which runs on the
+                // post-squeeze channel list, from which the defaults
+                // could no longer be derived) sees explicit params.
+                if t.squeeze_params.is_empty() {
+                    t.squeeze_params = default_squeeze_params(&descs)?;
                 }
+                let params = &t.squeeze_params;
                 for sp in params {
                     let begin = sp.begin_c as usize;
                     let num_c = sp.num_c as usize;

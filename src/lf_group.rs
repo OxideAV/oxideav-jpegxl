@@ -458,7 +458,7 @@ impl HfMetadata {
         // single index channel, RCT does not change the layout. The
         // resulting `decode_descs` is the channel list that the per-
         // sample decode loop sees on the wire.
-        let decode_descs = apply_transforms_to_channel_layout(base_descs.clone(), &transforms)?;
+        let decode_descs = apply_transforms_to_channel_layout(base_descs.clone(), &mut transforms)?;
 
         let mut tree = if inner_use_global_tree {
             lf_global

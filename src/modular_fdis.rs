@@ -1687,13 +1687,11 @@ pub fn get_properties(
             continue;
         }
         let r_c = img.get(j, x, y);
-        let r_w = if x > 0 {
-            img.get(j, x - 1, y)
-        } else if y > 0 {
-            img.get(j, x, y - 1)
-        } else {
-            0
-        };
+        // Listing D.8: `rleft = (x > 0 ? channel[i](x - 1, y) : 0)` —
+        // hard zero in column 0, NOT the Listing C.15 top fallback the
+        // main W neighbour uses (round 408; the fallback mis-picked MA
+        // leaves down the first column of Squeeze residual channels).
+        let r_w = if x > 0 { img.get(j, x - 1, y) } else { 0 };
         let r_n = if y > 0 { img.get(j, x, y - 1) } else { r_w };
         let r_nw = if x > 0 && y > 0 {
             img.get(j, x - 1, y - 1)
@@ -2540,13 +2538,22 @@ pub fn inverse_palette(
     Ok(())
 }
 
-/// 2024-spec Annex H.6.2 — Tendency function.
+/// 2024-spec Annex H.6.2 / FDIS Listing I.21 — Tendency function.
 fn squeeze_tendency(a: i32, b: i32, c: i32) -> i32 {
-    // `Idiv 12` per the listing — sec 5.2 Idiv rounds towards zero
-    // (round 406: floor division diverges when the numerator is
-    // negative; same Idiv-vs-floor class as the Listing C.16
-    // averaging predictors pinned by the sunset_logo stream).
-    let mut x = ((4i64 * a as i64 - 3 * c as i64 - b as i64 + 6) / 12) as i32;
+    // The listing prints `Idiv 12` (round toward zero), but the
+    // division is empirically FLOOR: solving real Squeeze streams'
+    // coded residuals for the encoder's tendency values gives e.g.
+    // (A=24, B=48, C=80) → -186 / 12 → -16 (floor), where Idiv's -15
+    // mis-reconstructs every downstream sample pair (round 408 —
+    // pinned on encoder-generated responsive-mode fixtures at three
+    // sizes plus the grayscale_public_university conformance stream;
+    // Idiv left a ±2/255 haze over the whole image, floor is
+    // sample-exact). The two readings agree for non-negative
+    // numerators, which is how the round-406 Idiv reading (imported
+    // here alongside the legitimate Listing C.16 Idiv fix, which
+    // stands) survived every non-Squeeze fixture.
+    let x_num = 4i64 * a as i64 - 3 * c as i64 - b as i64 + 6;
+    let mut x = x_num.div_euclid(12) as i32;
     if a >= b && b >= c {
         if x.wrapping_sub(x & 1) > 2i32.wrapping_mul(a.wrapping_sub(b)) {
             x = 2i32.wrapping_mul(a.wrapping_sub(b)).wrapping_add(1);
