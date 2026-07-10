@@ -361,19 +361,32 @@ pub fn decode_permutation_from_stream(
 
     // `end` is decoded against D[GetContext(size)] (capped at 7: only
     // 8 distributions exist).
+    //
+    // Round 408 — the §C.3.2 `end` ambiguity ("endpoint vs count",
+    // round-393 docs-gap) resolved on the 18181-3 `grayscale`
+    // conformance stream, the first staged stream with
+    // `used_orders != 0` AND `skip != 0`: `end` is the NUMBER of
+    // coded Lehmer entries (indices [skip, skip + end)), not an
+    // endpoint. The spec's "(end - skip) elements" phrasing is
+    // impossible on that stream — its first permutation decodes
+    // `end = 0` with `skip = 4` ("identity beyond the skipped
+    // prefix"), which no endpoint reading admits. With `skip == 0`
+    // (the TOC case validated round 393) the two readings coincide,
+    // which is why this stayed ambiguous until a `skip != 0` oracle
+    // existed.
     let end_ctx = get_context(size as u32).min(7);
     let end = decode_uint_in_with_dist_pub(hybrid, entropy, br, end_ctx, 0)? as usize;
-    if end < skip || end > size {
+    if end > size - skip {
         return Err(Error::InvalidData(format!(
             "JXL coeff permutation: end {end} out of range [skip={skip}, size={size}]"
         )));
     }
 
-    // `(end - skip)` Lehmer entries are produced; indices [skip, end).
+    // `end` Lehmer entries are produced; indices [skip, skip + end).
     // All other lehmer entries stay 0.
     let mut lehmer = vec![0u32; size];
     let mut prev: u32 = 0;
-    for slot in lehmer.iter_mut().take(end).skip(skip) {
+    for slot in lehmer.iter_mut().take(skip + end).skip(skip) {
         let ctx = get_context(prev).min(7);
         let v = decode_uint_in_with_dist_pub(hybrid, entropy, br, ctx, 0)?;
         // lehmer[i] indexes the (shrinking) `temp` array, so it must be

@@ -134,17 +134,19 @@ impl HfPass {
             // state is shared by EVERY DecodePermutation() call in the
             // per-bit loop below — it is read ONCE here.
             //
-            // KNOWN GAP (round 393): this path has never decoded a REAL
-            // cjxl `used_orders != 0` stream to a verified position —
-            // the C.3.2 `end` semantics (endpoint vs count) and the
-            // per-element lehmer context (`D[prev_elem]` literal vs
-            // `D[GetContext(prev_elem)]`) are underdetermined by the
-            // FDIS text and no staged trace pins them (docs-gap filed
-            // round 393; the multi-LfGroup `large-3072x2048-multigroup`
-            // fixture and every cjxl `-d 1 -e >= 5` stream signal
-            // 0x5F/0x13 and stall here). A wrong reading surfaces as a
-            // loud InvalidData from the range guards below or from the
-            // §C.7.2 parse that follows — never as silent misdecode.
+            // KNOWN GAP, narrowed round 408 (was round 393): the C.3.2
+            // `end` field is pinned as a COUNT of coded Lehmer entries
+            // (see `decode_permutation_from_stream`), which advances
+            // real `used_orders != 0` streams past every
+            // DecodePermutation() — but the stream's exact bit
+            // consumption is still wrong somewhere: on locally
+            // generated `used_orders` streams the shared stream's ANS
+            // final state misses the D.3.3 0x130000 invariant and the
+            // §C.7.2 parse that follows misparses LOUDLY (never a
+            // silent misdecode). Still needs a per-symbol §C.3.2
+            // trace (end token + per-entry context / token /
+            // renormalisation bits) from a small custom-orders
+            // stream — docs-gap refined round 408.
             let mut entropy = EntropyStream::read(br, 8)?;
             entropy.read_ans_state_init(br)?;
             let mut hybrid = HybridUintState::new(entropy.lz77, entropy.lz_len_conf);
