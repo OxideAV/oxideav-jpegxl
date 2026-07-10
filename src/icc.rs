@@ -71,6 +71,47 @@ use crate::modular_fdis::{decode_uint_in_with_dist_pub, EntropyStream};
 /// stream — Annex E.4.1 first paragraph.
 pub const ICC_NUM_DIST: usize = 41;
 
+/// The ICC-stream start framing, captured per-thread by
+/// [`decode_encoded_icc_stream`] when armed via
+/// [`set_icc_start_trace_armed`].
+///
+/// **Round-408 empirical finding (SPECGAP):** FDIS §B.2 opens "The
+/// bitstream is byte aligned as specified in 6.3. The decoder reads
+/// `enc_size` as `U64()`" — but real IS-era codestreams carry **no**
+/// `ZeroPadToByte()` between the end of ImageMetadata and `enc_size`.
+/// On the 18181-3 `grayscale` conformance stream, ImageMetadata ends
+/// at bit 25 and `enc_size` is coded at bit 25 exactly (byte 3, bit 1);
+/// decoding from the byte-aligned position (byte 4) mis-frames the
+/// whole ICC stream, while the unaligned read yields the stream's
+/// embedded 912-byte profile. So the load-bearing invariant is
+/// `bit_offset_of_enc_size == bit_offset_end_of_ImageMetadata` — no
+/// pad. Together with the metadata-tail gating trace this pins the
+/// ImageMetadata→ICC boundary bit-exactly.
+#[derive(Debug, Clone, Copy)]
+pub struct IccStartTrace {
+    /// Bit offset (within the post-signature codestream) at which the
+    /// ICC stream's `enc_size` field begins — equal to the end of
+    /// ImageMetadata (no byte-align; see the struct docs).
+    pub bit_offset_of_enc_size: usize,
+    /// The decoded `enc_size` (`U64()`).
+    pub enc_size: u64,
+    /// Bit offset immediately after the last entropy-decoded ICC byte
+    /// — where the (byte-aligned) frame array framing resumes.
+    pub bit_offset_after_icc: usize,
+}
+
+thread_local! {
+    /// Captured [`IccStartTrace`] for the CURRENT thread.
+    pub static ICC_START_TRACE: std::cell::RefCell<Option<IccStartTrace>> =
+        const { std::cell::RefCell::new(None) };
+    static ICC_START_TRACE_ARMED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Arm / disarm [`ICC_START_TRACE`] for the CURRENT thread.
+pub fn set_icc_start_trace_armed(on: bool) {
+    ICC_START_TRACE_ARMED.with(|c| c.set(on));
+}
+
 /// Sanity bound on the encoded byte-stream size. The spec doesn't cap
 /// `enc_size` directly; ICC profiles in practice are < 1 MB. We accept
 /// up to 64 MB to give very generous headroom while still rejecting
@@ -95,9 +136,14 @@ pub fn icc_context(i: usize, b1: u8, b2: u8) -> u32 {
     if i <= 128 {
         return 0;
     }
+    // Listing B.1 classifies ASCII digits together with '.' and ','
+    // (p = 1). Round 408: the digit rows were missing here, sending
+    // digits to the catch-all class — every profile whose text tags
+    // contain digit runs ("Copyright 2000 …") mis-contexted the bytes
+    // right after a digit and derailed the entropy decode from there.
     let p1: u32 = if b1.is_ascii_lowercase() || b1.is_ascii_uppercase() {
         0
-    } else if b1 == b'.' || b1 == b',' {
+    } else if b1.is_ascii_digit() || b1 == b'.' || b1 == b',' {
         1
     } else if b1 <= 1 {
         2 + (b1 as u32)
@@ -112,7 +158,7 @@ pub fn icc_context(i: usize, b1: u8, b2: u8) -> u32 {
     };
     let p2: u32 = if b2.is_ascii_lowercase() || b2.is_ascii_uppercase() {
         0
-    } else if b2 == b'.' || b2 == b',' {
+    } else if b2.is_ascii_digit() || b2 == b'.' || b2 == b',' {
         1
     } else if b2 < 16 {
         2
@@ -135,7 +181,31 @@ pub fn icc_context(i: usize, b1: u8, b2: u8) -> u32 {
 /// The caller is responsible for then handing the returned bytes to
 /// [`reconstruct_icc_profile`] to obtain the final ICC profile.
 pub fn decode_encoded_icc_stream(br: &mut BitReader<'_>) -> Result<Vec<u8>> {
+    let trace_armed = ICC_START_TRACE_ARMED.with(|c| c.get());
+
+    // NO byte-align here: despite FDIS §B.2's "the bitstream is byte
+    // aligned", real codestreams code `enc_size` at the very next bit
+    // after the end of ImageMetadata (see [`IccStartTrace`]).
+    let bit_offset_of_enc_size = br.bits_read();
     let enc_size = br.read_u64()?;
+    let out = decode_encoded_icc_stream_body(br, enc_size);
+    if trace_armed {
+        ICC_START_TRACE.with(|s| {
+            *s.borrow_mut() = Some(IccStartTrace {
+                bit_offset_of_enc_size,
+                enc_size,
+                bit_offset_after_icc: br.bits_read(),
+            })
+        });
+    }
+    out
+}
+
+/// The Annex B entropy decode AFTER `enc_size` — the 41-distribution
+/// D.3 prelude + `enc_size` hybrid-integer reads under `IccContext`.
+/// Split out so diagnostic tooling can drive it from an arbitrary
+/// bit position with an externally supplied `enc_size`.
+pub fn decode_encoded_icc_stream_body(br: &mut BitReader<'_>, enc_size: u64) -> Result<Vec<u8>> {
     if enc_size == 0 {
         return Err(Error::InvalidData(
             "JXL ICC: enc_size == 0 (no encoded byte stream)".into(),
@@ -774,6 +844,18 @@ mod tests {
             assert_eq!(icc_context(i, b'A', b'B'), 0);
             assert_eq!(icc_context(i, 255, 255), 0);
         }
+    }
+
+    #[test]
+    fn icc_context_digits_class_with_dot_comma() {
+        // Listing B.1: digits share class 1 with '.' and ','. For
+        // i > 128: b1 digit → p1 = 1; b2 digit → p2 = 1.
+        for d in b'0'..=b'9' {
+            assert_eq!(icc_context(200, d, b'A'), 1 + 1); // p1=1, p2=0
+            assert_eq!(icc_context(200, b'A', d), 1 + 8); // p1=0, p2=1
+            assert_eq!(icc_context(200, d, d), 1 + 1 + 8);
+        }
+        assert_eq!(icc_context(200, b'.', b','), 1 + 1 + 8);
     }
 
     #[test]

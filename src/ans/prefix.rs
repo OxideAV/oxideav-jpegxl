@@ -361,12 +361,22 @@ fn read_simple_prefix(br: &mut BitReader<'_>, alphabet_size: u32) -> Result<Pref
             code_lengths[symbols[1] as usize] = 1;
         }
         3 => {
-            // RFC 7932 §3.4: "For NSYM = 3, the bit lengths are 1, 2, 2."
-            // Canonical Huffman assigns lengths in ascending symbol-id
-            // order: sorted_symbols[0] → length 1, [1] → length 2,
-            // [2] → length 2. Sort ALL three (not just the last two —
-            // round-3 typo fix #5; see project_jpegxl_fdis_typos.md).
-            symbols.sort();
+            // Lengths 1, 2, 2. The 1-bit code belongs to the FIRST
+            // symbol as transmitted; only the two 2-bit symbols are
+            // sorted (canonicalisation needs an order only among
+            // symbols of equal length). Round 408: the earlier
+            // sort-ALL-three reading mis-assigned the 1-bit code
+            // whenever the most-frequent symbol was not the
+            // numerically smallest — pinned empirically on the
+            // 18181-3 `grayscale` conformance stream, whose ICC
+            // cluster-1 simple code transmits its most-frequent
+            // symbol (0) after establishing the histogram order; with
+            // first-symbol assignment the embedded 912-byte profile
+            // reproduces the reference tooling's fields and the
+            // stream's end-of-ICC bit offset lands where the frame
+            // header parses. The sort-all reading derailed the whole
+            // ICC entropy decode.
+            symbols[1..].sort_unstable();
             code_lengths[symbols[0] as usize] = 1;
             code_lengths[symbols[1] as usize] = 2;
             code_lengths[symbols[2] as usize] = 2;
@@ -374,14 +384,19 @@ fn read_simple_prefix(br: &mut BitReader<'_>, alphabet_size: u32) -> Result<Pref
         4 => {
             // Read tree-select bit.
             let tree_select = br.read_bit()?;
-            symbols.sort();
             if tree_select == 0 {
-                // Lengths 2, 2, 2, 2.
+                // Lengths 2, 2, 2, 2 — all four sorted (all equal
+                // length).
+                symbols.sort_unstable();
                 for &s in &symbols {
                     code_lengths[s as usize] = 2;
                 }
             } else {
-                // Lengths 1, 2, 3, 3.
+                // Lengths 1, 2, 3, 3 — the 1-bit and 2-bit codes
+                // belong to the first two symbols as transmitted;
+                // only the two 3-bit symbols are sorted (same
+                // rationale as the 3-symbol case above).
+                symbols[2..].sort_unstable();
                 code_lengths[symbols[0] as usize] = 1;
                 code_lengths[symbols[1] as usize] = 2;
                 code_lengths[symbols[2] as usize] = 3;
@@ -973,35 +988,69 @@ mod tests {
     }
 
     #[test]
-    fn read_simple_prefix_three_symbols_canonical_lengths() {
-        // Round-3 regression: NSYM=3 must assign length 1 to the
-        // *smallest* sorted symbol, not the first-read symbol. With
-        // alphabet_size=64, bits=6, encode symbols [50, 7, 33]: read
-        // order [50, 7, 33] → sorted [7, 33, 50] → lengths [1, 2, 2].
+    fn read_simple_prefix_three_symbols_first_gets_short_code() {
+        // Round-408 (rewrites the round-3 premise, which sorted ALL
+        // three symbols): NSYM=3 assigns length 1 to the FIRST symbol
+        // as transmitted; only the two 2-bit symbols are sorted. With
+        // alphabet_size=64, bits=6, encode symbols [50, 7, 33]:
+        // len(50)=1, then {7, 33} sorted → len(7)=len(33)=2.
+        // Empirically pinned on the 18181-3 grayscale conformance
+        // stream's ICC entropy decode (see read_simple_prefix).
         let bytes = pack_lsb(&[
             (1, 2),  // kind = simple
             (2, 2),  // nsym - 1 = 2 → nsym = 3
-            (50, 6), // first symbol
+            (50, 6), // first symbol → the 1-bit code
             (7, 6),  // second symbol
             (33, 6), // third symbol
         ]);
         let mut br = BitReader::new(&bytes);
         let code = read_prefix_code(&mut br, 64).unwrap();
-        // Decoding bit "0" should give symbol 7 (the smallest sorted).
+        // Decoding bit "0" gives the FIRST-transmitted symbol 50.
         let bytes2 = pack_lsb(&[(0, 1)]);
         let mut br2 = BitReader::new(&bytes2);
-        assert_eq!(code.decode(&mut br2).unwrap(), 7);
-        // Decoding bits "10" (LSB-first → first bit 0, second bit 1
-        // → raw=2 → in lookup table this maps to a stride replication
-        // of the length-1 entry. Decoding "01" = LSB-first 1, 0 →
-        // raw=1 → sym 33 (length 2).
+        assert_eq!(code.decode(&mut br2).unwrap(), 50);
+        // raw "01" (LSB-first 1, 0) → the smaller 2-bit symbol 7.
         let bytes3 = pack_lsb(&[(1, 1), (0, 1)]);
         let mut br3 = BitReader::new(&bytes3);
-        assert_eq!(code.decode(&mut br3).unwrap(), 33);
-        // "11" → raw=3 → sym 50.
+        assert_eq!(code.decode(&mut br3).unwrap(), 7);
+        // raw "11" → the larger 2-bit symbol 33.
         let bytes4 = pack_lsb(&[(1, 1), (1, 1)]);
         let mut br4 = BitReader::new(&bytes4);
-        assert_eq!(code.decode(&mut br4).unwrap(), 50);
+        assert_eq!(code.decode(&mut br4).unwrap(), 33);
+    }
+
+    #[test]
+    fn read_simple_prefix_four_symbols_tree_select_keeps_leading_pair() {
+        // NSYM=4 with tree_select=1 (lengths 1, 2, 3, 3): the 1-bit
+        // and 2-bit codes belong to the first two symbols as
+        // transmitted; only the two 3-bit symbols are sorted.
+        // alphabet_size=64, bits=6, symbols [40, 9, 61, 12].
+        let bytes = pack_lsb(&[
+            (1, 2),  // kind = simple
+            (3, 2),  // nsym - 1 = 3 → nsym = 4
+            (40, 6), // first symbol → length 1
+            (9, 6),  // second symbol → length 2
+            (61, 6), // third symbol → length 3 (sorted pair {12, 61})
+            (12, 6), // fourth symbol → length 3
+            (1, 1),  // tree_select = 1
+        ]);
+        let mut br = BitReader::new(&bytes);
+        let code = read_prefix_code(&mut br, 64).unwrap();
+        // "0" → 40 (first-transmitted).
+        let bits = pack_lsb(&[(0, 1)]);
+        let mut b = BitReader::new(&bits);
+        assert_eq!(code.decode(&mut b).unwrap(), 40);
+        // "01" (raw 1) → 9 (second-transmitted, length 2).
+        let bits = pack_lsb(&[(1, 1), (0, 1)]);
+        let mut b = BitReader::new(&bits);
+        assert_eq!(code.decode(&mut b).unwrap(), 9);
+        // 3-bit codes: sorted {12, 61} → 12 first, 61 second.
+        let bits = pack_lsb(&[(1, 1), (1, 1), (0, 1)]);
+        let mut b = BitReader::new(&bits);
+        assert_eq!(code.decode(&mut b).unwrap(), 12);
+        let bits = pack_lsb(&[(1, 1), (1, 1), (1, 1)]);
+        let mut b = BitReader::new(&bits);
+        assert_eq!(code.decode(&mut b).unwrap(), 61);
     }
 
     #[test]

@@ -971,15 +971,25 @@ fn read_codestream_prelude(
     // 2. ImageMetadata (FDIS A.6).
     let metadata = ImageMetadataFdis::read(&mut br)?;
 
-    // 3. ICC profile (Annex E.4) — round-6 lands the decoder. The
-    //    decoded ICC bytes are validated (must contain "acsp" magic at
-    //    offset 36 if length >= 40) but not currently propagated to
-    //    `VideoFrame` because `oxideav_core::VideoFrame` has no ICC
-    //    slot. The decode is still run because (a) it advances the
-    //    bit reader past the ICC stream so subsequent FrameHeader /
-    //    TOC parsing finds the right bit offset, and (b) it gives a
-    //    direct `Error::InvalidData` if the codestream's ICC stream
-    //    is malformed.
+    // 3. ICC profile (Annex B / E.4-2024 numbering) — round-6 lands the
+    //    decoder. The decoded ICC bytes are validated (must contain
+    //    "acsp" magic at offset 36 if length >= 40) but not currently
+    //    propagated to `VideoFrame` because `oxideav_core::VideoFrame`
+    //    has no ICC slot. The decode is still run because (a) it
+    //    advances the bit reader past the ICC stream so subsequent
+    //    FrameHeader / TOC parsing finds the right bit offset, and (b)
+    //    it gives a direct `Error::InvalidData` if the codestream's ICC
+    //    stream is malformed.
+    //
+    //    Round 408: `enc_size` is coded at the very next bit after the
+    //    end of ImageMetadata — there is NO ZeroPadToByte() before the
+    //    ICC stream, despite FDIS §B.2's "the bitstream is byte
+    //    aligned" opener (empirically pinned on the 18181-3 grayscale
+    //    conformance stream; see `icc::IccStartTrace`). The pre-408
+    //    failure on that stream was the ImageMetadata TAIL mis-count
+    //    (Table A.16 `default_transform` gating — see
+    //    `ImageMetadataFdis::read`), which shifted `enc_size` by one
+    //    bit and mis-framed everything after it.
     if metadata.colour_encoding.want_icc {
         let _icc_bytes = decode_icc_stream_at(&mut br)?;
     }
