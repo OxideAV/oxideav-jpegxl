@@ -228,6 +228,33 @@ What is implemented and tested today:
   `large-3072x2048-multigroup` (2×1 LF groups, 96 groups, permuted
   100-entry TOC) up to the §C.7.1 boundary below.
 
+### Round 406 — ISO/IEC 18181-3 conformance corpus (Modular blending / layering)
+
+Four of the six committed Part 3 conformance streams now decode
+end-to-end, validated against black-box reference decodes
+(`round406_conformance_composition`):
+
+- **`alpha_nonpremultiplied`** (12-bit) and **`alpha_triangles`**
+  (9-bit): **bit-exact** on all four channels.
+- **`blendmodes`** — a five-frame `Reference[1]` chain exercising every
+  Table C.8 blend mode (kReplace → kBlend → kAdd → kMul →
+  kAlphaWeightedAdd) — within ±1/4095 (alpha exact at native depth).
+- **`sunset_logo`** (RCT, 10-bit, orientation 7, two kBlend layers with
+  out-of-canvas signed crops): **bit-exact** on all four channels at
+  the correct transposed 924×1386 extent.
+
+The fixes behind them (each an FDIS-text divergence pinned on the
+official corpus): float-domain **unclamped** §C.2 composition
+(`DecodedFrame::raw_f32` carries out-of-range Modular samples;
+quantisation only at presentation), 9–16-bit plane composition,
+kAlphaWeightedAdd weighting by the frame's own alpha with the alpha
+channel left unchanged, signed (`UnpackSigned`) crop offsets with
+§3.5.1 clipping, Table C.7 `alpha_channel`/`clamp` presence gated on
+the blend mode alone (not `multi_extra`), §A.6 Table A.17 orientation
+(all eight transforms, new `orientation` module), and the §5.2 **Idiv**
+semantics (round toward zero) in the Listing C.16 averaging predictors
+and the Listing I.21 Squeeze tendency function.
+
 ### Not yet implemented
 
 - **§C.7.1 `used_orders != 0` custom coefficient orders.** The C.3.2
@@ -255,6 +282,16 @@ What is implemented and tested today:
   feeding them into that driver in the registered path is the
   remaining wiring step.
 - Floating-point samples and `bps > 16`; high-bit-depth XYB / YCbCr.
+- **ICC-bearing streams** (`want_icc = 1`, e.g. the `grayscale`
+  conformance case): the ImageMetadata tail (`default_transform` /
+  opsin / `cw_mask` — exact 2024 gating still a SPECGAP) shifts the
+  byte-aligned ICC stream start, and the Annex B entropy decode
+  mis-parses real encoder ICC streams (complex D.3.5 clustering path);
+  reproducible with locally generated `-x icc_pathname=…` fixtures.
+- Modular multi-LfGroup frames (> 2048 px, e.g. the
+  `grayscale_public_university` conformance case), the kNoise /
+  kPatches image features, JPEG reconstruction, and the LfFrame
+  (`lf_level > 0`) dimension scaling `progressive-dc` needs.
 - The encoder (not registered).
 
 Unsupported inputs surface as `Error::Unsupported` rather than a silent
