@@ -9,6 +9,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Round 406 — ISO/IEC 18181-3 conformance corpus: the Modular
+  blending / layering test cases decode end-to-end, four of them
+  pinned in CI against black-box reference decodes
+  (`round406_conformance_composition`):
+  - `alpha_nonpremultiplied` (12-bit) and `alpha_triangles` (9-bit)
+    decode **bit-exact** on all four channels;
+  - `blendmodes` — the five-frame `Reference[1]` chain covering every
+    Table C.8 blend mode (kReplace -> kBlend -> kAdd -> kMul ->
+    kAlphaWeightedAdd) — composes to within +-1/4095 of the reference
+    (alpha plane exact against the native-depth reference);
+  - `sunset_logo` (RCT, 10-bit, orientation 7, two kBlend layers with
+    out-of-canvas crops) presents at the correct transposed 924x1386
+    extent with a bit-exact alpha plane; the colour channels carry a
+    known sub-RMS-40 deviation in the smooth sky region (open Modular
+    item, ratcheted).
+- **sec A.6 Table A.17 orientation** (`orientation` module): all eight
+  Exif-style transforms applied at presentation, after composition;
+  SizeHeader dimensions are the sample grid, so orientations 5-8
+  present transposed.
+- **sec C.2 composition rework** (fixture-measured on the Part 3
+  corpus; each item is a real-stream divergence from the FDIS text):
+  - the composition state is now **float-domain and unclamped**:
+    Modular frames legally decode to out-of-range samples (the
+    `blendmodes` base layer carries a negative red plane) and
+    over-range kAdd intermediates must survive into later kMul /
+    kBlend stages; decoded integer planes are lifted to normalised
+    f32 (`DecodedFrame::raw_f32` preserves the pre-clamp values) and
+    quantisation happens only at presentation;
+  - 9-16-bit (little-endian 2-byte) planes compose with the correct
+    `2^bits - 1` denominator (previously byte-planes were assumed,
+    which misread every high-bit-depth frame rect);
+  - **kAlphaWeightedAdd** weights the colour channels by the frame's
+    own `new_alpha` and leaves the alpha channel itself unchanged —
+    the FDIS prints a post-blend-alpha weight and a kBlend-style
+    alpha rule, both contradicted field-exactly by the conformance
+    stream;
+  - Table C.7 `clamp` wired through (`FrameComposeMeta::{clamp,
+    alpha_clamp}`); the undefined clamp-with-kMul combination errors
+    precisely.
+- **FrameHeader crop offsets are signed** (`UnpackSigned`, sec 5.2):
+  `sunset_logo` codes x0 = 1323 / y0 = 199, which only cohere as
+  UnpackSigned values -662 / -100 (both layers then exactly cover the
+  1386x924 image). The FDIS reads them unsigned and even asserts
+  `x0 + width <= size.width`; treated as an erratum, and `full_frame`
+  now tests signed coverage. Frame rects extending beyond the canvas
+  are **clipped** per the sec 3.5.1 grid rule instead of rejected.
+- **Table C.7 `alpha_channel` / `clamp` presence** is gated on the
+  blend mode alone, NOT on `multi_extra`: the FDIS' `multi_extra &&`
+  gate desyncs every single-extra-channel stream whose frame uses
+  kBlend / kAlphaWeightedAdd / kMul (pinned by exact-cover parses of
+  the `blendmodes` five-frame chain and both `sunset_logo` layers).
+
+
 - Round 393 — flat-content fixture arbitration + alpha blending +
   multi-LfGroup framing:
   - **sec F.3 HfMul erratum candidate (major accuracy fix)**: HfMul is

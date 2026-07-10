@@ -526,6 +526,7 @@ pub mod multi_pass_decode;
 pub mod multi_pass_hf_header;
 pub mod multi_pass_hf_histogram_decoder;
 pub mod non_zeros_grid;
+pub mod orientation;
 pub mod pass_group;
 pub mod pass_group_hf;
 pub mod per_channel_non_zeros;
@@ -744,8 +745,11 @@ fn decode_all_frames_from_codestream(
     let mut frame_pts = pts;
     // §C.2 composition state: the Reference[…] slots + image-sized
     // canvas the per-frame BlendingInfo composes against.
-    let mut compose_state =
-        frame_compose::ComposeState::new(size.width as usize, size.height as usize)?;
+    let mut compose_state = frame_compose::ComposeState::new_with_depth(
+        size.width as usize,
+        size.height as usize,
+        metadata.bit_depth.bits_per_sample,
+    )?;
     loop {
         if offset >= codestream.len() {
             return Err(Error::InvalidData(
@@ -779,14 +783,43 @@ fn decode_all_frames_from_codestream(
                     meta.alpha_plane = None;
                 }
             }
-            compose_state.compose(&decoded.frame, &meta)?
+            // Prefer the unclamped float planes when the decode path
+            // preserved them (Modular pass-through): out-of-range
+            // samples are meaningful blend inputs.
+            match &decoded.raw_f32 {
+                Some(raw) if raw.len() == decoded.frame.planes.len() => {
+                    let bytes = if metadata.bit_depth.bits_per_sample > 8 {
+                        2
+                    } else {
+                        1
+                    };
+                    let fw = decoded.frame.planes[0].stride / bytes;
+                    let fh = decoded.frame.planes[0].data.len() / decoded.frame.planes[0].stride;
+                    let mut out = compose_state.compose_planes(raw, fw, fh, &meta)?;
+                    out.pts = decoded.frame.pts;
+                    out
+                }
+                _ => compose_state.compose(&decoded.frame, &meta)?,
+            }
         } else {
             decoded.frame
         };
         // Presentation rule (§C.2): a zero-duration non-last frame is
-        // composed but not presented.
+        // composed but not presented. Presented frames get the §A.6
+        // orientation transform (Table A.17) — the last step before
+        // hand-off; all decode/composition geometry above runs in
+        // sample-grid space.
         if decoded.compose.duration > 0 || is_last {
-            frames.push(composed);
+            let bytes = if metadata.bit_depth.bits_per_sample > 8 {
+                2
+            } else {
+                1
+            };
+            frames.push(orientation::apply_orientation(
+                composed,
+                metadata.orientation,
+                bytes,
+            )?);
         }
         frame_pts = None;
         if is_last {
@@ -913,6 +946,14 @@ struct DecodedFrame {
     /// §C.2 composition fields the multi-frame walk feeds to
     /// [`frame_compose::ComposeState::compose`].
     compose: frame_compose::FrameComposeMeta,
+    /// The frame's planes as normalised **unclamped** `f32` samples
+    /// (1.0 = `2^bits − 1`), when the decode path preserves them —
+    /// Modular samples may legally lie outside the integer range and
+    /// the §C.2 blend arithmetic needs those values un-truncated (the
+    /// `blendmodes` conformance stream's base layer carries a negative
+    /// red plane). `None` on paths that only produce clamped output;
+    /// the composer then lifts the integer planes instead.
+    raw_f32: Option<Vec<Vec<f32>>>,
 }
 
 /// Read the codestream prelude that precedes the frame array: SizeHeader
@@ -952,7 +993,12 @@ fn read_codestream_prelude(
 fn decode_codestream(codestream: &[u8], pts: Option<i64>) -> Result<VideoFrame> {
     let (mut br, size, metadata) = read_codestream_prelude(codestream)?;
     let decoded = decode_frame_body(&mut br, codestream, &size, &metadata, pts)?;
-    Ok(decoded.frame)
+    let bytes = if metadata.bit_depth.bits_per_sample > 8 {
+        2
+    } else {
+        1
+    };
+    orientation::apply_orientation(decoded.frame, metadata.orientation, bytes)
 }
 
 /// Decode one frame whose FrameHeader begins at `br`'s current
@@ -1015,8 +1061,8 @@ fn decode_frame_body(
         .get(alpha_ec)
         .filter(|ec| matches!(ec.kind, crate::metadata_fdis::ExtraChannelType::Alpha));
     let compose_meta = frame_compose::FrameComposeMeta {
-        x0: fh.x0.max(0) as u32,
-        y0: fh.y0.max(0) as u32,
+        x0: fh.x0,
+        y0: fh.y0,
         mode: fh.blending_info.mode,
         source: fh.blending_info.source,
         save_as_reference: fh.save_as_reference,
@@ -1030,6 +1076,12 @@ fn decode_frame_body(
             .get(alpha_ec)
             .map(|b| b.mode)
             .unwrap_or(frame_header::BlendMode::Replace),
+        clamp: fh.blending_info.clamp,
+        alpha_clamp: fh
+            .ec_blending_info
+            .get(alpha_ec)
+            .map(|b| b.clamp)
+            .unwrap_or(false),
     };
 
     // 7. Single-group frames have a single TOC entry containing all
@@ -1081,6 +1133,7 @@ fn decode_frame_body(
             is_last,
             next_frame_offset,
             compose: compose_meta,
+            raw_f32: None,
         });
     }
     if fh.encoding != crate::frame_header::Encoding::Modular {
@@ -1316,6 +1369,7 @@ fn decode_frame_body(
             is_last,
             next_frame_offset,
             compose: compose_meta,
+            raw_f32: None,
         });
     }
     if expected_chans == 3 && fh.do_ycbcr {
@@ -1331,6 +1385,7 @@ fn decode_frame_body(
             is_last,
             next_frame_offset,
             compose: compose_meta,
+            raw_f32: None,
         });
     }
 
@@ -1352,6 +1407,15 @@ fn decode_frame_body(
     // documented in this crate's README under "Plane byte layout".
     let bps = metadata.bit_depth.bits_per_sample;
     let max_sample: i32 = (1i32 << bps) - 1;
+    // Unclamped float planes for §C.2 composition: Modular samples may
+    // legally lie outside [0, 2^bps - 1] and the blend arithmetic
+    // needs them un-truncated (see `DecodedFrame::raw_f32`).
+    let inv_max = 1.0f32 / max_sample as f32;
+    let raw_f32: Vec<Vec<f32>> = img
+        .channels
+        .iter()
+        .map(|ch| ch.iter().map(|&v| v as f32 * inv_max).collect())
+        .collect();
     let mut planes: Vec<VideoPlane> = Vec::with_capacity(n_chans);
     for (i, ch_data) in img.channels.iter().enumerate() {
         let desc = img.descs[i];
@@ -1387,6 +1451,7 @@ fn decode_frame_body(
         is_last,
         next_frame_offset,
         compose: compose_meta,
+        raw_f32: Some(raw_f32),
     })
 }
 

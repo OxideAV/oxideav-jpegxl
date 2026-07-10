@@ -129,7 +129,8 @@ impl BlendingInfo {
         let mode = BlendMode::from_u32(mode_v)?;
         let mut alpha_channel = 0u32;
         let mut clamp = false;
-        if multi_extra && (mode == BlendMode::Blend || mode == BlendMode::AlphaWeightedAdd) {
+        let _ = multi_extra;
+        if mode == BlendMode::Blend || mode == BlendMode::AlphaWeightedAdd {
             alpha_channel = br.read_u32([
                 U32Dist::Val(0),
                 U32Dist::Val(1),
@@ -137,10 +138,7 @@ impl BlendingInfo {
                 U32Dist::BitsOffset(3, 3),
             ])?;
         }
-        if multi_extra
-            && (mode == BlendMode::Blend
-                || mode == BlendMode::AlphaWeightedAdd
-                || mode == BlendMode::Mul)
+        if mode == BlendMode::Blend || mode == BlendMode::AlphaWeightedAdd || mode == BlendMode::Mul
         {
             clamp = br.read_bool()?;
         }
@@ -643,13 +641,20 @@ impl FrameHeader {
         ];
         if have_crop {
             if frame_type != FrameType::ReferenceOnly {
-                // FDIS uses UnpackSigned on x0/y0 implicitly via the U32
-                // distribution. The U32 result is non-negative; the
-                // signed semantics come from the caller's interpretation
-                // (the FDIS text only constrains x0 + width <= image
-                // width). We store as i32 for forward compat.
-                x0 = br.read_u32(crop_dist)? as i32;
-                y0 = br.read_u32(crop_dist)? as i32;
+                // x0 / y0 are SIGNED: the U32-coded value goes through
+                // UnpackSigned (§5.2), so a crop frame may extend past
+                // the image's top-left corner. The FDIS prose reads the
+                // offsets as unsigned and even asserts `x0 + width <=
+                // size.width` — but the ISO/IEC 18181-3 conformance
+                // corpus contradicts it: `sunset_logo` codes x0 = 1323 /
+                // y0 = 199, which only make sense as UnpackSigned
+                // values −662 / −100 (then x0 + width = 1386 and y0 +
+                // height = 924, exactly the image extent, making the
+                // frame a cover of the image as the stream's blending
+                // fields require). Treated as an FDIS erratum; the
+                // conformance bitstream is authoritative.
+                x0 = crate::bitreader::unpack_signed(br.read_u32(crop_dist)?);
+                y0 = crate::bitreader::unpack_signed(br.read_u32(crop_dist)?);
             }
             width = br.read_u32(crop_dist)?;
             height = br.read_u32(crop_dist)?;
@@ -661,11 +666,16 @@ impl FrameHeader {
             frame_type == FrameType::Regular || frame_type == FrameType::SkipProgressive;
 
         // full_frame: `have_crop is false or the frame area completely
-        // covers the image area`.
+        // covers the image area` — with signed offsets, coverage means
+        // the rect [x0, x0 + width) × [y0, y0 + height) contains
+        // [0, image_width) × [0, image_height).
         let full_frame = if !have_crop {
             true
         } else {
-            x0 == 0 && y0 == 0 && width >= params.image_width && height >= params.image_height
+            x0 <= 0
+                && y0 <= 0
+                && x0 as i64 + width as i64 >= params.image_width as i64
+                && y0 as i64 + height as i64 >= params.image_height as i64
         };
 
         let multi_extra = params.num_extra_channels >= 2;
