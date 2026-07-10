@@ -21,6 +21,64 @@ use oxideav_core::{Error, Result};
 use crate::bitreader::{unpack_signed, BitReader, U32Dist};
 use crate::extensions::Extensions;
 
+/// One tail-field entry of the [`MetadataTailTrace`] — field name, its
+/// gating condition's value, the bits it consumed, and the running
+/// absolute bit offset (relative to the start of the codestream after
+/// the 2-byte `FF 0A` signature) after the field was read.
+#[derive(Debug, Clone)]
+pub struct TailFieldTrace {
+    pub name: &'static str,
+    /// The Table A.16 condition value for this field — `false` means
+    /// the field was absent (0 bits) and the entry records the skip.
+    pub present: bool,
+    /// Bits consumed by this field (0 when `present == false`).
+    pub bits: usize,
+    /// `BitReader::bits_read()` immediately after this field.
+    pub bit_offset_after: usize,
+}
+
+/// The "metadata-tail gating trace" — every field of the ImageMetadata
+/// tail (Table A.16, from `tone_mapping` on), its condition, its bit
+/// width, and the running bit offset, plus the head flags needed to
+/// interpret it. Captured per-thread when armed via
+/// [`set_metadata_tail_trace_armed`]; read back from
+/// [`METADATA_TAIL_TRACE`].
+///
+/// The single load-bearing invariant this trace pins is that the
+/// byte-aligned ICC stream (`enc_size`) begins at
+/// `ceil(bit_offset_end_of_image_metadata / 8)` — any ImageMetadata
+/// tail mis-count shifts that byte offset.
+#[derive(Debug, Clone, Default)]
+pub struct MetadataTailTrace {
+    pub all_default: bool,
+    pub extra_fields: bool,
+    pub xyb_encoded: bool,
+    pub num_extra_channels: u32,
+    pub want_icc: bool,
+    /// Raw `Extensions` bit-array (`U64()`), pre-decode.
+    pub extensions_mask: u64,
+    /// Per-present-extension payload bit counts.
+    pub extension_bits: Vec<u64>,
+    pub fields: Vec<TailFieldTrace>,
+    /// Absolute bit offset (post-signature codestream) at which the
+    /// ImageMetadata bundle ends.
+    pub bit_offset_end_of_image_metadata: usize,
+}
+
+thread_local! {
+    /// Captured [`MetadataTailTrace`] for the CURRENT thread, filled by
+    /// [`ImageMetadataFdis::read`] when armed.
+    pub static METADATA_TAIL_TRACE: std::cell::RefCell<Option<MetadataTailTrace>> =
+        const { std::cell::RefCell::new(None) };
+    static METADATA_TAIL_TRACE_ARMED: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// Arm / disarm [`METADATA_TAIL_TRACE`] for the CURRENT thread.
+pub fn set_metadata_tail_trace_armed(on: bool) {
+    METADATA_TAIL_TRACE_ARMED.with(|c| c.set(on));
+}
+
 /// Re-decoded `SizeHeader` per FDIS Table A.3. Identical wire format to
 /// the existing [`crate::metadata::SizeHeader`]; lifted here so the
 /// FDIS-side parsers do not have to depend on the older module.
@@ -856,6 +914,9 @@ pub struct ImageMetadataFdis {
     pub colour_encoding: ColourEncoding,
     pub tone_mapping: ToneMapping,
     pub extensions: Extensions,
+    /// Table A.16 tail: `true` means the opsin matrix and upsampling
+    /// weights are the spec defaults and no further tail fields were
+    /// coded (inverted gating — see [`Self::read`]).
     pub default_transform: bool,
     pub opsin_inverse_matrix: OpsinInverseMatrix,
     pub cw_mask: u32,
@@ -864,20 +925,63 @@ pub struct ImageMetadataFdis {
 const MAX_NUM_EXTRA_CHANNELS: u32 = 4097;
 
 impl ImageMetadataFdis {
-    /// FDIS Table A.16. Note that the cw_mask custom-weight arrays are
-    /// not stored — they're decoded and immediately discarded since
-    /// applying them is the upsampling routine's job (Annex L), not the
-    /// metadata parser's.
+    /// FDIS Table A.16, including the tail (`default_transform` /
+    /// `opsin_inverse_matrix` / `cw_mask` / custom upsampling-weight
+    /// arrays).
+    ///
+    /// ## The ImageMetadata-tail SPECGAP, resolved empirically (round 408)
+    ///
+    /// Table A.16's tail has two printing subtleties, one confirmed and
+    /// one corrected against real codestreams:
+    ///
+    /// * `default_transform` Bool() is **unconditional** — its
+    ///   condition column is blank, so the bit is present even when the
+    ///   bundle's `all_default` bit is set. Confirmed as printed.
+    /// * The printed gating `default_transform` → read
+    ///   `opsin_inverse_matrix` / `cw_mask` is **inverted**: the field
+    ///   name means "the transform data IS the default", so
+    ///   `default_transform == 1` means *nothing follows* and
+    ///   `default_transform == 0` reads `opsin_inverse_matrix`
+    ///   (iff `xyb_encoded`), `cw_mask` `u(3)`, and the 15/55/210-entry
+    ///   `F16()` upsampling-weight arrays per `cw_mask` bit.
+    ///
+    /// The inverted reading is pinned by the round-408 metadata-tail
+    /// gating trace on every staged fixture plus the 18181-3
+    /// conformance corpus (all with `default_transform == 1`):
+    ///
+    /// * `grayscale` (`want_icc == true`, extensions end at bit 24):
+    ///   the ICC stream's `enc_size` begins at bit 25 — immediately
+    ///   after the `default_transform` bit — and the Annex B decode
+    ///   from there yields the stream's embedded 912-byte GRAY/ADBE
+    ///   profile (size / CMM / colour-space / rendering-intent fields
+    ///   all matching the reference tooling's report). The literal
+    ///   gating would drag in a phantom `cw_mask = 3` plus 1120
+    ///   weight bits.
+    /// * The lossless fixtures (`noise` / `gradient`, `xyb = 0`,
+    ///   `default_transform` at bit 21): the byte-exact FrameHeader
+    ///   begins at byte 3, consistent with the tail ending at bit 22;
+    ///   the literal gating lands at bit 25 → byte 4 and every frame
+    ///   field misparses.
+    /// * `vardct_256x256_d1` (`all_default == 1`): the unconditional
+    ///   `default_transform` bit at position 11 reads 1, the bundle
+    ///   ends at bit 12, and the byte-exact frame begins at byte 2;
+    ///   the literal gating would read a phantom 257-bit
+    ///   OpsinInverseMatrix.
     pub fn read(br: &mut BitReader<'_>) -> Result<Self> {
+        let trace_armed = METADATA_TAIL_TRACE_ARMED.with(|c| c.get());
+        let mut trace = trace_armed.then(MetadataTailTrace::default);
+
         let all_default = br.read_bool()?;
         let mut out = Self::defaults();
         out.all_default = all_default;
         if all_default {
-            // Even when all_default, the bundle still emits the trailing
-            // `default_transform` Bool() — the FDIS table shows it
-            // unconditional. We just leave it at its (true) default and
-            // do NOT consume bits for it; the spec says all_default
-            // shortcircuits the entire bundle.
+            Self::read_tail(br, &mut out, trace.as_mut())?;
+            if let Some(mut t) = trace {
+                t.all_default = true;
+                t.xyb_encoded = out.xyb_encoded;
+                t.bit_offset_end_of_image_metadata = br.bits_read();
+                METADATA_TAIL_TRACE.with(|s| *s.borrow_mut() = Some(t));
+            }
             return Ok(out);
         }
         out.extra_fields = br.read_bool()?;
@@ -924,38 +1028,127 @@ impl ImageMetadataFdis {
         }
         out.xyb_encoded = br.read_bool()?;
         out.colour_encoding = ColourEncoding::read(br)?;
+        let before = br.bits_read();
         if out.extra_fields {
             out.tone_mapping = ToneMapping::read(br)?;
         }
+        if let Some(t) = trace.as_mut() {
+            t.fields.push(TailFieldTrace {
+                name: "tone_mapping",
+                present: out.extra_fields,
+                bits: br.bits_read() - before,
+                bit_offset_after: br.bits_read(),
+            });
+        }
+        let before = br.bits_read();
         out.extensions = Extensions::read(br)?;
         out.extensions.skip_payload(br)?;
+        if let Some(t) = trace.as_mut() {
+            t.extensions_mask = out.extensions.mask;
+            t.extension_bits = out.extensions.extension_bits.clone();
+            t.fields.push(TailFieldTrace {
+                name: "extensions",
+                present: true,
+                bits: br.bits_read() - before,
+                bit_offset_after: br.bits_read(),
+            });
+        }
 
-        // 2024-spec ImageMetadata: the FDIS-2021 listing's tail bundle
-        // (`default_transform` Bool + `opsin_inverse_matrix` + `cw_mask`
-        // u(3) + per-mask F16 arrays) is gated by `!all_default` AND a
-        // separate `default_transform` flag. Black-box validation
-        // against `cjxl 0.12.0` shows the small-fixture trace consumes
-        // exactly the bits enumerated above this comment when
-        // `all_default=0` — i.e. the tail is actually conditioned on
-        // an additional `!default_transform_implicit` flag.
-        //
-        // Round 2 reads default_transform conditionally — only when the
-        // remaining body suggests we have at least 1 more bit. A more
-        // precise condition is round-3 work; for the fixtures we care
-        // about the metadata ends right after Extensions.
-        //
-        // SPECGAP: 2024-spec ImageMetadata tail (default_transform /
-        // cw_mask / per-mask weights) — exact gating condition unclear.
-        // Round 1 read these unconditionally on `!all_default`; the
-        // resulting bit cursor was 4-5 bits past where the reference
-        // behavioural trace stops. Round 2 simply does not read them,
-        // falling back to defaults.
-        out.default_transform = true;
-        out.cw_mask = 0;
+        Self::read_tail(br, &mut out, trace.as_mut())?;
+
+        if let Some(mut t) = trace {
+            t.all_default = false;
+            t.extra_fields = out.extra_fields;
+            t.xyb_encoded = out.xyb_encoded;
+            t.num_extra_channels = out.num_extra_channels;
+            t.want_icc = out.colour_encoding.want_icc;
+            t.bit_offset_end_of_image_metadata = br.bits_read();
+            METADATA_TAIL_TRACE.with(|s| *s.borrow_mut() = Some(t));
+        }
         Ok(out)
     }
 
-    #[allow(dead_code)]
+    /// The Table A.16 tail: the unconditional `default_transform`
+    /// Bool() (blank condition column — present even when
+    /// `all_default`), then — with the round-408 **inverted** gating,
+    /// see [`Self::read`] — `opsin_inverse_matrix` iff
+    /// `!default_transform && xyb_encoded`, `cw_mask` `u(3)` iff
+    /// `!default_transform`, and the custom upsampling-weight `F16()`
+    /// arrays per `cw_mask` bit (15 / 55 / 210 values for 2×/4×/8×).
+    fn read_tail(
+        br: &mut BitReader<'_>,
+        out: &mut Self,
+        mut trace: Option<&mut MetadataTailTrace>,
+    ) -> Result<()> {
+        let record = |t: &mut Option<&mut MetadataTailTrace>,
+                      name: &'static str,
+                      present: bool,
+                      bits: usize,
+                      after: usize| {
+            if let Some(t) = t.as_mut() {
+                t.fields.push(TailFieldTrace {
+                    name,
+                    present,
+                    bits,
+                    bit_offset_after: after,
+                });
+            }
+        };
+
+        out.default_transform = br.read_bool()?;
+        record(&mut trace, "default_transform", true, 1, br.bits_read());
+
+        let custom = !out.default_transform;
+        let opsin_present = custom && out.xyb_encoded;
+        let before = br.bits_read();
+        if opsin_present {
+            out.opsin_inverse_matrix = OpsinInverseMatrix::read(br)?;
+        }
+        record(
+            &mut trace,
+            "opsin_inverse_matrix",
+            opsin_present,
+            br.bits_read() - before,
+            br.bits_read(),
+        );
+
+        let before = br.bits_read();
+        if custom {
+            out.cw_mask = br.read_bits(3)?;
+        }
+        record(
+            &mut trace,
+            "cw_mask",
+            custom,
+            br.bits_read() - before,
+            br.bits_read(),
+        );
+
+        for (bit, n, name) in [
+            (1u32, 15usize, "up2_weight"),
+            (2, 55, "up4_weight"),
+            (4, 210, "up8_weight"),
+        ] {
+            let present = out.cw_mask & bit != 0;
+            let before = br.bits_read();
+            if present {
+                // The decoded weights are not retained: applying them
+                // is the Annex L upsampling routine's job and no
+                // staged stream carries a custom table yet — but the
+                // bits must be consumed to keep the cursor aligned.
+                Self::skip_f16_array(br, n)?;
+            }
+            record(
+                &mut trace,
+                name,
+                present,
+                br.bits_read() - before,
+                br.bits_read(),
+            );
+        }
+        Ok(())
+    }
+
     fn skip_f16_array(br: &mut BitReader<'_>, n: usize) -> Result<()> {
         // Each F16 read consumes 16 bits.
         if n.saturating_mul(16) > br.bits_remaining() {
@@ -1007,13 +1200,33 @@ mod tests {
 
     #[test]
     fn image_metadata_all_default_short_circuit() {
-        let bytes = pack_lsb(&[(1, 1)]);
+        // all_default = 1, then the unconditional Table A.16 tail:
+        // default_transform = 1 (defaults, nothing follows).
+        let bytes = pack_lsb(&[(1, 1), (1, 1)]);
         let mut br = BitReader::new(&bytes);
         let im = ImageMetadataFdis::read(&mut br).unwrap();
         assert!(im.all_default);
         assert_eq!(im.orientation, 1);
         assert_eq!(im.bit_depth, BitDepthFdis::DEFAULT);
         assert!(im.xyb_encoded);
+        assert!(im.default_transform);
+        assert_eq!(im.cw_mask, 0);
+        assert_eq!(br.bits_read(), 2);
+    }
+
+    #[test]
+    fn image_metadata_tail_inverted_gating_custom_opsin() {
+        // all_default = 1, default_transform = 0 → the tail reads
+        // OpsinInverseMatrix (xyb_encoded defaults to true) and
+        // cw_mask. Opsin all_default = 1 (1 bit), cw_mask = 0 (3 bits).
+        let bytes = pack_lsb(&[(1, 1), (0, 1), (1, 1), (0, 3)]);
+        let mut br = BitReader::new(&bytes);
+        let im = ImageMetadataFdis::read(&mut br).unwrap();
+        assert!(im.all_default);
+        assert!(!im.default_transform);
+        assert!(im.opsin_inverse_matrix.all_default);
+        assert_eq!(im.cw_mask, 0);
+        assert_eq!(br.bits_read(), 6);
     }
 
     #[test]

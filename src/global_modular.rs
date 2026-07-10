@@ -630,7 +630,7 @@ mod tests {
         // for a Grey 8bpp image: !xyb, colour_space=Grey,
         // num_extra_channels=0, bit_depth=8.
         // Easiest: read all_default then mutate the colour_space.
-        let bytes = crate::ans::test_helpers::pack_lsb(&[(1, 1)]);
+        let bytes = crate::ans::test_helpers::pack_lsb(&[(1, 1), (1, 1)]);
         let mut br = crate::bitreader::BitReader::new(&bytes);
         let mut m = ImageMetadataFdis::read(&mut br).unwrap();
         m.xyb_encoded = false;

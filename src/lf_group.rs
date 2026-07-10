@@ -751,7 +751,7 @@ mod tests {
     /// through to `HfMetadata::read` for the inverse Palette path's
     /// `bit_depth`).
     fn build_metadata_default() -> ImageMetadataFdis {
-        let bytes = crate::ans::test_helpers::pack_lsb(&[(1, 1)]);
+        let bytes = crate::ans::test_helpers::pack_lsb(&[(1, 1), (1, 1)]);
         let mut br = BitReader::new(&bytes);
         ImageMetadataFdis::read(&mut br).unwrap()
     }
@@ -870,7 +870,7 @@ mod tests {
         // colour_space if needed. For VarDCT path we don't actually
         // consume the metadata in LfGlobal::read for the empty-channel
         // case, but we still need a valid bundle.
-        let md_bytes = pack_lsb(&[(1, 1)]);
+        let md_bytes = pack_lsb(&[(1, 1), (1, 1)]);
         let mut md_br = BitReader::new(&md_bytes);
         let metadata = ImageMetadataFdis::read(&mut md_br).unwrap();
 
