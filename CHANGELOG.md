@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Internal decode plumbing (Modular / VarDCT / ANS / bundle-parsing
+  modules, diagnostic trace hooks, the mid-pipeline
+  `decode_vardct_frame` test driver) is now `#[doc(hidden)]` so
+  cargo-semver-checks / rustdoc no longer treat internals as public
+  API. The stable surface — decode entry points, probes + header
+  types, registry surface, and the `container` / `metadata` /
+  `metadata_fdis` / `extensions` modules — is unchanged; no
+  signatures or behaviour were touched.
+
 ### Added
 
 - Round 408 — ICC-bearing streams unblocked end-to-end through the

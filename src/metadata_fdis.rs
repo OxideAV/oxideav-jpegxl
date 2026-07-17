@@ -25,6 +25,7 @@ use crate::extensions::Extensions;
 /// gating condition's value, the bits it consumed, and the running
 /// absolute bit offset (relative to the start of the codestream after
 /// the 2-byte `FF 0A` signature) after the field was read.
+#[doc(hidden)] // internal: diagnostic trace record, not stable API
 #[derive(Debug, Clone)]
 pub struct TailFieldTrace {
     pub name: &'static str,
@@ -48,6 +49,7 @@ pub struct TailFieldTrace {
 /// byte-aligned ICC stream (`enc_size`) begins at
 /// `ceil(bit_offset_end_of_image_metadata / 8)` — any ImageMetadata
 /// tail mis-count shifts that byte offset.
+#[doc(hidden)] // internal: diagnostic trace record, not stable API
 #[derive(Debug, Clone, Default)]
 pub struct MetadataTailTrace {
     pub all_default: bool,
@@ -68,6 +70,7 @@ pub struct MetadataTailTrace {
 thread_local! {
     /// Captured [`MetadataTailTrace`] for the CURRENT thread, filled by
     /// [`ImageMetadataFdis::read`] when armed.
+    #[doc(hidden)] // internal: per-thread diagnostic test hook, not stable API
     pub static METADATA_TAIL_TRACE: std::cell::RefCell<Option<MetadataTailTrace>> =
         const { std::cell::RefCell::new(None) };
     static METADATA_TAIL_TRACE_ARMED: std::cell::Cell<bool> =
@@ -75,6 +78,7 @@ thread_local! {
 }
 
 /// Arm / disarm [`METADATA_TAIL_TRACE`] for the CURRENT thread.
+#[doc(hidden)] // internal: per-thread diagnostic test hook, not stable API
 pub fn set_metadata_tail_trace_armed(on: bool) {
     METADATA_TAIL_TRACE_ARMED.with(|c| c.set(on));
 }

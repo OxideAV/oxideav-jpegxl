@@ -485,59 +485,121 @@
 //! spec-conformant; new HF-decode wiring will call through
 //! [`idct::idct_for_transform`] exclusively.
 
+// Internal decode plumbing (Modular / VarDCT / ANS / bundle parsing):
+// `pub` so integration tests and fuzz targets can drive each stage, but
+// NOT part of the crate's stable API surface — `#[doc(hidden)]` keeps
+// cargo-semver-checks (and rustdoc) from treating internals as public.
+//
+// The stable surface is: the crate-root decode entry points
+// (`decode_one_frame` / `decode_all_frames` /
+// `decode_vardct_frame_from_codestream`), the probes (`probe` /
+// `probe_fdis` + their header types), the registry surface (`register` /
+// `register_codecs` / `make_encoder` / `CODEC_ID_STR`), and the
+// `container` / `metadata` / `metadata_fdis` / `extensions` modules
+// whose types appear in those signatures.
+#[doc(hidden)] // internal: committee-draft bit-level range coder (D.7)
 pub mod abrac;
+#[doc(hidden)] // internal: AFV transform primitives
 pub mod afv;
+#[doc(hidden)] // internal: FDIS Annex D entropy decoder plumbing
 pub mod ans;
+#[doc(hidden)] // internal: committee-draft bounded-Exp-Golomb coder (D.7.1)
 pub mod begabrac;
+#[doc(hidden)] // internal: LSB-first bitstream reader plumbing
 pub mod bitreader;
+#[doc(hidden)] // internal: VarDCT block-context resolution
 pub mod block_context_resolver;
+#[doc(hidden)] // internal: per-block dequantisation
 pub mod block_dequant;
+#[doc(hidden)] // internal: chroma-from-luma reconstruction
 pub mod chroma_from_luma;
+#[doc(hidden)] // internal: HF coefficient-order decode (C.7.1)
 pub mod coeff_order;
 pub mod container;
+#[doc(hidden)] // internal: multi-pass cross-pass coefficient accumulation
 pub mod cross_pass;
+#[doc(hidden)] // internal: DCT dequant weight tables (Listing C.10)
 pub mod dct_quant_weights;
+#[doc(hidden)] // internal: Table C.16 transform-type / varblock placement
 pub mod dct_select;
+#[doc(hidden)] // internal: edge-preserving filter (J.3)
 pub mod epf;
 pub mod extensions;
+#[doc(hidden)] // internal: §C.2 frame composition / blending state
 pub mod frame_compose;
+#[doc(hidden)] // internal: C.2 FrameHeader bundle parsing
 pub mod frame_header;
+#[doc(hidden)] // internal: Gaborish smoothing (J.2)
 pub mod gaborish;
+#[doc(hidden)] // internal: GlobalModular section decode (C.4.8 / G.1.3)
 pub mod global_modular;
+#[doc(hidden)] // internal: per-group rectangle geometry
 pub mod group_rect;
+#[doc(hidden)] // internal: HF histogram sizing helper
 pub mod hf_coeff_histogram_size;
+#[doc(hidden)] // internal: C.7.2 HF coefficient histograms
 pub mod hf_coefficient_histograms;
+#[doc(hidden)] // internal: F.3 HF dequantisation
 pub mod hf_dequant;
+#[doc(hidden)] // internal: C.6 HfGlobal bundle parsing
 pub mod hf_global;
+#[doc(hidden)] // internal: §C.7 HfGlobal-section assembly
 pub mod hf_global_section;
+#[doc(hidden)] // internal: C.7 HfPass coefficient orders
 pub mod hf_pass;
+#[doc(hidden)] // internal: Annex E.4 entropy-coded ICC stream decode
 pub mod icc;
+#[doc(hidden)] // internal: Annex I.2 inverse DCT primitives
 pub mod idct;
+#[doc(hidden)] // internal: F.1 LF dequantisation + F.2 smoothing
 pub mod lf_dequant;
+#[doc(hidden)] // internal: C.4 LfGlobal bundle parsing
 pub mod lf_global;
+#[doc(hidden)] // internal: G.2 LfGroup section decode
 pub mod lf_group;
+#[doc(hidden)] // internal: Listings I.15/I.16 LLF-from-LF composition
 pub mod llf_from_lf;
+#[doc(hidden)] // internal: committee-draft meta-adaptive tree (D.7.2)
 pub mod matree;
 pub mod metadata;
 pub mod metadata_fdis;
+#[doc(hidden)] // internal: committee-draft Modular channel decode (C.9)
 pub mod modular;
+#[doc(hidden)] // internal: FDIS Modular sub-bitstream decode (Annex H)
 pub mod modular_fdis;
+#[doc(hidden)] // internal: multi-pass decode driver
 pub mod multi_pass_decode;
+#[doc(hidden)] // internal: multi-pass HF header parsing
 pub mod multi_pass_hf_header;
+#[doc(hidden)] // internal: multi-pass HF histogram decoding
 pub mod multi_pass_hf_histogram_decoder;
+#[doc(hidden)] // internal: per-varblock non-zeros bookkeeping grid
 pub mod non_zeros_grid;
+#[doc(hidden)] // internal: §A.6 orientation transform (Table A.17)
 pub mod orientation;
+#[doc(hidden)] // internal: G.4 PassGroup Modular section decode
 pub mod pass_group;
+#[doc(hidden)] // internal: C.8.3 PassGroup HF coefficient decode
 pub mod pass_group_hf;
+#[doc(hidden)] // internal: per-channel non-zeros state
 pub mod per_channel_non_zeros;
+#[doc(hidden)] // internal: per-pass non-zeros state
 pub mod per_pass_non_zeros;
+#[doc(hidden)] // internal: C.9.3.1 pixel predictors
 pub mod predictors;
+#[doc(hidden)] // internal: residual-plane crop/accumulate helpers
 pub mod residual_plane;
+#[doc(hidden)] // internal: Annex K spline parse + render
 pub mod splines;
+#[doc(hidden)] // internal: C.3 TOC + Lehmer permutation decode
 pub mod toc;
+#[doc(hidden)] // internal: varblock raster walk
 pub mod varblock_walk;
+#[doc(hidden)] // internal: round-8 VarDCT scaffold + legacy 8x8 IDCT
 pub mod vardct;
+#[doc(hidden)] // internal: VarDCT LfGroup reconstruction drivers
 pub mod vardct_reconstruct;
+#[doc(hidden)] // internal: Annex L colour transforms (XYB / YCbCr)
 pub mod xyb;
 
 pub use container::{detect, extract_codestream, Signature};
@@ -1701,6 +1763,7 @@ thread_local! {
     /// test-hook pattern as the `modular_fdis` rich-range statics — a
     /// process-global arm flag would race between concurrently running
     /// tests (one test disarming while another thread is mid-decode).
+    #[doc(hidden)] // internal: per-thread diagnostic test hook, not stable API
     pub static VARDCT_XYB_CAPTURE: std::cell::RefCell<Option<[Vec<f32>; 3]>> =
         const { std::cell::RefCell::new(None) };
     /// Per-thread arm flag for [`VARDCT_XYB_CAPTURE`]. Off by default
@@ -1713,6 +1776,7 @@ thread_local! {
     /// stack)` exactly as fed to the §C.8.3 cross-pass reconstruction.
     /// Populated when [`set_vardct_hf_coeff_capture_armed`] armed the
     /// current thread.
+    #[doc(hidden)] // internal: per-thread diagnostic test hook, not stable API
     pub static VARDCT_HF_COEFF_CAPTURE: std::cell::RefCell<
         Option<Vec<(u32, crate::multi_pass_decode::MultiPassThreeChannelOutput)>>,
     > = const { std::cell::RefCell::new(None) };
@@ -1722,11 +1786,13 @@ thread_local! {
 }
 
 /// Arm / disarm [`VARDCT_HF_COEFF_CAPTURE`] for the CURRENT thread.
+#[doc(hidden)] // internal: per-thread diagnostic test hook, not stable API
 pub fn set_vardct_hf_coeff_capture_armed(on: bool) {
     VARDCT_HF_COEFF_CAPTURE_ARMED.with(|c| c.set(on));
 }
 
 /// Arm / disarm [`VARDCT_XYB_CAPTURE`] for the CURRENT thread.
+#[doc(hidden)] // internal: per-thread diagnostic test hook, not stable API
 pub fn set_vardct_xyb_capture_armed(on: bool) {
     VARDCT_XYB_CAPTURE_ARMED.with(|c| c.set(on));
 }
@@ -2099,6 +2165,7 @@ fn finish_vardct_decode(
 /// its structural invariants (plane count, dimensions, that every stage
 /// runs without aborting). Restoration filters (Gaborish §J.2, EPF
 /// §J.3) are likewise not applied here yet.
+#[doc(hidden)] // internal: mid-pipeline driver exposed for integration tests; use decode_one_frame
 pub fn decode_vardct_frame(
     fh: &FrameHeader,
     metadata: &ImageMetadataFdis,
