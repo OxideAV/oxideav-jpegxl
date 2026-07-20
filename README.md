@@ -260,16 +260,62 @@ and the Listing I.21 Squeeze tendency function.
 - **Squeeze decodes end-to-end** (second block): the Listing I.19
   default-parameter sequence (derived at transform-application time;
   the printed `count` formula has a sign typo), the Listing I.21
-  tendency **floor-division erratum** (the printed `Idiv` breaks every
-  negative-numerator case; pinned by solving real streams' coded
-  residuals — 255k+ samples), and the Listing D.8 `rleft = 0` column-0
-  rule. Single-group Squeeze is **bit-exact**
+  tendency erratum (refined round 420, below), and the Listing D.8
+  `rleft = 0` column-0 rule. Single-group Squeeze is **bit-exact**
   (`round408_squeeze_multilf`).
 - **§C.5.2 ModularLfGroup**: multi-LfGroup Modular frames decode — the
   `grayscale_public_university` conformance stream (2880×1620, 2 LF
-  groups, Squeeze) went from hard-`Unsupported` to a full decode
-  (MAD 1.68 vs the reference; the residual tail is a pre-existing
-  multi-group Squeeze divergence, ratcheted).
+  groups, Squeeze) went from hard-`Unsupported` to a full decode.
+
+### Round 420 — the multi-group Squeeze tail CLOSED, restoration filters on Modular
+
+- **Coded-domain forward-Squeeze oracle**
+  (`round420_squeeze_residual_oracle`): the inverse Squeeze is a
+  bijection, so forward-transforming a reference decode reconstructs
+  the exact coded channel pyramid; comparing it sample-by-sample
+  against the decoder's assembled pre-inverse Modular image pins every
+  GlobalModular / per-LfGroup / per-PassGroup residual slice exactly.
+- **Listing I.21 tendency half-tie erratum** (refines the round-408
+  floor reading): the division rounds **half-away-from-zero** —
+  `x = sign(m) × ((|m| + 6) Idiv 12)` for `m = 4A - 3C - B`. The two
+  readings differ ONLY on exact negative half-ties (`m ≡ 6 mod 12`,
+  ascending), which is precisely where every multi-group Squeeze
+  stream diverged. **`sq_512` is now bit-exact** (was MAD 0.27); the
+  round-408 "sporadic multi-group residual tail" was never a
+  group-boundary issue.
+- **Multi-LfGroup + weighted-predictor Squeeze pinned bit-exact**: new
+  fixture `sq_2880x320_wp` (2 LfGroups, 12 PassGroups, > 1024-node
+  all-predictor-6 global tree) decodes coded-domain and output
+  bit-exact — WP state, group-seam borders and the §C.5.2 walk all
+  verified in the coded domain. The D.4.2 tree-size cap now matches
+  the spec bound (`(1 << 26)`; the old 1024 working cap rejected this
+  real encoder output).
+- **Listing I.18 in-place inverse-Squeeze pairing fix**: `r` stays
+  constant through the c-loop (each merge removes `channel[r]`).
+  The old `r + (c - begin)` mis-paired every in-place step with
+  `num_c > 1` — invisible on grey pyramids, a hard error on the
+  3-channel XYB default sequence. Lossy-modular XYB streams now run
+  the full inverse (their RGB output mapping for Grey colour-space
+  frames is still pending).
+- **§J restoration filters wired into the registered Modular path**:
+  Gabor-like transform + EPF now run on Modular frames that signal
+  them. The `grayscale_public_university` stream (lossy Squeeze,
+  gab=1, epf_iters=3) drops from MAD 1.68 to **1.00**; its Modular
+  pyramid decode is verified fully in sync (all 87 modular
+  sub-bitstreams end on the D.3.3 ANS final-state invariant `0x130000`
+  — the residual is filter accuracy, not entropy or Squeeze).
+- **§J.2 EPF weight-sign erratum**: the printed
+  `4 × (sqrt(0.5) - 1) / sigma` is negative, making `Weight()`
+  INCREASE with distance (the most dissimilar neighbours would get
+  the largest weights) — contradicting J.3.1's normative "decreasing
+  function" prose. The magnitude `4 × (1 - sqrt(0.5))` is the
+  conformant reading (literal sign: MAD 6.3 on the same stream).
+- **Docs-gap (filed)**: the §J.3 EPF sample-domain / channel-scale
+  semantics for kModular non-XYB frames are underdetermined — under
+  the literal signalled `epf_sigma_for_modular = 20` the EPF is a
+  near-identity on 8-bit-scaled samples, while an (unjustified)
+  sigma ≈ ×32 would minimise the residual at ≈ 0.42. The literal
+  reading is shipped pending a behavioural trace.
 
 - **The ImageMetadata-tail SPECGAP is resolved** (Table A.16): the
   `default_transform` Bool() is unconditional — present even when
@@ -330,13 +376,14 @@ and the Listing I.21 Squeeze tendency function.
   samples (the `grayscale` stream's image output currently uses the
   signalled/default transfer, sRGB, rather than the profile's
   gamma-2.2-class `kTRC` curve).
-- The multi-GROUP Squeeze residual tail: sporadic per-sample
-  residual-channel decode divergences (~2 % of samples, scattered)
-  keep `sq_512` / `grayscale_public_university` at MAD 0.27 / 1.68
-  instead of bit-exact — single-group Squeeze is sample-exact, so the
-  divergence lives in the group-scoped decode of shift ≥ 1 channels
-  (predictor/property mismatch, not entropy desync; ratcheted in
-  `round408_squeeze_multilf`).
+- The §J.3 EPF sample-domain / channel-scale semantics for kModular
+  non-XYB frames (docs-gap, see Round 420 above) — keeps
+  `grayscale_public_university` at MAD 1.00 instead of lower; the
+  Squeeze/entropy decode of that stream is verified exact.
+- Output mapping for xyb_encoded Modular frames whose colour space is
+  Grey (3 XYB channels → 1 grey plane): the Modular + inverse-Squeeze
+  walk completes since round 420, the final XYB→grey hand-off is
+  unwired and errors loudly.
 - The kNoise / kPatches image features, JPEG reconstruction, and the
   LfFrame (`lf_level > 0`) dimension scaling `progressive-dc` needs.
 - The encoder (not registered).

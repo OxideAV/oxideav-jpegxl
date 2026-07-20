@@ -7,6 +7,60 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Round 420 — the "multi-group Squeeze residual tail" is CLOSED; it
+  was never a group-boundary issue:
+  - **Listing I.21 tendency half-tie erratum (refines round 408).**
+    The tendency division rounds HALF-AWAY-FROM-ZERO: for the
+    unbiased numerator `m = 4A - 3C - B`, `x = sign(m) × ((|m| + 6)
+    Idiv 12)`. This agrees with the round-408 biased-floor reading
+    everywhere except exact NEGATIVE half-ties (`m ≡ 6 mod 12`,
+    ascending branch, e.g. A=49 B=64 C=86 → -10.5 → -11), which is
+    precisely where every multi-group Squeeze stream diverged.
+    `sq_512` is now **bit-exact** (was MAD 0.27 ratchet).
+  - **Listing I.18 in-place inverse-Squeeze pairing**: `r` is
+    computed once per step and stays CONSTANT through the c-loop
+    (each merge removes `channel[r]`, shifting the next residual
+    down into `r`). The old arithmetic advanced the index as if no
+    removal happened — unreachable on 1-channel grey pyramids,
+    fatal on the 3-channel XYB default parameter sequence (`w1=4
+    w2=8 not pair-compatible` hard error on every lossy-modular XYB
+    stream). Such streams now decode through the full inverse.
+  - **D.4.2 MA-tree size cap**: raised from the old 1024-node
+    working cap to the spec bound (`tree.size() <= (1 << 26)`);
+    real encoder output (2880-px weighted-predictor Squeeze
+    streams) signals global trees past 1024 nodes.
+  - **§J.2 EPF weight-sign erratum**: the listing's printed
+    `inv_sigma = 4 × (sqrt(0.5) - 1) / sigma` is negative, making
+    `Weight()` an INCREASING function of distance — the most
+    dissimilar neighbours would get the largest weights,
+    contradicting the normative J.3.1 "decreasing function" prose
+    three times over. The magnitude `4 × (1 - sqrt(0.5))` is used.
+
+### Added
+
+- Round 420 — coded-domain forward-Squeeze oracle
+  (`round420_squeeze_residual_oracle`): the inverse Squeeze is a
+  bijection, so forward-transforming a reference decode reconstructs
+  the exact coded channel pyramid; comparing it against the decoder's
+  pre-inverse Modular image (new `MODULAR_PRE_INVERSE_CAPTURE`
+  diagnostic hook) pins every per-group / per-LfGroup residual sample
+  bit-exactly. New fixture `sq_2880x320_wp` (2 LfGroups, 12
+  PassGroups, all-weighted-predictor > 1024-node tree) is coded-domain
+  AND output bit-exact; `sq_512` likewise.
+- Round 420 — §J restoration filters wired into the registered
+  Modular decode path (Gabor-like transform + EPF on gab /
+  `epf_iters > 0` frames, grey riding the Y plane). On the 18181-3
+  `grayscale_public_university` conformance stream (lossy Squeeze,
+  gab=1, epf_iters=3) the reference-decode MAD drops 1.68 → 1.00;
+  the stream's Modular pyramid decode itself is verified fully in
+  sync (all 87 modular sub-bitstreams end on the D.3.3 ANS
+  final-state invariant). The residual gap is the §J.3-for-kModular
+  sample-domain / channel-scale docs-gap (the literal signalled
+  sigma makes the EPF a near-identity there; see
+  `apply_modular_restoration_filters`).
+
 ### Changed
 
 - Internal decode plumbing (Modular / VarDCT / ANS / bundle-parsing
