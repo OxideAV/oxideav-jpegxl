@@ -148,21 +148,24 @@ fn round144_vardct_sigma_default_sharpness_seven_full_quant() {
 
 /// FDIS §J.2 Listing J.2 — `inv_sigma` derivation at
 /// `step_multiplier = epf_pass0_sigma_scale = 0.9` (default),
-/// sigma derived above:
-/// `inv_sigma = 0.9 × 4 × (sqrt(0.5) - 1) / sigma`.
+/// sigma derived above. Round-420 sign erratum: the listing's
+/// printed `4 × (sqrt(0.5) - 1)` is negative, which would make
+/// Weight() an INCREASING function of distance — contradicting the
+/// normative J.3.1 "decreasing function" prose; the magnitude is
+/// used: `inv_sigma = 0.9 × 4 × (1 - sqrt(0.5)) / sigma`.
 #[test]
 fn round144_inv_sigma_for_pass0_from_default_rf() {
     let rf = RestorationFilter::default();
     let sigma = vardct_sigma_from_listing_j3(2.5, 7, &rf).unwrap();
     let inv = inv_sigma_for_pass(rf.epf_pass0_sigma_scale, sigma).unwrap();
-    let expected = rf.epf_pass0_sigma_scale * 4.0_f32 * (0.5_f32.sqrt() - 1.0) / sigma;
+    let expected = rf.epf_pass0_sigma_scale * 4.0_f32 * (1.0 - 0.5_f32.sqrt()) / sigma;
     assert!(
         (inv - expected).abs() < 1e-6,
         "inv_sigma {inv} != {expected}"
     );
-    // The numeric is negative under positive step_multiplier and
-    // positive sigma (sqrt(0.5) - 1 < 0).
-    assert!(inv < 0.0, "inv_sigma {inv} expected negative");
+    // Positive under positive step_multiplier and positive sigma —
+    // Weight() then DECREASES with distance as J.3.1 requires.
+    assert!(inv > 0.0, "inv_sigma {inv} expected positive");
 }
 
 /// FDIS §J.3.3 — `is_border_position` predicate hand-derived
@@ -370,5 +373,6 @@ fn round144_modular_sigma_default_is_1_point_0() {
     // clamp (the clamp is only in the VarDCT branch); the default
     // 1.0 is well clear regardless.
     let inv = inv_sigma_for_pass(1.0, rf.epf_sigma_for_modular).unwrap();
-    assert!(inv < 0.0);
+    // Positive per the round-420 J.2 weight-sign erratum.
+    assert!(inv > 0.0);
 }

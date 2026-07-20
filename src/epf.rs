@@ -454,11 +454,18 @@ pub fn inv_sigma_for_pass(step_multiplier: f32, sigma: f32) -> Result<f32> {
             "JXL EPF: sigma must be finite and > 0, got {sigma}"
         )));
     }
-    // 0.5_f32.sqrt() is the standard f32 sqrt; the constant
-    // (sqrt(0.5) - 1) ≈ -0.29289323. We compute at run time per
-    // call — cheap, and keeps the formula textual rather than
-    // pre-baking a literal.
-    let factor = 0.5_f32.sqrt() - 1.0_f32;
+    // Sign erratum (round 420): the listing prints `4 × (sqrt(0.5)
+    // - 1) / sigma`, which is NEGATIVE — and `v = 1.0 -
+    // scaled_distance × inv_sigma` would then INCREASE with
+    // distance, handing the largest weights to the most dissimilar
+    // neighbours. That contradicts the normative J.3.1 prose three
+    // times over ("each weight is computed as a DECREASING function
+    // of an L1 distance metric") and produces gross over-smoothing
+    // (MAD 1.0 → 6.3 on the 18181-3 `grayscale_public_university`
+    // stream, deltas up to ±160/255). The intended constant is the
+    // magnitude, `4 × (1 - sqrt(0.5)) ≈ 1.1716`; with it the filter
+    // matches the reference decode of that stream to MAD 0.012.
+    let factor = 1.0_f32 - 0.5_f32.sqrt();
     Ok(step_multiplier * 4.0_f32 * factor / sigma)
 }
 
@@ -1513,13 +1520,17 @@ mod tests {
         assert!(inv_sigma_for_pass(1.0, f32::NAN).is_err());
     }
 
-    /// `inv_sigma = step_multiplier × 4 × (sqrt(0.5) - 1) / sigma`.
+    /// `inv_sigma = step_multiplier × 4 × (1 - sqrt(0.5)) / sigma` —
+    /// the MAGNITUDE of the listing's printed constant (sign erratum,
+    /// round 420: the literal negative constant makes Weight() an
+    /// INCREASING function of distance, contradicting the J.3.1
+    /// "decreasing function" prose; see `inv_sigma_for_pass`).
     /// Hand-derived at step_multiplier=1, sigma=1.0:
-    /// inv_sigma = 4 × (sqrt(0.5) - 1) ≈ 4 × -0.29289323 ≈ -1.17157.
+    /// inv_sigma = 4 × (1 - sqrt(0.5)) ≈ 1.17157.
     #[test]
     fn inv_sigma_for_pass_hand_value() {
         let v = inv_sigma_for_pass(1.0, 1.0).unwrap();
-        let expected = 4.0_f32 * (0.5_f32.sqrt() - 1.0);
+        let expected = 4.0_f32 * (1.0 - 0.5_f32.sqrt());
         assert!((v - expected).abs() < 1e-6, "inv_sigma {v} != {expected}");
     }
 
@@ -2167,10 +2178,16 @@ mod tests {
     fn per_block_mixed_grid_skips_low_sigma_blocks() {
         let rf = modular_rf(1); // Step 1 only (5-tap, DistanceStep0and1)
                                 // 2×1 blocks across a 16×8 frame: left block skipped (0.1),
-                                // right block filtered (6.0).
+                                // right block filtered. The filtered sigma must be large
+                                // enough that Weight() — a DECREASING function of distance
+                                // per the round-420 sign erratum — stays above the pass-1
+                                // zeroflush for this pattern's cross-tap distances
+                                // (|Δ| = 3 × Σ channel_scale × 5 taps ≈ 7e2), else the
+                                // kernel degenerates to the identity and the "changed"
+                                // probe below is vacuous.
         let (w, h) = (16, 8);
         let base: Vec<f32> = (0..(w * h)).map(|v| ((v * 3) % 19) as f32).collect();
-        let grid = SigmaGrid::new(vec![0.1, 6.0], 2, 1).unwrap();
+        let grid = SigmaGrid::new(vec![0.1, 4000.0], 2, 1).unwrap();
 
         let (mut dx, mut dy, mut db) = (base.clone(), base.clone(), base.clone());
         apply_epf_iterations_per_block_sigma(&mut dx, &mut dy, &mut db, w, h, &grid, &rf).unwrap();
