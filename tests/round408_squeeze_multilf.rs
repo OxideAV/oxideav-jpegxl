@@ -6,19 +6,22 @@
 //!
 //! * `sq_32` (32×32, single group): **bit-exact** — pins the Listing
 //!   I.19 default-parameter sequence, the Listing I.21 tendency
-//!   FLOOR-division erratum, and the Listing D.8 `rleft = 0` column-0
-//!   rule end-to-end.
-//! * `sq_512` (512×512, 4 groups, 1 LfGroup): MAD ratchet — a
-//!   PRE-EXISTING sporadic per-sample residual-decode divergence
-//!   remains on multi-group Squeeze streams (~2 % of samples in the
-//!   group-scoped residual channel decode to slightly wrong values;
-//!   scattered, not group-boundary-aligned). Round 408 improved this
-//!   stream's MAD from 1.02 to 0.27 (tendency floor); the ratchet
-//!   pins the current bound so the tail can only shrink.
+//!   erratum, and the Listing D.8 `rleft = 0` column-0 rule
+//!   end-to-end.
+//! * `sq_512` (512×512, 4 groups, 1 LfGroup): **bit-exact** since
+//!   round 420 — the round-408 "sporadic multi-group residual tail"
+//!   (MAD 0.27) was never a group-boundary issue: it was the Listing
+//!   I.21 tendency mis-rounding exact negative half-ties (`4A - 3C -
+//!   B ≡ 6 mod 12`, ascending). Ties round HALF-AWAY-FROM-ZERO.
 //! * `grayscale_public_university` (2880×1620, ISO/IEC 18181-3
-//!   conformance, 2 LfGroups): decodes end-to-end through the new
-//!   §C.5.2 per-LfGroup walk (was: hard `Unsupported`); same
-//!   sporadic-residual tail, MAD ratchet 1.7 (was undecodable).
+//!   conformance, 2 LfGroups, LOSSY Squeeze + gab + 3-pass EPF): the
+//!   Modular pyramid decode is entropy-verified in sync (all 87
+//!   sub-bitstreams end on the D.3.3 ANS final-state invariant); the
+//!   residual MAD is restoration-filter accuracy, not Squeeze:
+//!   1.68 (r408, no filters) → 1.00 (r420: Gabor-like transform
+//!   wired + the §J.2 weight-sign erratum keeping EPF sane). The
+//!   remaining ≈1.0 is the §J.3-for-kModular sample-domain docs-gap
+//!   (see `apply_modular_restoration_filters`).
 
 use std::io::Cursor;
 
@@ -58,16 +61,14 @@ fn squeeze_default_params_32x32_bit_exact() {
 }
 
 #[test]
-fn squeeze_multigroup_512_ratchet() {
+fn squeeze_multigroup_512_bit_exact() {
     let (mad, max) = decode_and_compare(
         include_bytes!("fixtures/sq_512.jxl"),
         include_bytes!("fixtures/sq_512_expected.png"),
     );
-    // Known tail: sporadic residual-channel decode divergence on
-    // multi-group Squeeze (see module docs). Ratchet only — tighten
-    // to bit-exact when the tail is closed.
-    assert!(mad < 0.3, "sq_512 MAD ratchet regressed: {mad} (max {max})");
-    assert!(max <= 8, "sq_512 max-error ratchet regressed: {max}");
+    // Round 420: the Listing I.21 half-tie erratum closed the
+    // round-408 residual tail — multi-group Squeeze is bit-exact.
+    assert_eq!(max, 0, "multi-group Squeeze must be bit-exact (MAD {mad})");
 }
 
 #[test]
@@ -78,10 +79,13 @@ fn conformance_grayscale_public_university_decodes() {
     );
     // 2 LfGroups (2880 px wide) — pins the §C.5.2 ModularLfGroup walk
     // (channels with hshift >= 3 && vshift >= 3 decoded per LF group,
-    // slices clamped to the channel extent). Same sporadic-residual
-    // tail as sq_512; ratchet only.
+    // slices clamped to the channel extent). The Modular decode is
+    // entropy-verified in sync; the ratchet bounds the remaining §J
+    // restoration-filter accuracy (Gaborish wired round 420; EPF
+    // near-identity under the literal kModular sigma reading —
+    // docs-gap). Was 1.8 before round 420.
     assert!(
-        mad < 1.8,
+        mad < 1.05,
         "grayscale_public_university MAD ratchet regressed: {mad} (max {max})"
     );
 }

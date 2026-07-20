@@ -1515,6 +1515,24 @@ fn decode_frame_body(
     // documented in this crate's README under "Plane byte layout".
     let bps = metadata.bit_depth.bits_per_sample;
     let max_sample: i32 = (1i32 << bps) - 1;
+    // §J restoration filters on the Modular pass-through path
+    // (round 420): when the frame header signals the Gabor-like
+    // transform and/or the edge-preserving filter, they apply to the
+    // colour channels of the assembled frame BEFORE output
+    // quantisation — the 18181-3 `grayscale_public_university`
+    // conformance stream (lossy Squeeze, gab=1, epf_iters=3) is the
+    // staged pin. Extra channels (alpha, depth, ...) are not
+    // filtered.
+    let mut img = img;
+    if fh.restoration_filter.gab || fh.restoration_filter.epf_iters > 0 {
+        apply_modular_restoration_filters(
+            &mut img,
+            expected_chans,
+            &fh.restoration_filter,
+            max_sample,
+        )?;
+    }
+    let img = img;
     // Unclamped float planes for §C.2 composition: Modular samples may
     // legally lie outside [0, 2^bps - 1] and the blend arithmetic
     // needs them un-truncated (see `DecodedFrame::raw_f32`).
@@ -1781,6 +1799,113 @@ fn build_rgb_planes_from_ycbcr(img: &crate::modular_fdis::ModularImage) -> Resul
             data: b_bytes,
         },
     ])
+}
+
+/// Apply the §J restoration filters (Gabor-like transform + EPF) to
+/// the colour channels of a decoded Modular image, in place.
+///
+/// The filters run on 8-bit-scaled float samples (`v × 255 /
+/// max_sample`) and the result is rounded back to integers; the
+/// caller's output quantisation clamps as usual. For a 3-channel image
+/// the channels map to the three filter planes in order (the
+/// per-channel Gaborish weights and EPF channel scales apply
+/// positionally); a 1-channel (Grey) image rides the Y plane.
+///
+/// Fixture measurement (18181-3 `grayscale_public_university`, gab=1,
+/// epf_iters=3, epf_sigma_for_modular=20 signalled): the Gabor-like
+/// transform alone takes the reference-decode MAD from 1.57 to 1.00;
+/// the J.2-weight-sign erratum fix (see `epf::inv_sigma_for_pass`)
+/// keeps the EPF from wrecking that (literal sign: MAD 6.3). DOCS-GAP:
+/// under the literal signalled sigma the EPF is a near-identity here
+/// (distances ≈ channel_scale × cross-tap sums dwarf sigma = 20) while
+/// an unjustified sigma × ≈32 would minimise the residual at ≈ 0.42 —
+/// the §J.3 sample-domain / channel-scale semantics for kModular
+/// non-XYB frames are underdetermined by the spec text and need a
+/// behavioural trace; the literal reading is shipped.
+fn apply_modular_restoration_filters(
+    img: &mut crate::modular_fdis::ModularImage,
+    n_colour: usize,
+    rf: &crate::frame_header::RestorationFilter,
+    max_sample: i32,
+) -> Result<()> {
+    if !(rf.gab || rf.epf_iters > 0) || img.channels.is_empty() {
+        return Ok(());
+    }
+    if n_colour != 1 && n_colour != 3 {
+        return Err(Error::Unsupported(format!(
+            "jxl decoder (round 420): restoration filters on {n_colour}-colour-channel \
+             Modular frame not supported"
+        )));
+    }
+    if n_colour == 3 && img.channels.len() < 3 {
+        return Err(Error::InvalidData(
+            "JXL restoration filters: 3 colour channels expected but image has fewer".into(),
+        ));
+    }
+    let w = img.descs[0].width as usize;
+    let h = img.descs[0].height as usize;
+    for k in 0..n_colour {
+        let d = img.descs[k];
+        if d.width as usize != w || d.height as usize != h {
+            return Err(Error::Unsupported(
+                "jxl decoder (round 420): restoration filters on subsampled colour channels \
+                 not supported"
+                    .into(),
+            ));
+        }
+    }
+    // Filter domain: 8-bit-scaled samples (`v × 255 / max_sample`).
+    // The `epf_sigma_for_modular` default is 1.0 but real streams
+    // signal values like 20.0 — pixel-scale distances, not the [0, 1]
+    // float domain the XYB path uses (in [0, 1] a sigma of 20 makes
+    // every EPF weight saturate and the filter degenerates to a box
+    // blur; fixture-measured on `grayscale_public_university`).
+    let inv = 255.0f32 / max_sample as f32;
+    let to_f32 = |ch: &[i32]| -> Vec<f32> { ch.iter().map(|&v| v as f32 * inv).collect() };
+    let (mut p0, mut p1, mut p2) = if n_colour == 3 {
+        (
+            to_f32(&img.channels[0]),
+            to_f32(&img.channels[1]),
+            to_f32(&img.channels[2]),
+        )
+    } else {
+        // Grey rides the Y plane (index 1); X/B planes are zero. The
+        // grey channel then takes the Y-position Gaborish weights and
+        // the Y-position EPF channel scale — the "grey is the luma
+        // plane" reading. Measured closest to the reference decode of
+        // `grayscale_public_university` among the literal-sigma
+        // candidate mappings (see the module docs-gap note below).
+        let p = to_f32(&img.channels[0]);
+        let z = vec![0.0f32; p.len()];
+        (z.clone(), p, z)
+    };
+    if rf.gab {
+        crate::gaborish::apply_xyb_planes_in_place(&mut p0, &mut p1, &mut p2, w, h, rf)?;
+    }
+    if rf.epf_iters > 0 {
+        crate::epf::apply_epf_iterations(
+            &mut p0,
+            &mut p1,
+            &mut p2,
+            w,
+            h,
+            rf.epf_sigma_for_modular,
+            rf,
+        )?;
+    }
+    let from_f32 = |p: &[f32], ch: &mut Vec<i32>| {
+        for (dst, &v) in ch.iter_mut().zip(p.iter()) {
+            *dst = (v / inv).round() as i32;
+        }
+    };
+    if n_colour == 3 {
+        from_f32(&p0, &mut img.channels[0]);
+        from_f32(&p1, &mut img.channels[1]);
+        from_f32(&p2, &mut img.channels[2]);
+    } else {
+        from_f32(&p1, &mut img.channels[0]);
+    }
+    Ok(())
 }
 
 thread_local! {
