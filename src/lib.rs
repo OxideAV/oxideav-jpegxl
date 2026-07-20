@@ -1351,6 +1351,35 @@ fn decode_frame_body(
         // paragraph).
         let bit_depth = metadata.bit_depth.bits_per_sample.max(1);
         let transforms = lf_global.global_modular.transforms.clone();
+        if MODULAR_PRE_INVERSE_CAPTURE_ARMED.with(|c| c.get()) {
+            MODULAR_PRE_INVERSE_CAPTURE.with(|s| {
+                *s.borrow_mut() = Some((
+                    lf_global.global_modular.image.descs.clone(),
+                    lf_global.global_modular.image.channels.clone(),
+                    transforms.clone(),
+                ));
+            });
+            MODULAR_PRE_INVERSE_CAPTURE_INFO.with(|s| {
+                *s.borrow_mut() = Some(format!(
+                    "restoration_filter: {:?}\nwp_header: {:?}\nglobal_tree_present: {} inner_used_global_tree: {}\nlz77: {:?}\ntree: {}",
+                    fh.restoration_filter,
+                    lf_global.global_modular.wp_header,
+                    lf_global.global_modular.global_tree_present,
+                    lf_global.global_modular.inner_used_global_tree,
+                    lf_global
+                        .global_modular
+                        .global_tree
+                        .as_ref()
+                        .map(|t| t.entropy.lz77),
+                    lf_global
+                        .global_modular
+                        .global_tree
+                        .as_ref()
+                        .map(|t| t.debug_summary())
+                        .unwrap_or_else(|| "<none>".into()),
+                ));
+            });
+        }
         crate::global_modular::apply_inverse_transforms(
             &mut lf_global.global_modular.image,
             &transforms,
@@ -1783,6 +1812,40 @@ thread_local! {
     /// Per-thread arm flag for [`VARDCT_HF_COEFF_CAPTURE`].
     static VARDCT_HF_COEFF_CAPTURE_ARMED: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
+    /// Diagnostic capture of the fully-assembled Modular image at the
+    /// moment every per-LfGroup / per-PassGroup sub-bitstream has been
+    /// decoded and copied back, IMMEDIATELY BEFORE the frame-level
+    /// inverse transforms run (G.4.2 last paragraph). Payload:
+    /// `(descs, channels, transforms)` — the transforms carry any
+    /// materialised default Squeeze parameter sequence, so a test can
+    /// re-run the forward transform against reference pixels and
+    /// compare the coded-domain channels sample-by-sample. Populated
+    /// when [`set_modular_pre_inverse_capture_armed`] armed the
+    /// current thread.
+    #[doc(hidden)] // internal: per-thread diagnostic test hook, not stable API
+    #[allow(clippy::type_complexity)] // one-off diagnostic payload tuple
+    pub static MODULAR_PRE_INVERSE_CAPTURE: std::cell::RefCell<
+        Option<(
+            Vec<crate::modular_fdis::ChannelDesc>,
+            Vec<Vec<i32>>,
+            Vec<crate::modular_fdis::TransformInfo>,
+        )>,
+    > = const { std::cell::RefCell::new(None) };
+    /// Companion free-form diagnostics for
+    /// [`MODULAR_PRE_INVERSE_CAPTURE`]: WP header + MA-tree summary of
+    /// the GlobalModular section (armed by the same flag).
+    #[doc(hidden)] // internal: per-thread diagnostic test hook, not stable API
+    pub static MODULAR_PRE_INVERSE_CAPTURE_INFO: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+    /// Per-thread arm flag for [`MODULAR_PRE_INVERSE_CAPTURE`].
+    static MODULAR_PRE_INVERSE_CAPTURE_ARMED: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// Arm / disarm [`MODULAR_PRE_INVERSE_CAPTURE`] for the CURRENT thread.
+#[doc(hidden)] // internal: per-thread diagnostic test hook, not stable API
+pub fn set_modular_pre_inverse_capture_armed(on: bool) {
+    MODULAR_PRE_INVERSE_CAPTURE_ARMED.with(|c| c.set(on));
 }
 
 /// Arm / disarm [`VARDCT_HF_COEFF_CAPTURE`] for the CURRENT thread.

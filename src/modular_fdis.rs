@@ -854,7 +854,13 @@ impl MaTreeFdis {
         let mut nodes: Vec<MaNode> = Vec::new();
         let mut nodes_left: u32 = 1;
         let mut ctx_id: u32 = 0;
-        const MAX_NODES: usize = 1024;
+        // D.4.2 last paragraph: `tree.size() <= (1 << 26)`. The
+        // earlier 1024 working cap rejected real encoder output — a
+        // 2880-px lossless weighted-predictor Squeeze stream signals a
+        // > 1024-node global tree (round 420). Allocation stays
+        // bounded: each node is decoded from the stream, so a
+        // malformed stream still cannot allocate past the spec bound.
+        const MAX_NODES: usize = 1 << 26;
 
         // Local hybrid state for the tree sub-stream (LZ77 + window).
         let mut tree_hybrid = HybridUintState::new(tree_stream.lz77, tree_stream.lz_len_conf);
@@ -2539,21 +2545,44 @@ pub fn inverse_palette(
 }
 
 /// 2024-spec Annex H.6.2 / FDIS Listing I.21 — Tendency function.
+/// Public re-export of [`squeeze_tendency`] for the coded-domain
+/// forward-Squeeze test oracle (`round420_squeeze_residual_oracle`).
+#[doc(hidden)] // internal: diagnostic test hook, not stable API
+pub fn squeeze_tendency_pub(a: i32, b: i32, c: i32) -> i32 {
+    squeeze_tendency(a, b, c)
+}
+
 fn squeeze_tendency(a: i32, b: i32, c: i32) -> i32 {
-    // The listing prints `Idiv 12` (round toward zero), but the
-    // division is empirically FLOOR: solving real Squeeze streams'
-    // coded residuals for the encoder's tendency values gives e.g.
-    // (A=24, B=48, C=80) → -186 / 12 → -16 (floor), where Idiv's -15
-    // mis-reconstructs every downstream sample pair (round 408 —
-    // pinned on encoder-generated responsive-mode fixtures at three
-    // sizes plus the grayscale_public_university conformance stream;
-    // Idiv left a ±2/255 haze over the whole image, floor is
-    // sample-exact). The two readings agree for non-negative
-    // numerators, which is how the round-406 Idiv reading (imported
-    // here alongside the legitimate Listing C.16 Idiv fix, which
-    // stands) survived every non-Squeeze fixture.
-    let x_num = 4i64 * a as i64 - 3 * c as i64 - b as i64 + 6;
-    let mut x = x_num.div_euclid(12) as i32;
+    // The listing prints `(4A - 3C - B + 6) Idiv 12` (round toward
+    // zero). Empirically the division is ROUND-HALF-AWAY-FROM-ZERO of
+    // the UNBIASED numerator `m = 4A - 3C - B`, i.e.
+    // `sign(m) × ((|m| + 6) Idiv 12)`, refined in two steps:
+    //
+    // * Round 408 pinned negative-numerator cases as "floor" (the
+    //   Idiv reading mis-reconstructs every downstream sample pair;
+    //   floor((m+6)/12) fixed all sq_32 samples). Floor-of-biased and
+    //   half-away agree everywhere EXCEPT exact negative half-ties.
+    // * Round 420's coded-domain forward-Squeeze oracle (decoded
+    //   pyramid vs the bijective forward transform of the reference
+    //   decode) isolated the residual tail entirely to `m ≡ 6
+    //   (mod 12)` ascending triples (A < B < C, e.g. A=49 B=64 C=86,
+    //   m = -126, exact -10.5): floor-of-biased gives -10, every
+    //   coded stream wants -11. Ties round AWAY from zero, matching
+    //   the descending branch where floor((m+6)/12) already rounds
+    //   half-ties up (away). Closing this made sq_512 and the
+    //   multi-group / multi-LfGroup lossless fixtures bit-exact — the
+    //   "multi-group Squeeze tail" was never a group-boundary issue
+    //   at all.
+    //
+    // For non-negative numerators the expression below is identical
+    // to the literal biased-floor reading, which is how the earlier
+    // readings survived every descending-branch sample.
+    let m = 4i64 * a as i64 - 3 * c as i64 - b as i64;
+    let mut x = if m >= 0 {
+        ((m + 6) / 12) as i32
+    } else {
+        -(((-m + 6) / 12) as i32)
+    };
     if a >= b && b >= c {
         if x.wrapping_sub(x & 1) > 2i32.wrapping_mul(a.wrapping_sub(b)) {
             x = 2i32.wrapping_mul(a.wrapping_sub(b)).wrapping_add(1);

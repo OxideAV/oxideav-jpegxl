@@ -377,10 +377,18 @@ fn apply_inverse_squeeze(image: &mut ModularImage, squeeze_params: &[SqueezePara
                 .saturating_sub(begin)
         };
         for c in begin..=end {
-            // We pair channel[c] with channel[r + (c - begin)] (since
-            // each iteration removes channel r, the residual stays at
-            // the same index r as we step through c).
-            let r_index = if sp.in_place { r + (c - begin) } else { r };
+            // Listing I.18: `r` is computed ONCE per step and stays
+            // CONSTANT through the c-loop — each iteration merges
+            // `channel[r]` and removes it, so the next channel's
+            // residual shifts down INTO index r. This holds for both
+            // the in-place layout (residuals at end+1..end+num_c) and
+            // the at-the-end layout (residuals in the trailing
+            // num_c positions). Round 420: the previous in-place
+            // arithmetic advanced the index by (c - begin) as if no
+            // removal happened, mis-pairing every in-place step with
+            // num_c > 1 — unreachable on 1-channel grey pyramids,
+            // fatal on the 3-channel XYB default sequence.
+            let r_index = r;
             if r_index >= image.channels.len() {
                 return Err(Error::InvalidData(format!(
                     "JXL Modular Squeeze: residual channel index {r_index} out of range {}",
