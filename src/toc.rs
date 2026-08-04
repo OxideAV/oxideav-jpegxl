@@ -25,7 +25,7 @@ use oxideav_core::{Error, Result};
 use crate::ans::hybrid::HybridUintState;
 use crate::bitreader::{BitReader, U32Dist};
 use crate::frame_header::{Encoding, FrameHeader};
-use crate::modular_fdis::{decode_uint_in_with_dist_pub, EntropyStream};
+use crate::modular_fdis::EntropyStream;
 
 /// Decoded `TOC` per FDIS C.3.
 #[derive(Debug, Clone)]
@@ -198,23 +198,15 @@ impl Toc {
     }
 }
 
-/// `GetContext(x) = min(8, ceil(log2(x + 1)))` per FDIS C.3.2.
-fn get_context(x: u32) -> u32 {
-    if x <= 1 {
-        // ceil(log2(0+1)) = 0; ceil(log2(1+1)) = 1.
-        x
-    } else {
-        let nbits = 32 - (x).leading_zeros();
-        nbits.min(8)
-    }
-}
-
-/// FDIS C.3.2 Lehmer-code permutation decoder.
+/// FDIS C.3.2 Lehmer-code permutation decoder (TOC call site,
+/// `skip = 0` per C.3.1).
 ///
-/// Reads the integer `end` from the 8-cluster D.3 sub-stream using
-/// distribution `D[GetContext(size)]`, then `(end - skip)` further
-/// integers (skip = 0 for TOC), then turns the resulting Lehmer
-/// sequence into the final permutation array.
+/// Reads the §C.3.1 permutation sub-stream prelude
+/// (`PermStreamConfig::num_dists` clustered distributions per D.3 —
+/// see `crate::coeff_order` for the Part 8.3 context/count
+/// resolution) and delegates the Lehmer walk to the shared
+/// [`decode_permutation_from_stream`] so the TOC and Listing C.12
+/// call sites cannot drift apart.
 ///
 /// Round 393: the sub-stream is a FULL D.3 entropy stream — cjxl's
 /// large-image progressive TOC permutations ship with LZ77 enabled —
@@ -241,83 +233,22 @@ fn decode_permutation(br: &mut BitReader<'_>, size: usize) -> Result<Vec<u32>> {
     }
 
     // C.3.1: "a single entropy coded stream with 8 clustered
-    // distributions, as specified in D.3". The full D.3 prelude —
+    // distributions, as specified in D.3" (count per the Part 8.3
+    // resolution — see `PermStreamConfig`). The full D.3 prelude —
     // LZ77Params (+1 distance context when enabled), clustering,
     // use_prefix_code, per-cluster configs + distributions — then the
     // ANS state init (u(32), a no-op for prefix streams) directly
     // before the first symbol.
-    let mut stream = EntropyStream::read(br, 8)?;
+    let cfg = crate::coeff_order::perm_stream_config();
+    let mut stream = EntropyStream::read(br, cfg.num_dists as usize)?;
     stream.read_ans_state_init(br)?;
     let mut hybrid = HybridUintState::new(stream.lz77, stream.lz_len_conf);
-    let mut decode_one = |br: &mut BitReader<'_>, ctx_dist: u32| -> Result<u32> {
-        decode_uint_in_with_dist_pub(&mut hybrid, &mut stream, br, ctx_dist, 0)
-    };
-
-    // FDIS: end = decode using D[GetContext(size)]; we pass the
-    // GetContext result as the ctx into our distribution-context
-    // mapping. The values returned by GetContext are 0..=8, but we
-    // only have 8 distributions — so cap at 7.
-    let end_ctx = get_context(size as u32).min(7);
-    let end = decode_one(br, end_ctx)?;
-    if end as u64 > size as u64 {
-        return Err(Error::InvalidData(format!(
-            "JXL permutation: decoded end {end} exceeds size {size}"
-        )));
-    }
-    let end = end as usize;
-
-    let mut lehmer = vec![0u32; size];
-    let mut prev: u32 = 0;
-    // skip = 0 for TOC (per C.3.1).
-    for slot in lehmer.iter_mut().take(end) {
-        let ctx = get_context(prev).min(7);
-        let v = decode_one(br, ctx)?;
-        if v as u64 >= size as u64 {
-            return Err(Error::InvalidData(format!(
-                "JXL permutation: lehmer entry {v} >= size {size}"
-            )));
-        }
-        *slot = v;
-        prev = v;
-    }
-
-    // Convert Lehmer code to permutation using the spec's `temp`
-    // procedure: temp = [0..size); for each i, append temp[lehmer[i]]
-    // to permutation, remove from temp.
-    let mut temp: Vec<u32> = (0..size as u32).collect();
-    let mut permutation: Vec<u32> = Vec::with_capacity(size);
-    for &lh in &lehmer {
-        let idx = lh as usize;
-        if idx >= temp.len() {
-            return Err(Error::InvalidData(
-                "JXL permutation: lehmer index out of range".into(),
-            ));
-        }
-        let v = temp.remove(idx);
-        permutation.push(v);
-    }
-    // Remaining elements in temp keep their natural order at the tail
-    // of the permutation.
-    permutation.extend_from_slice(&temp);
-    Ok(permutation)
+    crate::coeff_order::decode_permutation_from_stream(br, &mut stream, &mut hybrid, size, 0)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn get_context_basic() {
-        assert_eq!(get_context(0), 0);
-        assert_eq!(get_context(1), 1);
-        assert_eq!(get_context(2), 2);
-        assert_eq!(get_context(3), 2);
-        assert_eq!(get_context(4), 3);
-        // saturate at 8
-        assert_eq!(get_context(255), 8);
-        assert_eq!(get_context(256), 8);
-        assert_eq!(get_context(u32::MAX), 8);
-    }
 
     #[test]
     fn num_toc_entries_single_group_single_pass() {

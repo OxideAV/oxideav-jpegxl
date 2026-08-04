@@ -127,12 +127,10 @@ pub fn recognise_vardct_codestream(
 ) -> std::result::Result<VarDctScaffold, Error> {
     // Round 393: multi-LfGroup frames are assembled at the frame level
     // by `decode_vardct_frame` (§C.5 tiling) — no LF-group-count gate.
-    if fh.passes.num_passes > 1 {
-        return Err(Error::Unsupported(format!(
-            "jxl VarDCT (round 8 scaffold): num_passes = {} > 1 not yet supported",
-            fh.passes.num_passes
-        )));
-    }
+    // Round 437: no pass-count gate either — the §C.3.1 pass-major TOC
+    // walk, per-pass §C.7 orders/histograms and the §C.8.3 cross-pass
+    // accumulation (round 389) drive `num_passes > 1` frames end to end
+    // (pinned on the staged `progressive-ac-multipass` fixture).
     if metadata.num_extra_channels > 0 {
         return Err(Error::Unsupported(format!(
             "jxl VarDCT (round 8 scaffold): {} extra channels not yet supported",

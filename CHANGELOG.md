@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Round 437 — §C.7.1 custom coefficient orders: the Part 8.3 finite
+  bisection (staged `fdis-errata.md`) is EXHAUSTED and the machinery
+  is now first-class:
+  - The frame-level **multi-pass gate is lifted**: `num_passes > 1`
+    VarDCT frames are no longer refused up-front — the §C.3.1
+    pass-major TOC walk, per-pass §C.7 slices and the §C.8.3
+    cross-pass accumulation (round 389) run end to end, and a
+    multi-pass stream now decodes or stops only at a real boundary.
+  - **`PermStreamConfig`** (`coeff_order`): the §C.3.2
+    permutation-stream shape — the per-entry `D[prev_elem]` reading
+    (three candidate readings) × the clustered-distribution count
+    (8/cap-7 vs 9/cap-8) — has one home shared by the §C.3.1 TOC
+    call site and the Listing C.12 `DecodePermutation`; the TOC
+    reader now delegates its Lehmer walk to the shared decoder so
+    the two call sites cannot drift. A per-thread override feeds the
+    bisection harness.
+  - **D.3.3 ANS final-state closure enforced** at the end of the
+    shared Listing C.12 permutation stream: a state ≠ `0x130000`
+    is now a precise loud `InvalidData` at the exact boundary
+    instead of a confusing downstream §C.7.2 misparse.
+  - Bisection result (fixture `progressive-ac-multipass` + local
+    specimens, full-decode + closure oracles): NO grid point closes.
+    The shipped default (`GetContext` of the previous value, 8
+    distributions, cap 7) is the only in-range walk — a bit-level
+    hand-decode of a minimal single-order prefix-coded specimen
+    confirms it consumes exactly the prescribed bits — but the §C.7
+    layout after a preset's order bundle (or the §C.7.2 prelude) is
+    still underdetermined; refined docs-gap filed via the round
+    report. `used_orders != 0` streams keep refusing loudly.
+
 ### Fixed
 
 - Round 420 — the "multi-group Squeeze residual tail" is CLOSED; it

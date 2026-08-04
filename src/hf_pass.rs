@@ -134,23 +134,37 @@ impl HfPass {
             // state is shared by EVERY DecodePermutation() call in the
             // per-bit loop below — it is read ONCE here.
             //
-            // KNOWN GAP, narrowed round 408 (was round 393): the C.3.2
-            // `end` field is pinned as a COUNT of coded Lehmer entries
-            // (see `decode_permutation_from_stream`), which advances
-            // real `used_orders != 0` streams past every
-            // DecodePermutation() — but the stream's exact bit
-            // consumption is still wrong somewhere: on locally
-            // generated `used_orders` streams the shared stream's ANS
-            // final state misses the D.3.3 0x130000 invariant and the
-            // §C.7.2 parse that follows misparses LOUDLY (never a
-            // silent misdecode). Still needs a per-symbol §C.3.2
-            // trace (end token + per-entry context / token /
-            // renormalisation bits) from a small custom-orders
-            // stream — docs-gap refined round 408.
-            let mut entropy = EntropyStream::read(br, 8)?;
+            // Round 437 — the round-408 "exact bit consumption still
+            // wrong somewhere" gap is CLOSED: the per-entry context
+            // reading + distribution count are resolved by the
+            // fdis-errata.md Part 8.3 six-way bisection (see
+            // `crate::coeff_order::PermStreamConfig`), with the D.3.3
+            // ANS final-state closure below as the decisive per-stream
+            // oracle and the staged `progressive-ac-multipass` fixture
+            // as the end-to-end pin.
+            let cfg = crate::coeff_order::perm_stream_config();
+            let mut entropy = EntropyStream::read(br, cfg.num_dists as usize)?;
             entropy.read_ans_state_init(br)?;
             let mut hybrid = HybridUintState::new(entropy.lz77, entropy.lz_len_conf);
-            build_permuted_orders(br, &mut entropy, &mut hybrid, used_orders)?
+            let orders = build_permuted_orders(br, &mut entropy, &mut hybrid, used_orders)?;
+            // D.3.3: "the decoder checks that the final state of the
+            // ANS decoder is 0x130000" — the shared permutation
+            // stream ends with the last DecodePermutation() symbol,
+            // so the invariant must hold HERE. A miss means the
+            // stream was misparsed; erroring loudly upholds the
+            // crate's no-silent-misparse contract. (Prefix-coded
+            // streams carry no ANS state; nothing to check.)
+            if let Some(ans) = entropy.ans_state.as_ref() {
+                if !ans.final_state() {
+                    return Err(Error::InvalidData(format!(
+                        "JXL HfPass: ANS final-state invariant (0x130000) failed at the end \
+                         of the C.3.2 permutation stream (state {:#x}) - used_orders \
+                         sub-stream misparsed",
+                        ans.state()
+                    )));
+                }
+            }
+            orders
         } else {
             // used_orders == 0 → every order is the natural order.
             build_natural_orders()

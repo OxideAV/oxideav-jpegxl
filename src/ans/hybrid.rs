@@ -245,9 +245,34 @@ impl HybridUintState {
         ctx: u32,
         ctx_lz: u32,
         dist_multiplier: u32,
-        mut read_token: R,
+        read_token: R,
         configs: C,
     ) -> Result<u32>
+    where
+        R: FnMut(&mut BitReader<'_>, u32) -> Result<u32>,
+        C: Fn(u32) -> HybridUintConfig,
+    {
+        self.decode_with_token(br, ctx, ctx_lz, dist_multiplier, read_token, configs)
+            .map(|(v, _)| v)
+    }
+
+    /// Like [`Self::decode`], but additionally returns the raw
+    /// entropy-coded token the value was completed from — `Some(token)`
+    /// when the value was decoded as a literal, `None` when it was
+    /// produced by an LZ77 window copy (a copied value has no token of
+    /// its own). Needed by the §C.3.2 permutation-context bisection
+    /// (`crate::coeff_order`): the committee-draft reading selects the
+    /// next entry's distribution by the PREVIOUS entry's ANS symbol
+    /// (`s[i-1]`), which is exactly this token.
+    pub fn decode_with_token<R, C>(
+        &mut self,
+        br: &mut BitReader<'_>,
+        ctx: u32,
+        ctx_lz: u32,
+        dist_multiplier: u32,
+        mut read_token: R,
+        configs: C,
+    ) -> Result<(u32, Option<u32>)>
     where
         R: FnMut(&mut BitReader<'_>, u32) -> Result<u32>,
         C: Fn(u32) -> HybridUintConfig,
@@ -262,7 +287,7 @@ impl HybridUintState {
                 self.num_to_copy -= 1;
                 self.window[(self.num_decoded as usize) & (WINDOW_SIZE - 1)] = r;
                 self.num_decoded = self.num_decoded.wrapping_add(1);
-                return Ok(r);
+                return Ok((r, None));
             }
 
             let token = read_token(br, ctx)?;
@@ -317,7 +342,7 @@ impl HybridUintState {
             let r = cfg.read_uint(br, token)?;
             self.window[(self.num_decoded as usize) & (WINDOW_SIZE - 1)] = r;
             self.num_decoded = self.num_decoded.wrapping_add(1);
-            return Ok(r);
+            return Ok((r, Some(token)));
         }
     }
 }

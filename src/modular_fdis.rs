@@ -2175,6 +2175,24 @@ pub fn decode_uint_in_with_dist_pub(
     decode_uint_in_with_dist(hybrid, entropy, br, ctx, dist_multiplier)
 }
 
+/// Like [`decode_uint_in_with_dist_pub`], but additionally returns the
+/// raw entropy-coded token the value was completed from (`None` when
+/// the value came out of the LZ77 window — a copied value has no token
+/// of its own). Consumed by the §C.3.2 permutation-context machinery in
+/// [`crate::coeff_order`], whose committee-draft candidate reading
+/// selects the next entry's distribution by the previous entry's ANS
+/// symbol.
+#[doc(hidden)] // internal: decode plumbing for the §C.3.2 permutation context
+pub fn decode_uint_in_with_dist_token_pub(
+    hybrid: &mut HybridUintState,
+    entropy: &mut EntropyStream,
+    br: &mut BitReader<'_>,
+    ctx: u32,
+    dist_multiplier: u32,
+) -> Result<(u32, Option<u32>)> {
+    decode_uint_in_with_dist_token(hybrid, entropy, br, ctx, dist_multiplier)
+}
+
 /// Variant of `decode_uint_in` that propagates a non-zero
 /// `dist_multiplier` to the LZ77 special-distance branch (H.3 prescribes
 /// this for the channel-decode hybrid uint stream).
@@ -2200,6 +2218,18 @@ fn decode_uint_in_with_dist(
     ctx: u32,
     dist_multiplier: u32,
 ) -> Result<u32> {
+    decode_uint_in_with_dist_token(hybrid, entropy, br, ctx, dist_multiplier).map(|(v, _)| v)
+}
+
+/// Core of [`decode_uint_in_with_dist`] that also surfaces the raw
+/// entropy-coded token (`None` for LZ77-copied values).
+fn decode_uint_in_with_dist_token(
+    hybrid: &mut HybridUintState,
+    entropy: &mut EntropyStream,
+    br: &mut BitReader<'_>,
+    ctx: u32,
+    dist_multiplier: u32,
+) -> Result<(u32, Option<u32>)> {
     let lz_dist_ctx = if entropy.lz77.enabled {
         entropy.cluster_map.len().saturating_sub(1) as u32
     } else {
@@ -2249,7 +2279,7 @@ fn decode_uint_in_with_dist(
             }
         }
     };
-    hybrid.decode(br, ctx, lz_dist_ctx, dist_multiplier, read_token, cfg_for)
+    hybrid.decode_with_token(br, ctx, lz_dist_ctx, dist_multiplier, read_token, cfg_for)
 }
 
 // ----------------------------------------------------------------------

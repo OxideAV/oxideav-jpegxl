@@ -295,21 +295,116 @@ fn listing_i14_keys(x: u32, y: u32, cx: u32, cy: u32, m: u32) -> (u32, i64) {
     (key1 as u32, key2)
 }
 
-/// `GetContext(x) = min(8, ceil(log2(x + 1)))` per FDIS §C.3.2.
+/// `GetContext(x) = min(cap, ceil(log2(x + 1)))` per FDIS §C.3.2, with
+/// the cap threaded in from [`PermStreamConfig`].
 ///
-/// The eight clustered distributions `D` are indexed by `GetContext`,
-/// whose range is 0..=8. Callers cap the value at 7 before using it as
-/// a distribution context because there are only 8 distributions
-/// (indices 0..=7) — this matches the existing TOC permutation reader
-/// (`crate::toc`).
-fn get_context(x: u32) -> u32 {
+/// The printed text is self-contradictory here (the staged
+/// `fdis-errata.md` Part 8.3 catalogues it): `GetContext` as printed is
+/// `min(8, ceil(log2(x + 1)))` — nine distinct values — while both call
+/// sites (§C.3.1 and Listing C.12) declare the stream carries **8**
+/// clustered distributions, so context 8 would be out of range. Exactly
+/// one of {cap is 7, distribution count is 9} is the erratum; the
+/// resolved combination lives in [`PermStreamConfig::default`], and the
+/// cap is always `num_dists - 1` so the two stay consistent.
+fn get_context(x: u32, cap: u32) -> u32 {
     if x <= 1 {
         // ceil(log2(0+1)) = 0; ceil(log2(1+1)) = 1.
-        x
+        x.min(cap)
     } else {
         let nbits = 32 - x.leading_zeros();
-        nbits.min(8)
+        nbits.min(cap)
     }
+}
+
+/// Candidate readings for the §C.3.2 per-entry distribution selector
+/// (`D[prev_elem]`), catalogued in the staged `fdis-errata.md` Part 8.3.
+/// The FDIS and the committee draft disagree on what `prev_elem` is,
+/// and neither printed form indexes the declared distribution array
+/// consistently:
+///
+/// * [`Self::LehmerValue`] — the FDIS literal: `prev_elem` is the
+///   previous *reconstructed* Lehmer value `lehmer[skip + i - 1]`
+///   (range up to `size`, capped to the distribution count).
+/// * [`Self::PrevToken`] — the committee draft: `prev_elem` is the
+///   previous entry's raw ANS symbol `s[i - 1]` (the exponent token,
+///   capped). An LZ77-copied value has no token; the reading falls
+///   back to `GetContext` of the value in that case.
+/// * [`Self::GetContextOfValue`] — `D[GetContext(lehmer[skip+i-1])]`:
+///   the previous value routed through the same context bucketing the
+///   `end` decode uses.
+#[doc(hidden)] // internal: §C.3.2 bisection surface, not stable API
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PermPrevContext {
+    /// FDIS literal: previous reconstructed value.
+    LehmerValue,
+    /// Committee draft: previous raw token.
+    PrevToken,
+    /// `GetContext` of the previous reconstructed value.
+    GetContextOfValue,
+}
+
+/// The §C.3.2 permutation-stream shape: the per-entry context reading ×
+/// the clustered-distribution count (8 with `GetContext` capped at 7,
+/// or 9 with the printed cap of 8). One home for both call sites (the
+/// §C.3.1 TOC permutation and the Listing C.12 `DecodePermutation`).
+#[doc(hidden)] // internal: §C.3.2 bisection surface, not stable API
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PermStreamConfig {
+    /// Per-entry `D[prev_elem]` reading.
+    pub prev_context: PermPrevContext,
+    /// Number of clustered distributions read from the §D.3 prelude
+    /// (8 or 9). `GetContext` is capped at `num_dists - 1`.
+    pub num_dists: u32,
+}
+
+impl Default for PermStreamConfig {
+    /// The shipped combination (round 437): `GetContext` of the
+    /// previous reconstructed value over **8** clustered distributions
+    /// with the context capped at 7.
+    ///
+    /// **Status — sole in-range survivor, NOT yet closure-verified.**
+    /// The round-437 walk of the full Part 8.3 grid (3 readings × 2
+    /// distribution counts) against `used_orders != 0` specimens found
+    /// this the only combination whose Lehmer entries stay within the
+    /// shrinking `temp` bound on every specimen, and a bit-level hand
+    /// decode of a minimal single-order prefix-coded specimen confirmed
+    /// it consumes exactly the bits RFC 7932 §3.4 + §D.3.5/§D.3.6
+    /// prescribe — but on ANS-coded specimens the shared stream still
+    /// misses the D.3.3 final-state closure, and on multi-preset
+    /// streams the next preset's `used_orders` reads back garbage. The
+    /// residual divergence (a §C.7 layout / §C.7.2-prelude question the
+    /// finite grid cannot separate) is a docs-gap; `HfPass::read`
+    /// refuses loudly at this boundary either way, so no combination
+    /// can silently misdecode.
+    fn default() -> Self {
+        Self {
+            prev_context: PermPrevContext::GetContextOfValue,
+            num_dists: 8,
+        }
+    }
+}
+
+thread_local! {
+    /// Per-thread override of [`PermStreamConfig::default`] — the
+    /// bisection harness sets this to walk the Part 8.3 candidate
+    /// grid; production decodes leave it `None`.
+    static PERM_STREAM_CONFIG_OVERRIDE: std::cell::Cell<Option<PermStreamConfig>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Override the §C.3.2 permutation-stream shape for the CURRENT thread
+/// (`None` restores the resolved default). Bisection-harness hook.
+#[doc(hidden)] // internal: per-thread bisection test hook, not stable API
+pub fn set_perm_stream_config_override(cfg: Option<PermStreamConfig>) {
+    PERM_STREAM_CONFIG_OVERRIDE.with(|c| c.set(cfg));
+}
+
+/// The active §C.3.2 permutation-stream shape for this thread.
+#[doc(hidden)] // internal: read by `crate::toc` + `crate::hf_pass`
+pub fn perm_stream_config() -> PermStreamConfig {
+    PERM_STREAM_CONFIG_OVERRIDE
+        .with(|c| c.get())
+        .unwrap_or_default()
 }
 
 /// FDIS §C.3.2 — decode one permutation of length `size` from an already
@@ -359,8 +454,11 @@ pub fn decode_permutation_from_stream(
         return Ok(Vec::new());
     }
 
-    // `end` is decoded against D[GetContext(size)] (capped at 7: only
-    // 8 distributions exist).
+    let cfg = perm_stream_config();
+    let cap = cfg.num_dists - 1;
+
+    // `end` is decoded against D[GetContext(size)] (context capped at
+    // `num_dists - 1` — see `get_context` / `PermStreamConfig`).
     //
     // Round 408 — the §C.3.2 `end` ambiguity ("endpoint vs count",
     // round-393 docs-gap) resolved on the 18181-3 `grayscale`
@@ -373,8 +471,8 @@ pub fn decode_permutation_from_stream(
     // prefix"), which no endpoint reading admits. With `skip == 0`
     // (the TOC case validated round 393) the two readings coincide,
     // which is why this stayed ambiguous until a `skip != 0` oracle
-    // existed.
-    let end_ctx = get_context(size as u32).min(7);
+    // existed. (Codified as `fdis-errata.md` Part 8.2.)
+    let end_ctx = get_context(size as u32, cap);
     let end = decode_uint_in_with_dist_pub(hybrid, entropy, br, end_ctx, 0)? as usize;
     if end > size - skip {
         return Err(Error::InvalidData(format!(
@@ -383,12 +481,29 @@ pub fn decode_permutation_from_stream(
     }
 
     // `end` Lehmer entries are produced; indices [skip, skip + end).
-    // All other lehmer entries stay 0.
+    // All other lehmer entries stay 0. The distribution for each entry
+    // is selected from the PREVIOUS entry per the active
+    // `PermPrevContext` reading (fdis-errata.md Part 8.3).
     let mut lehmer = vec![0u32; size];
-    let mut prev: u32 = 0;
+    let mut prev_value: u32 = 0;
+    let mut prev_token: Option<u32> = None;
+    let mut first = true;
     for slot in lehmer.iter_mut().take(skip + end).skip(skip) {
-        let ctx = get_context(prev).min(7);
-        let v = decode_uint_in_with_dist_pub(hybrid, entropy, br, ctx, 0)?;
+        let ctx = if first {
+            // `prev_elem` is 0 for the first entry under every reading.
+            0
+        } else {
+            match cfg.prev_context {
+                PermPrevContext::LehmerValue => prev_value.min(cap),
+                PermPrevContext::PrevToken => match prev_token {
+                    Some(t) => t.min(cap),
+                    None => get_context(prev_value, cap),
+                },
+                PermPrevContext::GetContextOfValue => get_context(prev_value, cap),
+            }
+        };
+        let (v, token) =
+            crate::modular_fdis::decode_uint_in_with_dist_token_pub(hybrid, entropy, br, ctx, 0)?;
         // lehmer[i] indexes the (shrinking) `temp` array, so it must be
         // strictly less than the remaining temp length at that step.
         // The tightest static bound is `< size`; the exact-length check
@@ -398,8 +513,11 @@ pub fn decode_permutation_from_stream(
                 "JXL coeff permutation: lehmer entry {v} >= size {size}"
             )));
         }
+
         *slot = v;
-        prev = v;
+        prev_value = v;
+        prev_token = token;
+        first = false;
     }
 
     lehmer_to_permutation(&lehmer)
@@ -669,18 +787,23 @@ mod tests {
 
     #[test]
     fn get_context_matches_spec() {
-        // GetContext(x) = min(8, ceil(log2(x + 1))).
-        assert_eq!(get_context(0), 0); // ceil(log2(1)) = 0
-        assert_eq!(get_context(1), 1); // ceil(log2(2)) = 1
-        assert_eq!(get_context(2), 2); // ceil(log2(3)) = 2
-        assert_eq!(get_context(3), 2); // ceil(log2(4)) = 2
-        assert_eq!(get_context(4), 3); // ceil(log2(5)) = 3
-        assert_eq!(get_context(7), 3); // ceil(log2(8)) = 3
-        assert_eq!(get_context(8), 4); // ceil(log2(9)) = 4
-                                       // Saturates at 8.
-        assert_eq!(get_context(255), 8);
-        assert_eq!(get_context(256), 8);
-        assert_eq!(get_context(u32::MAX), 8);
+        // GetContext(x) = min(cap, ceil(log2(x + 1))); the resolved
+        // default cap is 7 (8 distributions — fdis-errata.md Part 8.3).
+        assert_eq!(get_context(0, 7), 0); // ceil(log2(1)) = 0
+        assert_eq!(get_context(1, 7), 1); // ceil(log2(2)) = 1
+        assert_eq!(get_context(2, 7), 2); // ceil(log2(3)) = 2
+        assert_eq!(get_context(3, 7), 2); // ceil(log2(4)) = 2
+        assert_eq!(get_context(4, 7), 3); // ceil(log2(5)) = 3
+        assert_eq!(get_context(7, 7), 3); // ceil(log2(8)) = 3
+        assert_eq!(get_context(8, 7), 4); // ceil(log2(9)) = 4
+                                          // Saturates at the cap.
+        assert_eq!(get_context(255, 7), 7);
+        assert_eq!(get_context(256, 7), 7);
+        assert_eq!(get_context(u32::MAX, 7), 7);
+        // The printed (uncapped-at-7) form saturates at 8.
+        assert_eq!(get_context(255, 8), 8);
+        assert_eq!(get_context(u32::MAX, 8), 8);
+        assert_eq!(get_context(127, 8), 7);
     }
 
     #[test]
