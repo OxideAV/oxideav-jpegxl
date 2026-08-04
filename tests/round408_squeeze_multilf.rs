@@ -81,11 +81,13 @@ fn conformance_grayscale_public_university_decodes() {
     // (channels with hshift >= 3 && vshift >= 3 decoded per LF group,
     // slices clamped to the channel extent). The Modular decode is
     // entropy-verified in sync; the ratchet bounds the remaining §J
-    // restoration-filter accuracy (Gaborish wired round 420; EPF
-    // near-identity under the literal kModular sigma reading —
-    // docs-gap). Was 1.8 before round 420.
+    // restoration-filter accuracy. Was 1.8 before round 420 (no EPF),
+    // 1.00 rounds 420-431 (literal sample-domain reading), 0.2909
+    // since round 437 resolved the fdis-errata.md Part 9 kModular
+    // sample-domain + grey-mapping SPECGAP by the prescribed grid
+    // bisection (see `round437_modular_epf_posture`).
     assert!(
-        mad < 1.05,
+        mad < 0.32,
         "grayscale_public_university MAD ratchet regressed: {mad} (max {max})"
     );
 }

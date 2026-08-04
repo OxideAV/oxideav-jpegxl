@@ -1801,27 +1801,132 @@ fn build_rgb_planes_from_ycbcr(img: &crate::modular_fdis::ModularImage) -> Resul
     ])
 }
 
+/// Sample domain the §J filters run in for kModular non-XYB frames —
+/// the §9.3 (fdis-errata.md Part 9) SPECGAP freedom. The FDIS never
+/// states what domain Annex J sees for kModular; the staged errata
+/// catalogue enumerates two self-consistent readings next to the
+/// as-printed literal one, and prescribes an in-crate bisection with
+/// the black-box reference decode as the residual oracle.
+#[doc(hidden)] // internal: Part 9 bisection surface, not stable API
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModularEpfDomain {
+    /// The as-printed literal reading: raw integer samples (scaled to
+    /// the 8-bit range for non-8-bit depths), `sigma` as signalled.
+    Raw8Literal,
+    /// Part 9 reading **N1**: samples normalised to `[0, 1]`
+    /// (`raw / (2^bps - 1)`), `sigma` and the §J.3.3 `sigma < 0.3`
+    /// block-skip untouched.
+    Normalised,
+    /// Part 9 reading **N2**: samples raw, `sigma` multiplied by
+    /// `2^bps - 1`. Weight-identical to N1; differs only through any
+    /// clause that reads `sigma` directly (the 0.3 skip rule).
+    SigmaScaled,
+}
+
+/// Which filter plane (and therefore which `epf_channel_scale` /
+/// Gaborish weight position) a 1-channel Grey Modular frame rides —
+/// the §9.2 (fdis-errata.md Part 9) SPECGAP freedom: Annex J is
+/// written for exactly three channels and states no reduction rule.
+#[doc(hidden)] // internal: Part 9 bisection surface, not stable API
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModularGreyMapping {
+    /// Grey is channel 0 (§7.3 channel order "first Grey") —
+    /// `epf_channel_scale[0]` (40.0) alone. Part 9's recommended
+    /// posture.
+    C0,
+    /// Grey rides the Y position — `epf_channel_scale[1]` (5.0).
+    YPlane,
+    /// Grey replicated into all three planes — distances scale by
+    /// `40 + 5 + 3.5` (the §9.2 "1.2125× relative to c0" candidate).
+    Replicate3,
+}
+
+/// The (domain × grey-mapping) posture for §J filters on kModular
+/// non-XYB frames. One home for the Part 9 bisection grid.
+#[doc(hidden)] // internal: Part 9 bisection surface, not stable API
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ModularEpfPosture {
+    /// §9.3 sample-domain reading.
+    pub domain: ModularEpfDomain,
+    /// §9.2 grey-channel mapping.
+    pub grey: ModularGreyMapping,
+}
+
+impl Default for ModularEpfPosture {
+    /// The shipped posture — the argmin of the round-437 3×3 grid
+    /// measurement on the 18181-3 `grayscale_public_university`
+    /// stream (lossy Squeeze, gab=1, epf_iters=3,
+    /// `epf_sigma_for_modular = 20` signalled) against its black-box
+    /// reference decode; the arbitration is CI-gated
+    /// (`round437_modular_epf_posture`). Measured grid (grey-plane
+    /// MAD / max, 2880×1620):
+    ///
+    /// | domain          | C0          | YPlane      | Replicate3      |
+    /// |-----------------|-------------|-------------|-----------------|
+    /// | `Raw8Literal`   | 1.0041 / 21 | 1.0009 / 21 | 1.0042 / 21     |
+    /// | `Normalised`    | 0.4157 / 23 | 1.9995 / 83 | **0.2909 / 8**  |
+    /// | `SigmaScaled`   | 0.4157 / 23 | 1.9995 / 83 | 0.2909 / 8      |
+    ///
+    /// `Normalised` and `SigmaScaled` are weight-identical (Part 9
+    /// predicted this: they differ only through the §J.3.3
+    /// `sigma < 0.3` skip, which the signalled sigma = 20 never
+    /// triggers under either); `Normalised` is shipped so the skip
+    /// rule keeps operating on its calibrated scale. The
+    /// `Normalised/C0` cell reproduces #312's reported ≈ 0.42
+    /// empirical best fit exactly, confirming the "×32" fit was the
+    /// missing domain normalisation, and the §9.2 grey 3-way
+    /// bisection then selects `Replicate3` decisively (0.29 vs 0.42
+    /// vs 2.0).
+    fn default() -> Self {
+        Self {
+            domain: ModularEpfDomain::Normalised,
+            grey: ModularGreyMapping::Replicate3,
+        }
+    }
+}
+
+thread_local! {
+    /// Per-thread override of [`ModularEpfPosture::default`] for the
+    /// Part 9 bisection harness.
+    static MODULAR_EPF_POSTURE_OVERRIDE: std::cell::Cell<Option<ModularEpfPosture>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Override the kModular §J posture for the CURRENT thread (`None`
+/// restores the measured default). Bisection-harness hook.
+#[doc(hidden)] // internal: per-thread bisection test hook, not stable API
+pub fn set_modular_epf_posture_override(p: Option<ModularEpfPosture>) {
+    MODULAR_EPF_POSTURE_OVERRIDE.with(|c| c.set(p));
+}
+
+fn modular_epf_posture() -> ModularEpfPosture {
+    MODULAR_EPF_POSTURE_OVERRIDE
+        .with(|c| c.get())
+        .unwrap_or_default()
+}
+
 /// Apply the §J restoration filters (Gabor-like transform + EPF) to
 /// the colour channels of a decoded Modular image, in place.
 ///
-/// The filters run on 8-bit-scaled float samples (`v × 255 /
-/// max_sample`) and the result is rounded back to integers; the
-/// caller's output quantisation clamps as usual. For a 3-channel image
-/// the channels map to the three filter planes in order (the
-/// per-channel Gaborish weights and EPF channel scales apply
-/// positionally); a 1-channel (Grey) image rides the Y plane.
+/// The sample domain and the 1-channel (Grey) plane mapping follow the
+/// active [`ModularEpfPosture`] — the two SPECGAP freedoms the staged
+/// `fdis-errata.md` Part 9 catalogues for kModular non-XYB frames
+/// (§9.3: Annex J states no sample domain for kModular; §9.2: Annex J
+/// is written for exactly three channels). The shipped default is the
+/// argmin of the round-437 3×3 grid measurement on the
+/// `grayscale_public_university` conformance stream (see
+/// `ModularEpfPosture::default`); the filtered result is rounded back
+/// to integers and the caller's output quantisation clamps as usual.
 ///
 /// Fixture measurement (18181-3 `grayscale_public_university`, gab=1,
 /// epf_iters=3, epf_sigma_for_modular=20 signalled): the Gabor-like
 /// transform alone takes the reference-decode MAD from 1.57 to 1.00;
 /// the J.2-weight-sign erratum fix (see `epf::inv_sigma_for_pass`)
-/// keeps the EPF from wrecking that (literal sign: MAD 6.3). DOCS-GAP:
-/// under the literal signalled sigma the EPF is a near-identity here
-/// (distances ≈ channel_scale × cross-tap sums dwarf sigma = 20) while
-/// an unjustified sigma × ≈32 would minimise the residual at ≈ 0.42 —
-/// the §J.3 sample-domain / channel-scale semantics for kModular
-/// non-XYB frames are underdetermined by the spec text and need a
-/// behavioural trace; the literal reading is shipped.
+/// keeps the EPF from wrecking that (literal sign: MAD 6.3). The
+/// residual ≈1.0 tail (#312's "an unjustified sigma ≈ ×32 would reach
+/// ≈ 0.42") remains open per Part 9's verdict: a factor that is
+/// neither the full-scale normaliser nor a clean shift is a symptom of
+/// a third missing rule and must not be adopted.
 fn apply_modular_restoration_filters(
     img: &mut crate::modular_fdis::ModularImage,
     n_colour: usize,
@@ -1854,13 +1959,28 @@ fn apply_modular_restoration_filters(
             ));
         }
     }
-    // Filter domain: 8-bit-scaled samples (`v × 255 / max_sample`).
-    // The `epf_sigma_for_modular` default is 1.0 but real streams
-    // signal values like 20.0 — pixel-scale distances, not the [0, 1]
-    // float domain the XYB path uses (in [0, 1] a sigma of 20 makes
-    // every EPF weight saturate and the filter degenerates to a box
-    // blur; fixture-measured on `grayscale_public_university`).
-    let inv = 255.0f32 / max_sample as f32;
+    let posture = modular_epf_posture();
+    // §9.3 sample domain (Part 9): the literal reading runs on
+    // 8-bit-scaled samples with `sigma` as signalled; N1 normalises
+    // samples to [0, 1]; N2 keeps samples raw-8-bit-scaled and scales
+    // `sigma` by the same full-scale factor instead (weight-identical
+    // to N1, but the §J.3.3 `sigma < 0.3` skip reads the scaled
+    // sigma).
+    let inv = match posture.domain {
+        ModularEpfDomain::Raw8Literal | ModularEpfDomain::SigmaScaled => {
+            255.0f32 / max_sample as f32
+        }
+        ModularEpfDomain::Normalised => 1.0f32 / max_sample as f32,
+    };
+    let sigma = match posture.domain {
+        ModularEpfDomain::Raw8Literal => rf.epf_sigma_for_modular,
+        // N1: samples land in [0, 1]; sigma (and the 0.3 skip) stay
+        // untouched per the Part 9 recommendation.
+        ModularEpfDomain::Normalised => rf.epf_sigma_for_modular,
+        // N2: samples stay full-scale; sigma carries the full-scale
+        // factor instead.
+        ModularEpfDomain::SigmaScaled => rf.epf_sigma_for_modular * 255.0,
+    };
     let to_f32 = |ch: &[i32]| -> Vec<f32> { ch.iter().map(|&v| v as f32 * inv).collect() };
     let (mut p0, mut p1, mut p2) = if n_colour == 3 {
         (
@@ -1869,29 +1989,23 @@ fn apply_modular_restoration_filters(
             to_f32(&img.channels[2]),
         )
     } else {
-        // Grey rides the Y plane (index 1); X/B planes are zero. The
-        // grey channel then takes the Y-position Gaborish weights and
-        // the Y-position EPF channel scale — the "grey is the luma
-        // plane" reading. Measured closest to the reference decode of
-        // `grayscale_public_university` among the literal-sigma
-        // candidate mappings (see the module docs-gap note below).
+        // §9.2 grey mapping (Part 9): Annex J is written for exactly
+        // three channels and states no reduction rule for a 1-channel
+        // Grey frame; the three self-consistent candidates are
+        // measured by the round-437 grid.
         let p = to_f32(&img.channels[0]);
         let z = vec![0.0f32; p.len()];
-        (z.clone(), p, z)
+        match posture.grey {
+            ModularGreyMapping::C0 => (p, z.clone(), z),
+            ModularGreyMapping::YPlane => (z.clone(), p, z),
+            ModularGreyMapping::Replicate3 => (p.clone(), p.clone(), p),
+        }
     };
     if rf.gab {
         crate::gaborish::apply_xyb_planes_in_place(&mut p0, &mut p1, &mut p2, w, h, rf)?;
     }
     if rf.epf_iters > 0 {
-        crate::epf::apply_epf_iterations(
-            &mut p0,
-            &mut p1,
-            &mut p2,
-            w,
-            h,
-            rf.epf_sigma_for_modular,
-            rf,
-        )?;
+        crate::epf::apply_epf_iterations(&mut p0, &mut p1, &mut p2, w, h, sigma, rf)?;
     }
     let from_f32 = |p: &[f32], ch: &mut Vec<i32>| {
         for (dst, &v) in ch.iter_mut().zip(p.iter()) {
@@ -1903,7 +2017,11 @@ fn apply_modular_restoration_filters(
         from_f32(&p1, &mut img.channels[1]);
         from_f32(&p2, &mut img.channels[2]);
     } else {
-        from_f32(&p1, &mut img.channels[0]);
+        let grey_out = match posture.grey {
+            ModularGreyMapping::C0 | ModularGreyMapping::Replicate3 => &p0,
+            ModularGreyMapping::YPlane => &p1,
+        };
+        from_f32(grey_out, &mut img.channels[0]);
     }
     Ok(())
 }

@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Round 437 — the §J.3-for-kModular restoration-filter SPECGAP
+  (staged `fdis-errata.md` Part 9) is RESOLVED by the prescribed
+  in-crate grid bisection; no behavioural trace was needed:
+  - **§9.3 sample domain**: kModular non-XYB frames present Annex J
+    with samples normalised to `[0, 1]` (`raw / (2^bps - 1)`; Part 9
+    reading N1), keeping the XYB-calibrated `epf_channel_scale` /
+    `epf_sigma_for_modular` constants on the scale they were tuned
+    for. The as-printed literal reading (raw samples) degenerated the
+    EPF to a near-identity.
+  - **§9.2 grey mapping**: a 1-channel Grey frame is replicated into
+    all three Annex J planes (distances weighted by the full
+    `40 + 5 + 3.5` channel-scale sum), selected decisively over the
+    grey-in-c0 and grey-as-Y candidates.
+  - `grayscale_public_university` reference-decode MAD drops
+    **1.00 → 0.2909** (max error 21 → 8); the ratchet tightens to
+    0.32. The previously reported "unjustified sigma ≈ ×32 best fit
+    at ≈ 0.42" is reproduced exactly by the normalised-domain
+    grey-in-c0 grid cell — that fit was the missing domain
+    normalisation. The arbitration is CI-gated
+    (`round437_modular_epf_posture`), same pattern as the round-393
+    §F.2 ramp.
+
 ### Changed
 
 - Round 437 — §C.7.1 custom coefficient orders: the Part 8.3 finite
