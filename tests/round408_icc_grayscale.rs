@@ -142,17 +142,28 @@ fn synthesised_profile_round_trips_byte_exact() {
     );
 }
 
-/// The full grayscale frame decode reaches the §C.7.1 custom
-/// coefficient orders and fails LOUDLY there (never a silent
-/// misparse). Flip to a pixel assertion when the C.3.2 permutation
-/// semantics gap closes.
+/// The full grayscale frame DECODES since round 437 — the §C.7.1
+/// boundary this test used to pin was the Listing C.12 per-channel
+/// permutation layout erratum (see `round437_custom_orders_decode`),
+/// now resolved. The decode is structural only: this stream's
+/// `want_icc` output must go through the embedded profile's
+/// gamma-2.2-class `kTRC` curve, which the crate documents as an open
+/// limitation (the signalled/default sRGB transfer is used instead),
+/// so the pixel values are NOT yet reference-accurate. This test pins
+/// the structural decode (dimensions + planes + non-degenerate
+/// output); flip to a pixel ratchet when the ICC transfer-curve
+/// application lands.
 #[test]
-fn grayscale_frame_decode_fails_loudly_at_c71_boundary() {
-    let err = oxideav_jpegxl::decode_one_frame(GRAYSCALE, None)
-        .expect_err("grayscale frame decode is expected to stop at the §C.7.1 boundary");
-    let msg = format!("{err}");
-    assert!(
-        msg.contains("HybridUintConfig") || msg.contains("coeff permutation"),
-        "expected a loud §C.7-area error, got: {msg}"
-    );
+fn grayscale_frame_decodes_past_the_former_c71_boundary() {
+    let frame = oxideav_jpegxl::decode_one_frame(GRAYSCALE, None)
+        .expect("grayscale frame must decode (round 437 §C.7.1 per-channel layout)");
+    assert_eq!(frame.planes.len(), 3);
+    assert_eq!(frame.planes[0].stride, 200);
+    assert_eq!(frame.planes[0].data.len(), 200 * 200);
+    // Non-degenerate: the image is not a constant plane.
+    let p = &frame.planes[0].data;
+    let (mn, mx) = p
+        .iter()
+        .fold((255u8, 0u8), |(a, b), &v| (a.min(v), b.max(v)));
+    assert!(mx > mn, "decoded grayscale image is a constant plane");
 }

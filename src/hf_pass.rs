@@ -78,12 +78,26 @@ pub struct HfPass {
     /// order ID `b` carries a permutation; otherwise the order takes
     /// its natural ordering.
     pub used_orders: u32,
-    /// Final coefficient order per [`OrderId`]. Length = 13. For an
-    /// order whose `used_orders` bit is 0, this is exactly
-    /// [`natural_coeff_order(o)`]; for an order whose bit is 1, the
-    /// permutation is `natural_coeff_order[nat_ord_perm[i]]`, where
-    /// `nat_ord_perm` is the §C.3.2 `DecodePermutation()` result.
-    pub orders: [Vec<u32>; NUM_ORDERS],
+    /// Final coefficient order per channel × [`OrderId`] — indexed
+    /// `orders[channel][order_id]` with the §C.8.3 channel numbering
+    /// (0 = X, 1 = Y, 2 = B). For an order whose `used_orders` bit is
+    /// 0, every channel takes [`natural_coeff_order(o)`]; for a set
+    /// bit, THREE §C.3.2 `DecodePermutation()` results are decoded
+    /// from the shared stream — one per channel in the §C.8.3 decode
+    /// sequence **Y, X, B** — and
+    /// `orders[c][b][i] = natural_coeff_order[nat_ord_perm_c[i]]`.
+    ///
+    /// **Round-437 erratum (fixture-pinned).** Listing C.12 prints ONE
+    /// `DecodePermutation()` per set bit; the wire carries one per
+    /// colour channel. Pinned bit-exactly on the staged
+    /// `patches-256x256` fixture, whose clean-room decode trace gives
+    /// per-stream ground truth for the HfGlobal section: under the
+    /// printed one-per-bit reading the §C.7.2 read starts 281 bits
+    /// early and its prelude misparses, while under one-per-channel
+    /// the very next bit begins a §C.7.2 whose parse reproduces the
+    /// trace exactly (`lz77=0`, ANS, 74 clusters) and the frame's
+    /// AC decode comes out reference-accurate.
+    pub orders: [[Vec<u32>; NUM_ORDERS]; 3],
     /// Number of clustered distributions the §C.7.2 step reads from
     /// the codestream: `495 × num_hf_presets × nb_block_ctx`. The
     /// histogram bytes themselves are not yet consumed by this
@@ -103,9 +117,10 @@ impl HfPass {
     ///   `num_histogram_distributions`.
     ///
     /// When `used_orders != 0` the decoder reads the shared 8-cluster
-    /// ANS stream (Listing C.12) once and then a `DecodePermutation()`
-    /// (§C.3.2) for each set bit, building the permuted coefficient
-    /// order `order[i] = natural_coeff_order[nat_ord_perm[i]]`.
+    /// ANS stream (Listing C.12) once and then THREE
+    /// `DecodePermutation()` (§C.3.2) per set bit — one per colour
+    /// channel in Y, X, B order (round-437 erratum; see [`Self::orders`]) —
+    /// building `orders[c][b][i] = natural_coeff_order[nat_ord_perm[i]]`.
     ///
     /// Returns `Err(InvalidData)` when the parsed `used_orders` exceeds
     /// its 13-bit cap (defensive: the
@@ -188,14 +203,22 @@ impl HfPass {
         })
     }
 
-    /// Look up the final coefficient order for an [`OrderId`].
-    pub fn order_for(&self, o: OrderId) -> &[u32] {
-        &self.orders[o.index() as usize]
+    /// Look up the final coefficient order for a colour channel
+    /// (§C.8.3 numbering: 0 = X, 1 = Y, 2 = B) and an [`OrderId`].
+    pub fn order_for(&self, channel: u32, o: OrderId) -> &[u32] {
+        &self.orders[(channel as usize).min(2)][o.index() as usize]
     }
 }
 
+/// Build the per-channel 13-element natural-order set (every order =
+/// natural, identical across the three channels).
+fn build_natural_orders() -> [[Vec<u32>; NUM_ORDERS]; 3] {
+    let one = build_natural_orders_one();
+    [one.clone(), one.clone(), one]
+}
+
 /// Build the 13-element natural-order set (every order = natural).
-fn build_natural_orders() -> [Vec<u32>; NUM_ORDERS] {
+fn build_natural_orders_one() -> [Vec<u32>; NUM_ORDERS] {
     [
         natural_coeff_order(OrderId::Id0),
         natural_coeff_order(OrderId::Id1),
@@ -233,7 +256,7 @@ fn build_permuted_orders(
     entropy: &mut EntropyStream,
     hybrid: &mut HybridUintState,
     used_orders: u32,
-) -> Result<[Vec<u32>; NUM_ORDERS]> {
+) -> Result<[[Vec<u32>; NUM_ORDERS]; 3]> {
     // Start from the all-natural baseline; overwrite the permuted ones.
     let mut orders = build_natural_orders();
     for b in 0..NUM_ORDERS as u32 {
@@ -244,25 +267,42 @@ fn build_permuted_orders(
         let natural = natural_coeff_order(order_id);
         let size = natural.len();
         let skip = size / 64;
-        let nat_ord_perm = decode_permutation_from_stream(br, entropy, hybrid, size, skip)?;
-        if nat_ord_perm.len() != size {
-            return Err(Error::InvalidData(format!(
-                "JXL HfPass: DecodePermutation for order {b} returned {} entries (expected {size})",
-                nat_ord_perm.len()
-            )));
+        // Round-437 erratum: the wire carries THREE permutations per
+        // set bit — one per colour channel, transmitted in the §C.8.3
+        // decode sequence Y, X, B (Listing C.12 prints only one; the
+        // staged `patches-256x256` decode trace pins the per-channel
+        // layout bit-exactly — see the `HfPass::orders` docs).
+        // Round-437 erratum: the wire carries THREE §C.3.2 permutations
+        // per set bit — one per colour channel, transmitted in the
+        // §C.8.3 decode sequence Y, X, B (Listing C.12 prints only
+        // one). Pinned bit-exactly by the staged `patches-256x256`
+        // clean-room decode trace (the §C.7.2 stream that follows
+        // starts exactly at the section position the trace records,
+        // and the whole HfGlobal section lands on the trace's
+        // AC_GLOBAL_END bit count) and by the D.3.3 ANS final-state
+        // closure on ANS-coded specimens, which fails under the
+        // printed one-per-bit reading and closes under this one.
+        for channel in [1usize, 0, 2] {
+            let nat_ord_perm = decode_permutation_from_stream(br, entropy, hybrid, size, skip)?;
+            if nat_ord_perm.len() != size {
+                return Err(Error::InvalidData(format!(
+                    "JXL HfPass: DecodePermutation for order {b} returned {} entries (expected {size})",
+                    nat_ord_perm.len()
+                )));
+            }
+            // order[i] = natural_coeff_order[nat_ord_perm[i]] (Listing C.12).
+            let mut permuted = Vec::with_capacity(size);
+            for &p in &nat_ord_perm {
+                let pi = p as usize;
+                let v = *natural.get(pi).ok_or_else(|| {
+                    Error::InvalidData(format!(
+                        "JXL HfPass: permutation index {pi} out of range for order {b} (size {size})"
+                    ))
+                })?;
+                permuted.push(v);
+            }
+            orders[channel][b as usize] = permuted;
         }
-        // order[i] = natural_coeff_order[nat_ord_perm[i]].
-        let mut permuted = Vec::with_capacity(size);
-        for &p in &nat_ord_perm {
-            let pi = p as usize;
-            let v = *natural.get(pi).ok_or_else(|| {
-                Error::InvalidData(format!(
-                    "JXL HfPass: permutation index {pi} out of range for order {b} (size {size})"
-                ))
-            })?;
-            permuted.push(v);
-        }
-        orders[b as usize] = permuted;
     }
     Ok(orders)
 }
@@ -333,7 +373,7 @@ mod tests {
         for i in 0..NUM_ORDERS as u32 {
             let o = OrderId::from_index(i).unwrap();
             let expected = natural_coeff_order(o);
-            assert_eq!(hp.order_for(o), expected.as_slice(), "order {i}");
+            assert_eq!(hp.order_for(1, o), expected.as_slice(), "order {i}");
         }
         // 495 × 1 × 15 = 7425
         assert_eq!(hp.num_histogram_distributions, 7425);

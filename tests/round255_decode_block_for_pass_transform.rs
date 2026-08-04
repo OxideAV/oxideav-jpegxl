@@ -65,7 +65,7 @@ fn r255_integration_dct8x8_short_circuits_with_zero_non_zeros() {
     let mut br = BitReader::new(&bytes);
     let bits_before = br.bits_read();
     let (decoded, raw) = ctx
-        .decode_block_for_pass_transform(&mut br, 0, TransformType::Dct8x8, 0, 0, 15)
+        .decode_block_for_pass_transform(&mut br, 0, 1, TransformType::Dct8x8, 0, 0, 15)
         .unwrap();
     // DCT8x8: size = 64, num_blocks = 1.
     assert_eq!(decoded.coeffs.len(), 64);
@@ -88,6 +88,7 @@ fn r255_integration_dct16x16_yields_256_coeff_vec_short_circuit() {
         .decode_block_for_pass_transform(
             &mut br,
             0,
+            1,
             TransformType::Dct16x16,
             32, // predicted_non_zeros at (0, 0)
             0,
@@ -108,7 +109,7 @@ fn r255_integration_dct16x8_yields_128_coeff_vec_short_circuit() {
     let bytes = [0u8; 4];
     let mut br = BitReader::new(&bytes);
     let (decoded, raw) = ctx
-        .decode_block_for_pass_transform(&mut br, 0, TransformType::Dct16x8, 0, 0, 15)
+        .decode_block_for_pass_transform(&mut br, 0, 1, TransformType::Dct16x8, 0, 0, 15)
         .unwrap();
     // DCT16x8: size = 128, num_blocks = 2.
     assert_eq!(decoded.coeffs.len(), 128);
@@ -123,7 +124,7 @@ fn r255_integration_dct8x16_yields_128_coeff_vec_short_circuit() {
     let bytes = [0u8; 4];
     let mut br = BitReader::new(&bytes);
     let (decoded, raw) = ctx
-        .decode_block_for_pass_transform(&mut br, 0, TransformType::Dct8x16, 0, 0, 15)
+        .decode_block_for_pass_transform(&mut br, 0, 1, TransformType::Dct8x16, 0, 0, 15)
         .unwrap();
     // DCT8x16: size = 128, num_blocks = 2.
     assert_eq!(decoded.coeffs.len(), 128);
@@ -141,7 +142,7 @@ fn r255_integration_dct4x4_yields_64_coeff_vec_short_circuit() {
     let bytes = [0u8; 4];
     let mut br = BitReader::new(&bytes);
     let (decoded, raw) = ctx
-        .decode_block_for_pass_transform(&mut br, 0, TransformType::Dct4x4, 0, 0, 15)
+        .decode_block_for_pass_transform(&mut br, 0, 1, TransformType::Dct4x4, 0, 0, 15)
         .unwrap();
     assert_eq!(decoded.coeffs.len(), 64);
     assert_eq!(raw, 0);
@@ -168,13 +169,13 @@ fn r255_integration_per_pass_offset_routes_through_cluster_map() {
     let mut br = BitReader::new(&bytes);
     // Pass 0 — offset 0.
     let (d0, raw0) = ctx
-        .decode_block_for_pass_transform(&mut br, 0, TransformType::Dct8x8, 0, 0, 1)
+        .decode_block_for_pass_transform(&mut br, 0, 1, TransformType::Dct8x8, 0, 0, 1)
         .unwrap();
     assert_eq!(raw0, 0);
     assert_eq!(d0.coeffs.len(), 64);
     // Pass 1 — offset 495.
     let (d1, raw1) = ctx
-        .decode_block_for_pass_transform(&mut br, 1, TransformType::Dct8x8, 0, 0, 1)
+        .decode_block_for_pass_transform(&mut br, 1, 1, TransformType::Dct8x8, 0, 0, 1)
         .unwrap();
     assert_eq!(raw1, 0);
     assert_eq!(d1.coeffs.len(), 64);
@@ -187,7 +188,7 @@ fn r255_integration_rejects_out_of_range_pass() {
     let mut ctx = HfHistogramDecodeContext::new(&mut h, &headers).unwrap();
     let bytes = [0u8; 4];
     let mut br = BitReader::new(&bytes);
-    let r = ctx.decode_block_for_pass_transform(&mut br, 7, TransformType::Dct8x8, 0, 0, 15);
+    let r = ctx.decode_block_for_pass_transform(&mut br, 7, 1, TransformType::Dct8x8, 0, 0, 15);
     assert!(r.is_err());
 }
 
@@ -201,7 +202,7 @@ fn r255_integration_rejects_u32_overflow_offset() {
     let mut ctx = HfHistogramDecodeContext::new(&mut h, &headers).unwrap();
     let bytes = [0u8; 4];
     let mut br = BitReader::new(&bytes);
-    let r = ctx.decode_block_for_pass_transform(&mut br, 0, TransformType::Dct8x8, 0, 0, 1);
+    let r = ctx.decode_block_for_pass_transform(&mut br, 0, 1, TransformType::Dct8x8, 0, 0, 1);
     assert!(r.is_err());
 }
 
@@ -217,7 +218,7 @@ fn r255_integration_does_not_advance_br_on_short_circuit() {
     let mut br = BitReader::new(&bytes);
     let bits_before = br.bits_read();
     let _ = ctx
-        .decode_block_for_pass_transform(&mut br, 0, TransformType::Dct8x8, 0, 0, 15)
+        .decode_block_for_pass_transform(&mut br, 0, 1, TransformType::Dct8x8, 0, 0, 15)
         .unwrap();
     assert_eq!(br.bits_read(), bits_before);
 }
@@ -241,10 +242,10 @@ fn r255_integration_round_trip_with_per_pass_hf_headers_read() {
     let bytes = [0u8; 4];
     let mut br = BitReader::new(&bytes);
     let (_, raw0) = ctx
-        .decode_block_for_pass_transform(&mut br, 0, TransformType::Dct8x8, 0, 0, 15)
+        .decode_block_for_pass_transform(&mut br, 0, 1, TransformType::Dct8x8, 0, 0, 15)
         .unwrap();
     let (_, raw1) = ctx
-        .decode_block_for_pass_transform(&mut br, 1, TransformType::Dct8x8, 0, 0, 15)
+        .decode_block_for_pass_transform(&mut br, 1, 1, TransformType::Dct8x8, 0, 0, 15)
         .unwrap();
     assert_eq!(raw0, 0);
     assert_eq!(raw1, 0);

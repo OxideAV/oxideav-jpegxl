@@ -2690,7 +2690,6 @@ pub fn decode_vardct_frame(
     let quantizer = lf_global
         .quantizer
         .ok_or_else(|| Error::InvalidData("JXL VarDCT round 13: Quantizer missing".into()))?;
-
     // §C.5 frame-level assembly: LfGroups tile the frame in raster
     // order at `group_dim × 8` pixels. Every per-LfGroup structure
     // (quantised LF, dequantised LF, DctSelect/HfMul grid, CfL tile

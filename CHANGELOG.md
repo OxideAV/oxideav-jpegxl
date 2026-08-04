@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Round 437 (second block) — **the §C.7.1 `used_orders != 0` custom
+  coefficient orders DECODE**: the Listing C.12 **per-channel
+  permutation layout erratum**. The printed listing shows ONE
+  `DecodePermutation()` per set `used_orders` bit; the wire carries
+  THREE — one per colour channel, in the §C.8.3 decode sequence
+  Y, X, B. Two independent oracles pin it: the staged
+  `patches-256x256` fixture's clean-room decode trace (under
+  one-per-bit our §C.7.2 read starts 281 bits early and misparses;
+  under one-per-channel the §C.7.2 stream begins at the recorded
+  position, parses to the recorded shape — ANS, no LZ77, 74
+  clusters — and the section lands on the trace's `AC_GLOBAL_END` to
+  the bit) and the D.3.3 ANS final-state closure on locally generated
+  ANS-coded specimens (fails under one-per-bit for every Part 8.3
+  grid combination, closes under one-per-channel). `HfPass::orders`
+  is now per-channel (`orders[3][13]`), `order_for(channel, oid)`,
+  and the §C.8.3 block decode threads its channel through.
+  - Newly decoding end-to-end: single-preset single-pass
+    `used_orders` streams — including the 18181-3 `grayscale`
+    conformance stream (refused at this boundary since round 393; its
+    pixel output still awaits the documented ICC-`kTRC`
+    transfer-curve limitation) and the new
+    `custom_orders_t256_e1` fixture (`round437_custom_orders_decode`).
+  - Known limitation (ratcheted, not silent): synthetic-edge content
+    decodes structurally exactly (closure invariant, byte-exact flat
+    regions) but carries a high-detail accuracy deficiency
+    (MAD ≈ 20 vs sub-1 on photo content) that is INDEPENDENT of the
+    permutation content (eight alternative order compositions move
+    the MAD < 0.4) — an open follow-up.
+  - Multi-preset / multi-pass §C.7 slices (the staged
+    `progressive-ac-multipass` fixture) still refuse loudly one
+    boundary later (`round437_custom_orders_boundary`).
+
 ### Added
 
 - Round 437 — the **§K.4 kNoise image feature decodes end to end**

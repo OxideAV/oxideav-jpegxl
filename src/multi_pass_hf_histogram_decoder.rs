@@ -501,6 +501,7 @@ impl<'a> HfHistogramDecodeContext<'a> {
         &mut self,
         br: &mut BitReader<'_>,
         p: u32,
+        channel: u32,
         t: TransformType,
         predicted: u32,
         block_ctx: u32,
@@ -526,12 +527,13 @@ impl<'a> HfHistogramDecodeContext<'a> {
         }
         let oid = order_id_for_transform(t);
         // §C.8.3 Listing C.14 places each decoded coefficient through
-        // `order[k]`, where `order` is the §C.7.1 per-pass per-OrderId
-        // coefficient order — the natural order, or the signalled
-        // §C.3.2 permutation of it when the pass' HfPass has the
-        // corresponding `used_orders` bit set. When no per-pass order
-        // source is attached (order-agnostic unit-test constructions),
-        // fall back to the natural order.
+        // `order[k]`, where `order` is the §C.7.1 per-pass
+        // per-(channel, OrderId) coefficient order (round-437 erratum:
+        // one §C.3.2 permutation per colour channel per set
+        // `used_orders` bit) — the natural order, or the signalled
+        // permutation of it. When no per-pass order source is attached
+        // (order-agnostic unit-test constructions), fall back to the
+        // natural order.
         let natural_fallback;
         let order: &[u32] = match &self.per_pass_orders {
             Some(po) => {
@@ -542,7 +544,7 @@ impl<'a> HfHistogramDecodeContext<'a> {
                         po.len()
                     ))
                 })?;
-                hf_pass.order_for(oid)
+                hf_pass.order_for(channel, oid)
             }
             None => {
                 natural_fallback = natural_coeff_order(oid);
@@ -731,6 +733,7 @@ impl<'a> HfHistogramDecodeContext<'a> {
             let (d, r) = self.decode_block_for_pass_transform(
                 br,
                 p,
+                c,
                 vb.transform,
                 predicted[c as usize],
                 ctx,
@@ -1321,6 +1324,7 @@ mod tests {
             .decode_block_for_pass_transform(
                 &mut br,
                 /*p*/ 0,
+                /*channel*/ 1,
                 TransformType::Dct8x8,
                 /*predicted*/ 0,
                 /*block_ctx*/ 0,
@@ -1349,6 +1353,7 @@ mod tests {
         let r = ctx_dec.decode_block_for_pass_transform(
             &mut br,
             /*p*/ 5, // > num_passes (= 1)
+            /*channel*/ 1,
             TransformType::Dct8x8,
             /*predicted*/ 0,
             /*block_ctx*/ 0,
@@ -1373,6 +1378,7 @@ mod tests {
             .decode_block_for_pass_transform(
                 &mut br,
                 0,
+                /*channel*/ 1,
                 TransformType::Dct16x16,
                 /*predicted*/ 32, // top-left → predicted_non_zeros = 32
                 /*block_ctx*/ 0,
@@ -1408,6 +1414,7 @@ mod tests {
             .decode_block_for_pass_transform(
                 &mut br,
                 /*p*/ 1,
+                1,
                 TransformType::Dct8x8,
                 /*predicted*/ 0,
                 /*block_ctx*/ 0,
@@ -1430,7 +1437,8 @@ mod tests {
         let mut ctx_dec = HfHistogramDecodeContext::new(&mut h, &headers).unwrap();
         let bytes = [0u8; 4];
         let mut br = BitReader::new(&bytes);
-        let r = ctx_dec.decode_block_for_pass_transform(&mut br, 0, TransformType::Dct8x8, 0, 0, 1);
+        let r =
+            ctx_dec.decode_block_for_pass_transform(&mut br, 0, 1, TransformType::Dct8x8, 0, 0, 1);
         assert!(matches!(r, Err(Error::InvalidData(_))));
     }
 
@@ -1447,7 +1455,7 @@ mod tests {
         let bytes = [0u8; 4];
         let mut br = BitReader::new(&bytes);
         let (decoded, raw_non_zeros) = ctx_dec
-            .decode_block_for_pass_transform(&mut br, 0, TransformType::Dct8x16, 0, 0, 15)
+            .decode_block_for_pass_transform(&mut br, 0, 1, TransformType::Dct8x16, 0, 0, 15)
             .unwrap();
         assert_eq!(raw_non_zeros, 0);
         assert_eq!(decoded.coeffs.len(), 128);
@@ -1469,7 +1477,7 @@ mod tests {
         let mut br = BitReader::new(&bytes);
         let bits_before = br.bits_read();
         let _ = ctx_dec
-            .decode_block_for_pass_transform(&mut br, 0, TransformType::Dct8x8, 0, 0, 15)
+            .decode_block_for_pass_transform(&mut br, 0, 1, TransformType::Dct8x8, 0, 0, 15)
             .unwrap();
         assert_eq!(br.bits_read(), bits_before);
     }

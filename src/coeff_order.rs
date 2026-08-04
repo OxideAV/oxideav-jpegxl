@@ -362,20 +362,17 @@ impl Default for PermStreamConfig {
     /// previous reconstructed value over **8** clustered distributions
     /// with the context capped at 7.
     ///
-    /// **Status — sole in-range survivor, NOT yet closure-verified.**
-    /// The round-437 walk of the full Part 8.3 grid (3 readings × 2
-    /// distribution counts) against `used_orders != 0` specimens found
-    /// this the only combination whose Lehmer entries stay within the
-    /// shrinking `temp` bound on every specimen, and a bit-level hand
-    /// decode of a minimal single-order prefix-coded specimen confirmed
-    /// it consumes exactly the bits RFC 7932 §3.4 + §D.3.5/§D.3.6
-    /// prescribe — but on ANS-coded specimens the shared stream still
-    /// misses the D.3.3 final-state closure, and on multi-preset
-    /// streams the next preset's `used_orders` reads back garbage. The
-    /// residual divergence (a §C.7 layout / §C.7.2-prelude question the
-    /// finite grid cannot separate) is a docs-gap; `HfPass::read`
-    /// refuses loudly at this boundary either way, so no combination
-    /// can silently misdecode.
+    /// **Status — closure-verified (round 437).** Under the printed
+    /// one-permutation-per-bit Listing C.12 layout no grid combination
+    /// closed the D.3.3 final-state oracle; the actual erratum was the
+    /// LAYOUT (three per-channel `DecodePermutation()` per set bit —
+    /// see `crate::hf_pass`). Under the per-channel layout this
+    /// combination closes both round-437 oracles: the
+    /// `patches-256x256` clean-room trace's per-stream bit boundaries
+    /// (the §C.7.2 read lands on the recorded position exactly) and
+    /// the ANS final-state invariant on ANS-coded specimens. The other
+    /// grid points remain reachable through the per-thread override
+    /// for regression bisection.
     fn default() -> Self {
         Self {
             prev_context: PermPrevContext::GetContextOfValue,
@@ -513,7 +510,6 @@ pub fn decode_permutation_from_stream(
                 "JXL coeff permutation: lehmer entry {v} >= size {size}"
             )));
         }
-
         *slot = v;
         prev_value = v;
         prev_token = token;

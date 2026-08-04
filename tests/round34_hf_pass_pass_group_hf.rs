@@ -70,9 +70,9 @@ fn hf_pass_used_orders_zero_yields_all_natural_orders() {
     for i in 0..NUM_ORDERS as u32 {
         let o = OrderId::from_index(i).unwrap();
         let expected = natural_coeff_order(o);
-        assert_eq!(hp.order_for(o), expected.as_slice(), "OrderId {i}");
+        assert_eq!(hp.order_for(1, o), expected.as_slice(), "OrderId {i}");
         assert_eq!(
-            hp.order_for(o).len(),
+            hp.order_for(1, o).len(),
             ORDER_COEFFICIENT_COUNTS[i as usize] as usize
         );
     }
