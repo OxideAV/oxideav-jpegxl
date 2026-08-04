@@ -31,10 +31,11 @@ same fixture resolved **§F.2 erratum candidate 4**: the corrected
 `clamp(4·gap − 3, 0, 1)` smoothing ramp is the conformant reading
 (CI-gated arbitration). Single-LfGroup frames of any group count
 decode; §C.5 multi-LfGroup (> 2048 px) framing + LZ77 TOC permutations
-landed round 393 and are pinned on `large-3072x2048-multigroup` up to
-the §C.7.1 `used_orders != 0` custom-coefficient-order boundary (a
-docs-gap: the C.3.2 permutation sub-stream's `end`/context reading
-needs an external trace; the decode errors loudly there). Multi-frame
+landed round 393 and are pinned on `large-3072x2048-multigroup`.
+Round 437 resolved the §C.7.1 `used_orders != 0` boundary for
+single-preset single-pass frames (the Listing C.12 per-channel
+permutation layout erratum — see below); multi-preset / multi-pass
+§C.7 slices still refuse loudly. Multi-frame
 codestreams compose per §C.2 (Reference slots + Table C.8 blending,
 incl. round-393 kBlend / kAlphaWeightedAdd alpha modes) in
 `decode_all_frames`. Programs that only need probe-level information
@@ -343,32 +344,75 @@ and the Listing I.21 Squeeze tendency function.
   generated `used_orders` streams), so the grayscale frame itself
   remains refused, one boundary later than round 393.
 
+### Round 437 — used_orders custom coefficient orders, kNoise, kModular EPF posture, multi-pass gate
+
+- **§C.7.1 `used_orders != 0` streams DECODE — the Listing C.12
+  per-channel permutation layout erratum.** The printed listing reads
+  ONE `DecodePermutation()` per set `used_orders` bit; the wire
+  carries THREE — one per colour channel, in the §C.8.3 decode
+  sequence Y, X, B. Pinned by two independent oracles: the staged
+  `patches-256x256` clean-room decode trace (under one-per-bit the
+  §C.7.2 read starts 281 bits early and misparses; under
+  one-per-channel it begins at the recorded position, parses to the
+  recorded shape and the section lands on the trace's `AC_GLOBAL_END`
+  to the bit) and the D.3.3 ANS final-state closure on ANS-coded
+  specimens (fails under one-per-bit for every fdis-errata.md Part 8.3
+  context/count grid combination — the prescribed six-way bisection
+  was run to exhaustion first — and closes under one-per-channel).
+  The 18181-3 `grayscale` conformance stream decodes past its
+  round-393 boundary, and the frame-level **multi-pass gate is
+  lifted** (pass-major §C.3.1 TOC walk + §C.8.3 cross-pass
+  accumulation run end to end). Multi-preset / multi-pass §C.7 slices
+  (the staged `progressive-ac-multipass` fixture, 3 passes × 2
+  presets) still refuse loudly one boundary later.
+- **Known limitation (ratcheted):** synthetic-edge content decodes
+  structurally exactly (closure invariant; flat saturated regions
+  byte-exact) but carries a high-detail VarDCT accuracy deficiency
+  (MAD ≈ 20 on the `custom_orders_t256_e1` fixture vs sub-1 on photo
+  content) that is INDEPENDENT of the permutation content — an open
+  follow-up, bounded by `round437_custom_orders_decode`.
+- **§K.4 kNoise decodes end to end** (`noise` module): §C.4.7 LUT
+  parse in LfGlobal + per-group XorShift128Plus/SplitMix64
+  pseudorandom channels + frame-level 5×5 convolution (§6.5
+  mirroring) + Listing K.5 injection. Staged `noise-feature-256x256`
+  fixture: sRGB MAD 0.92 / 0.79 / 0.88, max ≤ 7 — the same sub-1/255
+  band as the noise-free VarDCT fixtures.
+- **The §J.3-for-kModular SPECGAP is RESOLVED** by the in-crate grid
+  bisection fdis-errata.md Part 9 prescribes: samples normalised to
+  `[0, 1]` (reading N1) with a 1-channel Grey frame replicated into
+  all three Annex J planes. `grayscale_public_university` MAD
+  **1.00 → 0.2909** (max 21 → 8); the previously reported
+  "sigma ≈ ×32 best fit at ≈ 0.42" is reproduced exactly by the
+  normalised-domain grey-in-c0 grid cell — that fit was the missing
+  domain normalisation. CI-gated arbitration
+  (`round437_modular_epf_posture`).
+
 ### Not yet implemented
 
-- **§C.7.1 `used_orders != 0` custom coefficient orders** (remaining
-  half). Round 408 pinned the §C.3.2 `end` field as a count (see
-  above), but the permutation stream's exact bit consumption is still
-  wrong somewhere — on locally generated `used_orders` streams the
-  shared stream's ANS final state misses the D.3.3 `0x130000`
-  invariant, and §C.7.2 misparses loudly right after. Needs a
-  per-symbol §C.3.2 trace (end token + per-entry context / token /
-  renormalisation bits) from a small custom-orders stream — docs-gap
-  refined round 408 (was round 393).
+- **Multi-preset / multi-pass §C.7 slices with `used_orders != 0`**
+  (the round-437 residual): after preset 0's per-channel Listing C.12
+  bundles, the next preset's fields still misparse on the staged
+  `progressive-ac-multipass` fixture — the per-preset repetition or
+  per-pass slice layout hides one more wire divergence
+  (`round437_custom_orders_boundary` pins the loud refusal).
+- **The synthetic-content VarDCT accuracy deficiency** (round 437):
+  high-detail regions of hard-edge synthetic streams decode ≈ 20/255
+  off while flat regions are byte-exact and photo content sits below
+  1/255 — order-content-independent; needs its own bisection round
+  (suspects: HF dequant weight tables under non-default
+  `x_qm_scale = 3`, non-DCT reconstruction accuracy, EPF sigma from
+  Sharpness on synthetic content).
 - The residual sub-1/255 VarDCT accuracy tail (float rounding + §J
-  filter differences), a progressive-AC (true multi-pass) fixture to
-  pin the round-389 multi-pass framing end-to-end, and
-  `save_before_ct` pre-CT reference recording in the §C.2 composer.
+  filter differences) and `save_before_ct` pre-CT reference recording
+  in the §C.2 composer. (The staged `progressive-ac-multipass`
+  fixture now exists and reaches the multi-preset §C.7 boundary
+  above; the end-to-end multi-pass pixel pin lands when that boundary
+  closes.)
 - ColorEncoding / ToneMapping fuller decode, preview / animation /
   intrinsic-size sub-bundles (parsing stops cleanly at the `have_*`
   flags).
-- The AFV non-DCT IDCT variants, the §C.7.2 entropy-histogram wiring,
-  Gaborish + EPF integration into the registered path. The VarDCT
-  per-block EPF sigma (Listing J.3 from HfMul / Sharpness) and the
-  `sigma < 0.3` block-skip now have a dedicated driver
-  (`apply_epf_iterations_per_block_sigma` + `SigmaGrid`); deriving the
-  per-block `HfMul`/`Sharpness` grids from the §C.5.4 HF pipeline and
-  feeding them into that driver in the registered path is the
-  remaining wiring step.
+- The AFV non-DCT IDCT variants (parsed and dispatched; accuracy
+  unvalidated — no staged fixture reaches them with a pixel oracle).
 - Floating-point samples and `bps > 16`; high-bit-depth XYB / YCbCr.
 - Surfacing the decoded ICC profile to callers (the Annex B decode
   runs and validates, but `oxideav_core::VideoFrame` has no ICC slot)
@@ -376,16 +420,16 @@ and the Listing I.21 Squeeze tendency function.
   samples (the `grayscale` stream's image output currently uses the
   signalled/default transfer, sRGB, rather than the profile's
   gamma-2.2-class `kTRC` curve).
-- The §J.3 EPF sample-domain / channel-scale semantics for kModular
-  non-XYB frames (docs-gap, see Round 420 above) — keeps
-  `grayscale_public_university` at MAD 1.00 instead of lower; the
-  Squeeze/entropy decode of that stream is verified exact.
+
 - Output mapping for xyb_encoded Modular frames whose colour space is
   Grey (3 XYB channels → 1 grey plane): the Modular + inverse-Squeeze
   walk completes since round 420, the final XYB→grey hand-off is
   unwired and errors loudly.
-- The kNoise / kPatches image features, JPEG reconstruction, and the
-  LfFrame (`lf_level > 0`) dimension scaling `progressive-dc` needs.
+- The kPatches image feature (kNoise decodes since round 437; the
+  staged `patches-256x256` fixture turned out flags=0 — no
+  patches-bearing fixture is staged yet), JPEG reconstruction, and
+  the LfFrame (`lf_level > 0`) dimension scaling `progressive-dc`
+  needs.
 - The encoder (not registered).
 
 Unsupported inputs surface as `Error::Unsupported` rather than a silent
