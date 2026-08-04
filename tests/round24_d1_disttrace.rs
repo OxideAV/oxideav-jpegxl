@@ -279,6 +279,7 @@ fn d1_per_call_alias_mapping_invariant_round_24() {
     let (d1, a1) = snap(1);
 
     let lf_global = LfGlobal {
+        noise: None,
         lf_dequant,
         quantizer: Some(quantizer),
         hf_block_context: Some(hbc),

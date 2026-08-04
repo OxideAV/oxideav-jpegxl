@@ -762,6 +762,7 @@ mod tests {
     /// `nb_meta_channels = 0`; tree is `None`.
     fn build_empty_lf_global() -> LfGlobal {
         LfGlobal {
+            noise: None,
             lf_dequant: LfChannelDequantization::default(),
             quantizer: None,
             hf_block_context: None,

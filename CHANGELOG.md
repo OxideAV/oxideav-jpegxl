@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Round 437 — the **§K.4 kNoise image feature decodes end to end**
+  (`crate::noise`): the §C.4.7 `NoiseParameters` 8-entry LUT parses in
+  LfGlobal (Table C.10 position), and the VarDCT finish step renders
+  noise after the §J filters per the §5.2 order — per-group
+  XorShift128Plus/SplitMix64 pseudorandom channels (Listings K.2/K.3,
+  seeded from each group's top-left pixel), Listing K.4 `[1, 2)`
+  floats, the frame-level 5×5 Laplacian-like convolution with §6.5
+  mirroring, and the Listing K.5 strength-modulated injection with the
+  §C.4.4 base correlations. The staged `noise-feature-256x256` fixture
+  (photon noise ISO 3200) pins the chain black-box: per-channel sRGB
+  MAD 0.92 / 0.79 / 0.88, max ≤ 7 — the same sub-1/255 band as the
+  noise-free VarDCT fixtures (`round437_noise_feature`). kNoise on
+  Modular frames stays precisely refused (feature unwired there).
+
 ### Fixed
 
 - Round 437 — the §J.3-for-kModular restoration-filter SPECGAP

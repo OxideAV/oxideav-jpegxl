@@ -79,6 +79,7 @@ fn d1_lfcoefficients_ans_final_state_round_20() {
     let cfl = LfChannelCorrelation::read(&mut shared_br).unwrap();
     let global_modular = GlobalModular::read(&mut shared_br, &fh, &metadata).unwrap();
     let lf_global = LfGlobal {
+        noise: None,
         lf_dequant,
         quantizer: Some(quantizer),
         hf_block_context: Some(hbc),

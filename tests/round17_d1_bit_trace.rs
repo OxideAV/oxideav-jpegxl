@@ -170,6 +170,7 @@ fn d1_bit_position_walk_round_17() {
     );
 
     let lf_global = LfGlobal {
+        noise: None,
         lf_dequant,
         quantizer: Some(quantizer),
         hf_block_context: Some(hbc),

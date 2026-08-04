@@ -117,6 +117,7 @@ fn d1_dc_group_recount_round_20() {
         "LfGlobal must end at section-local bit 1026 (cjxl DC_GLOBAL_END)"
     );
     let lf_global = LfGlobal {
+        noise: None,
         lf_dequant,
         quantizer: Some(quantizer),
         hf_block_context: Some(hbc),

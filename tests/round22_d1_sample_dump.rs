@@ -86,6 +86,7 @@ fn decode_lfcoeff_with_bias(bias: i32) -> (Option<LfCoefficients>, u32, usize) {
     let cfl = LfChannelCorrelation::read(&mut shared_br).unwrap();
     let global_modular = GlobalModular::read(&mut shared_br, &fh, &metadata).unwrap();
     let lf_global = LfGlobal {
+        noise: None,
         lf_dequant,
         quantizer: Some(quantizer),
         hf_block_context: Some(hbc),

@@ -573,6 +573,8 @@ pub mod multi_pass_decode;
 pub mod multi_pass_hf_header;
 #[doc(hidden)] // internal: multi-pass HF histogram decoding
 pub mod multi_pass_hf_histogram_decoder;
+#[doc(hidden)] // internal: §C.4.7 + §K.4 noise feature (round 437)
+pub mod noise;
 #[doc(hidden)] // internal: per-varblock non-zeros bookkeeping grid
 pub mod non_zeros_grid;
 #[doc(hidden)] // internal: §A.6 orientation transform (Table A.17)
@@ -2123,6 +2125,9 @@ struct VarDctFinishInputs<'a> {
     sharpness: &'a [i32],
     /// LfGlobal §I.2.7 colour-correlation base/colour factors.
     cfl: crate::lf_global::LfChannelCorrelation,
+    /// LfGlobal §C.4.7 noise-synthesis LUT — `Some` when the frame
+    /// signals kNoise; drives the §K.4 renderer after the §J filters.
+    noise: Option<crate::noise::NoiseParameters>,
     /// LfGlobal §I.2.2 block-context bundle (drives the resolver).
     hf_block_context: crate::lf_global::HfBlockContext,
     /// Quantised LF samples in `[X, Y, B]` channel order (the §C.8.3
@@ -2180,6 +2185,7 @@ fn finish_vardct_decode(
         b_from_y,
         sharpness,
         cfl,
+        noise,
         hf_block_context,
         lf_quant,
         lf_quant_width,
@@ -2387,6 +2393,33 @@ fn finish_vardct_decode(
                 )?;
             }
         }
+    }
+
+    // §K.4 noise feature (round 437): rendered after the restoration
+    // filters and before the §L.2.2 colour transform, per the §5.2
+    // decode order (IT → RF → features → CT). Patches and splines are
+    // rejected upstream (LfGlobal), so noise is the only feature that
+    // can reach this point.
+    if (fh.flags & crate::frame_header::flags::NOISE) != 0 {
+        let params = noise.ok_or_else(|| {
+            Error::InvalidData(
+                "jxl VarDCT decoder: kNoise flag set but LfGlobal carried no                  NoiseParameters"
+                    .into(),
+            )
+        })?;
+        let w = frame_width as usize;
+        let h = frame_height as usize;
+        let noise_planes = crate::noise::generate_noise_planes(w, h, fh.group_dim() as usize)?;
+        let [x_plane, y_plane, b_plane] = &mut cropped.planes;
+        crate::noise::apply_noise(
+            &mut x_plane.samples,
+            &mut y_plane.samples,
+            &mut b_plane.samples,
+            &noise_planes,
+            &params,
+            cfl.base_correlation_x,
+            cfl.base_correlation_b,
+        );
     }
 
     // Diagnostic capture: when armed, snapshot the cropped pre-§L.2.2
@@ -2846,6 +2879,7 @@ pub fn decode_vardct_frame(
         b_from_y: &b_from_y,
         sharpness: &sharpness,
         cfl,
+        noise: lf_global.noise,
         hf_block_context: hbc,
         lf_quant_width: fbw as u32,
         lf_quant_height: fbh as u32,

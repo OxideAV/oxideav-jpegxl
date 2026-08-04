@@ -9,11 +9,12 @@
 //! * [`crate::global_modular::GlobalModular`] — wraps a Modular
 //!   sub-bitstream (§C.4.8 + §C.9). Round 3 covers this minimum.
 //!
-//! Patches (§C.4.5), Splines (§C.4.6), NoiseParameters (§C.4.7),
-//! Quantizer (§C.4.3), HF Block Context (§C.8.4), and
-//! LfChannelCorrelation (§C.4.4) are deferred to round 4 — they are
-//! only needed when `frame_header.flags` enables the corresponding
-//! feature or when `encoding == kVarDCT`.
+//! Patches (§C.4.5) and Splines (§C.4.6) are rejected with a precise
+//! `Error::Unsupported` (their bundles are unparsed, so continuing
+//! would misalign every later field). NoiseParameters (§C.4.7) parses
+//! since round 437 (`crate::noise`). Quantizer (§C.4.3), HF Block
+//! Context (§C.8.4) and LfChannelCorrelation (§C.4.4) read when
+//! `encoding == kVarDCT`.
 //!
 //! Allocation bound: this bundle reads at most a handful of fixed-size
 //! fields. The only variable allocation is in the embedded
@@ -344,10 +345,13 @@ impl HfBlockContext {
 /// downstream LfGroup parser (round 11 too) can reach the LF
 /// coefficients sub-bitstream.
 ///
-/// Patches / Splines / NoiseParameters are still rejected with a precise
-/// `Error::Unsupported` — round-12+ work.
+/// Patches / Splines are still rejected with a precise
+/// `Error::Unsupported`; NoiseParameters parses since round 437.
 #[derive(Debug, Clone)]
 pub struct LfGlobal {
+    /// §C.4.7 noise-synthesis LUT — present when the frame signals
+    /// kNoise (round 437).
+    pub noise: Option<crate::noise::NoiseParameters>,
     /// Always present (defaulted).
     pub lf_dequant: LfChannelDequantization,
     /// Present when `encoding == kVarDCT`, else `None`.
@@ -361,16 +365,11 @@ pub struct LfGlobal {
 }
 
 impl LfGlobal {
-    /// Decode the LfGlobal bundle. Currently rejects:
-    ///
-    /// * any of `flags::PATCHES | SPLINES | NOISE` set,
-    /// * `encoding == kVarDCT` (Quantizer / HfBlockContext / CfL all
-    ///   read in that path).
-    ///
-    /// These limits will be relaxed in round 4 once Patches / Splines /
-    /// VarDCT land. The router in `crate::lib::make_decoder` does not
-    /// have to know about them — the FDIS bundle naturally short-circuits
-    /// on any flag bit it can't yet parse.
+    /// Decode the LfGlobal bundle. Currently rejects
+    /// `flags::PATCHES | SPLINES` (their bundles are not parsed yet, so
+    /// continuing would misalign every later field); kNoise parses per
+    /// §C.4.7 (round 437) and the renderer runs in the VarDCT finish
+    /// step (§K.4).
     pub fn read(
         br: &mut BitReader<'_>,
         fh: &FrameHeader,
@@ -386,11 +385,13 @@ impl LfGlobal {
                 "JXL LfGlobal: Splines not yet supported (round 4)".into(),
             ));
         }
-        if (fh.flags & flags::NOISE) != 0 {
-            return Err(Error::Unsupported(
-                "JXL LfGlobal: NoiseParameters not yet supported (round 4)".into(),
-            ));
-        }
+        // §C.4.7 NoiseParameters (Table C.10 row 3: after Patches and
+        // Splines, before LfChannelDequantization) — round 437.
+        let noise = if (fh.flags & flags::NOISE) != 0 {
+            Some(crate::noise::NoiseParameters::read(br)?)
+        } else {
+            None
+        };
 
         let lf_dequant = LfChannelDequantization::read(br)?;
 
@@ -413,6 +414,7 @@ impl LfGlobal {
         let global_modular = GlobalModular::read(br, fh, metadata)?;
 
         Ok(Self {
+            noise,
             lf_dequant,
             quantizer,
             hf_block_context,

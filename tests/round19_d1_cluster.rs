@@ -90,6 +90,7 @@ fn d1_cluster_and_refill_trace_round_19() {
     assert_eq!(shared_br.bits_read(), 1026, "LfGlobal must end at bit 1026");
 
     let lf_global = LfGlobal {
+        noise: None,
         lf_dequant,
         quantizer: Some(quantizer),
         hf_block_context: Some(hbc),
