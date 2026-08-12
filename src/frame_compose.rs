@@ -185,6 +185,13 @@ pub struct ComposeState {
     /// 9–16) and the `2^bits − 1` float normalisation denominator.
     bits_per_sample: u32,
     reference: [Option<Vec<Vec<f32>>>; 4],
+    /// Slots whose last recording was requested **pre-colour-transform**
+    /// (§C.2 `save_before_ct`). The pre-CT planes themselves live in the
+    /// walk-level [`crate::patches::ReferenceFrames`] store (the §K.2
+    /// patch renderer's input); the §C.2 *blending* domain is post-CT,
+    /// so using such a slot as a blending source is refused precisely
+    /// instead of blending the wrong domain.
+    pre_ct_recorded: [bool; 4],
 }
 
 impl ComposeState {
@@ -214,6 +221,7 @@ impl ComposeState {
             height,
             bits_per_sample,
             reference: [None, None, None, None],
+            pre_ct_recorded: [false; 4],
         })
     }
 
@@ -358,6 +366,13 @@ impl ComposeState {
         if source >= self.reference.len() {
             return Err(Error::InvalidData(format!(
                 "JXL frame composition: source {source} out of range"
+            )));
+        }
+        if self.pre_ct_recorded[source] {
+            return Err(Error::Unsupported(format!(
+                "jxl frame composition: Reference[{source}] was recorded pre-colour-\
+                 transform (save_before_ct); §C.2 blending runs in the post-CT domain \
+                 and no staged stream exercises a pre-CT blending source"
             )));
         }
 
@@ -508,20 +523,25 @@ impl ComposeState {
         // float domain — later frames may bring out-of-range samples
         // back into range).
         if meta.save_as_reference != 0 {
-            if meta.save_before_ct {
-                return Err(Error::Unsupported(
-                    "jxl frame composition: save_before_ct reference recording (pre-colour-\
-                     transform domain) is not wired — follow-up"
-                        .into(),
-                ));
-            }
             let slot = meta.save_as_reference as usize;
             if slot >= self.reference.len() {
                 return Err(Error::InvalidData(format!(
                     "JXL frame composition: save_as_reference {slot} out of range"
                 )));
             }
-            self.reference[slot] = Some(planes.clone());
+            if meta.save_before_ct {
+                // §C.2: the recording is in the pre-CT domain — it
+                // lives in the walk-level pre-CT store (the §K.2 patch
+                // renderer's input, round 441), not in the composer's
+                // post-CT blending slots. Mark the slot so a later
+                // frame that names it as a *blending* source errs
+                // precisely instead of blending the wrong domain.
+                self.reference[slot] = None;
+                self.pre_ct_recorded[slot] = true;
+            } else {
+                self.reference[slot] = Some(planes.clone());
+                self.pre_ct_recorded[slot] = false;
+            }
         }
 
         // Materialise the presented frame: clamp to the nominal range
@@ -742,12 +762,23 @@ mod tests {
         };
         assert!(matches!(st.compose(&f, &m), Err(Error::Unsupported(_))));
 
+        // A pre-CT recording (round 441) composes fine — the pre-CT
+        // planes live in the walk-level patches store — but the slot is
+        // poisoned for *blending*: a later frame naming it as its
+        // source errs precisely (§C.2 blending is post-CT domain).
         let m2 = FrameComposeMeta {
             save_as_reference: 1,
             save_before_ct: true,
             ..meta_replace()
         };
-        assert!(matches!(st.compose(&f, &m2), Err(Error::Unsupported(_))));
+        assert!(st.compose(&f, &m2).is_ok());
+        let m3 = FrameComposeMeta {
+            mode: BlendMode::Add,
+            source: 1,
+            ..meta_replace()
+        };
+        let err = st.compose(&f, &m3).unwrap_err();
+        assert!(err.to_string().contains("pre-colour"), "{err}");
     }
 
     /// §C.2 + §3.5.1: frame rects extending beyond the canvas are

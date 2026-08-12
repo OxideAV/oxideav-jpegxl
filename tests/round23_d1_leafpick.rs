@@ -125,6 +125,8 @@ fn decode_with_target_and_bias(
     let cfl = LfChannelCorrelation::read(&mut shared_br).unwrap();
     let global_modular = GlobalModular::read(&mut shared_br, &fh, &metadata).unwrap();
     let lf_global = LfGlobal {
+        patches: None,
+        splines: None,
         noise: None,
         lf_dequant,
         quantizer: Some(quantizer),
@@ -552,6 +554,8 @@ fn decode_with_log_and_bias(bias: i32) -> (u32, usize, LeafLog) {
     let cfl = LfChannelCorrelation::read(&mut shared_br).unwrap();
     let global_modular = GlobalModular::read(&mut shared_br, &fh, &metadata).unwrap();
     let lf_global = LfGlobal {
+        patches: None,
+        splines: None,
         noise: None,
         lf_dequant,
         quantizer: Some(quantizer),

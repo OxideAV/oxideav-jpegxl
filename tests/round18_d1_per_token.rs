@@ -78,6 +78,8 @@ fn d1_per_token_trace_round_18() {
     assert_eq!(shared_br.bits_read(), 1026, "LfGlobal must end at bit 1026");
 
     let lf_global = LfGlobal {
+        patches: None,
+        splines: None,
         noise: None,
         lf_dequant,
         quantizer: Some(quantizer),

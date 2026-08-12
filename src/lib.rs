@@ -583,6 +583,7 @@ pub mod orientation;
 pub mod pass_group;
 #[doc(hidden)] // internal: C.8.3 PassGroup HF coefficient decode
 pub mod pass_group_hf;
+pub mod patches;
 #[doc(hidden)] // internal: per-channel non-zeros state
 pub mod per_channel_non_zeros;
 #[doc(hidden)] // internal: per-pass non-zeros state
@@ -655,18 +656,15 @@ fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
     }))
 }
 
-/// Round-1 (2024-spec) JXL decoder. Drives `decode_one_frame` per packet.
+/// Registered JXL decoder. Drives `decode_one_frame` per packet.
 ///
-/// Limitations (round 1):
-/// * Only Modular-encoded frames (kModular, not kVarDCT).
-/// * Grey (1ch) OR RGB (3ch) only — XYB / YCbCr defer.
-/// * Single-group, single-pass frames.
-/// * Inverse Palette / Squeeze transforms defer (parsing + RCT
-///   layout pass-through is wired).
-/// * Predictor 6 (Self-correcting) only at (0, 0) origin.
-/// * No Patches / Splines / Noise / ICC profile.
+/// The envelope has grown far past its round-1 origin (see the crate
+/// README "Status"): Modular and VarDCT frames, XYB / YCbCr inverse
+/// colour, multi-group / multi-LfGroup framing, restoration filters,
+/// and the Annex K image features (patches §K.2 + splines §K.3 since
+/// round 441, noise §K.4 since round 437 on VarDCT frames).
 ///
-/// Anything outside this envelope returns `Error::Unsupported` from a
+/// Anything outside the envelope returns `Error::Unsupported` from a
 /// well-defined point in the bitstream rather than panicking.
 struct JxlDecoder {
     codec_id: CodecId,
@@ -814,6 +812,10 @@ fn decode_all_frames_from_codestream(
         size.height as usize,
         metadata.bit_depth.bits_per_sample,
     )?;
+    // §C.2 / §K.2 pre-CT `Reference[…]` slots — recorded by frames with
+    // `save_as_reference != 0 && save_before_ct` (kReferenceOnly patch
+    // sources foremost), consumed by the §K.2 patch renderer.
+    let mut refs = crate::patches::ReferenceFrames::default();
     loop {
         if offset >= codestream.len() {
             return Err(Error::InvalidData(
@@ -826,9 +828,33 @@ fn decode_all_frames_from_codestream(
         // absolute codestream offset.
         let frame_slice = &codestream[offset..];
         let mut br = BitReader::new(frame_slice);
-        let decoded = decode_frame_body(&mut br, frame_slice, &size, &metadata, frame_pts)?;
+        let mut decoded =
+            decode_frame_body(&mut br, frame_slice, &size, &metadata, frame_pts, &refs)?;
         let is_last = decoded.is_last;
         let next_rel = decoded.next_frame_offset;
+        // §C.2 pre-CT reference recording (the slot index is
+        // `save_as_reference`; `decode_frame_body` only produces the
+        // snapshot when the frame requested recording).
+        if let Some(pre) = decoded.pre_ct.take() {
+            refs.slots[decoded.compose.save_as_reference as usize] = Some(pre);
+        }
+        // Table C.3 kReferenceOnly: "Frame will only be used as a
+        // source for Patches. Is not itself part of the image" — no
+        // composition, no presentation.
+        if decoded.frame_type == crate::frame_header::FrameType::ReferenceOnly {
+            if is_last {
+                return Err(Error::InvalidData(
+                    "jxl decoder: kReferenceOnly frame flagged is_last".into(),
+                ));
+            }
+            if next_rel == 0 {
+                return Err(Error::InvalidData(
+                    "jxl decoder: frame array made no forward progress (zero-length frame)".into(),
+                ));
+            }
+            offset = offset.saturating_add(next_rel);
+            continue;
+        }
         // §C.2 composition: blend the decoded frame over
         // Reference[source] (crop rectangles update the source frame's
         // rect; full-frame kReplace passes through; kBlend /
@@ -1018,6 +1044,17 @@ struct DecodedFrame {
     /// red plane). `None` on paths that only produce clamped output;
     /// the composer then lifts the integer planes instead.
     raw_f32: Option<Vec<Vec<f32>>>,
+    /// FrameHeader `frame_type` (Table C.3) — the multi-frame walk
+    /// skips composition and presentation for kReferenceOnly frames
+    /// ("only used as a source for Patches. Is not itself part of the
+    /// image").
+    frame_type: crate::frame_header::FrameType,
+    /// The §C.2 pre-colour-transform recording, when the frame asked
+    /// for `save_as_reference != 0 && save_before_ct` (or has no colour
+    /// transform, where the two domains coincide). The walk stores it
+    /// into the `Reference[save_as_reference]` slot the §K.2 patch
+    /// renderer reads.
+    pre_ct: Option<crate::patches::PreCtFrame>,
 }
 
 /// Read the codestream prelude that precedes the frame array: SizeHeader
@@ -1065,14 +1102,47 @@ fn read_codestream_prelude(
 }
 
 fn decode_codestream(codestream: &[u8], pts: Option<i64>) -> Result<VideoFrame> {
-    let (mut br, size, metadata) = read_codestream_prelude(codestream)?;
-    let decoded = decode_frame_body(&mut br, codestream, &size, &metadata, pts)?;
-    let bytes = if metadata.bit_depth.bits_per_sample > 8 {
-        2
-    } else {
-        1
-    };
-    orientation::apply_orientation(decoded.frame, metadata.orientation, bytes)
+    let (prelude_br, size, metadata) = read_codestream_prelude(codestream)?;
+    // The "first frame" is the first frame that is part of the image:
+    // Table C.3 kReferenceOnly frames (patch sources) are decoded into
+    // the pre-CT `Reference[…]` slots and skipped.
+    let mut refs = crate::patches::ReferenceFrames::default();
+    let mut offset = prelude_br.bytes_consumed();
+    let max_frames = codestream.len().max(1);
+    let mut skipped = 0usize;
+    loop {
+        if offset >= codestream.len() {
+            return Err(Error::InvalidData(
+                "jxl decoder: frame array ended before a presentable frame".into(),
+            ));
+        }
+        let frame_slice = &codestream[offset..];
+        let mut br = BitReader::new(frame_slice);
+        let mut decoded = decode_frame_body(&mut br, frame_slice, &size, &metadata, pts, &refs)?;
+        if let Some(pre) = decoded.pre_ct.take() {
+            refs.slots[decoded.compose.save_as_reference as usize] = Some(pre);
+        }
+        if decoded.frame_type != crate::frame_header::FrameType::ReferenceOnly {
+            let bytes = if metadata.bit_depth.bits_per_sample > 8 {
+                2
+            } else {
+                1
+            };
+            return orientation::apply_orientation(decoded.frame, metadata.orientation, bytes);
+        }
+        if decoded.is_last || decoded.next_frame_offset == 0 {
+            return Err(Error::InvalidData(
+                "jxl decoder: kReferenceOnly frame ends the frame array".into(),
+            ));
+        }
+        offset = offset.saturating_add(decoded.next_frame_offset);
+        skipped += 1;
+        if skipped > max_frames {
+            return Err(Error::InvalidData(
+                "jxl decoder: frame array exceeds codestream-length bound".into(),
+            ));
+        }
+    }
 }
 
 /// Decode one frame whose FrameHeader begins at `br`'s current
@@ -1087,6 +1157,7 @@ fn decode_frame_body(
     size: &SizeHeaderFdis,
     metadata: &ImageMetadataFdis,
     pts: Option<i64>,
+    refs: &crate::patches::ReferenceFrames,
 ) -> Result<DecodedFrame> {
     // 5. FrameHeader (FDIS C.2).
     let fh_params = FrameDecodeParams {
@@ -1197,13 +1268,25 @@ fn decode_frame_body(
         // multi-LfGroup, non-empty lf_thresholds) still surface a
         // precise `Error::Unsupported` from `decode_vardct_frame`
         // instead of pixels.
-        let frame = decode_vardct_frame(&fh, metadata, &toc, br, scaffold, pts)?;
+        let want_pre_ct = fh.save_as_reference != 0 && fh.save_before_ct;
+        let (frame, pre_ct) = decode_vardct_frame_with_refs(
+            &fh,
+            metadata,
+            &toc,
+            br,
+            scaffold,
+            pts,
+            refs,
+            want_pre_ct,
+        )?;
         return Ok(DecodedFrame {
             frame,
             is_last,
             next_frame_offset,
             compose: compose_meta,
             raw_f32: None,
+            frame_type: fh.frame_type,
+            pre_ct,
         });
     }
     if fh.encoding != crate::frame_header::Encoding::Modular {
@@ -1219,12 +1302,20 @@ fn decode_frame_body(
     // FDIS §5.2 / Table C.5: when the FrameHeader `flags` bitfield
     // carries kNoise / kPatches / kSplines, the decoder must draw those
     // image features (Annex K.4 / K.2 / K.3) *after* the restoration
-    // filters, in that listed order, before the colour transform. This
-    // crate does not yet render any of those features, so a frame that
-    // requests one would have its pixels emitted with the feature
-    // silently omitted — exactly the "no silent misparse" failure this
-    // crate's contract forbids. Reject precisely instead.
-    reject_undrawn_image_features(fh.flags)?;
+    // filters, in that listed order, before the colour transform.
+    // Patches and splines render on the Modular paths below (round
+    // 441); kNoise on Modular frames is still unwired — reject
+    // precisely rather than emit pixels with the feature silently
+    // omitted (the "no silent misparse" contract).
+    reject_undrawn_image_features(
+        fh.flags & !(crate::frame_header::flags::PATCHES | crate::frame_header::flags::SPLINES),
+    )?;
+    // §C.2 pre-CT reference recording: requested explicitly via
+    // `save_before_ct`, or implied when the frame has no colour
+    // transform at all (the two domains coincide — recording it lets
+    // patches consume references from lossless Modular chains).
+    let has_ct = metadata.xyb_encoded || fh.do_ycbcr;
+    let want_pre_ct = fh.save_as_reference != 0 && (fh.save_before_ct || !has_ct);
 
     // Map TOC entries to byte ranges (post-permutation order). Each
     // section starts byte-aligned and runs `entries[i]` bytes. The
@@ -1468,11 +1559,18 @@ fn decode_frame_body(
                 metadata.bit_depth.bits_per_sample
             )));
         }
-        let planes = build_rgb_planes_from_xyb(
+        let (planes, pre_ct) = build_rgb_planes_from_xyb(
             &img,
             &lf_global.lf_dequant,
             metadata,
             &fh.restoration_filter,
+            ModularXybFeatures {
+                flags: fh.flags,
+                patches: lf_global.patches.as_deref(),
+                splines: lf_global.splines.as_deref(),
+                refs,
+                want_pre_ct,
+            },
         )?;
         return Ok(DecodedFrame {
             frame: VideoFrame { pts, planes },
@@ -1480,6 +1578,8 @@ fn decode_frame_body(
             next_frame_offset,
             compose: compose_meta,
             raw_f32: None,
+            frame_type: fh.frame_type,
+            pre_ct,
         });
     }
     if expected_chans == 3 && fh.do_ycbcr {
@@ -1489,6 +1589,15 @@ fn decode_frame_body(
                 metadata.bit_depth.bits_per_sample
             )));
         }
+        if (fh.flags & (crate::frame_header::flags::PATCHES | crate::frame_header::flags::SPLINES))
+            != 0
+        {
+            return Err(Error::Unsupported(
+                "jxl decoder: patches/splines on a YCbCr Modular frame are not wired \
+                 (no specimen exercises the §L.3 pre-CT feature domain)"
+                    .into(),
+            ));
+        }
         let planes = build_rgb_planes_from_ycbcr(&img)?;
         return Ok(DecodedFrame {
             frame: VideoFrame { pts, planes },
@@ -1496,6 +1605,8 @@ fn decode_frame_body(
             next_frame_offset,
             compose: compose_meta,
             raw_f32: None,
+            frame_type: fh.frame_type,
+            pre_ct: None,
         });
     }
 
@@ -1534,16 +1645,75 @@ fn decode_frame_body(
             max_sample,
         )?;
     }
-    let img = img;
     // Unclamped float planes for §C.2 composition: Modular samples may
     // legally lie outside [0, 2^bps - 1] and the blend arithmetic
     // needs them un-truncated (see `DecodedFrame::raw_f32`).
     let inv_max = 1.0f32 / max_sample as f32;
-    let raw_f32: Vec<Vec<f32>> = img
+    let mut raw_f32: Vec<Vec<f32>> = img
         .channels
         .iter()
         .map(|ch| ch.iter().map(|&v| v as f32 * inv_max).collect())
         .collect();
+
+    // §K.2 patches on the integer pass-through path (round 441): the
+    // frame has no colour transform, so the pre-CT feature domain is
+    // the decoded samples themselves, normalised to `[0, 1]` (the same
+    // normalisation raw_f32 and the §C.2 composer use, and the Part 9
+    // reading the §J.3 kModular EPF posture arbitrated). The blended
+    // colour channels are written back as rounded integers for the
+    // packed output; raw_f32 keeps the unclamped float values.
+    if (fh.flags & crate::frame_header::flags::PATCHES) != 0 {
+        let patches = lf_global.patches.as_deref().ok_or_else(|| {
+            Error::InvalidData(
+                "jxl decoder: kPatches flag set but LfGlobal carried no patch dictionary".into(),
+            )
+        })?;
+        let w = img.descs[0].width as usize;
+        let h = img.descs[0].height as usize;
+        {
+            let mut color: Vec<&mut [f32]> = raw_f32
+                .iter_mut()
+                .take(expected_chans)
+                .map(|p| p.as_mut_slice())
+                .collect();
+            crate::patches::render_patches(patches, refs, &mut color, w, h)?;
+        }
+        for (ch, plane) in img
+            .channels
+            .iter_mut()
+            .zip(raw_f32.iter())
+            .take(expected_chans)
+        {
+            for (v, &f) in ch.iter_mut().zip(plane.iter()) {
+                *v = (f * max_sample as f32).round() as i32;
+            }
+        }
+    }
+    if (fh.flags & crate::frame_header::flags::SPLINES) != 0 {
+        // The §K.3 spline coefficients are XYB-channel quantities; on a
+        // frame with no XYB transform the rendering domain is
+        // underdetermined and no specimen exercises it.
+        return Err(Error::Unsupported(
+            "jxl decoder: splines on a non-XYB Modular frame are not wired (the §K.3 \
+             coefficients are XYB-domain; no specimen exercises this combination)"
+                .into(),
+        ));
+    }
+    let img = img;
+    let raw_f32 = raw_f32;
+
+    // §C.2 pre-CT reference recording on the no-colour-transform path:
+    // the pre-CT and output domains coincide; record the normalised
+    // (post-filter, post-feature) planes.
+    let pre_ct = if want_pre_ct {
+        Some(crate::patches::PreCtFrame {
+            width: img.descs[0].width as usize,
+            height: img.descs[0].height as usize,
+            planes: raw_f32.clone(),
+        })
+    } else {
+        None
+    };
     let mut planes: Vec<VideoPlane> = Vec::with_capacity(n_chans);
     for (i, ch_data) in img.channels.iter().enumerate() {
         let desc = img.descs[i];
@@ -1580,6 +1750,8 @@ fn decode_frame_body(
         next_frame_offset,
         compose: compose_meta,
         raw_f32: Some(raw_f32),
+        frame_type: fh.frame_type,
+        pre_ct,
     })
 }
 
@@ -1634,12 +1806,24 @@ fn reject_undrawn_image_features(frame_flags: u64) -> Result<()> {
 /// features → colour transform). For a Modular frame the EPF degree of
 /// smoothing is the constant `rf.epf_sigma_for_modular` (§J.3.3: "set
 /// to rf.epf_sigma_for_modular" for non-kVarDCT frames).
+/// Image-feature inputs of the Modular XYB output path (round 441):
+/// the frame's feature flags, the LfGlobal dictionaries, the pre-CT
+/// reference slots, and the `save_before_ct` snapshot request.
+struct ModularXybFeatures<'a> {
+    flags: u64,
+    patches: Option<&'a [crate::patches::Patch]>,
+    splines: Option<&'a [crate::splines::Spline]>,
+    refs: &'a crate::patches::ReferenceFrames,
+    want_pre_ct: bool,
+}
+
 fn build_rgb_planes_from_xyb(
     img: &crate::modular_fdis::ModularImage,
     lf_dequant: &crate::lf_global::LfChannelDequantization,
     metadata: &ImageMetadataFdis,
     rf: &crate::frame_header::RestorationFilter,
-) -> Result<Vec<VideoPlane>> {
+    features: ModularXybFeatures<'_>,
+) -> Result<(Vec<VideoPlane>, Option<crate::patches::PreCtFrame>)> {
     if img.channels.len() != 3 {
         return Err(Error::InvalidData(format!(
             "JXL XYB inverse: expected 3 channels (Y', X', B'), got {}",
@@ -1716,6 +1900,42 @@ fn build_rgb_planes_from_xyb(
         )?;
     }
 
+    // Step 2b — image features (Annex K, round 441): after the
+    // restoration filters and before the colour transform (§5.2), in
+    // draw order patches (§K.2) then splines (§K.3). The pre-CT domain
+    // here is the float XYB planes, matching the domain the reference
+    // frames were recorded in. (kNoise on Modular frames is rejected
+    // upstream.)
+    if (features.flags & crate::frame_header::flags::PATCHES) != 0 {
+        let patches = features.patches.ok_or_else(|| {
+            Error::InvalidData(
+                "jxl decoder: kPatches flag set but LfGlobal carried no patch dictionary".into(),
+            )
+        })?;
+        let mut color: [&mut [f32]; 3] = [&mut x_plane, &mut y_plane, &mut b_plane];
+        crate::patches::render_patches(patches, features.refs, &mut color, w, h)?;
+    }
+    if (features.flags & crate::frame_header::flags::SPLINES) != 0 {
+        let splines = features.splines.ok_or_else(|| {
+            Error::InvalidData(
+                "jxl decoder: kSplines flag set but LfGlobal carried no spline dictionary".into(),
+            )
+        })?;
+        crate::splines::render_splines(splines, &mut x_plane, &mut y_plane, &mut b_plane, w, h)?;
+    }
+
+    // §C.2 `save_before_ct` recording: the post-feature float XYB
+    // planes, one step short of the colour transform.
+    let pre_ct = if features.want_pre_ct {
+        Some(crate::patches::PreCtFrame {
+            width: w,
+            height: h,
+            planes: vec![x_plane.clone(), y_plane.clone(), b_plane.clone()],
+        })
+    } else {
+        None
+    };
+
     // Step 3 — inverse XYB colour transform (§L.2.2) → linear RGB →
     // signalled transfer encoding (Table A.10, round 389) → 8-bit,
     // per sample.
@@ -1732,20 +1952,23 @@ fn build_rgb_planes_from_xyb(
         g_bytes.push(enc.encode_u8(g_lin));
         b_bytes.push(enc.encode_u8(b_lin));
     }
-    Ok(vec![
-        VideoPlane {
-            stride: w,
-            data: r_bytes,
-        },
-        VideoPlane {
-            stride: w,
-            data: g_bytes,
-        },
-        VideoPlane {
-            stride: w,
-            data: b_bytes,
-        },
-    ])
+    Ok((
+        vec![
+            VideoPlane {
+                stride: w,
+                data: r_bytes,
+            },
+            VideoPlane {
+                stride: w,
+                data: g_bytes,
+            },
+            VideoPlane {
+                stride: w,
+                data: b_bytes,
+            },
+        ],
+        pre_ct,
+    ))
 }
 
 /// Convert a 3-channel decoded modular image whose channels carry
@@ -2125,6 +2348,18 @@ struct VarDctFinishInputs<'a> {
     sharpness: &'a [i32],
     /// LfGlobal §I.2.7 colour-correlation base/colour factors.
     cfl: crate::lf_global::LfChannelCorrelation,
+    /// LfGlobal §C.4.5 patch dictionary — `Some` when the frame signals
+    /// kPatches; drives the §K.2 renderer after the §J filters.
+    patches: Option<Vec<crate::patches::Patch>>,
+    /// LfGlobal §C.4.6 spline dictionary — `Some` when the frame
+    /// signals kSplines; drives the §K.3 renderer after patches.
+    splines: Option<Vec<crate::splines::Spline>>,
+    /// The §C.2 `Reference[…]` slots in their pre-CT recordings — the
+    /// §K.2 patch sample source.
+    refs: &'a crate::patches::ReferenceFrames,
+    /// Snapshot the post-feature pre-CT planes for §C.2
+    /// `save_before_ct` reference recording.
+    want_pre_ct: bool,
     /// LfGlobal §C.4.7 noise-synthesis LUT — `Some` when the frame
     /// signals kNoise; drives the §K.4 renderer after the §J filters.
     noise: Option<crate::noise::NoiseParameters>,
@@ -2168,7 +2403,7 @@ fn finish_vardct_decode(
     hf_section: &mut crate::hf_global_section::HfGlobalSection,
     group_readers: Vec<(crate::group_rect::GroupRect, Vec<BitReader<'_>>)>,
     pts: Option<i64>,
-) -> Result<VideoFrame> {
+) -> Result<(VideoFrame, Option<crate::patches::PreCtFrame>)> {
     use crate::block_context_resolver::BlockContextResolver;
     use crate::hf_dequant::QmScaleFactors;
     use crate::multi_pass_hf_header::PerPassHfHeaders;
@@ -2185,6 +2420,10 @@ fn finish_vardct_decode(
         b_from_y,
         sharpness,
         cfl,
+        patches,
+        splines,
+        refs,
+        want_pre_ct,
         noise,
         hf_block_context,
         lf_quant,
@@ -2395,11 +2634,48 @@ fn finish_vardct_decode(
         }
     }
 
-    // §K.4 noise feature (round 437): rendered after the restoration
-    // filters and before the §L.2.2 colour transform, per the §5.2
-    // decode order (IT → RF → features → CT). Patches and splines are
-    // rejected upstream (LfGlobal), so noise is the only feature that
-    // can reach this point.
+    // Image features (Annex K), rendered after the restoration filters
+    // and before the §L.2.2 colour transform, per the §5.2 decode order
+    // (IT → RF → features → CT) — in the K.1 draw order: patches (§K.2)
+    // first, splines (§K.3) after patches, noise (§K.4) last.
+    if (fh.flags & crate::frame_header::flags::PATCHES) != 0 {
+        let patches = patches.ok_or_else(|| {
+            Error::InvalidData(
+                "jxl VarDCT decoder: kPatches flag set but LfGlobal carried no patch \
+                 dictionary"
+                    .into(),
+            )
+        })?;
+        let w = frame_width as usize;
+        let h = frame_height as usize;
+        let [x_plane, y_plane, b_plane] = &mut cropped.planes;
+        let mut color: [&mut [f32]; 3] = [
+            &mut x_plane.samples,
+            &mut y_plane.samples,
+            &mut b_plane.samples,
+        ];
+        crate::patches::render_patches(&patches, refs, &mut color, w, h)?;
+    }
+    if (fh.flags & crate::frame_header::flags::SPLINES) != 0 {
+        let splines = splines.ok_or_else(|| {
+            Error::InvalidData(
+                "jxl VarDCT decoder: kSplines flag set but LfGlobal carried no spline \
+                 dictionary"
+                    .into(),
+            )
+        })?;
+        let w = frame_width as usize;
+        let h = frame_height as usize;
+        let [x_plane, y_plane, b_plane] = &mut cropped.planes;
+        crate::splines::render_splines(
+            &splines,
+            &mut x_plane.samples,
+            &mut y_plane.samples,
+            &mut b_plane.samples,
+            w,
+            h,
+        )?;
+    }
     if (fh.flags & crate::frame_header::flags::NOISE) != 0 {
         let params = noise.ok_or_else(|| {
             Error::InvalidData(
@@ -2437,6 +2713,23 @@ fn finish_vardct_decode(
         });
     }
 
+    // §C.2 `save_before_ct` reference recording: snapshot the pre-CT
+    // planes after every drawn feature (the recording captures the
+    // fully decoded frame, one step short of the colour transform).
+    let pre_ct = if want_pre_ct {
+        Some(crate::patches::PreCtFrame {
+            width: frame_width as usize,
+            height: frame_height as usize,
+            planes: vec![
+                cropped.planes[0].samples.clone(),
+                cropped.planes[1].samples.clone(),
+                cropped.planes[2].samples.clone(),
+            ],
+        })
+    } else {
+        None
+    };
+
     // §L.2.2 inverse XYB → linear RGB → signalled transfer encoding
     // (Table A.10, round 389) → 8-bit. The reconstructed XYB samples
     // come straight out of the IDCT (no §L.2.2 kModular rescale
@@ -2464,23 +2757,26 @@ fn finish_vardct_decode(
         g_bytes.push(enc.encode_u8(g));
         b_bytes.push(enc.encode_u8(bb));
     }
-    Ok(VideoFrame {
-        pts,
-        planes: vec![
-            VideoPlane {
-                stride: w,
-                data: r_bytes,
-            },
-            VideoPlane {
-                stride: w,
-                data: g_bytes,
-            },
-            VideoPlane {
-                stride: w,
-                data: b_bytes,
-            },
-        ],
-    })
+    Ok((
+        VideoFrame {
+            pts,
+            planes: vec![
+                VideoPlane {
+                    stride: w,
+                    data: r_bytes,
+                },
+                VideoPlane {
+                    stride: w,
+                    data: g_bytes,
+                },
+                VideoPlane {
+                    stride: w,
+                    data: b_bytes,
+                },
+            ],
+        },
+        pre_ct,
+    ))
 }
 
 /// Integrated single-LfGroup VarDCT decode. Reads LfGlobal + LfGroup +
@@ -2513,6 +2809,34 @@ pub fn decode_vardct_frame(
     scaffold: crate::vardct::VarDctScaffold,
     pts: Option<i64>,
 ) -> Result<VideoFrame> {
+    decode_vardct_frame_with_refs(
+        fh,
+        metadata,
+        toc,
+        br,
+        scaffold,
+        pts,
+        &crate::patches::ReferenceFrames::default(),
+        false,
+    )
+    .map(|(frame, _)| frame)
+}
+
+/// [`decode_vardct_frame`] with the §C.2 reference-frame state the §K.2
+/// patch renderer consumes, plus the `save_before_ct` pre-CT snapshot
+/// request. The multi-frame walk drives this form.
+#[doc(hidden)] // internal: mid-pipeline driver exposed for integration tests; use decode_one_frame
+#[allow(clippy::too_many_arguments)]
+pub fn decode_vardct_frame_with_refs(
+    fh: &FrameHeader,
+    metadata: &ImageMetadataFdis,
+    toc: &Toc,
+    br: &mut BitReader<'_>,
+    scaffold: crate::vardct::VarDctScaffold,
+    pts: Option<i64>,
+    refs: &crate::patches::ReferenceFrames,
+    want_pre_ct: bool,
+) -> Result<(VideoFrame, Option<crate::patches::PreCtFrame>)> {
     let num_groups = fh.num_groups();
     let num_lf_groups = fh.num_lf_groups();
 
@@ -2878,6 +3202,10 @@ pub fn decode_vardct_frame(
         b_from_y: &b_from_y,
         sharpness: &sharpness,
         cfl,
+        patches: lf_global.patches,
+        splines: lf_global.splines,
+        refs,
+        want_pre_ct,
         noise: lf_global.noise,
         hf_block_context: hbc,
         lf_quant_width: fbw as u32,
@@ -3029,9 +3357,19 @@ mod tests {
             ..frame_header::RestorationFilter::default()
         };
 
-        let with_filters = build_rgb_planes_from_xyb(&img, &lf_dequant, &metadata, &rf_on).unwrap();
-        let without_filters =
-            build_rgb_planes_from_xyb(&img, &lf_dequant, &metadata, &rf_off).unwrap();
+        let refs = crate::patches::ReferenceFrames::default();
+        let no_features = || ModularXybFeatures {
+            flags: 0,
+            patches: None,
+            splines: None,
+            refs: &refs,
+            want_pre_ct: false,
+        };
+        let (with_filters, _) =
+            build_rgb_planes_from_xyb(&img, &lf_dequant, &metadata, &rf_on, no_features()).unwrap();
+        let (without_filters, _) =
+            build_rgb_planes_from_xyb(&img, &lf_dequant, &metadata, &rf_off, no_features())
+                .unwrap();
 
         assert_eq!(with_filters.len(), 3);
         for (p_on, p_off) in with_filters.iter().zip(without_filters.iter()) {
@@ -3141,7 +3479,20 @@ mod tests {
             epf_iters: 0,
             ..frame_header::RestorationFilter::default()
         };
-        let planes = build_rgb_planes_from_xyb(&img, &lf_dequant, &metadata, &rf_off).unwrap();
+        let (planes, _) = build_rgb_planes_from_xyb(
+            &img,
+            &lf_dequant,
+            &metadata,
+            &rf_off,
+            ModularXybFeatures {
+                flags: 0,
+                patches: None,
+                splines: None,
+                refs: &crate::patches::ReferenceFrames::default(),
+                want_pre_ct: false,
+            },
+        )
+        .unwrap();
 
         // Independent recompute via the convenience wrapper used before
         // the filter split, plus the signalled (default = sRGB) Table

@@ -345,10 +345,19 @@ impl HfBlockContext {
 /// downstream LfGroup parser (round 11 too) can reach the LF
 /// coefficients sub-bitstream.
 ///
-/// Patches / Splines are still rejected with a precise
-/// `Error::Unsupported`; NoiseParameters parses since round 437.
+/// All three Table C.10 image-feature bundles parse: Patches (§C.4.5,
+/// round 441), Splines (§C.4.6, round 441) and NoiseParameters (§C.4.7,
+/// round 437).
 #[derive(Debug, Clone)]
 pub struct LfGlobal {
+    /// §C.4.5 patch dictionary — present when the frame signals
+    /// kPatches (round 441).
+    pub patches: Option<Vec<crate::patches::Patch>>,
+    /// §C.4.6 spline dictionary, dequantised + recorrelated with the
+    /// frame's §C.4.4 base correlations (Table C.13 defaults for
+    /// kModular frames, which carry no LfChannelCorrelation bundle) —
+    /// present when the frame signals kSplines (round 441).
+    pub splines: Option<Vec<crate::splines::Spline>>,
     /// §C.4.7 noise-synthesis LUT — present when the frame signals
     /// kNoise (round 437).
     pub noise: Option<crate::noise::NoiseParameters>,
@@ -365,26 +374,44 @@ pub struct LfGlobal {
 }
 
 impl LfGlobal {
-    /// Decode the LfGlobal bundle. Currently rejects
-    /// `flags::PATCHES | SPLINES` (their bundles are not parsed yet, so
-    /// continuing would misalign every later field); kNoise parses per
-    /// §C.4.7 (round 437) and the renderer runs in the VarDCT finish
-    /// step (§K.4).
+    /// Decode the LfGlobal bundle, Table C.10 row order: Patches
+    /// (§C.4.5) → Splines (§C.4.6) → NoiseParameters (§C.4.7) →
+    /// LfChannelDequantization → the kVarDCT bundles → GlobalModular.
+    ///
+    /// The Splines bundle is parsed raw and dequantised only after the
+    /// LfChannelCorrelation bundle (whose `base_correlation_{x,b}` the
+    /// §C.4.6 recorrelation consumes) has been read — Table C.10 places
+    /// it later in the same bundle; kModular frames carry none and use
+    /// the Table C.13 defaults.
     pub fn read(
         br: &mut BitReader<'_>,
         fh: &FrameHeader,
         metadata: &ImageMetadataFdis,
     ) -> Result<Self> {
-        if (fh.flags & flags::PATCHES) != 0 {
-            return Err(Error::Unsupported(
-                "JXL LfGlobal: Patches not yet supported (round 4)".into(),
-            ));
-        }
-        if (fh.flags & flags::SPLINES) != 0 {
-            return Err(Error::Unsupported(
-                "JXL LfGlobal: Splines not yet supported (round 4)".into(),
-            ));
-        }
+        // §C.4.5 Patches (Table C.10 row 1).
+        let patches = if (fh.flags & flags::PATCHES) != 0 {
+            let num_alpha = metadata
+                .extra_channel_info
+                .iter()
+                .filter(|ec| matches!(ec.kind, crate::metadata_fdis::ExtraChannelType::Alpha))
+                .count();
+            Some(crate::patches::decode_patches(
+                br,
+                metadata.num_extra_channels,
+                num_alpha,
+                fh.width,
+                fh.height,
+            )?)
+        } else {
+            None
+        };
+        // §C.4.6 Splines (Table C.10 row 2) — raw parse; finalized
+        // below once the base correlations are known.
+        let splines_raw = if (fh.flags & flags::SPLINES) != 0 {
+            Some(crate::splines::decode_splines_raw(br)?)
+        } else {
+            None
+        };
         // §C.4.7 NoiseParameters (Table C.10 row 3: after Patches and
         // Splines, before LfChannelDequantization) — round 437.
         let noise = if (fh.flags & flags::NOISE) != 0 {
@@ -410,10 +437,27 @@ impl LfGlobal {
                 (None, None, None)
             };
 
+        // §C.4.6 spline dequantisation, now that the frame's base
+        // correlations are known (Table C.13 defaults when the frame
+        // carries no LfChannelCorrelation bundle).
+        let splines = match splines_raw {
+            Some(raw) => {
+                let cfl = lf_channel_correlation.unwrap_or_default();
+                Some(crate::splines::finalize_splines(
+                    &raw,
+                    cfl.base_correlation_x,
+                    cfl.base_correlation_b,
+                )?)
+            }
+            None => None,
+        };
+
         // C.4.8 GlobalModular.
         let global_modular = GlobalModular::read(br, fh, metadata)?;
 
         Ok(Self {
+            patches,
+            splines,
             noise,
             lf_dequant,
             quantizer,
