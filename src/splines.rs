@@ -512,10 +512,79 @@ pub const SPLINE_NUM_CONTEXTS: usize = 6;
 /// `2` num_splines, `0` quant_adjust, `1` start coords, `3`
 /// num_control_points, `4` control-point deltas, `5` DCT32 coefficients.
 pub fn decode_splines_with<F>(
-    mut read_uint: F,
+    read_uint: F,
     base_correlation_x: f32,
     base_correlation_b: f32,
 ) -> Result<Vec<Spline>>
+where
+    F: FnMut(u32) -> Result<u32>,
+{
+    let raw = decode_splines_raw_with(read_uint)?;
+    finalize_splines(&raw, base_correlation_x, base_correlation_b)
+}
+
+/// A spline as it sits on the wire (§C.4.6): control points already
+/// through the Listing C.4 double-delta, DCT32 coefficients still
+/// **quantised** (no `quant_adjust` divisor, no channel weight, no
+/// recorrelation). Produced by [`decode_splines_raw_with`]; turned into
+/// renderable [`Spline`]s by [`finalize_splines`].
+///
+/// The split exists because the §C.4.6 dequantisation needs
+/// `base_correlation_{x,b}` from the LfChannelCorrelation bundle
+/// (§C.4.4), which Table C.10 places *after* the Splines bundle in
+/// LfGlobal — the entropy parse must run before those values are known.
+#[derive(Debug, Clone)]
+pub struct RawSpline {
+    pub control_points: Vec<Point>,
+    /// Quantised DCT32 coefficients in wire order: X, Y, B, σ.
+    pub raw_dct: [[i32; SPLINE_DCT_LEN]; 4],
+}
+
+/// The §C.4.6 wire structure before dequantisation: `quant_adjust` plus
+/// every spline's control points and quantised coefficients.
+#[derive(Debug, Clone)]
+pub struct RawSplines {
+    pub quant_adjust: i32,
+    pub splines: Vec<RawSpline>,
+}
+
+/// FDIS §C.4.6 — dequantise + recorrelate a decoded [`RawSplines`] set
+/// into renderable [`Spline`]s, given the frame's
+/// `base_correlation_{x,b}` (§C.4.4; defaults `0.0` / `1.0` when the
+/// frame carries no LfChannelCorrelation bundle, i.e. kModular).
+pub fn finalize_splines(
+    raw: &RawSplines,
+    base_correlation_x: f32,
+    base_correlation_b: f32,
+) -> Result<Vec<Spline>> {
+    let mut out = Vec::with_capacity(raw.splines.len().min(1024));
+    for rs in &raw.splines {
+        let mut dct_x = dequant_dct32(&rs.raw_dct[0], raw.quant_adjust, 0).unwrap();
+        let dct_y = dequant_dct32(&rs.raw_dct[1], raw.quant_adjust, 1).unwrap();
+        let mut dct_b = dequant_dct32(&rs.raw_dct[2], raw.quant_adjust, 2).unwrap();
+        let dct_sigma = dequant_dct32(&rs.raw_dct[3], raw.quant_adjust, 3).unwrap();
+        recorrelate_xb(
+            &mut dct_x,
+            &mut dct_b,
+            &dct_y,
+            base_correlation_x,
+            base_correlation_b,
+        );
+        out.push(Spline {
+            control_points: rs.control_points.clone(),
+            dct_x,
+            dct_y,
+            dct_b,
+            dct_sigma,
+        });
+    }
+    Ok(out)
+}
+
+/// FDIS §C.4.6 — the Listing C.3 / Listing C.4 wire parse against an
+/// abstract `ReadHybridVarLenUint(ctx)` source, stopping short of
+/// dequantisation (see [`RawSpline`] for why).
+pub fn decode_splines_raw_with<F>(mut read_uint: F) -> Result<RawSplines>
 where
     F: FnMut(u32) -> Result<u32>,
 {
@@ -524,8 +593,6 @@ where
         .checked_add(1)
         .ok_or_else(|| Error::InvalidData("JXL splines: num_splines overflow".into()))?
         as usize;
-    // quant_adjust = UnpackSigned(ReadHybridVarLenUint(0));
-    let quant_adjust = unpack_signed(read_uint(0)?);
 
     // Listing C.3 — starting coordinates (delta-coded after the first).
     let mut start = Vec::with_capacity(num_splines.min(1024));
@@ -545,6 +612,24 @@ where
         last_x = x;
         last_y = y;
     }
+
+    // quant_adjust = UnpackSigned(ReadHybridVarLenUint(0)).
+    //
+    // ## Erratum (round 441): quant_adjust follows the start-point loop
+    //
+    // Listing C.3 prints `quant_adjust` immediately after
+    // `num_splines`, BEFORE the starting-coordinate loop. The wire
+    // carries it AFTER the loop. Arbitrated black-box on hand-assembled
+    // single-spline codestreams (the reference decoder binary as an
+    // opaque oracle — it accepts the 43-byte specimens and renders
+    // them): under the printed order the reference decode places the
+    // spline at y = <our sp_x>, starts x at 0, and dims/tightens the
+    // brush by exactly `1 + <our sp_y>/8` — i.e. it consumed our
+    // second token as a start coordinate and our fourth as
+    // `quant_adjust`. Three independent geometry/σ probes (horizontal
+    // deltas, vertical deltas, swapped start tokens) all fit the
+    // corrected order exactly and contradict the printed one.
+    let quant_adjust = unpack_signed(read_uint(0)?);
 
     // Per-spline: control points (double-delta) + 4×32 DCT coefficients.
     let mut out = Vec::with_capacity(num_splines.min(1024));
@@ -575,27 +660,15 @@ where
                 *c = unpack_signed(read_uint(5)?);
             }
         }
-        let mut dct_x = dequant_dct32(&raw[0], quant_adjust, 0).unwrap();
-        let dct_y = dequant_dct32(&raw[1], quant_adjust, 1).unwrap();
-        let mut dct_b = dequant_dct32(&raw[2], quant_adjust, 2).unwrap();
-        let dct_sigma = dequant_dct32(&raw[3], quant_adjust, 3).unwrap();
-        recorrelate_xb(
-            &mut dct_x,
-            &mut dct_b,
-            &dct_y,
-            base_correlation_x,
-            base_correlation_b,
-        );
-
-        out.push(Spline {
+        out.push(RawSpline {
             control_points,
-            dct_x,
-            dct_y,
-            dct_b,
-            dct_sigma,
+            raw_dct: raw,
         });
     }
-    Ok(out)
+    Ok(RawSplines {
+        quant_adjust,
+        splines: out,
+    })
 }
 
 /// FDIS §C.4.6 — decode the spline dictionary from the codestream.
@@ -609,15 +682,34 @@ pub fn decode_splines(
     base_correlation_x: f32,
     base_correlation_b: f32,
 ) -> Result<Vec<Spline>> {
+    let raw = decode_splines_raw(br)?;
+    finalize_splines(&raw, base_correlation_x, base_correlation_b)
+}
+
+/// FDIS §C.4.6 — the wire-level parse of the Splines LfGlobal bundle,
+/// deferred-dequant form: reads the §D.3 six-distribution prelude, its
+/// ANS-state init (§C.3.2), then the Listing C.3 / C.4 structure into
+/// [`RawSplines`]. After the last symbol the §D.3.3 ANS final-state
+/// invariant is enforced (a misparse guard; prefix-coded streams carry
+/// no ANS state and skip the check).
+pub fn decode_splines_raw(br: &mut crate::bitreader::BitReader<'_>) -> Result<RawSplines> {
     use crate::modular_fdis::{decode_uint_in_with_dist_pub, EntropyStream};
     let mut entropy = EntropyStream::read(br, SPLINE_NUM_CONTEXTS)?;
     entropy.read_ans_state_init(br)?;
     let mut hybrid = crate::ans::hybrid::HybridUintState::new(entropy.lz77, entropy.lz_len_conf);
-    decode_splines_with(
-        |ctx| decode_uint_in_with_dist_pub(&mut hybrid, &mut entropy, br, ctx, 0),
-        base_correlation_x,
-        base_correlation_b,
-    )
+    let raw = decode_splines_raw_with(|ctx| {
+        decode_uint_in_with_dist_pub(&mut hybrid, &mut entropy, br, ctx, 0)
+    })?;
+    if let Some(dec) = entropy.ans_state.as_ref() {
+        if !dec.final_state() {
+            return Err(Error::InvalidData(
+                "JXL splines: ANS final-state invariant (D.3.3) failed after the \
+                 §C.4.6 stream — misparse"
+                    .into(),
+            ));
+        }
+    }
+    Ok(raw)
 }
 
 /// FDIS §K.3 — render every spline in draw order onto the XYB planes
@@ -937,10 +1029,11 @@ mod tests {
     fn decode_splines_with_parses_one_spline() {
         // Scripted ReadHybridVarLenUint returns; also records the ctx
         // sequence so the parse's context routing is verified.
-        // ctx2 num_splines-1=0; ctx0 quant_adjust=0; ctx1 sp_x[0]=10,
-        // sp_y[0]=24; ctx3 num_control_points-1=1; ctx4 x1 raw
-        // (UnpackSigned=20), y1 raw (0).
-        let mut script: Vec<u32> = vec![0, 0, 10, 24, 1, 40, 0];
+        // ctx2 num_splines-1=0; ctx1 sp_x[0]=10, sp_y[0]=24;
+        // ctx0 quant_adjust=0 (after the start loop — the round-441
+        // Listing C.3 order erratum); ctx3 num_control_points-1=1;
+        // ctx4 x1 raw (UnpackSigned=20), y1 raw (0).
+        let mut script: Vec<u32> = vec![0, 10, 24, 0, 1, 40, 0];
         // X channel: 32 zeros.
         script.resize(script.len() + 32, 0);
         // Y channel: index 0 = UnpackSigned(200) = 100, rest 0.
@@ -952,7 +1045,7 @@ mod tests {
         script.push(40);
         script.resize(script.len() + 31, 0);
 
-        let expected_ctx_prefix = [2u32, 0, 1, 1, 3, 4, 4];
+        let expected_ctx_prefix = [2u32, 1, 1, 0, 3, 4, 4];
 
         let mut idx = 0usize;
         let mut ctxs: Vec<u32> = Vec::new();
@@ -996,11 +1089,11 @@ mod tests {
         //       = (5 + 2, 5 + 1) = (7, 6).
         let mut script: Vec<u32> = vec![
             1, // ctx2: num_splines - 1 = 1 → 2 splines
-            0, // ctx0: quant_adjust = 0
             5, // ctx1: sp_x[0] = 5 (literal)
             5, // ctx1: sp_y[0] = 5
             4, // ctx1: sp_x[1] raw → UnpackSigned(4) = 2 → 7
             2, // ctx1: sp_y[1] raw → UnpackSigned(2) = 1 → 6
+            0, // ctx0: quant_adjust = 0 (after the start loop — round-441 erratum)
         ];
         // Spline 0: 1 control point (num_cp - 1 = 0), then 4×32 coeffs.
         script.push(0); // ctx3

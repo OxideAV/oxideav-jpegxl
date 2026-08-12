@@ -12,7 +12,9 @@ use oxideav_jpegxl::splines::{decode_splines_with, render_splines, Point, Spline
 
 /// Build the token script for a single spline with two control points and
 /// a chosen (Y, σ) DC value, everything else zero. Mirrors the reader's
-/// context order: ctx2, ctx0, ctx1×2, ctx3, ctx4×2, ctx5×128.
+/// context order: ctx2, ctx1×2, ctx0, ctx3, ctx4×2, ctx5×128 (the
+/// round-441 Listing C.3 erratum: `quant_adjust` follows the start-point
+/// loop on the wire).
 fn script_one_spline(
     sp_x: u32,
     sp_y: u32,
@@ -23,10 +25,10 @@ fn script_one_spline(
 ) -> Vec<u32> {
     let mut s = vec![
         0,      // ctx2: num_splines - 1
-        0,      // ctx0: quant_adjust (UnpackSigned → 0)
         sp_x,   // ctx1: sp_x[0]
         sp_y,   // ctx1: sp_y[0]
-        1,      // ctx3: num_control_points - 1 = 1
+        0, // ctx0: quant_adjust (UnpackSigned → 0; read after the start loop — round-441 erratum)
+        1, // ctx3: num_control_points - 1 = 1
         dx_raw, // ctx4: x1 delta raw
         dy_raw, // ctx4: y1 delta raw
     ];
