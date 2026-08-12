@@ -7,7 +7,73 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Round 441 — the **§C.4.5 + §K.2 kPatches image feature decodes and
+  renders end to end** (`crate::patches`): Listing C.2 dictionary
+  parse (10-distribution §D.3 stream with the D.3.3 final-state
+  guard) and Table K.1 blending (kNone / kReplace / kAdd / kMul;
+  alpha modes and extra-channel blending refuse precisely — no
+  specimen exercises them). The §C.2 plumbing underneath: Table C.3
+  kReferenceOnly frames decode and are excluded from composition and
+  presentation, and `save_before_ct` recordings land in a walk-level
+  pre-CT `Reference[0..4]` store (`patches::ReferenceFrames`) — the
+  §K.2 sample source — while a pre-CT slot named as a §C.2 *blending*
+  source refuses precisely (the composer's blending domain is
+  post-CT). Pinned on locally generated fixtures: two lossless
+  Modular patch streams decode **bit-exact** against black-box
+  reference decodes (`round441_patches_dots_lossless_bit_exact`,
+  60 single-position dot patches; `..glyphs..`, 9×5-dict non-square
+  multi-position patches), and a VarDCT+XYB sibling (Modular-XYB
+  dictionary consumed in the pre-CT float-XYB domain) is ratcheted at
+  MAD < 2.2 (its residual is the round-437 impulse deficiency, not
+  patch error). The Listing C.2 `mode`-context question (printed
+  ctx 5 vs the otherwise-unused ctx 6) is unarbitrable on available
+  wire evidence (every specimen's cluster map merges 5 and 6): the
+  printed reading ships with a CI equivalence pin
+  (`round441_patches_mode_ctx_5_vs_6_equivalent_on_wire`).
+- Round 441 — the **§C.4.6 + §K.3 kSplines feature is wired into the
+  registered decode path** (VarDCT + Modular-XYB frames, §K.1 draw
+  order patches → splines → noise) and **wire-validated for the first
+  time**: no encoder emits spline streams, so a 43-byte codestream is
+  hand-assembled from the FDIS bundle tables in
+  `round441_image_features.rs` (the builder must reproduce the
+  committed fixture byte-for-byte); the reference decoder binary
+  accepts it black-box and our render matches its decode to max
+  ±1/255 (`round441_spline_synth_renders_reference_exact_band`).
+  `decode_splines_raw` / `finalize_splines` split the wire parse from
+  dequantisation so LfGlobal can apply the §C.4.4 base correlations
+  that Table C.10 places after the Splines bundle.
+
 ### Fixed
+
+- Round 441 — **the §C.4.6 Listing C.3 field-order erratum**: on the
+  wire `quant_adjust` follows the starting-coordinate loop; the
+  listing prints it immediately after `num_splines`. Arbitrated
+  black-box on hand-assembled single-spline codestreams: under the
+  printed order the reference decode places the spline at
+  `y = sp_x`, starts x at 0, and scales the brush by exactly
+  `1 + sp_y/8` — it consumed our second token as a start coordinate
+  and our fourth as `quant_adjust`; three independent geometry/σ
+  probes fit the corrected order exactly.
+- Round 441 — **the §L.2 kModular XYB rescale erratum: the ×`m`
+  product divides by 128** (`xyb::modular_xyb_rescale`). The literal
+  FDIS reading (`X = X' × m_x_lf_unscaled`) saturates every sample on
+  real streams (≈128× too large); per-channel linear regression of
+  the wire integers against black-box reference decodes of three
+  independently generated lossy-Modular-XYB streams fits slope
+  `m / 128` on every channel to within 0.02 % with zero intercept.
+  The Modular-XYB output path (never pixel-validated before) now
+  lands max ±1/255 (`round441_modular_xyb_rescale_erratum`), and the
+  VarDCT patches fixture's XYB dictionary decodes on the correct
+  scale.
+- Round 441 — the round-437 synthetic-content VarDCT deficiency is
+  **characterised** (not yet fixed): isolated single-pixel impulses
+  vanish because the affected Hornuss / DCT2×2 varblocks decode fewer
+  nonzero coefficients than their declared NonZeros
+  (`remaining_non_zeros > 0` after the full §C.8.3 k-walk, currently
+  accepted silently) — follow-up material with a standalone
+  reproducer.
 
 - Round 437 (second block) — **the §C.7.1 `used_orders != 0` custom
   coefficient orders DECODE**: the Listing C.12 **per-channel

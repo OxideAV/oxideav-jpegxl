@@ -136,22 +136,23 @@ What is implemented and tested today:
   constant-sigma path.
 - **§C.4.6 + §K.3 Splines image feature** — the self-contained `splines`
   module decodes and renders centripetal Catmull-Rom splines. The §C.4.6
-  parse (`decode_splines` / `decode_splines_with`) reads Listing C.3
-  (num_splines, `quant_adjust`, delta-coded start coords) + per-spline
-  control points (Listing C.4 `DecodeDoubleDelta`) and 4×32 DCT
-  coefficients over the §D.3 six-distribution ANS stream, dequantizes
-  (`dequant_dct32`, `kChannelWeight`) and recorrelates (`recorrelate_xb`,
+  parse (`decode_splines` / `decode_splines_raw`) reads Listing C.3
+  (num_splines, delta-coded start coords, then `quant_adjust` — the
+  round-441 field-order erratum, see below) + per-spline control points
+  (Listing C.4 `DecodeDoubleDelta`) and 4×32 DCT coefficients over the
+  §D.3 six-distribution entropy stream, dequantizes (`dequant_dct32`,
+  `kChannelWeight`) and recorrelates (`recorrelate_xb`,
   `Y × base_correlation_{x,b}`). The §K.3 render (`Spline::render` /
   `render_splines`) upsamples control points (`upsample_control_points`),
   resamples by unit arc length (`resample_by_arclength`), and additively
   splats an `erf`-based Gaussian brush (`s2s = √2·σ`,
   `maximum_distance = -2·ln(0.1)·σ²`) onto the XYB planes, evaluating each
   channel via `continuous_idct`. A suspected FDIS typo in the Listing K.1
-  arc parameter is corrected (see below). 25 unit tests + 3 end-to-end
-  integration tests. **Not yet wired into the registered decode path** —
-  that needs an f32-XYB plane hand-off at the §C.4 LfGlobal splines
-  section plus a spline conformance fixture; the `lf_global.rs` splines
-  rejection is the integration hook.
+  arc parameter is corrected (see below). **Wired into the registered
+  decode path since round 441** (VarDCT and Modular-XYB frames, drawn
+  after patches and before noise per §K.1) and pinned wire-level on a
+  hand-assembled 43-byte codestream the reference decoder accepts —
+  our render lands within ±1/255 of the black-box reference decode.
 
 ### Round 389 — multi-group / multi-pass framing, sRGB output, public exposure
 
@@ -387,6 +388,64 @@ and the Listing I.21 Squeeze tendency function.
   domain normalisation. CI-gated arbitration
   (`round437_modular_epf_posture`).
 
+### Round 441 — Patches + Splines wired; two new FDIS errata (§L.2 /128, Listing C.3 order)
+
+- **§C.4.5 + §K.2 kPatches decodes and renders end to end** (`patches`
+  module): the Listing C.2 dictionary parse (10-distribution §D.3
+  stream, D.3.3 final-state guard) and the Table K.1 blending
+  (kNone / kReplace / kAdd / kMul; alpha modes and extra-channel
+  blending refuse precisely — no specimen exercises them). The §C.2
+  plumbing that feeds it: Table C.3 **kReferenceOnly frames** decode
+  and are skipped by the multi-frame walk ("not itself part of the
+  image"), and `save_before_ct` recordings land in a walk-level
+  **pre-CT `Reference[0..4]` store** (float-XYB for xyb frames,
+  normalised samples for integer Modular frames; a pre-CT slot named
+  as a §C.2 *blending* source refuses precisely). Pinned on three
+  locally generated fixtures: two lossless Modular patch streams
+  (60 single-position dot patches; 9×5-dict multi-position non-square
+  glyph patches) decode **bit-exact** against black-box reference
+  decodes, and a VarDCT+XYB sibling (Modular-XYB dictionary consumed
+  in the pre-CT float-XYB domain) sits at MAD 1.7/0.8/0.7 — its
+  residual is the round-437 impulse deficiency below, not patch error.
+  The Listing C.2 `mode`-context question (printed ctx 5 vs the unused
+  ctx 6) is **unarbitrable on available wire evidence** — every
+  specimen's cluster map merges contexts 5 and 6 — so the printed
+  reading ships, with a CI equivalence pin and a per-thread override.
+- **§C.4.6 + §K.3 kSplines wired and wire-validated.** No encoder
+  emits spline streams, so round 441 hand-assembles one bit-by-bit
+  from the FDIS bundle tables (43 bytes; the builder lives in the
+  round-441 test and must reproduce the committed fixture
+  byte-for-byte). The reference decoder accepts it, and arbitrated a
+  **NEW FDIS erratum — the Listing C.3 field order**: on the wire
+  `quant_adjust` follows the starting-coordinate loop, not
+  `num_splines` as printed. Under the printed order the reference
+  decode places the spline at `y = sp_x`, starts x at 0, and scales
+  the brush by exactly `1 + sp_y/8` (our second token consumed as a
+  start coordinate, our fourth as `quant_adjust`); three independent
+  geometry/σ probes all fit the corrected order. With it, our §K.3
+  render (Catmull-Rom upsampling → arc-length resampling → erf brush,
+  incl. the Part 3 K.1 arc-parameter correction) matches the
+  reference decode to **max ±1/255**.
+- **§L.2 kModular XYB rescale erratum — the ×`m` product divides by
+  128.** The FDIS prose reads `X = X' × m_x_lf_unscaled` with no
+  further scale; on real streams the literal reading saturates every
+  sample (≈128× too large). Per-channel linear regression of the wire
+  integers against black-box reference decodes of three independent
+  lossy-Modular-XYB streams fits slope `m / 128` on every channel
+  (±0.02 %, zero intercept). The Modular-XYB output path — previously
+  never pixel-validated — now lands **max ±1/255** on all three
+  fixtures; the same /128 makes the VarDCT patches fixture's XYB
+  dictionary land correctly.
+- **The round-437 "synthetic-content VarDCT accuracy deficiency" is
+  sharply characterised** (not yet fixed): isolated impulse content
+  (single-pixel dots) vanishes entirely on VarDCT frames with or
+  without features. The dot blocks are Hornuss / DCT2×2 varblocks
+  whose **declared NonZeros exceeds the decoded nonzero count** (e.g.
+  raw 20, decoded 9, `remaining_non_zeros = 11` after the full k-walk
+  — a silent D.3.3-class violation the §C.8.3 loop currently does not
+  reject). The dedicated fixture generated this round reproduces it
+  standalone; follow-up round material.
+
 ### Not yet implemented
 
 - **Multi-preset / multi-pass §C.7 slices with `used_orders != 0`**
@@ -395,13 +454,15 @@ and the Listing I.21 Squeeze tendency function.
   `progressive-ac-multipass` fixture — the per-preset repetition or
   per-pass slice layout hides one more wire divergence
   (`round437_custom_orders_boundary` pins the loud refusal).
-- **The synthetic-content VarDCT accuracy deficiency** (round 437):
-  high-detail regions of hard-edge synthetic streams decode ≈ 20/255
-  off while flat regions are byte-exact and photo content sits below
-  1/255 — order-content-independent; needs its own bisection round
-  (suspects: HF dequant weight tables under non-default
-  `x_qm_scale = 3`, non-DCT reconstruction accuracy, EPF sigma from
-  Sharpness on synthetic content).
+- **The synthetic-content VarDCT accuracy deficiency** (round 437;
+  sharply characterised round 441): isolated impulses (single-pixel
+  dots) vanish on VarDCT frames — the affected Hornuss / DCT2×2
+  varblocks decode fewer nonzero coefficients than their declared
+  NonZeros (`remaining_non_zeros > 0` after the full §C.8.3 k-walk,
+  currently accepted silently). Suspects narrowed to the Listing
+  C.13/C.14 coefficient-context math or the hybrid-uint completion on
+  impulse-heavy blocks; `patches_vardct_256x256` and the round-441
+  standalone reproducer pin it.
 - The residual sub-1/255 VarDCT accuracy tail (float rounding + §J
   filter differences) and `save_before_ct` pre-CT reference recording
   in the §C.2 composer. (The staged `progressive-ac-multipass`
@@ -425,11 +486,14 @@ and the Listing I.21 Squeeze tendency function.
   Grey (3 XYB channels → 1 grey plane): the Modular + inverse-Squeeze
   walk completes since round 420, the final XYB→grey hand-off is
   unwired and errors loudly.
-- The kPatches image feature (kNoise decodes since round 437; the
-  staged `patches-256x256` fixture turned out flags=0 — no
-  patches-bearing fixture is staged yet), JPEG reconstruction, and
-  the LfFrame (`lf_level > 0`) dimension scaling `progressive-dc`
-  needs.
+- Patch alpha blend modes (kBlendAbove/Below, kAlphaWeightedAdd
+  Above/Below) and extra-channel patch blending — parsed exactly,
+  refused precisely at render (no specimen exercises them; the
+  decode paths carry no extra planes there yet). Splines on non-XYB
+  Modular frames (the §K.3 coefficients are XYB-domain quantities;
+  domain undetermined) and kNoise on Modular frames stay refused.
+- JPEG reconstruction, and the LfFrame (`lf_level > 0`) dimension
+  scaling `progressive-dc` needs.
 - The encoder (not registered).
 
 Unsupported inputs surface as `Error::Unsupported` rather than a silent
