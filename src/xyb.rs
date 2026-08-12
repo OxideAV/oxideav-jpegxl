@@ -130,15 +130,36 @@ fn pow3_minus_cbrt_bias(gamma: f32, opsin_bias: f32, itscale: f32) -> f32 {
 /// Channel order on input: `(y_prime, x_prime, b_prime)` matches the
 /// JXL Modular convention "first three channels are Y', X', B'" per
 /// FDIS §L.2.2 first paragraph.
+///
+/// ## Erratum (round 441): the ×`m` product divides by 128
+///
+/// The FDIS §L.2 prose reads `X = X' × m_x_lf_unscaled` (and likewise
+/// for Y / B) with no further scale. The literal reading is wrong on
+/// real streams: pinned against black-box reference decodes of three
+/// independently generated lossy-Modular XYB codestreams (different
+/// content, distances and efforts; per-channel linear regression of
+/// the wire integers against the reference decode's XYB values), the
+/// fitted slope is `m / 128` on every channel to within 0.02 % with a
+/// zero intercept — under the literal reading every sample saturates
+/// (the decoded planes come out ≈ 128× too large). The same /128 also
+/// closes the round-441 patches fixture (whose kReferenceOnly dot
+/// dictionary is a Modular XYB frame recorded pre-CT). Hence:
+///
+/// ```text
+/// X = X' × m_x_lf_unscaled / 128
+/// Y = Y' × m_y_lf_unscaled / 128
+/// B = (B' + Y') × m_b_lf_unscaled / 128
+/// ```
 pub fn modular_xyb_rescale(
     y_prime: i32,
     x_prime: i32,
     b_prime: i32,
     lf_dequant: &LfChannelDequantization,
 ) -> (f32, f32, f32) {
-    let x = (x_prime as f32) * lf_dequant.m_x_lf_unscaled;
-    let y = (y_prime as f32) * lf_dequant.m_y_lf_unscaled;
-    let b = ((b_prime + y_prime) as f32) * lf_dequant.m_b_lf_unscaled;
+    const INV_SCALE: f32 = 1.0 / 128.0;
+    let x = (x_prime as f32) * lf_dequant.m_x_lf_unscaled * INV_SCALE;
+    let y = (y_prime as f32) * lf_dequant.m_y_lf_unscaled * INV_SCALE;
+    let b = ((b_prime + y_prime) as f32) * lf_dequant.m_b_lf_unscaled * INV_SCALE;
     (x, y, b)
 }
 
@@ -371,19 +392,20 @@ mod tests {
     }
 
     /// kModular preamble: rescale `(Y', X', B')` integer samples by
-    /// `m_*_lf_unscaled`. The B channel adds Y' before scaling per
-    /// §L.2.2 first paragraph.
+    /// `m_*_lf_unscaled / 128` (the round-441 §L.2 erratum — the FDIS
+    /// prose omits the /128; see [`modular_xyb_rescale`]). The B
+    /// channel adds Y' before scaling per §L.2.2 first paragraph.
     #[test]
     fn modular_xyb_rescale_applies_lf_multipliers() {
         let lf = LfChannelDequantization::default();
         // Y'=10, X'=2, B'=3. With defaults m_x=4096, m_y=512, m_b=256:
-        //   X = 2 * 4096 = 8192
-        //   Y = 10 * 512 = 5120
-        //   B = (3 + 10) * 256 = 3328
+        //   X = 2 * 4096 / 128 = 64
+        //   Y = 10 * 512 / 128 = 40
+        //   B = (3 + 10) * 256 / 128 = 26
         let (x, y, b) = modular_xyb_rescale(10, 2, 3, &lf);
-        assert!(approx_eq(x, 8192.0, 1e-3), "X={x}");
-        assert!(approx_eq(y, 5120.0, 1e-3), "Y={y}");
-        assert!(approx_eq(b, 3328.0, 1e-3), "B={b}");
+        assert!(approx_eq(x, 64.0, 1e-4), "X={x}");
+        assert!(approx_eq(y, 40.0, 1e-4), "Y={y}");
+        assert!(approx_eq(b, 26.0, 1e-4), "B={b}");
     }
 
     /// Modular path produces a sane RGB triple from a small +ve XYB
