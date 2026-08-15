@@ -267,22 +267,29 @@ fn build_permuted_orders(
         let natural = natural_coeff_order(order_id);
         let size = natural.len();
         let skip = size / 64;
-        // Round-437 erratum: the wire carries THREE permutations per
-        // set bit — one per colour channel, transmitted in the §C.8.3
-        // decode sequence Y, X, B (Listing C.12 prints only one; the
-        // staged `patches-256x256` decode trace pins the per-channel
-        // layout bit-exactly — see the `HfPass::orders` docs).
         // Round-437 erratum: the wire carries THREE §C.3.2 permutations
-        // per set bit — one per colour channel, transmitted in the
-        // §C.8.3 decode sequence Y, X, B (Listing C.12 prints only
-        // one). Pinned bit-exactly by the staged `patches-256x256`
+        // per set bit — one per colour channel (Listing C.12 prints
+        // only one). Pinned bit-exactly by the staged `patches-256x256`
         // clean-room decode trace (the §C.7.2 stream that follows
         // starts exactly at the section position the trace records,
         // and the whole HfGlobal section lands on the trace's
         // AC_GLOBAL_END bit count) and by the D.3.3 ANS final-state
         // closure on ANS-coded specimens, which fails under the
         // printed one-per-bit reading and closes under this one.
-        for channel in [1usize, 0, 2] {
+        //
+        // Round-444 refinement: the per-channel ASSIGNMENT is the
+        // Listing C.13 channel-INDEX order X (0), Y (1), B (2) — NOT
+        // the §C.8.3 per-varblock decode sequence Y, X, B that round
+        // 437 assumed. The assignment is invisible to every
+        // bit-position oracle (all three permutations are decoded
+        // back to back whatever the naming), so round 437 never
+        // actually arbitrated it; a custom-orders impulse specimen
+        // does — under Y-first assignment the Y channel's dominant
+        // Hornuss corner coefficient (§I.2.3.5's `coefficients(x + 2,
+        // y + 2)` sample driver) lands on the wrong cell and the dot
+        // vanishes, under index order it lands exactly and the decode
+        // matches the reference band.
+        for channel in [0usize, 1, 2] {
             let nat_ord_perm = decode_permutation_from_stream(br, entropy, hybrid, size, skip)?;
             if nat_ord_perm.len() != size {
                 return Err(Error::InvalidData(format!(

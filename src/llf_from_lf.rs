@@ -273,86 +273,69 @@ pub fn dct_2d(samples: &[f32], input_rows: usize, input_cols: usize) -> Result<V
         )));
     }
 
-    // We invert idct_2d step-by-step in reverse order. idct_2d
-    // expects `coefficients` in (short × long) row-major and
-    // produces `varblock` such that output dims match the caller's
-    // requested (output_rows × output_cols).
+    // Listing I.3, literally (round-444: this helper previously
+    // inverted the pre-444 `idct_2d`'s unconditional pre-transpose,
+    // which transposed the coefficient interpretation of square and
+    // tall blocks — see `crate::idct::idct_2d`):
     //
-    // The IDCT's final stage transposes (short × long) varblock to
-    // (long × short) when output_rows > output_cols. To invert:
-    // start by un-doing that transpose so we work in (short × long)
-    // varblock layout regardless of input aspect.
-    let short = input_rows.min(input_cols);
-    let long = input_rows.max(input_cols);
+    //   dct1   = ColumnDCT(samples);        // (R × C)
+    //   dct1_t = Transpose(dct1);           // (C × R)
+    //   dct2   = ColumnDCT(dct1_t);         // (C × R)
+    //   if (C > R) result = Transpose(dct2) // → (R × C) = (short × long)
+    //   else       result = dct2            //   (C × R) = (short × long)
+    //
+    // Either branch ends in the §I.2.4 coefficient layout
+    // (short × long) row-major, which is what `idct_2d` consumes.
+    let rows = input_rows;
+    let cols = input_cols;
 
-    // `varblock` (short × long) row-major. If input has rows <= cols
-    // (input_rows = short), it's already in (short × long). Otherwise
-    // (input_rows > input_cols), transpose to put it in (short × long).
-    let varblock: Vec<f32> = if input_rows <= input_cols {
-        samples.to_vec()
-    } else {
-        // Transpose (input_rows × input_cols) → (input_cols × input_rows)
-        // = (short × long).
-        let mut t = vec![0.0f32; short * long];
-        for r in 0..input_rows {
-            for c in 0..input_cols {
-                t[c * long + r] = samples[r * input_cols + c];
-            }
-        }
-        t
-    };
-
-    // Inverse of idct_2d step 4: idct_2d ran ColumnIDCT on `dct1`
-    // (short × long) → varblock (short × long), processing each of
-    // `long` cols (length `short`). We invert by ColumnDCT.
-    let mut dct1 = vec![0.0f32; short * long];
-    let mut col_buf = vec![0.0f32; short];
-    for c in 0..long {
-        for r in 0..short {
-            col_buf[r] = varblock[r * long + c];
+    // dct1 = ColumnDCT(samples): each of `cols` columns, length `rows`.
+    let mut dct1 = vec![0.0f32; rows * cols];
+    let mut col_buf = vec![0.0f32; rows];
+    for c in 0..cols {
+        for r in 0..rows {
+            col_buf[r] = samples[r * cols + c];
         }
         let col = dct_1d(&col_buf)?;
-        for r in 0..short {
-            dct1[r * long + c] = col[r];
+        for r in 0..rows {
+            dct1[r * cols + c] = col[r];
         }
     }
 
-    // Inverse of idct_2d step 3: dct1[c * long + r] = dct1_t[r * short + c],
-    // i.e. dct1 (short × long) = transpose of dct1_t (long × short).
-    // Invert: dct1_t (long × short) = transpose of dct1.
-    let mut dct1_t = vec![0.0f32; long * short];
-    for r in 0..short {
-        for c in 0..long {
-            dct1_t[c * short + r] = dct1[r * long + c];
+    // dct1_t = Transpose(dct1) — (C × R).
+    let mut dct1_t = vec![0.0f32; rows * cols];
+    for r in 0..rows {
+        for c in 0..cols {
+            dct1_t[c * rows + r] = dct1[r * cols + c];
         }
     }
 
-    // Inverse of idct_2d step 2: idct_2d ran ColumnIDCT on `dct2`
-    // (long × short) → dct1_t (long × short), processing each of
-    // `short` cols (length `long`). Invert by ColumnDCT.
-    let mut dct2 = vec![0.0f32; long * short];
-    let mut col_buf2 = vec![0.0f32; long];
-    for c in 0..short {
-        for r in 0..long {
-            col_buf2[r] = dct1_t[r * short + c];
+    // dct2 = ColumnDCT(dct1_t): each of `rows` columns, length `cols`.
+    let mut dct2 = vec![0.0f32; rows * cols];
+    let mut col_buf2 = vec![0.0f32; cols];
+    for c in 0..rows {
+        for r in 0..cols {
+            col_buf2[r] = dct1_t[r * rows + c];
         }
         let col = dct_1d(&col_buf2)?;
-        for r in 0..long {
-            dct2[r * short + c] = col[r];
+        for r in 0..cols {
+            dct2[r * rows + c] = col[r];
         }
     }
 
-    // Inverse of idct_2d step 1: dct2[r * short + c] = coefficients[c * long + r].
-    // Invert: coefficients[c * long + r] = dct2[r * short + c].
-    // coefficients is (short × long) row-major.
-    let mut coefficients = vec![0.0f32; short * long];
-    for r in 0..long {
-        for c in 0..short {
-            coefficients[c * long + r] = dct2[r * short + c];
+    if cols > rows {
+        // result = Transpose(dct2): (C × R) → (R × C) = (short × long).
+        let mut out = vec![0.0f32; rows * cols];
+        for r in 0..cols {
+            for c in 0..rows {
+                out[c * cols + r] = dct2[r * rows + c];
+            }
         }
+        Ok(out)
+    } else {
+        // (C × R) already IS (short × long).
+        Ok(dct2)
     }
-
-    Ok(coefficients)
 }
 
 /// LF→LLF coefficient block dimensions `(cx, cy)` for a transform.
@@ -497,33 +480,36 @@ pub fn llf_from_lf(input: &[f32], t: TransformType) -> Result<Vec<f32>> {
         t
     };
 
-    // Listing I.16 — corrected normalisation (FDIS erratum candidate,
-    // round 385). The FDIS listing multiplies `dc(x, y)` by
-    // `ScaleF(cy, bheight, y) × ScaleF(cx, bwidth, x)`. Measured
-    // against the `vardct-256x256-d1` reference decode (per-cell
-    // least-squares over the 16 DCT64×64 varblocks), that literal
-    // reading leaves every LLF AC cell off by exactly
-    // `ScaleF(8, 64, u)` per axis — the required correction is its
-    // reciprocal at every AC index — while the swapped-argument
-    // reading (`ScaleF(bheight, cy, y)`, i.e. exactly the reciprocal
-    // per Listing I.15's identity `ScaleF(N, n, x) × ScaleF(n, N, x)
-    // = 1`) overshoots by the same factor in the other direction. The
-    // unique reading consistent with the reference is **no ScaleF
-    // factor at all** over the §I.2.1-normalised forward DCT this
-    // module implements: the LLF block is the plain I.2.1 DCT of the
-    // LF block (measured per-axis scale 1.00 on Y and B; X within
-    // 8-bit reference noise). I.e. Listing I.16's `DCT_2D` refers to a
-    // DCT normalisation for which the `× ScaleF` factors land at the
-    // I.2.1 normalisation — composing them with an I.2.1-normalised
-    // DCT double-applies the scale. At `x = 0` `ScaleF(·, ·, 0) = 1`
-    // under every reading (D(N,0)·I(n,0) = 1/sqrt(nN) on both
-    // branches), which is why the DC-exact invariant (round 367) held
-    // while every AC cell was off.
+    // Listing I.16 — corrected normalisation, round-444 refinement of
+    // the round-385 erratum candidate. The FDIS multiplies `dc(x, y)`
+    // by the full `ScaleF(cy, bheight, y) × ScaleF(cx, bwidth, x)`;
+    // over the §I.2.1-normalised forward DCT this module implements,
+    // the `sqrt(nN) × D(N, u) × I(n, u)` part of Listing I.15 is the
+    // normalisation-convention conversion and is already accounted
+    // for — what remains per axis is exactly the boundary term
+    // `C(N, n, u)` (the reciprocal cosine product). Arbitrated on
+    // clean single-basis-function probe blocks (Dct32x32, black-box
+    // reference decodes, after the round-444 IDCT-orientation and
+    // 2^16/global_scale fixes landed): every non-DC LLF cell of the
+    // no-factor round-385 reading is small by exactly
+    // `C(32, 4, u)`-per-axis (measured 0.7871 at u = 3 and 0.9018 at
+    // u = 2, the cosine products to 4 decimal places), and the
+    // `× C(c, 8c, u)` reading lands the reference band. The
+    // round-385 "no factor at all" measurement was taken atop the
+    // pre-444 transposed square-block IDCT and the missing
+    // 2^16/global_scale dequant term, which masked it.
     //
-    // The Listing I.15 helpers (`scale_i8` / `scale_d8` / `scale_c` /
-    // `scale_f`) remain exposed + tested for the record and for any
-    // future re-derivation against a second fixture.
-    Ok(dc_yx)
+    // At u = 0 the C term is 1 under every reading, which is why the
+    // DC-exact invariant (round 367) always held.
+    let mut out = dc_yx;
+    for y in 0..cy_u {
+        let fy = scale_c(cy, 8 * cy, y as u32);
+        for x in 0..cx_u {
+            let fx = scale_c(cx, 8 * cx, x as u32);
+            out[y * cx_u + x] *= fy * fx;
+        }
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -836,11 +822,14 @@ mod tests {
         // So all four DCT coefficients are 1/4 = 0.25 exactly.
         let block = [1.0f32, 0.0, 0.0, 0.0];
         let out = llf_from_lf(&block, TransformType::Dct16x16).unwrap();
-        // Round-385 corrected normalisation: the LLF block is the plain
-        // §I.2.1-normalised forward DCT of the LF block — no ScaleF
-        // factors on top (see the in-function erratum note). All four
-        // DCT coefficients of this signal are exactly 0.25.
-        let expected = [0.25f32, 0.25, 0.25, 0.25];
+        // Round-444 corrected normalisation: the LLF block is the
+        // §I.2.1-normalised forward DCT of the LF block times the
+        // per-axis Listing I.15 `C(c, 8c, u)` boundary term (see the
+        // in-function erratum note). All four raw DCT coefficients of
+        // this signal are exactly 0.25; the AC cells then carry
+        // C(2, 16, 1) per non-zero axis index.
+        let c1 = scale_c(2, 16, 1);
+        let expected = [0.25f32, 0.25 * c1, 0.25 * c1, 0.25 * c1 * c1];
         for (i, (got, want)) in out.iter().zip(expected.iter()).enumerate() {
             assert!(
                 (got - want).abs() < 1e-5,

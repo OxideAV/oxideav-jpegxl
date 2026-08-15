@@ -143,8 +143,12 @@ fn llf_from_lf_dct16x16_impulse_byte_exact() {
     let out = llf_from_lf(&block, TransformType::Dct16x16).unwrap();
     // out layout: (cy × cx) row-major = (2 × 2) row-major,
     // out[y * 2 + x]. All four I.2.1 DCT coefficients of the impulse
-    // are exactly 0.25.
-    let expected = [0.25f32, 0.25, 0.25, 0.25];
+    // are exactly 0.25; the round-444 Listing I.16 normalisation then
+    // multiplies each AC axis by the Listing I.15 boundary term
+    // C(2, 16, 1) (wire-arbitrated on single-basis-function probe
+    // blocks — see `llf_from_lf`'s erratum note).
+    let c1 = scale_c(2, 16, 1);
+    let expected = [0.25f32, 0.25 * c1, 0.25 * c1, 0.25 * c1 * c1];
     for (i, (g, e)) in out.iter().zip(expected.iter()).enumerate() {
         assert!((g - e).abs() < 1e-6, "cell {i}: got {g}, expected {e}",);
     }

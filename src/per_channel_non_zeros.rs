@@ -407,7 +407,7 @@ mod tests {
         // channels 1 and 2 remain zero.
         let mut p = PerChannelNonZerosGrids::new_uniform(3, 2, 2).unwrap();
         let read_non_zeros = |_ctx: u32| -> Result<u32> { Ok(3u32) };
-        let decode_symbol = |_ctx: u32| -> Result<u32> { Ok(0u32) };
+        let decode_symbol = |_ctx: u32| -> Result<u32> { Ok(2u32) };
         let (_decoded, raw_non_zeros) = p
             .decode_block_at_for_channel(
                 0,
@@ -452,7 +452,7 @@ mod tests {
         // cell of the 2×2 footprint (§C.8.3 prose).
         let mut p = PerChannelNonZerosGrids::new_uniform(3, 2, 2).unwrap();
         let read_non_zeros = |_ctx: u32| -> Result<u32> { Ok(17u32) };
-        let decode_symbol = |_ctx: u32| -> Result<u32> { Ok(0u32) };
+        let decode_symbol = |_ctx: u32| -> Result<u32> { Ok(2u32) };
         let (_decoded, raw_non_zeros) = p
             .decode_block_at_for_channel(
                 1,
@@ -483,7 +483,7 @@ mod tests {
         // channel 2 gets 20.
         for (c, nz) in [(0u32, 4u32), (1, 12), (2, 20)] {
             let read_non_zeros = |_ctx: u32| -> Result<u32> { Ok(nz) };
-            let decode_symbol = |_ctx: u32| -> Result<u32> { Ok(0u32) };
+            let decode_symbol = |_ctx: u32| -> Result<u32> { Ok(2u32) };
             let _ = p
                 .decode_block_at_for_channel(
                     c,

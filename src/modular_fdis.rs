@@ -711,6 +711,19 @@ impl EntropyStream {
         Ok(())
     }
 
+    /// Drop any live ANS decode state so the next
+    /// [`Self::read_ans_state_init`] re-reads a fresh `u(32)`
+    /// initialiser. Callers that decode SEVERAL entropy-coded streams
+    /// against one shared histogram prelude (the §C.7.2 HF histograms
+    /// driving one stream per §C.8.3 PassGroup section) must clear the
+    /// previous section's terminal state between sections — the
+    /// idempotency guard above would otherwise silently skip the new
+    /// section's initialiser and resume from stale state. No-op for
+    /// prefix-code streams (which carry no ANS state).
+    pub fn reset_ans_state(&mut self) {
+        self.ans_state = None;
+    }
+
     /// Decode a symbol from the underlying entropy stream against the
     /// cluster mapped by `ctx`. Used internally by `decode_uint`.
     pub fn decode_symbol(&mut self, br: &mut BitReader<'_>, ctx: u32) -> Result<u32> {

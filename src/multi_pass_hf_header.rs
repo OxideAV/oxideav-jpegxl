@@ -562,7 +562,15 @@ mod tests {
             |_p, _c, _pred, _offset| Ok(1),
             |p, _c, _coef, offset| {
                 decode_symbol_pass_offsets.push((p, offset));
-                Ok(0)
+                // The single declared non-zero lands on the LAST k of
+                // each channel's 63-read walk, so every read still
+                // happens (and the round-444 declared-count guard is
+                // satisfied).
+                if decode_symbol_pass_offsets.len() % 63 == 0 {
+                    Ok(2)
+                } else {
+                    Ok(0)
+                }
             },
         )
         .unwrap();

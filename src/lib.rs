@@ -2376,6 +2376,9 @@ struct VarDctFinishInputs<'a> {
     /// Logical frame extent the padded block grid is cropped to (§6.2).
     frame_width: u32,
     frame_height: u32,
+    /// §C.4.3 Quantizer `global_scale` — scales the §C.6.2 dequant
+    /// matrices by `2^16 / global_scale` (round-444 §F.3 erratum).
+    global_scale: u32,
 }
 
 /// Finish an integrated single-LfGroup VarDCT decode across all of the
@@ -2431,6 +2434,7 @@ fn finish_vardct_decode(
         lf_quant_height,
         frame_width,
         frame_height,
+        global_scale,
     } = inputs;
 
     let num_hf_presets = hf_section.num_hf_presets();
@@ -2438,9 +2442,11 @@ fn finish_vardct_decode(
 
     let resolver = BlockContextResolver::new(&hf_block_context);
 
-    // F.3 dequant context: default dequant-matrix set + opsin-inverse
+    // F.3 dequant context: default dequant-matrix set scaled by the
+    // Quantizer's 2^16/global_scale (round-444 erratum) + opsin-inverse
     // bias + per-channel 0.8^(qm_scale - 2) factors.
-    let set = crate::dct_quant_weights::materialise_default_dequant_set()?;
+    let set =
+        crate::dct_quant_weights::materialise_default_dequant_set_for_quantizer(global_scale)?;
     let qm = QmScaleFactors::for_frame(fh);
     let dq = DequantContext {
         set: &set,
@@ -2538,7 +2544,13 @@ fn finish_vardct_decode(
         for (p, mut gbr) in per_pass_readers.into_iter().enumerate() {
             let headers = PerPassHfHeaders::read(&mut gbr, 1, num_hf_presets, nb_block_ctx)?;
             let pass_data = hf_section.pass_data_mut(p as u32)?;
-            pass_data.histograms.read_ans_state_init(&mut gbr)?;
+            // Each PassGroup section is its own entropy stream over
+            // the shared §C.7.2 histograms: fresh ANS `u(32)` init per
+            // section (D.3.3), fresh state teardown + final-state
+            // check after the section's last symbol (round-444 fix —
+            // the previous `read_ans_state_init` call was silently
+            // idempotent across sections on ANS streams).
+            pass_data.histograms.begin_section(&mut gbr)?;
             let mut ctx = pass_data.single_pass_context(&headers)?;
             let mut nz = PerPassNonZerosGrids::new_uniform(
                 1,
@@ -2550,6 +2562,13 @@ fn finish_vardct_decode(
                 &mut gbr, &sub_grid, &mut nz, &resolver, qdc_at,
             )?;
             debug_assert_eq!(out.len(), 1);
+            // D.3.3 section closure: the section's final ANS state
+            // must be 0x130000; tears the state down either way so
+            // the next section re-inits.
+            hf_section
+                .pass_data_mut(p as u32)?
+                .histograms
+                .finish_section()?;
             stacks.push(out.pop().ok_or_else(|| {
                 Error::InvalidData(
                     "jxl VarDCT integrated decode: empty per-pass decode output".into(),
@@ -3213,6 +3232,7 @@ pub fn decode_vardct_frame_with_refs(
         lf_quant,
         frame_width: scaffold.width,
         frame_height: scaffold.height,
+        global_scale: quantizer.global_scale,
     };
     finish_vardct_decode(finish_inputs, &mut hf_global_section, group_readers, pts)
 }

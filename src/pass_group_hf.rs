@@ -373,11 +373,12 @@ pub struct DecodedHfBlock {
     /// the natural-order index back to a `(y, x)` in the varblock per
     /// `natural_order[k] = y * bwidth + x`.
     pub coeffs: Vec<i32>,
-    /// `non_zeros` count after the per-block loop completed (always 0
-    /// when the loop runs to completion via the `if non_zeros reaches
-    /// 0` early-stop; non-zero only if every coefficient in the block
-    /// was actually non-zero — which the spec disallows for a real
-    /// block since `non_zeros` must reach 0 before the final `k`).
+    /// `non_zeros` count after the per-block loop completed. 0 for a
+    /// conformant in-sync stream; a positive residue means the
+    /// declared NonZeros and the decoded coefficients disagree (a
+    /// desynced or non-conformant stream). Since round 444 every
+    /// positive residue is counted loudly through
+    /// [`walk_underruns`] — never accepted silently.
     pub remaining_non_zeros: u32,
     /// Number of coefficients the loop actually decoded (the symbol
     /// reads performed against the entropy stream). Useful for tests
@@ -498,6 +499,23 @@ where
             non_zeros = non_zeros.saturating_sub(1);
         }
         k += 1;
+    }
+
+    // §C.8.3: when the walk runs to `k == size` a conformant stream
+    // has decoded exactly `initial_non_zeros` non-zero coefficients;
+    // a positive residue means the declared NonZeros and the decoded
+    // coefficients disagree — the stream is desynced or invalid.
+    // Round-444 posture: RECORDED loudly (public per-thread counter,
+    // pinned per fixture in CI), never silent (rounds 437/441
+    // accepted it invisibly, masking the missing D.3.6
+    // hybrid-integer completion on the histogram-backed path), but
+    // not fatal — the §C.8.3 section-closure diagnostic catches the
+    // same desync class at stream level, and the one known remaining
+    // producer of this state (see the README deficiency note)
+    // decodes to a bounded residual that a hard error would regress
+    // to a refusal.
+    if non_zeros > 0 {
+        WALK_UNDERRUN_COUNT.with(|c| c.set(c.get() + 1));
     }
 
     Ok(DecodedHfBlock {
@@ -676,6 +694,36 @@ where
         read_non_zeros,
         decode_symbol,
     )
+}
+
+thread_local! {
+    /// Per-thread count of §C.8.3 per-block walks that ended with a
+    /// positive `non_zeros` residue (declared non-zero coefficients
+    /// never materialised) — see [`decode_block_coefficients`].
+    static WALK_UNDERRUN_COUNT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Number of §C.8.3 per-block coefficient walks on this thread that
+/// completed the full `k` range with a positive `non_zeros` residue —
+/// i.e. the block's declared NonZeros disagreed with the decoded
+/// coefficients (a desynced or non-conformant stream; round-444
+/// diagnostic). Reset with [`reset_walk_underruns`]. CI pins this
+/// count per fixture so the state can never be accepted silently.
+pub fn walk_underruns() -> u64 {
+    WALK_UNDERRUN_COUNT.with(|c| c.get())
+}
+
+/// Reset the [`walk_underruns`] counter for this thread.
+pub fn reset_walk_underruns() {
+    WALK_UNDERRUN_COUNT.with(|c| c.set(0));
+}
+
+/// Record one §C.8.3 walk underrun (internal — the histogram-backed
+/// per-block walk in `multi_pass_hf_histogram_decoder` shares this
+/// counter with [`decode_block_coefficients`]).
+#[doc(hidden)]
+pub fn note_walk_underrun() {
+    WALK_UNDERRUN_COUNT.with(|c| c.set(c.get() + 1));
 }
 
 #[cfg(test)]
@@ -1456,23 +1504,40 @@ mod tests {
         let r =
             decode_block_coefficients_for_transform(TransformType::Dct16x16, 253, 0, 1, |_| Ok(0));
         assert!(matches!(r, Err(Error::InvalidData(_))));
-        // 252 is OK at the validation layer (the loop itself will run
-        // 252 reads). Smoke-test that with a closure that returns 0
-        // (which never decrements non_zeros, so the loop exits on
-        // `k == size`).
+        // 252 is OK at the validation layer: with every read non-zero
+        // the loop walks the full k range from num_blocks=4 to
+        // size=256 (= 252 iterations) and non_zeros reaches 0 exactly
+        // at the last read (a stream whose declared count is NOT
+        // satisfied by the walk is rejected — round-444 §C.8.3
+        // conformance guard, exercised in
+        // `decode_block_coefficients_rejects_unsatisfied_non_zeros`).
         let mut calls = 0;
         let decoded =
             decode_block_coefficients_for_transform(TransformType::Dct16x16, 252, 0, 1, |_| {
                 calls += 1;
-                Ok(0)
+                Ok(2)
             })
             .unwrap();
-        // The loop walks k from num_blocks=4 to size=256 (= 252
-        // iterations) since every read returns 0 → non_zeros never
-        // decrements.
         assert_eq!(calls, 252);
         assert_eq!(decoded.coeffs_read, 252);
-        // All coefficients are zero (every UnpackSigned(0) = 0).
-        assert!(decoded.coeffs.iter().all(|&v| v == 0));
+        assert_eq!(decoded.remaining_non_zeros, 0);
+        // Every coefficient decoded as UnpackSigned(2) = 1.
+        assert_eq!(decoded.coeffs.iter().filter(|&&v| v != 0).count(), 252);
+    }
+
+    #[test]
+    fn decode_block_coefficients_records_unsatisfied_non_zeros() {
+        // Round-444 §C.8.3 conformance diagnostic: a walk that reaches
+        // `k == size` with a positive non_zeros residue (declared
+        // non-zeros never materialised) is a desynced or invalid
+        // stream; the walk completes best-effort but the condition is
+        // counted loudly via `walk_underruns()` — never silent.
+        reset_walk_underruns();
+        let decoded =
+            decode_block_coefficients_for_transform(TransformType::Dct8x8, 3, 0, 1, |_| Ok(0))
+                .unwrap();
+        assert_eq!(decoded.remaining_non_zeros, 3);
+        assert_eq!(walk_underruns(), 1, "the underrun must be recorded");
+        reset_walk_underruns();
     }
 }

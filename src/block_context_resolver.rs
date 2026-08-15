@@ -942,7 +942,7 @@ mod tests {
             &resolver,
             |_| Ok([0, 0, 0]),
             |_, _| Ok(6),
-            |_, _| Ok(0),
+            |_, _| Ok(2),
         )
         .unwrap();
         // pass 0 untouched.
@@ -1039,7 +1039,7 @@ mod tests {
                 2 => Ok(7),
                 _ => unreachable!(),
             },
-            |_, _| Ok(0),
+            |_, _| Ok(2),
         )
         .unwrap();
         assert_eq!(out.len(), 1);

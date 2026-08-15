@@ -371,7 +371,7 @@ mod tests {
                 // pass-distinct, channel-distinct raw values.
                 Ok(10 * (p + 1) + c)
             },
-            |_p, _c, _coef| Ok(0),
+            |_p, _c, _coef| Ok(2),
         )
         .unwrap();
         assert_eq!(out.len(), 3);
@@ -612,7 +612,7 @@ mod tests {
                     Ok(2 + c)
                 }
             },
-            |_p, _c, _coef| Ok(0),
+            |_p, _c, _coef| Ok(2),
         )
         .unwrap();
         assert_eq!(out[0][0].2, [0, 0, 0]);

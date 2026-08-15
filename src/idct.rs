@@ -180,76 +180,86 @@ pub fn idct_2d(coefficients: &[f32], output_rows: usize, output_cols: usize) -> 
         )));
     }
 
-    // Listing I.4 step 1: dct2 is shape (long × short) = (max(R,C) × min(R,C))
-    // for both branches. Since coefficient input is in spec layout
-    // (short × long) row-major, transpose to obtain (long × short).
+    // Listing I.4, applied literally. The coefficient buffer is in the
+    // §I.2.4 natural-ordering layout — (short × long) row-major with
+    // `short = min(R,C) = bheight`, `long = max(R,C) = bwidth` — and
+    // the initial `Transpose` happens ONLY when `C > R`:
+    //
+    //   if (C > R) dct2 = Transpose(coefficients);
+    //   else       dct2 = coefficients;
+    //   dct1_t   = ColumnIDCT(dct2);
+    //   dct1     = Transpose(dct1_t);
+    //   varblock = ColumnIDCT(dct1);
+    //
+    // Rounds 12..441 ran the `C > R` branch (pre-transpose) for EVERY
+    // shape, which transposed the coefficient interpretation of square
+    // and tall blocks: a coefficient at natural position (x, y) drove
+    // the (y, x) frequency pair instead. Invisible on near-symmetric
+    // photo content inside the sub-1/255 band, arbitrated on the wire
+    // by a single-basis-function probe block (round 444): the
+    // reference decoder reproduces the encoded orientation, the
+    // pre-transposed reading reproduces its transpose.
     let short = output_rows.min(output_cols);
     let long = output_rows.max(output_cols);
 
-    // dct2[r,c] (long × short) = coefficients[c,r] (short × long).
+    // dct2 rows × cols per branch (row-major throughout).
+    let (d2_rows, d2_cols);
     let mut dct2 = vec![0.0f32; long * short];
-    for r in 0..long {
-        for c in 0..short {
-            dct2[r * short + c] = coefficients[c * long + r];
-        }
-    }
-
-    // Step 2: dct1_t = ColumnIDCT(dct2). Each of `short` columns
-    // (length `long`) is 1-D IDCT'd independently.
-    let mut dct1_t = vec![0.0f32; long * short];
-    let mut col_buf = vec![0.0f32; long];
-    for c in 0..short {
+    if output_cols > output_rows {
+        // C > R: dct2 = Transpose(coefficients) — (long × short).
+        d2_rows = long;
+        d2_cols = short;
         for r in 0..long {
-            col_buf[r] = dct2[r * short + c];
-        }
-        let col_idct = idct_1d(&col_buf)?;
-        for r in 0..long {
-            dct1_t[r * short + c] = col_idct[r];
-        }
-    }
-
-    // Step 3: dct1 = Transpose(dct1_t). dct1_t is (long × short),
-    // dct1 is (short × long).
-    let mut dct1 = vec![0.0f32; short * long];
-    for r in 0..long {
-        for c in 0..short {
-            dct1[c * long + r] = dct1_t[r * short + c];
-        }
-    }
-
-    // Step 4: varblock = ColumnIDCT(dct1). dct1 has `long` columns each
-    // of length `short`. Result is (short × long).
-    let mut varblock = vec![0.0f32; short * long];
-    let mut col_buf2 = vec![0.0f32; short];
-    for c in 0..long {
-        for r in 0..short {
-            col_buf2[r] = dct1[r * long + c];
-        }
-        let col_idct = idct_1d(&col_buf2)?;
-        for r in 0..short {
-            varblock[r * long + c] = col_idct[r];
-        }
-    }
-
-    // varblock is (short × long) row-major. The output is (R × C)
-    // = (output_rows × output_cols) row-major. Two cases:
-    //   * R <= C (R = short, C = long): varblock is (short × long) =
-    //     (R × C). Direct copy.
-    //   * R > C  (R = long, C = short): varblock is (short × long) =
-    //     (C × R). Transpose to (R × C).
-    if output_rows <= output_cols {
-        // varblock layout already matches output (R × C).
-        Ok(varblock)
-    } else {
-        // Transpose (C × R) → (R × C).
-        let mut out = vec![0.0f32; output_rows * output_cols];
-        for r in 0..output_cols {
-            for c in 0..output_rows {
-                out[c * output_cols + r] = varblock[r * output_rows + c];
+            for c in 0..short {
+                dct2[r * short + c] = coefficients[c * long + r];
             }
         }
-        Ok(out)
+    } else {
+        // C <= R (square and tall): dct2 = coefficients — (short × long).
+        d2_rows = short;
+        d2_cols = long;
+        dct2.copy_from_slice(coefficients);
     }
+
+    // dct1_t = ColumnIDCT(dct2): 1-D IDCT down each of `d2_cols`
+    // columns (each of length `d2_rows`).
+    let mut dct1_t = vec![0.0f32; d2_rows * d2_cols];
+    let mut col_buf = vec![0.0f32; d2_rows];
+    for c in 0..d2_cols {
+        for r in 0..d2_rows {
+            col_buf[r] = dct2[r * d2_cols + c];
+        }
+        let col_idct = idct_1d(&col_buf)?;
+        for r in 0..d2_rows {
+            dct1_t[r * d2_cols + c] = col_idct[r];
+        }
+    }
+
+    // dct1 = Transpose(dct1_t) — (d2_cols × d2_rows).
+    let mut dct1 = vec![0.0f32; d2_rows * d2_cols];
+    for r in 0..d2_rows {
+        for c in 0..d2_cols {
+            dct1[c * d2_rows + r] = dct1_t[r * d2_cols + c];
+        }
+    }
+
+    // varblock = ColumnIDCT(dct1): 1-D IDCT down each of `d2_rows`
+    // columns (each of length `d2_cols`). Result is
+    // (d2_cols × d2_rows) row-major — which is (R × C) in BOTH
+    // branches: `C > R` gives (short × long) = (R × C); `C <= R`
+    // gives (long × short) = (R × C).
+    let mut varblock = vec![0.0f32; d2_rows * d2_cols];
+    let mut col_buf2 = vec![0.0f32; d2_cols];
+    for c in 0..d2_rows {
+        for r in 0..d2_cols {
+            col_buf2[r] = dct1[r * d2_rows + c];
+        }
+        let col_idct = idct_1d(&col_buf2)?;
+        for r in 0..d2_cols {
+            varblock[r * d2_rows + c] = col_idct[r];
+        }
+    }
+    Ok(varblock)
 }
 
 /// Block dimensions in **pixels** for a Table C.16 transform that uses
@@ -1065,64 +1075,64 @@ mod tests {
     /// coefficient buffer that, when fed to [`super::idct_2d`] with the
     /// same `(R, C)`, recovers the input.
     fn forward_dct_2d(samples: &[f32], rows: usize, cols: usize) -> Vec<f32> {
-        let short = rows.min(cols);
-        let long = rows.max(cols);
-
-        // Reshape input into working layout (long × short) so we can do
-        // ColumnDCT followed by transpose followed by ColumnDCT —
-        // matching the spec algorithm with axes oriented identically to
-        // [`super::idct_2d`]'s working space (long × short).
+        // Listing I.3, literally (round-444: the previous helper
+        // mirrored the pre-444 inverse's unconditional pre-transpose):
         //
-        // For R <= C (rows = short, cols = long): samples is (short × long).
-        //   working[r,c] (long × short) = samples[c,r] (short × long).
-        // For R > C (rows = long, cols = short): samples is (long × short).
-        //   working[r,c] (long × short) = samples[r,c] (long × short).
-        let mut working = vec![0.0f32; long * short];
-        if rows <= cols {
-            for r in 0..short {
-                for c in 0..long {
-                    working[c * short + r] = samples[r * cols + c];
-                }
-            }
-        } else {
-            working.copy_from_slice(samples);
-        }
+        //   dct1   = ColumnDCT(samples);        // (R × C)
+        //   dct1_t = Transpose(dct1);           // (C × R)
+        //   dct2   = ColumnDCT(dct1_t);         // (C × R)
+        //   if (C > R) result = Transpose(dct2) // → (R × C) = (short × long)
+        //   else       result = dct2            //   (C × R) = (short × long)
+        //
+        // Either branch ends in the §I.2.4 coefficient layout
+        // (short × long) row-major.
 
-        // ColumnDCT on `working` (long × short): each of `short` columns
-        // has length `long`.
-        let mut dct1 = vec![0.0f32; long * short];
-        let mut col_buf = vec![0.0f32; long];
-        for c in 0..short {
-            for r in 0..long {
-                col_buf[r] = working[r * short + c];
+        // dct1 = ColumnDCT(samples): each of `cols` columns has length
+        // `rows`.
+        let mut dct1 = vec![0.0f32; rows * cols];
+        let mut col_buf = vec![0.0f32; rows];
+        for c in 0..cols {
+            for r in 0..rows {
+                col_buf[r] = samples[r * cols + c];
             }
             let cdct = forward_dct_1d(&col_buf);
-            for r in 0..long {
-                dct1[r * short + c] = cdct[r];
+            for r in 0..rows {
+                dct1[r * cols + c] = cdct[r];
             }
         }
-        // Transpose → dct1_t (short × long).
-        let mut dct1_t = vec![0.0f32; short * long];
-        for r in 0..long {
-            for c in 0..short {
-                dct1_t[c * long + r] = dct1[r * short + c];
+        // dct1_t = Transpose(dct1) — (C × R).
+        let mut dct1_t = vec![0.0f32; rows * cols];
+        for r in 0..rows {
+            for c in 0..cols {
+                dct1_t[c * rows + r] = dct1[r * cols + c];
             }
         }
-        // ColumnDCT on dct1_t: each of `long` columns has length `short`.
-        let mut dct2 = vec![0.0f32; short * long];
-        let mut col_buf2 = vec![0.0f32; short];
-        for c in 0..long {
-            for r in 0..short {
-                col_buf2[r] = dct1_t[r * long + c];
+        // dct2 = ColumnDCT(dct1_t): each of `rows` columns has length
+        // `cols`.
+        let mut dct2 = vec![0.0f32; rows * cols];
+        let mut col_buf2 = vec![0.0f32; cols];
+        for c in 0..rows {
+            for r in 0..cols {
+                col_buf2[r] = dct1_t[r * rows + c];
             }
             let cdct = forward_dct_1d(&col_buf2);
-            for r in 0..short {
-                dct2[r * long + c] = cdct[r];
+            for r in 0..cols {
+                dct2[r * rows + c] = cdct[r];
             }
         }
-        // dct2 is (short × long) row-major — exactly the spec coefficient
-        // layout. Return as-is.
-        dct2
+        if cols > rows {
+            // result = Transpose(dct2): (C × R) → (R × C) = (short × long).
+            let mut out = vec![0.0f32; rows * cols];
+            for r in 0..cols {
+                for c in 0..rows {
+                    out[c * cols + r] = dct2[r * rows + c];
+                }
+            }
+            out
+        } else {
+            // (C × R) already IS (short × long).
+            dct2
+        }
     }
 
     #[test]

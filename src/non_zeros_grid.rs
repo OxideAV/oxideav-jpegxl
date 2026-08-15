@@ -296,6 +296,18 @@ impl NonZerosGrid {
                 "JXL NonZerosGrid::update_after_block_for_transform: num_blocks must be ≥ 1".into(),
             ));
         }
+        // §C.8.3 — every covered cell receives the same ceiling-divided
+        // value, exactly as printed: `NonZeros(x, y) = (non_zeros +
+        // num_blocks - 1) Idiv num_blocks`. (Round-444 note: the prose
+        // defines a per-cell index `cur = j × X + i` in the preceding
+        // sentence and never uses it — a plausible-looking
+        // remainder-distributing `- cur` reading was probed and
+        // REJECTED on the wire: on a four-Dct32x32 specimen the D.3.3
+        // section closure and the reference-band pixel match hold only
+        // under the uniform ceiling; under `- cur` the fourth
+        // varblock's PredictedNonZeros drops by one, the
+        // NonZerosContext routes to a different cluster and its
+        // NonZeros read misdecodes.)
         let updated = non_zeros
             .saturating_add(num_blocks - 1)
             .checked_div(num_blocks)
@@ -644,8 +656,10 @@ mod tests {
     fn decode_block_at_dct8x8_chains_grid_state() {
         // End-to-end smoke through `decode_block_at` at DCT8×8 with a
         // hand-rolled `read_non_zeros` (returns a constant per call)
-        // and `decode_symbol` (returns zeros, so the inner block loop
-        // walks the natural-order tail with empty coefficients).
+        // and `decode_symbol` (returns a non-zero token per read, so
+        // the declared count is satisfied and the loop stops early —
+        // an all-zero walk with a positive declared count is rejected
+        // since round 444).
         //
         // We decode 2 varblocks at (0, 0) and (1, 0). After (0, 0) the
         // grid cell stores ceil(non_zeros / 1) = the same non_zeros
@@ -660,7 +674,7 @@ mod tests {
             non_zeros_ctxs_seen.push(ctx);
             Ok(3u32)
         };
-        let decode_symbol = |_ctx: u32| -> Result<u32> { Ok(0u32) };
+        let decode_symbol = |_ctx: u32| -> Result<u32> { Ok(2u32) };
         let (_decoded, raw_non_zeros) = decode_block_at(
             &mut g,
             0,
@@ -685,7 +699,7 @@ mod tests {
             second_ctxs.push(ctx);
             Ok(5u32)
         };
-        let decode_symbol_2 = |_ctx: u32| -> Result<u32> { Ok(0u32) };
+        let decode_symbol_2 = |_ctx: u32| -> Result<u32> { Ok(2u32) };
         let (_decoded, raw_non_zeros_2) = decode_block_at(
             &mut g,
             1,
@@ -719,7 +733,7 @@ mod tests {
         // not the identity-by-default DCT8×8 path.
         let mut g = NonZerosGrid::new(2, 2).unwrap();
         let read_non_zeros = |_ctx: u32| -> Result<u32> { Ok(17u32) };
-        let decode_symbol = |_ctx: u32| -> Result<u32> { Ok(0u32) };
+        let decode_symbol = |_ctx: u32| -> Result<u32> { Ok(2u32) };
         let (_decoded, raw_non_zeros) = decode_block_at(
             &mut g,
             0,

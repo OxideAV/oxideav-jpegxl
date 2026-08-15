@@ -497,7 +497,7 @@ mod tests {
         // pass 1's channel 0 grid; everything else stays zero.
         let mut p = PerPassNonZerosGrids::new_uniform(2, 3, 2, 2).unwrap();
         let read_non_zeros = |_ctx: u32| -> Result<u32> { Ok(3u32) };
-        let decode_symbol = |_ctx: u32| -> Result<u32> { Ok(0u32) };
+        let decode_symbol = |_ctx: u32| -> Result<u32> { Ok(2u32) };
         let (_decoded, raw_non_zeros) = p
             .decode_block_at_for_pass_channel(
                 1,
@@ -565,7 +565,7 @@ mod tests {
         // the 2×2 footprint (§C.8.3 prose).
         let mut p = PerPassNonZerosGrids::new_uniform(2, 3, 2, 2).unwrap();
         let read_non_zeros = |_ctx: u32| -> Result<u32> { Ok(17u32) };
-        let decode_symbol = |_ctx: u32| -> Result<u32> { Ok(0u32) };
+        let decode_symbol = |_ctx: u32| -> Result<u32> { Ok(2u32) };
         let (_decoded, raw_non_zeros) = p
             .decode_block_at_for_pass_channel(
                 0,
@@ -597,7 +597,7 @@ mod tests {
         // Pass 0 step.
         for (c, nz) in [(0u32, 7u32), (1, 9), (2, 11)] {
             let read_non_zeros = |_ctx: u32| -> Result<u32> { Ok(nz) };
-            let decode_symbol = |_ctx: u32| -> Result<u32> { Ok(0u32) };
+            let decode_symbol = |_ctx: u32| -> Result<u32> { Ok(2u32) };
             let _ = p
                 .decode_block_at_for_pass_channel(
                     0,
@@ -615,7 +615,7 @@ mod tests {
         // Pass 1 step.
         for (c, nz) in [(0u32, 2u32), (1, 4), (2, 6)] {
             let read_non_zeros = |_ctx: u32| -> Result<u32> { Ok(nz) };
-            let decode_symbol = |_ctx: u32| -> Result<u32> { Ok(0u32) };
+            let decode_symbol = |_ctx: u32| -> Result<u32> { Ok(2u32) };
             let _ = p
                 .decode_block_at_for_pass_channel(
                     1,
@@ -679,7 +679,7 @@ mod tests {
         let mut p = PerPassNonZerosGrids::new_uniform(3, 3, 2, 1).unwrap();
         for pp in 0..3 {
             let read_non_zeros = |_ctx: u32| -> Result<u32> { Ok(5u32) };
-            let decode_symbol = |_ctx: u32| -> Result<u32> { Ok(0u32) };
+            let decode_symbol = |_ctx: u32| -> Result<u32> { Ok(2u32) };
             let _ = p
                 .decode_block_at_for_pass_channel(
                     pp,

@@ -232,6 +232,12 @@ pub struct HfHistogramDecodeContext<'a> {
     /// [`HfCoefficientHistograms::read_ans_state_init`] for ANS
     /// streams before the first `decode_symbol_for_pass` call).
     histograms: &'a mut HfCoefficientHistograms,
+    /// §D.3.6 hybrid-integer / LZ77 window state for the stream this
+    /// context decodes (one per entropy-coded stream — a PassGroup
+    /// section in the integrated §C.8.3 walk). D.3.6: "num_to_copy is
+    /// initialized to 0 when the first symbol is decoded from the
+    /// stream", so the state is fresh per context construction.
+    hybrid: crate::ans::hybrid::HybridUintState,
     /// Per-pass `histogram_offset` array (one `u64` per pass).
     /// Cached from [`PerPassHfHeaders::digest`] at construction time
     /// so the per-symbol path is a single array indexing — no header
@@ -304,8 +310,13 @@ impl<'a> HfHistogramDecodeContext<'a> {
                     .expect("p < num_passes by construction")
             })
             .collect();
+        let hybrid = crate::ans::hybrid::HybridUintState::new(
+            histograms.entropy.lz77,
+            histograms.entropy.lz_len_conf,
+        );
         Ok(Self {
             histograms,
+            hybrid,
             per_pass_offsets,
             per_pass_orders: None,
         })
@@ -360,7 +371,27 @@ impl<'a> HfHistogramDecodeContext<'a> {
                 "JXL HfHistogramDecodeContext: ctx={ctx} + offset={offset} = {total} exceeds u32"
             ))
         })?;
-        self.histograms.entropy.decode_symbol(br, combined)
+        // §C.8.3: "the decoder reads symbols from an entropy-coded
+        // stream, as specified in D.3.6" — every `D[...]` read is a
+        // full Listing D.6 `DecodeHybridVarLenUint` (token → value
+        // completion with the cluster's HybridUintConfig raw-bit
+        // reads, plus the LZ77 copy machinery), with
+        // `dist_multiplier = 0` ("0 unless otherwise specified when
+        // referencing this subclause", D.3.6). The round-252..441
+        // code returned the raw entropy token here, which silently
+        // truncated every value ≥ the cluster's `split` and skipped
+        // its `n + lsb_in_token` raw bits — invisible while all
+        // coefficients stayed below the split (photo-content
+        // fixtures), a desyncing misparse on impulse-heavy blocks
+        // (the round-437/441 "synthetic-content VarDCT accuracy
+        // deficiency").
+        crate::modular_fdis::decode_uint_in_with_dist_pub(
+            &mut self.hybrid,
+            &mut self.histograms.entropy,
+            br,
+            combined,
+            0,
+        )
     }
 
     /// `NonZeros(x, y)` decode per Listing C.13's
@@ -562,14 +593,20 @@ impl<'a> HfHistogramDecodeContext<'a> {
         // (1) NonZerosContext read (round-252 routing).
         let raw_non_zeros = self.non_zeros_at(br, p, predicted, block_ctx, nb_block_ctx)?;
 
-        // (2) Cap check — round-90 invariant.
-        if raw_non_zeros > size - num_blocks {
-            return Err(Error::InvalidData(format!(
-                "JXL HfHistogramDecodeContext::decode_block_for_pass_transform: \
-                 non_zeros {raw_non_zeros} > size - num_blocks ({}) at predicted={predicted}",
-                size - num_blocks
-            )));
-        }
+        // (2) Cap — §C.8.3 bounds a varblock's declared non-zeros by
+        // its HF position count `size - num_blocks`. A larger value is
+        // a desynced or non-conformant stream; round-444 posture:
+        // recorded loudly via the shared
+        // [`crate::pass_group_hf::walk_underruns`] diagnostic and
+        // clamped so the best-effort walk stays within the block
+        // (the section-closure diagnostic independently flags the
+        // stream).
+        let raw_non_zeros = if raw_non_zeros > size - num_blocks {
+            crate::pass_group_hf::note_walk_underrun();
+            size - num_blocks
+        } else {
+            raw_non_zeros
+        };
 
         // (3) Listing C.14 per-block loop — sequential &mut self calls.
         let mut coeffs = vec![0i32; size as usize];
@@ -615,6 +652,25 @@ impl<'a> HfHistogramDecodeContext<'a> {
                 non_zeros = non_zeros.saturating_sub(1);
             }
             k += 1;
+        }
+
+        // §C.8.3: the loop terminates either because `non_zeros`
+        // reached 0 or because `k` reached `size`. In the latter case
+        // a conformant stream has decoded exactly `raw_non_zeros`
+        // non-zero coefficients (the encoder writes symbols only until
+        // the declared count is exhausted), so a positive residue
+        // means the declared NonZeros and the decoded coefficients
+        // disagree — a bitstream/decoder desync. Round-444 posture:
+        // counted loudly through
+        // [`crate::pass_group_hf::walk_underruns`] (rounds 437/441
+        // accepted this state invisibly, masking the missing D.3.6
+        // hybrid-integer completion), best-effort decode continues —
+        // the §C.8.3 section-closure diagnostic catches the same
+        // desync class at stream level, and the known remaining
+        // producer (README deficiency note) decodes to a bounded
+        // residual that a hard error would regress to a refusal.
+        if non_zeros > 0 {
+            crate::pass_group_hf::note_walk_underrun();
         }
 
         Ok((

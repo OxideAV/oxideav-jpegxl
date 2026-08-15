@@ -150,6 +150,54 @@ impl HfCoefficientHistograms {
         self.entropy.read_ans_state_init(br)
     }
 
+    /// Begin one §C.8.3 PassGroup section stream: drop any previous
+    /// section's terminal ANS state and read this section's own
+    /// `u(32)` initialiser (D.3.3 — each PassGroup section is its own
+    /// entropy-coded stream over the shared §C.7.2 histograms). A
+    /// no-op initialiser read for prefix-coded streams.
+    ///
+    /// Rounds 389..441 called [`Self::read_ans_state_init`] per
+    /// section, whose idempotency guard silently skipped every
+    /// section after the first on ANS streams (stale state, 32
+    /// unconsumed bits) — invisible only while the staged multi-group
+    /// fixtures happened to be prefix-coded.
+    pub fn begin_section(&mut self, br: &mut BitReader<'_>) -> Result<()> {
+        self.entropy.reset_ans_state();
+        self.entropy.read_ans_state_init(br)
+    }
+
+    /// Finish one §C.8.3 PassGroup section stream: check the D.3.3
+    /// end-of-stream invariant ("After the decoder reads the last
+    /// symbol in a given stream, state is 0x130000") and drop the
+    /// state so the next [`Self::begin_section`] starts fresh. A
+    /// no-op for prefix-coded streams, which carry no terminal-state
+    /// sentinel.
+    ///
+    /// A failed invariant is **recorded loudly, not fatal**: the count
+    /// is published through
+    /// [`section_closure_failures`] /
+    /// [`reset_section_closure_failures`], and the decode completes on
+    /// the decoded-as-read coefficients. Rationale (round 444): the
+    /// walk-level declared-NonZeros guard
+    /// (`decode_block_for_pass_transform`) already hard-rejects the
+    /// desync class that corrupts block structure, while the one
+    /// remaining known closure-failure class (photo/wave-leakage
+    /// streams whose §C.7.2 histograms carry non-trivial
+    /// bucket-residue distributions — see the crate README's open
+    /// deficiency) decodes to a small bounded pixel residual; a hard
+    /// error would regress those streams from "decodes within MAD ≈ 1"
+    /// to "refuses". Tests pin the failure count per fixture so the
+    /// deficiency can never go silent again.
+    pub fn finish_section(&mut self) -> Result<()> {
+        if let Some(ans) = &self.entropy.ans_state {
+            if !ans.final_state() {
+                SECTION_CLOSURE_FAILURES.with(|c| c.set(c.get() + 1));
+            }
+        }
+        self.entropy.reset_ans_state();
+        Ok(())
+    }
+
     /// `495 × num_hf_presets × nb_block_ctx` — the §C.7.2 total. The
     /// caller should not need to recompute this; surfaced for
     /// downstream consumers (e.g. logging / trace tape).
@@ -418,4 +466,31 @@ mod tests {
         let e: &mut EntropyStream = histos.entropy_mut();
         assert_eq!(e.cluster_map.len(), before_len);
     }
+}
+
+thread_local! {
+    /// Per-thread count of §C.8.3 PassGroup sections whose D.3.3
+    /// terminal-state invariant failed (see
+    /// [`HfCoefficientHistograms::finish_section`]).
+    static SECTION_CLOSURE_FAILURES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Number of §C.8.3 PassGroup sections decoded on this thread whose
+/// D.3.3 ANS terminal-state invariant (`state == 0x130000` after the
+/// last symbol) did NOT hold. Increments in
+/// [`HfCoefficientHistograms::finish_section`]; reset with
+/// [`reset_section_closure_failures`].
+///
+/// A non-zero count means the section's entropy decode is not fully in
+/// sync with the encoder even though every block-level structural
+/// guard passed — the decoded image is a best-effort reconstruction
+/// (bounded small residual on the known failing class; see the README
+/// deficiency note). CI pins this count per fixture.
+pub fn section_closure_failures() -> u64 {
+    SECTION_CLOSURE_FAILURES.with(|c| c.get())
+}
+
+/// Reset the [`section_closure_failures`] counter for this thread.
+pub fn reset_section_closure_failures() {
+    SECTION_CLOSURE_FAILURES.with(|c| c.set(0));
 }

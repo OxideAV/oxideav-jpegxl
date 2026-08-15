@@ -860,6 +860,46 @@ pub fn materialise_default_dequant_set() -> Result<DequantMatrixSet> {
     Ok(DequantMatrixSet { matrices })
 }
 
+/// Materialise the default dequantization set **scaled by the frame's
+/// §C.4.3 Quantizer** — the round-444 §F.3/§C.6.2 erratum: the "final
+/// multiplier defined by the channel, the transform type and the
+/// coefficient index" (F.3 last paragraph) also carries the global
+/// quantization scale, `2^16 / global_scale`, which the FDIS text
+/// omits for the HF path entirely (its LF sibling appears explicitly
+/// in Listing C.1 as the `/ (global_scale × quant_lf)` divisor —
+/// `global_scale` is a 16.16 fixed-point scale).
+///
+/// Arbitrated black-box on five independently generated
+/// single-basis-function probe streams spanning `global_scale`
+/// 1022..10223 and HfMul 7/11: the reference reconstruction amplitude
+/// fits `2^16 / global_scale` on every stream (−2..−9 % residual, the
+/// sign and magnitude of the Listing F.2 quant-bias adjustment), and
+/// is independent of `quant_lf` (which varied 15..23 across the same
+/// probes) and of HfMul beyond the §F.3 division already applied
+/// (round-393 erratum, unchanged).
+///
+/// `global_scale == 0` cannot be signalled (every `U32` branch has
+/// offset ≥ 1) and is rejected defensively.
+pub fn materialise_default_dequant_set_for_quantizer(
+    global_scale: u32,
+) -> Result<DequantMatrixSet> {
+    if global_scale == 0 {
+        return Err(Error::InvalidData(
+            "JXL dequant set: global_scale must be ≥ 1".into(),
+        ));
+    }
+    let mut set = materialise_default_dequant_set()?;
+    let inv = 65536.0f64 / (global_scale as f64);
+    for slot in &mut set.matrices {
+        for channel in slot.iter_mut() {
+            for w in channel.iter_mut() {
+                *w *= inv;
+            }
+        }
+    }
+    Ok(set)
+}
+
 /// Construct the [`DequantMatrixParams`] bundle for the default
 /// encoding of a single slot, transcribed from Table I.6 (page 60
 /// of the 2024 final core PDF).
