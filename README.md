@@ -446,6 +446,73 @@ and the Listing I.21 Squeeze tendency function.
   reject). The dedicated fixture generated this round reproduces it
   standalone; follow-up round material.
 
+### Round 444 — the §C.8.3 entropy layer root-caused: impulse deficiency FIXED, two new FDIS errata (§F.3 2^16/global_scale, Listing I.4 orientation)
+
+Round 444 took the round-441 impulse reproducer (Hornuss / DCT2×2
+varblocks decoding fewer nonzeros than declared, `remaining_non_zeros
+> 0` silently accepted) to root cause and found SIX distinct defects
+stacked across the §C.8.3 entropy layer and the reconstruction chain,
+each arbitrated black-box on purpose-built single-basis-function /
+impulse probe streams (committed as the `r444_*` fixtures with their
+reference decodes):
+
+- **§C.8.3 reads are D.3.6 hybrid-integer reads** — the
+  histogram-backed path returned raw entropy tokens, truncating every
+  value ≥ the cluster's `split` and skipping its raw completion bits.
+  Invisible while photo-content coefficients stayed below the split;
+  a desyncing misparse on impulse content. This was the round-437/441
+  deficiency's primary cause.
+- **Per-section entropy-stream lifecycle (D.3.3)** — each PassGroup
+  section is its own stream: the per-section `u(32)` ANS init was
+  silently skipped for sections after the first (idempotency guard),
+  and no terminal-state check existed. Sections now re-init, tear
+  down, and check `state == 0x130000`, with two public per-thread
+  diagnostics (`hf_coefficient_histograms::section_closure_failures`,
+  `pass_group_hf::walk_underruns`) that CI pins per fixture — the
+  desync states that rounds 437/441 accepted invisibly can never go
+  silent again.
+- **Listing I.4 IDCT orientation (FDIS erratum)** — the inverse-DCT
+  pre-transpose belongs to the `C > R` branch only; running it for
+  every shape (rounds 12..441) transposed the coefficient
+  interpretation of square and tall blocks. Masked inside the photo
+  sub-1/255 band, fatal on basis/impulse content: the reference
+  decoder reproduces the encoded orientation, the pre-transposed
+  reading its transpose. The forward `DCT_2D` helpers were re-derived
+  to Listing I.3 literally.
+- **§F.3 / §C.6.2 omit the global quantization scale (NEW FDIS
+  erratum #5)** — the "final multiplier defined by the channel, the
+  transform type and the coefficient index" also carries
+  `2^16 / global_scale` (the §C.4.3 Quantizer field; the LF sibling
+  is explicit in Listing C.1). Fit on five independently generated
+  probe streams spanning `global_scale` 1022..10223 and HfMul 7/11:
+  reference amplitude ratio ≡ `65536 / global_scale` on every stream
+  (−2..−9 %, the sign and size of the Listing F.2 bias adjustment);
+  independent of `quant_lf` (varied 15..23) and of HfMul beyond the
+  round-393 §F.3 division, which the same data re-confirms.
+- **Listing I.16 LLF normalisation (round-385 erratum refined)** —
+  over the §I.2.1-normalised forward DCT, each LLF axis carries
+  exactly the Listing I.15 `C(c, 8c, u)` boundary term (measured
+  0.7871 / 0.9018 at u = 3 / 2 on Dct32x32 probes — the cosine
+  products to four decimals). The round-385 "no factor at all"
+  measurement was taken atop the transposed IDCT and the missing
+  global scale, which masked it.
+- **§C.7.1 per-channel permutation assignment is channel-index order
+  X, Y, B (round-437 erratum refined)** — the assignment is invisible
+  to every bit-position oracle (the three permutations are decoded
+  back-to-back either way), so round 437's Y-X-B reading was never
+  actually arbitrated; a 171-byte custom-orders impulse specimen
+  (`r444_minidots`) decides it: under Y-first the Y-channel Hornuss
+  corner coefficient lands on the wrong cell and the dots vanish,
+  under index order the decode is reference-band exact.
+
+Measured: the round-441 standalone impulse reproducer class decodes
+at **max ±1/255** (`r444_onedot`, `r444_minidots`, `r444_basis32`,
+`r444_basis64` — including a Dct64x64 walk with 569 declared nonzeros
+and |q| ≈ 500), `flat-content-lf-smoothing` tightens to **max 1**,
+`vardct-256x256-d3` 0.47/0.31/0.55 (was 0.76/0.51/0.81),
+`large-1024x768-d2` 0.39/0.33/0.30, `noise-feature` 0.69/0.67/0.70
+max 4 (was max 7), `patches_vardct` MAD 1.91/0.85/0.91.
+
 ### Not yet implemented
 
 - **Multi-preset / multi-pass §C.7 slices with `used_orders != 0`**
@@ -454,15 +521,24 @@ and the Listing I.21 Squeeze tendency function.
   `progressive-ac-multipass` fixture — the per-preset repetition or
   per-pass slice layout hides one more wire divergence
   (`round437_custom_orders_boundary` pins the loud refusal).
-- **The synthetic-content VarDCT accuracy deficiency** (round 437;
-  sharply characterised round 441): isolated impulses (single-pixel
-  dots) vanish on VarDCT frames — the affected Hornuss / DCT2×2
-  varblocks decode fewer nonzero coefficients than their declared
-  NonZeros (`remaining_non_zeros > 0` after the full §C.8.3 k-walk,
-  currently accepted silently). Suspects narrowed to the Listing
-  C.13/C.14 coefficient-context math or the hybrid-uint completion on
-  impulse-heavy blocks; `patches_vardct_256x256` and the round-441
-  standalone reproducer pin it.
+- **A residual §C.8.3 entropy desync class** (round 444, replacing
+  the fixed round-437/441 impulse deficiency): streams whose §C.7.2
+  histograms carry near-uniform NON-DYADIC distributions (spectral
+  leakage of non-bin-aligned content; also the r437
+  `custom_orders_t256_e1` synthetic-edge stream and the committed
+  photo `vardct-256x256-d1`) decode with a D.3.3 terminal-state miss
+  and a bounded residual. The desync is now DIAGNOSED loudly (public
+  `section_closure_failures` / `walk_underruns` counters, per-fixture
+  CI pins on `r444_wave64` + `custom_orders_t256_e1`), never silent.
+  Ruled out on the wire this round: `prev` semantics variants, `s`
+  as the Table C.18 index, the Listing D.1 alias-pump stack/equality
+  variants (all break other bit-exact streams), the NonZeros value,
+  and the §C.8.3 writeback formula (the dangling `cur` in the FDIS
+  prose is dead text — the printed uniform ceiling is
+  wire-confirmed). The first divergent symbol on the minimal
+  reproducer is a `prev = 1`-context read one symbol after a correct
+  read; suspicion now rests on the large §C.7.2 cluster-map /
+  histogram-prelude decode for these distribution shapes.
 - The residual sub-1/255 VarDCT accuracy tail (float rounding + §J
   filter differences) and `save_before_ct` pre-CT reference recording
   in the §C.2 composer. (The staged `progressive-ac-multipass`

@@ -7,6 +7,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Round 444 — **the round-437/441 "synthetic-content VarDCT accuracy
+  deficiency" (vanishing impulses) is root-caused and FIXED**: six
+  stacked defects across the §C.8.3 entropy layer and the VarDCT
+  reconstruction chain, each arbitrated black-box on purpose-built
+  probe streams (committed as `tests/fixtures/r444_*` with their
+  reference decodes; single-pixel impulses, custom-orders impulse
+  lattices and multi-basis blocks all land at max ±1/255):
+  - §C.8.3 symbol reads are full **D.3.6 hybrid-integer reads**
+    (token → value completion + LZ77 window, `dist_multiplier = 0`);
+    the histogram-backed path previously returned raw tokens,
+    truncating every value ≥ the cluster split and skipping its raw
+    bits (`multi_pass_hf_histogram_decoder`).
+  - **Per-section D.3.3 stream lifecycle**: fresh `u(32)` ANS init
+    per PassGroup section (previously skipped for sections ≥ 1 by an
+    idempotency guard), terminal-state check + teardown per section
+    (`HfCoefficientHistograms::begin_section` / `finish_section`).
+  - **Listing I.4 orientation (FDIS erratum)**: the IDCT
+    pre-transpose runs ONLY for `C > R`; square and tall blocks
+    previously decoded with transposed coefficient axes. The forward
+    `DCT_2D` helpers now implement Listing I.3 literally.
+  - **§F.3/§C.6.2 global quantization scale (new FDIS erratum)**: the
+    dequantization matrices carry `2^16 / global_scale`
+    (`materialise_default_dequant_set_for_quantizer`); wire-fit
+    `65536 / global_scale` across five streams spanning
+    `global_scale` 1022..10223, independent of `quant_lf` and HfMul
+    (the round-393 §F.3 HfMul division is re-confirmed by the same
+    data).
+  - **Listing I.16 LLF normalisation** (round-385 erratum refined):
+    each LLF axis carries the Listing I.15 `C(c, 8c, u)` boundary
+    term over the §I.2.1-normalised DCT (measured 0.7871/0.9018 at
+    u = 3/2, the cosine products exactly).
+  - **§C.7.1 per-channel permutation assignment** (round-437 erratum
+    refined): the three per-bit §C.3.2 permutations are assigned in
+    channel-INDEX order X, Y, B, not the §C.8.3 decode order —
+    bit-invisible either way, arbitrated by the 171-byte
+    `r444_minidots` custom-orders impulse specimen.
+- Round 444 — desynced §C.8.3 streams are **diagnosed loudly, never
+  silently**: two public per-thread counters —
+  `hf_coefficient_histograms::section_closure_failures()` (D.3.3
+  terminal-state misses) and `pass_group_hf::walk_underruns()`
+  (declared NonZeros never materialised, or over-cap NonZeros reads,
+  now clamped) — pinned per fixture in CI. One desync class remains
+  open (near-uniform non-dyadic §C.7.2 histograms — wave-leakage
+  content, the r437 synthetic-edge stream, the committed d1 photo
+  fixture) and is pinned as a loud known-deficiency ratchet
+  (`r444_wave64`, `custom_orders_t256_e1`); see the README.
+
 ### Added
 
 - Round 441 — the **§C.4.5 + §K.2 kPatches image feature decodes and
