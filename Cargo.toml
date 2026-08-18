@@ -15,6 +15,11 @@ categories = ["multimedia::encoding", "multimedia::images"]
 
 [dependencies]
 oxideav-core = "0.1"
+# `compcol` (Karpelès Lab's compression collection, the workspace-wide
+# compression dependency) supplies the RFC 7932 Brotli decoder that
+# ISO/IEC 18181-2 §9.7 (`brob` boxes) and §9.11 (the `jbrd` trailing
+# data stream) require.
+compcol = { version = "0.6", default-features = false, features = ["brotli", "std"] }
 
 [dev-dependencies]
 # Used only by integration tests to decode the committed `expected.png`

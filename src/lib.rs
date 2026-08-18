@@ -551,6 +551,8 @@ pub mod hf_pass;
 pub mod icc;
 #[doc(hidden)] // internal: Annex I.2 inverse DCT primitives
 pub mod idct;
+/// ISO/IEC 18181-2 §9.11 JPEG Bitstream Reconstruction Data (`jbrd`).
+pub mod jpeg_bitstream;
 #[doc(hidden)] // internal: F.1 LF dequantisation + F.2 smoothing
 pub mod lf_dequant;
 #[doc(hidden)] // internal: C.4 LfGlobal bundle parsing
