@@ -6,7 +6,7 @@ rust-version = "1.80"
 license = "MIT"
 repository = "https://github.com/OxideAV/oxideav-jpegxl"
 authors = ["Mark Karpeles"]
-description = "Pure-Rust JPEG XL (JXL) codec — RETIRED 2026-05-08 pending strict-isolation cleanroom workspace; current state ships round-1..3 ANS + headers + LfGlobal + GlobalModular wiring only. Rounds 7-11 + encoder rounds 1-6 retired with the libjxl-trace-reverse-engineering.md docs retirement of 2026-05-06."
+description = "Pure-Rust clean-room JPEG XL (JXL, ISO/IEC 18181) decoder for the oxideav framework: Modular + VarDCT decode paths, the 18181-2 box file format, and byte-exact JPEG bitstream reconstruction from lossless JPEG transcodes."
 
 readme = "README.md"
 homepage = "https://github.com/OxideAV/oxideav-jpegxl"

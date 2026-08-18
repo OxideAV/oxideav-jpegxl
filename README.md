@@ -513,6 +513,65 @@ and |q| ≈ 500), `flat-content-lf-smoothing` tightens to **max 1**,
 `large-1024x768-d2` 0.39/0.33/0.30, `noise-feature` 0.69/0.67/0.70
 max 4 (was max 7), `patches_vardct` MAD 1.91/0.85/0.91.
 
+### Round 448 — ISO/IEC 18181-2 file format + byte-exact JPEG reconstruction; the round-444 desync class CLOSED
+
+- **The full 18181-2:2024 box layer** (`container`): the Clause 8 box
+  walk (LBox/XLBox/last-box), byte-exact Signature and File Type
+  validation, `jxll` (third-box constraint), the `jxli` Frame Index
+  parse (Table 9, E.4.2 Varint), strict `jxlc` XOR `jxlp` codestream
+  population with the §9.10 index sequence, ordered
+  `Exif` / `xml ` / `jumb` metadata capture including `brob`-wrapped
+  equivalents (Brotli via `compcol`; the §9.7 forbidden-payload types
+  reject), and `jbrd` capture.
+- **§9.11 JPEG Bitstream Reconstruction Data** (`jpeg_bitstream`):
+  the full Tables 11–18 bundle parse plus the trailing Brotli data
+  streams. Two wire-arbitrated corrections to the printed tables:
+  the per-code counts field has **17 slots** (code lengths 0..16 —
+  with 16 the first table's Kraft sum is 1/2 and every later table
+  misparses) and the values selector reaches **256**, the sentinel
+  symbol the A.3 rule drops when serializing DHT.
+- **Annex A JPEG reconstruction** (`jpeg_reconstruct::reconstruct_jpeg`):
+  a lossless JPEG→JXL transcode reproduces the ORIGINAL JPEG file
+  **byte-exactly** — coefficient-level codestream decode (§I.2.4 RAW
+  dequant matrices carrying the JPEG quant tables, §C.8.3 entropy,
+  §C.5.3 quantized LF as JPEG DC), the A.1–A.11 segment loop, and the
+  10918-1 sequential entropy re-encode. Ten committed transcode pairs
+  pin byte-exactness: 4:4:4 / 4:2:0 / 4:2:2, custom coefficient
+  orders, COM markers, DRI/restart markers, a 512×320 multi-group
+  frame, and the staged docs `jpeg-transcode` fixture (256×256 noisy
+  photo). Wire-arbitrated findings: the JXL cell layout is the
+  TRANSPOSE of the JPEG raster (coefficients and RAW tables); stored
+  chroma re-correlates in the integer domain as
+  `c += round(k·y·qY/qC)` with `k = base_correlation +
+  tile/colour_factor` (no Listing F.2 bias, no qm-scale factor); RAW
+  slots carry NO ZeroPadToByte before their modular sub-bitstream
+  (the 2021 FDIS prints one; the 2024 listing and the wire agree);
+  A.6 entropy padding defaults to ONE bits (the text prints "zero").
+- **The round-444 open §C.8.3 desync class is CLOSED — a 2021/2024
+  edition divergence.** At a block's first HF coefficient read the
+  2021 FDIS Listing C.14 prints `non_zeros > size/16 → prev = 1`; the
+  2024 IS (I.4) prints `→ prev = 0`. This crate implemented the 2021
+  text; blocks opening with `1 ≤ non_zeros ≤ size/16` routed their
+  first read to the wrong cluster whenever the stream's cluster map
+  splits the two contexts — exactly the near-uniform non-dyadic
+  histograms of the r444 reproducers. Pinned byte-exactly by the
+  JPEG-oracle fixtures; `r444_wave64` now closes cleanly at
+  MAD < 1.0 / max 2 (was one failed section, MAD < 6 / max 40). One
+  residual loud-refusal remains on noisy 4:4:4 transcode content
+  (`r448_noise444` — reconstruction refuses rather than emit a wrong
+  JPEG).
+- **F.2 channel-scaling correction** (first reachable this round): a
+  `jpeg_upsampling` value names that channel's sampling FACTORS and
+  the channels stored subsampled are those BELOW the frame-wide
+  maximum — for `{Cb, Y, Cr} = {0, 1, 0}` the chroma planes halve.
+  The I.4 subsampled varblock walk decodes chroma only on its
+  lattice with NonZeros bookkeeping on the channel's own grid; §I.6
+  chroma-from-luma is skipped entirely for subsampled frames.
+- `probe_fdis` on box-structured files now skips the extracted
+  codestream's `FF 0A` signature (previously the two signature bytes
+  parsed as SizeHeader bits and coincidentally yielded a plausible
+  header for 256-px-tall images).
+
 ### Not yet implemented
 
 - **Multi-preset / multi-pass §C.7 slices with `used_orders != 0`**
@@ -521,24 +580,13 @@ max 4 (was max 7), `patches_vardct` MAD 1.91/0.85/0.91.
   `progressive-ac-multipass` fixture — the per-preset repetition or
   per-pass slice layout hides one more wire divergence
   (`round437_custom_orders_boundary` pins the loud refusal).
-- **A residual §C.8.3 entropy desync class** (round 444, replacing
-  the fixed round-437/441 impulse deficiency): streams whose §C.7.2
-  histograms carry near-uniform NON-DYADIC distributions (spectral
-  leakage of non-bin-aligned content; also the r437
-  `custom_orders_t256_e1` synthetic-edge stream and the committed
-  photo `vardct-256x256-d1`) decode with a D.3.3 terminal-state miss
-  and a bounded residual. The desync is now DIAGNOSED loudly (public
-  `section_closure_failures` / `walk_underruns` counters, per-fixture
-  CI pins on `r444_wave64` + `custom_orders_t256_e1`), never silent.
-  Ruled out on the wire this round: `prev` semantics variants, `s`
-  as the Table C.18 index, the Listing D.1 alias-pump stack/equality
-  variants (all break other bit-exact streams), the NonZeros value,
-  and the §C.8.3 writeback formula (the dangling `cur` in the FDIS
-  prose is dead text — the printed uniform ceiling is
-  wire-confirmed). The first divergent symbol on the minimal
-  reproducer is a `prev = 1`-context read one symbol after a correct
-  read; suspicion now rests on the large §C.7.2 cluster-map /
-  histogram-prelude decode for these distribution shapes.
+- **A residual §C.8.3 desync on noisy 4:4:4 transcode content**
+  (round 448, replacing the round-444 wave-leakage class that the
+  Listing C.14 / I.4 `prev` edition fix closed): the `r448_noise444`
+  transcode still under-delivers declared NonZeros mid-frame and
+  reconstruction refuses loudly (never a silently wrong JPEG). The
+  round-444 diagnostics (`section_closure_failures` /
+  `walk_underruns`) keep every desync loud.
 - The residual sub-1/255 VarDCT accuracy tail (float rounding + §J
   filter differences) and `save_before_ct` pre-CT reference recording
   in the §C.2 composer. (The staged `progressive-ac-multipass`
@@ -568,8 +616,13 @@ max 4 (was max 7), `patches_vardct` MAD 1.91/0.85/0.91.
   decode paths carry no extra planes there yet). Splines on non-XYB
   Modular frames (the §K.3 coefficients are XYB-domain quantities;
   domain undetermined) and kNoise on Modular frames stay refused.
-- JPEG reconstruction, and the LfFrame (`lf_level > 0`) dimension
-  scaling `progressive-dc` needs.
+- JPEG reconstruction of progressive (SOF2) and greyscale JPEGs,
+  ICC-carrying APP2 chains, and MCU-padded dimensions (image sizes
+  that are not a multiple of the MCU) — each refuses precisely.
+  Pixel-domain decode of YCbCr transcode frames (the registered
+  decoder still refuses them; reconstruction is coefficient-level).
+- The LfFrame (`lf_level > 0`) dimension scaling `progressive-dc`
+  needs.
 - The encoder (not registered).
 
 Unsupported inputs surface as `Error::Unsupported` rather than a silent

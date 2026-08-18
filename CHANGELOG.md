@@ -7,7 +7,63 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Round 448 — the **complete ISO/IEC 18181-2:2024 file format layer**
+  (`container`): Clause 8 box walk, byte-exact Signature / File Type
+  validation, `jxll` Level box, `jxli` Frame Index parse (Table 9 +
+  E.4.2 Varint), strict `jxlc` XOR `jxlp` codestream population with
+  the §9.10 index sequence, ordered `Exif` / `xml ` / `jumb` metadata
+  capture including `brob`-wrapped equivalents (Brotli decompression
+  via `compcol`, the new workspace dependency), and `jbrd` capture.
+- Round 448 — **§9.11 JPEG Bitstream Reconstruction Data parse**
+  (`jpeg_bitstream`, Tables 11–18 + the trailing Brotli streams).
+  Wire-arbitrated corrections to the printed tables: the HuffmanCode
+  counts field has 17 slots (code lengths 0..16) and its values
+  selector reaches 256 — the sentinel symbol the A.3 serialization
+  rule drops (the fixture's DHT L/V bytes reproduce exactly).
+- Round 448 — **Annex A JPEG reconstruction**
+  (`jpeg_reconstruct::reconstruct_jpeg`): lossless JPEG→JXL
+  transcodes reproduce the original JPEG file **byte-exactly** —
+  coefficient-level codestream decode (§I.2.4 RAW dequant matrices =
+  the JPEG quant tables, §C.8.3 entropy, §C.5.3 quantized LF = JPEG
+  DC, integer chroma-from-luma inversion
+  `c += round(k·y·qY/qC)`), the A.1–A.11 segment loop and the
+  ISO/IEC 10918-1 sequential entropy re-encode (restart markers,
+  extra ZRL symbols, recorded/default padding bits). Ten committed
+  transcode pairs pin byte-exactness (4:4:4 / 4:2:0 / 4:2:2, custom
+  coefficient orders, COM, DRI/restarts, multi-group 512×320, and
+  the staged docs `jpeg-transcode` photo fixture). Progressive,
+  greyscale, ICC APP2 and MCU-padded dimensions refuse precisely.
+
 ### Fixed
+
+- Round 448 — **the round-444 open §C.8.3 "wave-leakage desync" class
+  is CLOSED: a 2021/2024 edition divergence in `prev`.** The 2021
+  FDIS Listing C.14 prints `non_zeros > size/16 → prev = 1` for a
+  block's first HF coefficient read; the 2024 IS (I.4) prints
+  `→ prev = 0`. The crate implemented the 2021 text; blocks opening
+  with `1 ≤ non_zeros ≤ size/16` routed their first read to the
+  wrong cluster wherever the cluster map splits the two contexts.
+  Arbitrated byte-exactly by the JPEG-reconstruction oracles;
+  `r444_wave64` now closes cleanly (MAD < 1.0 / max 2, pin
+  tightened per its own instruction). Also corrected: the I.4
+  `BlockContext()` `lf_idx` rescale (channel 1's threshold count,
+  not channel 0's — invisible on every committed stream).
+- Round 448 — **F.2 channel scaling for `jpeg_upsampling`**: the
+  subsampled channels are those whose sampling factors sit BELOW the
+  frame-wide maximum (chroma halves at 4:2:0, not luma), and the
+  §G.2.2 LfCoefficients channel shapes are listed in the
+  sub-bitstream's modular order (Y', X', B'). Both unreachable
+  before round 448 (every decoded frame was 4:4:4). The new I.4
+  subsampled varblock walk decodes a subsampled channel only on its
+  lattice with NonZeros bookkeeping on the channel's own grid; §I.6
+  CfL is skipped for subsampled frames.
+- Round 448 — `probe_fdis` on box-structured files skips the
+  extracted codestream's `FF 0A` signature (previously the two
+  signature bytes were parsed as SizeHeader bits, coincidentally
+  yielding a plausible-but-wrong header for 256-px-tall images).
+
 
 - Round 444 — **the round-437/441 "synthetic-content VarDCT accuracy
   deficiency" (vanishing impulses) is root-caused and FIXED**: six
