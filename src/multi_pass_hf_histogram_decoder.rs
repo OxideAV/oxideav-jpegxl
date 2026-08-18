@@ -1069,6 +1069,77 @@ impl<'a> HfHistogramDecodeContext<'a> {
         Ok(out)
     }
 
+    /// Single-pass §C.8.3 walk for frames with SUBSAMPLED chroma
+    /// (`jpeg_upsampling != 0`, the lossless-JPEG-transcode 4:2:0 /
+    /// 4:2:2 case): "if a channel is subsampled, its varblocks are
+    /// skipped unless the varblock corresponds to the top-left corner
+    /// of a non-subsampled varblock" (I.4). For each raster varblock
+    /// the driver reads channels in the Y → X → B stream order,
+    /// skipping channel `c` whenever `(x, y)` is not a multiple of its
+    /// `(1 << hshift, 1 << vshift)` lattice; a decoded channel's
+    /// NonZeros bookkeeping lives on that channel's OWN half-resolution
+    /// grid at `(x >> hshift, y >> vshift)` (the `nz` container must be
+    /// built with the per-channel shifted dims).
+    ///
+    /// `qdc_at(c, cx, cy)` returns the channel's quantized LF sample at
+    /// CHANNEL coordinates ("taking into account jpeg_upsampling", I.4).
+    ///
+    /// Returns one entry per varblock: `(vb, [Option<DecodedHfBlock>; 3])`
+    /// with `None` for the channels skipped at that position.
+    pub fn decode_lf_group_single_pass_subsampled<Q>(
+        &mut self,
+        br: &mut BitReader<'_>,
+        grid: &DctSelectGrid,
+        nz: &mut PerPassNonZerosGrids,
+        resolver: &BlockContextResolver<'_>,
+        shifts: [(u32, u32); 3],
+        mut qdc_at: Q,
+    ) -> Result<Vec<(Varblock, [Option<DecodedHfBlock>; 3])>>
+    where
+        Q: FnMut(u32, u32, u32) -> Result<i32>,
+    {
+        if self.num_passes() != 1 || nz.num_passes() != 1 {
+            return Err(Error::InvalidData(
+                "JXL HfHistogramDecodeContext: subsampled walk is single-pass only".into(),
+            ));
+        }
+        let nb_block_ctx = resolver.nb_block_ctx();
+        let mut out = Vec::with_capacity(crate::varblock_walk::count_varblocks(grid) as usize);
+        let mut walk = crate::varblock_walk::VarblockWalk::new(grid);
+        while let Some(vb) = walk.next()? {
+            // The Listing C.13 qdc triple, each channel at its own
+            // subsampled coordinates.
+            let mut qdc = [0i32; 3];
+            for c in 0..3u32 {
+                let (hs, vs) = shifts[c as usize];
+                qdc[c as usize] = qdc_at(c, vb.x >> hs, vb.y >> vs)?;
+            }
+            let mut decoded: [Option<DecodedHfBlock>; 3] = [None, None, None];
+            for c in [1u32, 0, 2] {
+                let (hs, vs) = shifts[c as usize];
+                if vb.x % (1 << hs) != 0 || vb.y % (1 << vs) != 0 {
+                    continue;
+                }
+                let (cx, cy) = (vb.x >> hs, vb.y >> vs);
+                let predicted = nz.predicted(0, c, cx, cy)?;
+                let ctx = resolver.resolve(c, &vb, qdc)?;
+                let (d, r) = self.decode_block_for_pass_transform(
+                    br,
+                    0,
+                    c,
+                    vb.transform,
+                    predicted,
+                    ctx,
+                    nb_block_ctx,
+                )?;
+                nz.update_after_block_for_transform(0, c, cx, cy, r, vb.transform)?;
+                decoded[c as usize] = Some(d);
+            }
+            out.push((vb, decoded));
+        }
+        Ok(out)
+    }
+
     /// Per-pass `histogram_offset(p)` lookup. Range-checked on `p`.
     pub fn histogram_offset(&self, p: u32) -> Result<u64> {
         self.per_pass_offsets

@@ -78,8 +78,49 @@ fn restart_interval_byte_exact() {
     assert_byte_exact("r448_rst444.jxl", "r448_rst444.jpg");
 }
 
-/// Noisy photo-like content still hits the round-444 open §C.7.2
-/// desync class (near-uniform non-dyadic histograms): the walk
+/// 16×16 hard edges at 4:2:0: the I.4 subsampled varblock walk
+/// (chroma decoded only at even lattice positions, NonZeros
+/// bookkeeping on the half-resolution grids) and the F.2 channel-dim
+/// scaling — chroma planes halve, luma stays full.
+#[test]
+fn edge_16x16_420_byte_exact() {
+    assert_byte_exact("r448_edge420.jxl", "r448_edge420.jpg");
+}
+
+/// 64×64 gradient at 4:2:0 — chroma-from-luma is skipped entirely for
+/// subsampled frames (I.6 first sentence).
+#[test]
+fn gradient_64x64_420_byte_exact() {
+    assert_byte_exact("r448_grad420.jxl", "r448_grad420.jpg");
+}
+
+/// 64×64 gradient at 4:2:2 — asymmetric per-axis lattices
+/// (`jpeg_upsampling` value 2, {2,1} factors).
+#[test]
+fn gradient_64x64_422_byte_exact() {
+    assert_byte_exact("r448_grad422.jxl", "r448_grad422.jpg");
+}
+
+/// 512×320 4:2:0 — a multi-group frame (2×2 PassGroup sections):
+/// per-group section slicing, group-local NonZeros resets on the
+/// subsampled lattices, and per-group entropy-stream lifecycle.
+#[test]
+fn big_512x320_420_byte_exact() {
+    assert_byte_exact("r448_big420.jxl", "r448_big420.jpg");
+}
+
+/// The staged docs `jpeg-transcode` fixture (256×256 noisy PHOTO at
+/// 4:2:0, quality 85, committed round 448 as
+/// `jpeg_transcode.jxl` / `jpeg_transcode_original.jpg`): the
+/// real-content flagship — container walk, jbrd, RAW tables,
+/// subsampled §C.8.3 decode and the 10918-1 re-encode all in one pin.
+#[test]
+fn docs_photo_transcode_byte_exact() {
+    assert_byte_exact("jpeg_transcode.jxl", "jpeg_transcode_original.jpg");
+}
+
+/// Noisy 4:4:4 content still hits the round-444 open §C.7.2 desync
+/// class (near-uniform non-dyadic histograms): the walk
 /// under-delivers declared NonZeros. Reconstruction must refuse
 /// LOUDLY — a silently wrong JPEG is never acceptable output. This
 /// pin flips to a byte-exact assertion when the desync class closes.

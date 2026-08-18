@@ -195,35 +195,36 @@ fn round444_basis64_large_token_walk_reference_band() {
     );
 }
 
-/// The known OPEN deficiency, pinned loudly: a non-bin-aligned wave
-/// (spectral leakage → near-uniform, non-dyadic §C.7.2 histograms)
-/// desyncs somewhere in the §C.8.3 entropy layer — every block-level
-/// structural guard passes, but the section's D.3.3 terminal state
-/// misses and the pixel output carries a bounded residual. This test
-/// pins the failure count (exactly this one section) and the residual
-/// band; if a future fix closes the stream, the
-/// `section_closure_failures` assertion below goes stale and must be
-/// tightened to 0 with a ±1 band.
+/// The round-444 "wave-leakage desync" — CLOSED in round 448. The
+/// deficiency was never a histogram-prelude problem: the 2021 FDIS
+/// Listing C.14 prints `non_zeros > size/16 → prev = 1` for a block's
+/// FIRST coefficient read while the 2024 IS (I.4) prints `→ prev = 0`;
+/// this crate implemented the 2021 text. Blocks opening with
+/// 1 ≤ non_zeros ≤ size/16 routed their first read to the wrong
+/// cluster whenever the stream's cluster map splits the two contexts —
+/// exactly the near-uniform non-dyadic histograms this fixture
+/// produces. With the 2024 reading (wire-arbitrated byte-exactly
+/// against original-JPEG oracles in `round448_jpeg_reconstruct`) the
+/// stream closes and the pixels land in the reference band, per the
+/// round-444 pin's own tightening instruction.
 #[test]
-fn round444_wave64_known_closure_deficiency_pinned() {
+fn round444_wave64_closure_deficiency_closed() {
     let jxl = include_bytes!("fixtures/r444_wave64.jxl");
     let (w, h, want) = png_rgb(include_bytes!("fixtures/r444_wave64_expected.png"));
     reset_section_closure_failures();
     reset_walk_underruns();
-    let frames = decode_all_frames(jxl, None).expect("stream decodes (best-effort)");
+    let frames = decode_all_frames(jxl, None).expect("stream decodes");
     assert_eq!(
         section_closure_failures(),
-        1,
-        "known deficiency: exactly one §C.8.3 section fails D.3.3 closure — \
-         if this stream now closes, tighten this test to 0 failures and a ±1 band"
+        0,
+        "the round-448 prev fix closed this stream; a regression reopened it"
     );
     assert_eq!(frames.len(), 1);
     let stats = compare_rgb(&frames[0], w, h, &want);
     for (c, &(mad, max)) in stats.iter().enumerate() {
         assert!(
-            mad < 6.0 && max <= 40,
-            "channel {c}: MAD {mad} (bound 6.0), max {max} (bound 40) — \
-             the wave-leakage residual band moved"
+            mad < 1.0 && max <= 2,
+            "channel {c}: MAD {mad} (bound 1.0), max {max} (bound 2)"
         );
     }
 }

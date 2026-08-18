@@ -854,6 +854,43 @@ impl FrameHeader {
     }
 
     /// `num_groups = ceil(width / kGroupDim) × ceil(height / kGroupDim)`.
+    /// Per-channel `(hshift, vshift)` implied by `jpeg_upsampling`
+    /// (F.2): each value maps to sampling factors 0 → {1,1}, 1 → {2,2},
+    /// 2 → {2,1}, 3 → {1,2}; a channel whose factor is below the
+    /// frame-wide maximum is stored subsampled by the ratio. All zero
+    /// for a non-YCbCr or 4:4:4 frame.
+    pub fn jpeg_upsampling_shifts(&self) -> [(u32, u32); 3] {
+        let f = |ju: u32| -> (u32, u32) {
+            match ju {
+                1 => (2, 2),
+                2 => (2, 1),
+                3 => (1, 2),
+                _ => (1, 1),
+            }
+        };
+        let factors = [
+            f(self.jpeg_upsampling[0]),
+            f(self.jpeg_upsampling[1]),
+            f(self.jpeg_upsampling[2]),
+        ];
+        let hmax = factors.iter().map(|&(h, _)| h).max().unwrap_or(1);
+        let vmax = factors.iter().map(|&(_, v)| v).max().unwrap_or(1);
+        [
+            (
+                (hmax / factors[0].0).trailing_zeros(),
+                (vmax / factors[0].1).trailing_zeros(),
+            ),
+            (
+                (hmax / factors[1].0).trailing_zeros(),
+                (vmax / factors[1].1).trailing_zeros(),
+            ),
+            (
+                (hmax / factors[2].0).trailing_zeros(),
+                (vmax / factors[2].1).trailing_zeros(),
+            ),
+        ]
+    }
+
     pub fn num_groups(&self) -> u64 {
         let g = self.group_dim() as u64;
         let w = self.width as u64;

@@ -169,16 +169,19 @@ impl LfCoefficients {
         let base_w = lf_group_width.div_ceil(8);
         let base_h = lf_group_height.div_ceil(8);
         let mut out = [(base_w, base_h); 3];
+        // F.2 semantics (round-448 correction, arbitrated on a real
+        // 4:2:0 transcode): a jpeg_upsampling VALUE names that
+        // channel's sampling FACTORS (1 → {2, 2} etc.), and the
+        // channels stored subsampled are the ones whose factor is
+        // BELOW the frame-wide maximum — e.g. for {Cb, Y, Cr} =
+        // {0, 1, 0} (4:2:0) the CHROMA planes halve, not luma. The
+        // rounds-11..447 reading shifted the ju != 0 channel instead;
+        // it was unreachable until round 448 (every decoded frame was
+        // 4:4:4).
+        let shifts = fh.jpeg_upsampling_shifts();
         for (c, slot) in out.iter_mut().enumerate() {
-            let shift = fh.jpeg_upsampling.get(c).copied().unwrap_or(0);
-            // Spec: "optionally right-shifted by one" — the practical
-            // interpretation (matching the reference-decoder behaviour
-            // observed via `cjxl`/`djxl` black-box) is shift by 1
-            // when jpeg_upsampling[c] != 0. Round-11 follows that
-            // reading; conformance-fixture-driven validation defers to
-            // round 12+ when end-to-end VarDCT pixel decode is wired.
-            let s = if shift > 0 { 1u32 } else { 0u32 };
-            *slot = (base_w >> s, base_h >> s);
+            let (hs, vs) = shifts[c];
+            *slot = (base_w.div_ceil(1 << hs), base_h.div_ceil(1 << vs));
         }
         out
     }
@@ -213,16 +216,23 @@ impl LfCoefficients {
         // the jpeg_upsampling shifts so the property[6..=10] (channel
         // shift) values are reported correctly to any MA tree that
         // branches on them.
-        let descs: Vec<ChannelDesc> = (0..3)
-            .map(|c| {
+        // The sub-bitstream's channels are in the MODULAR order
+        // (Y', X', B') — the same "first three channels" convention
+        // §L.2.2 documents — so the per-channel shapes must be listed
+        // Y-first. Indistinguishable at 4:4:4 (all shapes equal),
+        // arbitrated by the round-448 4:2:0 transcode fixtures (the
+        // channel-index order misshapes the modular image).
+        let shifts = fh.jpeg_upsampling_shifts();
+        let descs: Vec<ChannelDesc> = [1usize, 0, 2]
+            .iter()
+            .map(|&c| {
                 let (w, h) = dims[c];
-                let s = fh.jpeg_upsampling.get(c).copied().unwrap_or(0);
-                let shift = if s > 0 { 1 } else { 0 };
+                let (hs, vs) = shifts[c];
                 ChannelDesc {
                     width: w.max(1),
                     height: h.max(1),
-                    hshift: shift,
-                    vshift: shift,
+                    hshift: hs as i32,
+                    vshift: vs as i32,
                 }
             })
             .collect();
@@ -1094,14 +1104,25 @@ mod tests {
 
     #[test]
     fn lf_quant_dims_with_jpeg_upsampling_chroma() {
-        // jpeg_upsampling[1] = jpeg_upsampling[2] = 1 (4:2:0 subsampling
-        // applied to chroma). Y' (0) stays 8x8; X' (1) and B' (2) right-
-        // shifted by one to 4x4.
+        // F.2 semantics (round-448 correction, arbitrated on real
+        // 4:2:0 transcodes): a jpeg_upsampling VALUE names that
+        // channel's sampling FACTORS, and the channels stored
+        // subsampled are the ones whose factor sits BELOW the
+        // frame-wide maximum. Real 4:2:0 signals {Cb, Y, Cr} =
+        // {0, 1, 0}: luma (value 1 → factors {2, 2}) stays 8×8 and
+        // the two chroma planes halve to 4×4.
         let mut fh = build_fh(64, 64);
-        fh.jpeg_upsampling = [0, 1, 1];
+        fh.jpeg_upsampling = [0, 1, 0];
         let dims = LfCoefficients::lf_quant_dims(&fh, 64, 64);
-        assert_eq!(dims[0], (8, 8));
-        assert_eq!(dims[1], (4, 4));
+        assert_eq!(dims[0], (4, 4));
+        assert_eq!(dims[1], (8, 8));
         assert_eq!(dims[2], (4, 4));
+        // 4:2:2 ({2, 1} factors on luma): chroma halves horizontally
+        // only.
+        fh.jpeg_upsampling = [0, 2, 0];
+        let dims = LfCoefficients::lf_quant_dims(&fh, 64, 64);
+        assert_eq!(dims[0], (4, 8));
+        assert_eq!(dims[1], (8, 8));
+        assert_eq!(dims[2], (4, 8));
     }
 }

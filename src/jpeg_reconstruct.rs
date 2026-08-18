@@ -62,6 +62,10 @@ pub struct TranscodedCoefficients {
     /// Full-resolution 8×8-block grid dimensions.
     pub bw: usize,
     pub bh: usize,
+    /// Per JXL channel `(width, height)` in blocks — equal to
+    /// `(bw, bh)` for a 4:4:4 frame, halved per axis for a channel
+    /// subsampled by `jpeg_upsampling`.
+    pub cdims: [(usize, usize); 3],
     /// Per JXL channel (0 = X/Cb, 1 = Y/luma, 2 = B/Cr): `bw*bh` blocks
     /// in raster order, 64 coefficients per block in ISO/IEC 10918-1
     /// raster `(row, col)` order (transposed from the JXL cell layout,
@@ -126,12 +130,8 @@ pub fn decode_transcoded_coefficients(codestream: &[u8]) -> Result<TranscodedCoe
             fh.passes.num_passes
         )));
     }
-    if fh.jpeg_upsampling != [0, 0, 0] {
-        return Err(Error::Unsupported(format!(
-            "JXL jpeg_reconstruct: chroma subsampling {:?} not yet handled (4:4:4 only)",
-            fh.jpeg_upsampling
-        )));
-    }
+    let shifts = fh.jpeg_upsampling_shifts();
+    let subsampled = shifts.iter().any(|&(h, v)| h != 0 || v != 0);
     if fh.upsampling != 1 {
         return Err(Error::Unsupported(
             "JXL jpeg_reconstruct: upsampling != 1 in a transcode frame".into(),
@@ -165,13 +165,28 @@ pub fn decode_transcoded_coefficients(codestream: &[u8]) -> Result<TranscodedCoe
         && fh.passes.num_passes == 1
         && num_lf_groups == 1;
 
-    // Frame-level canvases.
+    // Frame-level canvases. Per channel: the full-resolution block
+    // grid divided (rounding up) by the channel's subsampling lattice.
     let fbw = fh.width.div_ceil(8) as usize;
     let fbh = fh.height.div_ceil(8) as usize;
+    let cdims: [(usize, usize); 3] = [
+        (
+            fbw.div_ceil(1 << shifts[0].0),
+            fbh.div_ceil(1 << shifts[0].1),
+        ),
+        (
+            fbw.div_ceil(1 << shifts[1].0),
+            fbh.div_ceil(1 << shifts[1].1),
+        ),
+        (
+            fbw.div_ceil(1 << shifts[2].0),
+            fbh.div_ceil(1 << shifts[2].1),
+        ),
+    ];
     let mut lf_quant: [Vec<i32>; 3] = [
-        vec![0i32; fbw * fbh],
-        vec![0i32; fbw * fbh],
-        vec![0i32; fbw * fbh],
+        vec![0i32; cdims[0].0 * cdims[0].1],
+        vec![0i32; cdims[1].0 * cdims[1].1],
+        vec![0i32; cdims[2].0 * cdims[2].1],
     ];
     let mut cells = vec![crate::dct_select::DctSelectCell::Empty; fbw * fbh];
     let mut hf_mul_grid = vec![0i32; fbw * fbh];
@@ -280,24 +295,28 @@ pub fn decode_transcoded_coefficients(codestream: &[u8]) -> Result<TranscodedCoe
                 lf_coeff.extra_precision
             )));
         }
-        let gbw = lf_coeff.lf_quant_widths[0] as usize;
-        let gbh = lf_coeff.lf_quant_heights[0] as usize;
-        if lf_coeff.lf_quant_widths != [gbw as u32; 3]
-            || lf_coeff.lf_quant_heights != [gbh as u32; 3]
-        {
-            return Err(Error::Unsupported(
-                "JXL jpeg_reconstruct: subsampled LF channels in 4:4:4 path".into(),
-            ));
-        }
         // LfCoefficients channels arrive in modular order (Y, X, B);
-        // reorder to channel index order (X, Y, B).
+        // reorder to channel index order (X, Y, B). Each channel pastes
+        // into its own (possibly subsampled) frame-level canvas at the
+        // LfGroup offset shifted by that channel's lattice.
         let order = [1usize, 0, 2];
         for c in 0..3 {
+            let gcw = lf_coeff.lf_quant_widths[order[c]] as usize;
+            let gch = lf_coeff.lf_quant_heights[order[c]] as usize;
+            let (hs, vs) = shifts[c];
+            let (cw, _ch) = cdims[c];
+            let cx0 = bx0 >> hs;
+            let cy0 = by0 >> vs;
             let src = &lf_coeff.lf_quant[order[c]];
-            for row in 0..gbh {
-                let s = row * gbw;
-                let d = (by0 + row) * fbw + bx0;
-                lf_quant[c][d..d + gbw].copy_from_slice(&src[s..s + gbw]);
+            if src.len() != gcw * gch {
+                return Err(Error::InvalidData(
+                    "JXL jpeg_reconstruct: LF channel size mismatch".into(),
+                ));
+            }
+            for row in 0..gch {
+                let s = row * gcw;
+                let d = (cy0 + row) * cw + cx0;
+                lf_quant[c][d..d + gcw].copy_from_slice(&src[s..s + gcw]);
             }
         }
         let hf_meta = lf_group.hf_meta.as_ref().ok_or_else(|| {
@@ -353,9 +372,9 @@ pub fn decode_transcoded_coefficients(codestream: &[u8]) -> Result<TranscodedCoe
     }
 
     let mut coeffs: [Vec<i32>; 3] = [
-        vec![0i32; fbw * fbh * 64],
-        vec![0i32; fbw * fbh * 64],
-        vec![0i32; fbw * fbh * 64],
+        vec![0i32; cdims[0].0 * cdims[0].1 * 64],
+        vec![0i32; cdims[1].0 * cdims[1].1 * 64],
+        vec![0i32; cdims[2].0 * cdims[2].1 * 64],
     ];
 
     for (rect, per_pass) in group_rects.into_iter().zip(pass_group_readers) {
@@ -367,23 +386,69 @@ pub fn decode_transcoded_coefficients(codestream: &[u8]) -> Result<TranscodedCoe
         let pass_data = hf_section.pass_data_mut(0)?;
         pass_data.histograms.begin_section(&mut gbr)?;
         let mut ctx = pass_data.single_pass_context(&headers)?;
-        let mut nz =
-            PerPassNonZerosGrids::new_uniform(1, 3, sub_grid.width_blocks, sub_grid.height_blocks)?;
-        let qdc_at = |_p: u32, vb: &crate::varblock_walk::Varblock| -> Result<[i32; 3]> {
-            let bx = (rect.bx0 + vb.x) as usize;
-            let by = (rect.by0 + vb.y) as usize;
-            let idx = by * fbw + bx;
-            Ok([lf_quant[0][idx], lf_quant[1][idx], lf_quant[2][idx]])
-        };
-        let mut out = ctx.decode_lf_group_multi_pass_three_channels(
-            &mut gbr, &sub_grid, &mut nz, &resolver, qdc_at,
-        )?;
-        hf_section.pass_data_mut(0)?.histograms.finish_section()?;
-        let varblocks = out.pop().ok_or_else(|| {
-            Error::InvalidData("JXL jpeg_reconstruct: empty per-pass decode output".into())
-        })?;
+        // Group-lattice invariant: every channel's subsampling lattice
+        // must align with the group origin (group_dim is a multiple of
+        // every lattice in practice — 256 px = 32 blocks).
+        for &(hs, vs) in &shifts {
+            if rect.bx0 % (1 << hs) != 0 || rect.by0 % (1 << vs) != 0 {
+                return Err(Error::Unsupported(
+                    "JXL jpeg_reconstruct: group origin off the subsampling lattice".into(),
+                ));
+            }
+        }
+        let per_channel_dims: [(u32, u32); 3] = [
+            (
+                sub_grid.width_blocks.div_ceil(1 << shifts[0].0),
+                sub_grid.height_blocks.div_ceil(1 << shifts[0].1),
+            ),
+            (
+                sub_grid.width_blocks.div_ceil(1 << shifts[1].0),
+                sub_grid.height_blocks.div_ceil(1 << shifts[1].1),
+            ),
+            (
+                sub_grid.width_blocks.div_ceil(1 << shifts[2].0),
+                sub_grid.height_blocks.div_ceil(1 << shifts[2].1),
+            ),
+        ];
+        let mut nz = PerPassNonZerosGrids::new(&[&per_channel_dims])?;
 
-        for (vb, blocks, _raw_nz) in varblocks {
+        // Per-varblock decoded blocks: uniform driver for 4:4:4, the
+        // lattice-skipping driver otherwise. Output normalised to
+        // `(vb, [Option<DecodedHfBlock>; 3])`.
+        let varblocks: Vec<(
+            crate::varblock_walk::Varblock,
+            [Option<crate::pass_group_hf::DecodedHfBlock>; 3],
+        )> = if subsampled {
+            let qdc_at = |c: u32, cx: u32, cy: u32| -> Result<i32> {
+                let (hs, vs) = shifts[c as usize];
+                let (cw, _) = cdims[c as usize];
+                let gx = ((rect.bx0 >> hs) + cx) as usize;
+                let gy = ((rect.by0 >> vs) + cy) as usize;
+                Ok(lf_quant[c as usize][gy * cw + gx])
+            };
+            ctx.decode_lf_group_single_pass_subsampled(
+                &mut gbr, &sub_grid, &mut nz, &resolver, shifts, qdc_at,
+            )?
+        } else {
+            let qdc_at = |_p: u32, vb: &crate::varblock_walk::Varblock| -> Result<[i32; 3]> {
+                let bx = (rect.bx0 + vb.x) as usize;
+                let by = (rect.by0 + vb.y) as usize;
+                let idx = by * fbw + bx;
+                Ok([lf_quant[0][idx], lf_quant[1][idx], lf_quant[2][idx]])
+            };
+            let mut out = ctx.decode_lf_group_multi_pass_three_channels(
+                &mut gbr, &sub_grid, &mut nz, &resolver, qdc_at,
+            )?;
+            let vbs = out.pop().ok_or_else(|| {
+                Error::InvalidData("JXL jpeg_reconstruct: empty per-pass decode output".into())
+            })?;
+            vbs.into_iter()
+                .map(|(vb, [d0, d1, d2], _raw)| (vb, [Some(d0), Some(d1), Some(d2)]))
+                .collect()
+        };
+        hf_section.pass_data_mut(0)?.histograms.finish_section()?;
+
+        for (vb, blocks) in varblocks {
             if vb.transform != TransformType::Dct8x8 {
                 return Err(Error::Unsupported(format!(
                     "JXL jpeg_reconstruct: varblock transform {:?} at ({}, {}) — a JPEG \
@@ -391,21 +456,23 @@ pub fn decode_transcoded_coefficients(codestream: &[u8]) -> Result<TranscodedCoe
                     vb.transform, vb.x, vb.y
                 )));
             }
-            let bx = (rect.bx0 + vb.x) as usize;
-            let by = (rect.by0 + vb.y) as usize;
-            let base = (by * fbw + bx) * 64;
-            for c in 0..3 {
-                let dhb = &blocks[c];
+            for (c, slot) in blocks.iter().enumerate() {
+                let Some(dhb) = slot else { continue };
+                let (hs, vs) = shifts[c];
+                let cx = ((rect.bx0 + vb.x) >> hs) as usize;
+                let cy = ((rect.by0 + vb.y) >> vs) as usize;
+                let (cw, _) = cdims[c];
                 if dhb.remaining_non_zeros != 0 {
                     return Err(Error::InvalidData(format!(
-                        "JXL jpeg_reconstruct: varblock ({bx}, {by}) channel {c} decoded with \
+                        "JXL jpeg_reconstruct: varblock ({cx}, {cy}) channel {c} decoded with \
                          {} undelivered NonZeros — refusing to reconstruct from a desynced \
                          stream",
                         dhb.remaining_non_zeros
                     )));
                 }
+                let base = (cy * cw + cx) * 64;
                 coeffs[c][base..base + 64].copy_from_slice(&dhb.coeffs);
-                coeffs[c][base] = lf_quant[c][by * fbw + bx];
+                coeffs[c][base] = lf_quant[c][cy * cw + cx];
             }
         }
     }
@@ -424,8 +491,11 @@ pub fn decode_transcoded_coefficients(codestream: &[u8]) -> Result<TranscodedCoe
             "JXL jpeg_reconstruct: non-neutral LF chroma-from-luma factors".into(),
         ));
     }
+    // I.6: "This clause is skipped if any channel is subsampled" — no
+    // CfL inversion for 4:2:0 / 4:2:2 frames.
+    let cfl_blocks = if subsampled { 0 } else { fbh };
     let cf = cfl.colour_factor as f64;
-    for by in 0..fbh {
+    for by in 0..cfl_blocks {
         for bx in 0..fbw {
             let tile = (by / 8).min(fth - 1) * ftw + (bx / 8).min(ftw - 1);
             let kx = cfl.base_correlation_x as f64 + (x_from_y[tile] as f64) / cf;
@@ -460,7 +530,8 @@ pub fn decode_transcoded_coefficients(codestream: &[u8]) -> Result<TranscodedCoe
     };
     let mut quant = quant;
     for c in 0..3 {
-        for b in 0..(fbw * fbh) {
+        let (cw, ch) = cdims[c];
+        for b in 0..(cw * ch) {
             transpose64(&mut coeffs[c][b * 64..b * 64 + 64]);
         }
         transpose64(&mut quant[c]);
@@ -472,6 +543,7 @@ pub fn decode_transcoded_coefficients(codestream: &[u8]) -> Result<TranscodedCoe
         jpeg_upsampling: fh.jpeg_upsampling,
         bw: fbw,
         bh: fbh,
+        cdims,
         coeffs,
         quant,
         x_from_y,
@@ -1067,13 +1139,6 @@ fn encode_sequential_scan(
         let fc = comps.get(csi.comp_idx as usize).ok_or_else(|| {
             Error::InvalidData("JXL jpeg_reconstruct: scan comp_idx out of range".into())
         })?;
-        // 4:4:4 only in this path: every component grid is the full
-        // block grid.
-        if fc.h != 1 || fc.v != 1 {
-            return Err(Error::Unsupported(
-                "JXL jpeg_reconstruct: subsampled component in the 4:4:4 scan encoder".into(),
-            ));
-        }
         let dc = dc_tables[csi.dc_tbl_idx as usize].as_ref().ok_or_else(|| {
             Error::InvalidData(format!(
                 "JXL jpeg_reconstruct: DC table {} not defined before the scan",
@@ -1086,12 +1151,13 @@ fn encode_sequential_scan(
                 csi.ac_tbl_idx
             ))
         })?;
+        let (cw, ch) = tc.cdims[fc.jxl_channel];
         scomps.push(ScanComp {
             jxl_channel: fc.jxl_channel,
             h: fc.h,
             v: fc.v,
-            width_blocks: tc.bw,
-            height_blocks: tc.bh,
+            width_blocks: cw,
+            height_blocks: ch,
             dc,
             ac,
             pred: 0,
