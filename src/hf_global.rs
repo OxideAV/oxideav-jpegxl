@@ -50,7 +50,22 @@
 
 use oxideav_core::{Error, Result};
 
-use crate::bitreader::BitReader;
+use crate::bitreader::{BitReader, U32Dist};
+use crate::global_modular::{apply_inverse_transforms, apply_transforms_to_channel_layout};
+use crate::modular_fdis::{
+    decode_channels_at_stream, ChannelDesc, MaTreeFdis, TransformInfo, WpHeader,
+};
+
+/// Context required to decode `RAW`-mode dequantization matrices: their
+/// Table I.4 modular sub-bitstreams reference the frame's LF-group count
+/// (stream index `1 + 3 × num_lf_groups + table index` per Table D.2
+/// property 1) and may use the GlobalModular MA tree.
+pub struct RawDequantContext<'a> {
+    /// `frame_header.num_lf_groups()`.
+    pub num_lf_groups: u64,
+    /// The GlobalModular global MA tree, if the frame decoded one.
+    pub global_tree: Option<&'a MaTreeFdis>,
+}
 
 /// Encoding-mode discriminator per Table I.5.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -150,9 +165,16 @@ pub struct DequantMatrixParams {
     /// for `Afv`.
     pub dct4x4_params: Vec<f32>,
     pub dct4x4_params_cols: u32,
-    /// RAW-mode denominator (F16). Present only for `Raw`. Round 14
-    /// rejects RAW; this field is reserved for round 15+.
+    /// RAW-mode denominator (F16). Present only for `Raw`.
     pub raw_denominator: f32,
+    /// RAW-mode quantization factors: the three per-channel integer
+    /// matrices decoded from the Table I.4 modular sub-bitstream, each
+    /// row-major of the slot's matrix shape. Empty for every other
+    /// mode. Per I.2.4 the dequantization matrix is the element-wise
+    /// `raw_params × raw_denominator`; for a lossless JPEG transcode
+    /// these integers ARE the original JPEG quantization table entries
+    /// (18181-2 A.7).
+    pub raw_params: Vec<Vec<i32>>,
 }
 
 impl Default for DequantMatrixParams {
@@ -166,6 +188,7 @@ impl Default for DequantMatrixParams {
             dct4x4_params: Vec::new(),
             dct4x4_params_cols: 0,
             raw_denominator: 0.0,
+            raw_params: Vec::new(),
         }
     }
 }
@@ -245,6 +268,7 @@ fn read_dct_params(br: &mut BitReader<'_>) -> Result<(Vec<f32>, u32)> {
 fn read_one_dequant_matrix(
     br: &mut BitReader<'_>,
     slot_index: usize,
+    raw_ctx: Option<&RawDequantContext<'_>>,
 ) -> Result<DequantMatrixParams> {
     let raw = br.read_bits(3)?;
     let mode = EncodingMode::from_u3(raw)?;
@@ -310,15 +334,95 @@ fn read_one_dequant_matrix(
             out.dct_params_cols = n;
         }
         EncodingMode::Raw => {
-            // RAW mode reads `denominator = F16()` then a modular
-            // sub-bitstream whose channel shape matches the target
-            // quant matrix per Table I.4. Wiring that sub-bitstream
-            // requires the IDCT consumer + Table H.4 stream_index
-            // computation; defer to round 15+.
-            return Err(Error::Unsupported(format!(
-                "JXL HfGlobal: dequant-matrix slot {slot_index} uses RAW encoding mode (modular \
-                 sub-bitstream of same shape as quant matrix) — round 15+ work"
-            )));
+            // RAW mode (Listing C.10): `denominator = F16()`, then
+            // `ZeroPadToByte()`, then a 3-channel modular sub-bitstream
+            // (C.9) of the same shape as the required quant matrix
+            // (Table I.4 dims for this slot). Its MA-tree stream index
+            // is `1 + 3 × num_lf_groups + table index` (Table D.2
+            // property 1, "RAW dequantization tables"), with the table
+            // index being this slot's index.
+            let ctx = raw_ctx.ok_or_else(|| {
+                Error::Unsupported(format!(
+                    "JXL HfGlobal: dequant-matrix slot {slot_index} uses RAW encoding mode but \
+                     the caller supplied no RawDequantContext (frame-level decode required)"
+                ))
+            })?;
+            out.raw_denominator = br.read_f16()?;
+            // Listing C.10 prints a ZeroPadToByte() here, but the wire
+            // carries NONE: on a stream whose cursor is unaligned at
+            // this point, skipping to the byte boundary misparses the
+            // modular sub-bitstream header (nb_transforms reads 7 and
+            // the first transform reads as a Squeeze with end 1679),
+            // while reading the ModularHeader at the very next bit
+            // parses cleanly and yields the correct quantization
+            // tables. Wire-arbitrated on two independently generated
+            // transcode streams; an aligned stream parses identically
+            // under both readings. Recorded as an FDIS erratum
+            // candidate.
+
+            let (x_dim, y_dim) =
+                crate::dct_quant_weights::weights_matrix_dims_for_slot(slot_index as u32)?;
+            let descs: Vec<ChannelDesc> = (0..3)
+                .map(|_| ChannelDesc {
+                    width: x_dim,
+                    height: y_dim,
+                    hshift: 0,
+                    vshift: 0,
+                })
+                .collect();
+
+            // Inner ModularHeader (Table H.1) per Annex H.2.
+            let use_global_tree = br.read_bool()?;
+            let wp_header = WpHeader::read(br)?;
+            let nb_transforms = br.read_u32([
+                U32Dist::Val(0),
+                U32Dist::Val(1),
+                U32Dist::BitsOffset(4, 2),
+                U32Dist::BitsOffset(8, 18),
+            ])?;
+            const MAX_TRANSFORMS: u32 = 274;
+            if nb_transforms > MAX_TRANSFORMS {
+                return Err(Error::InvalidData(format!(
+                    "JXL HfGlobal: RAW dequant slot {slot_index}: nb_transforms {nb_transforms} \
+                     exceeds {MAX_TRANSFORMS}"
+                )));
+            }
+            let mut transforms: Vec<TransformInfo> = Vec::with_capacity(nb_transforms as usize);
+            for _ in 0..nb_transforms {
+                transforms.push(TransformInfo::read(br)?);
+            }
+            let mut tree = if use_global_tree {
+                ctx.global_tree
+                    .ok_or_else(|| {
+                        Error::InvalidData(format!(
+                            "JXL HfGlobal: RAW dequant slot {slot_index} wants the global MA \
+                             tree but GlobalModular decoded none"
+                        ))
+                    })?
+                    .cloned_with_fresh_state()
+            } else {
+                MaTreeFdis::read(br)?
+            };
+            let stream_index = (1 + 3 * ctx.num_lf_groups + slot_index as u64) as i32;
+            let mut descs = descs;
+            if !transforms.is_empty() {
+                descs = apply_transforms_to_channel_layout(descs, &mut transforms)?;
+            }
+            let mut img =
+                decode_channels_at_stream(br, &descs, &mut tree, &wp_header, stream_index)?;
+            if !transforms.is_empty() {
+                // The RAW params are quantization factors; the modular
+                // bit_depth argument only affects paths these tiny
+                // integer images do not exercise.
+                apply_inverse_transforms(&mut img, &transforms, 8)?;
+            }
+            if img.channels.len() != 3 {
+                return Err(Error::InvalidData(format!(
+                    "JXL HfGlobal: RAW dequant slot {slot_index} decoded {} channels (want 3)",
+                    img.channels.len()
+                )));
+            }
+            out.raw_params = img.channels;
         }
     }
 
@@ -359,6 +463,18 @@ impl HfGlobal {
     /// `num_groups == 1` and the field uses 0 bits (legal value: 0 →
     /// `num_hf_presets = 1`).
     pub fn read(br: &mut BitReader<'_>, num_groups: u64) -> Result<Self> {
+        Self::read_with_raw(br, num_groups, None)
+    }
+
+    /// [`HfGlobal::read`] with the context that lets `RAW`-mode
+    /// dequantization matrices decode their Table I.4 modular
+    /// sub-bitstreams. Without a context (`None`, the [`HfGlobal::read`]
+    /// behaviour) a RAW slot refuses loudly.
+    pub fn read_with_raw(
+        br: &mut BitReader<'_>,
+        num_groups: u64,
+        raw_ctx: Option<&RawDequantContext<'_>>,
+    ) -> Result<Self> {
         // I.2.4 first sentence: read u(1). When 1, all dequant matrices
         // take their default encoding from I.2.5 / Table I.6.
         let dequant_default = br.read_bool()?;
@@ -369,7 +485,7 @@ impl HfGlobal {
             // Listing C.10.
             let mut v = Vec::with_capacity(17);
             for slot in 0..17 {
-                v.push(read_one_dequant_matrix(br, slot)?);
+                v.push(read_one_dequant_matrix(br, slot, raw_ctx)?);
             }
             v
         };

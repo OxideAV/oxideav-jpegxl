@@ -553,6 +553,8 @@ pub mod icc;
 pub mod idct;
 /// ISO/IEC 18181-2 §9.11 JPEG Bitstream Reconstruction Data (`jbrd`).
 pub mod jpeg_bitstream;
+/// ISO/IEC 18181-2 Annex A JPEG bitstream reconstruction.
+pub mod jpeg_reconstruct;
 #[doc(hidden)] // internal: F.1 LF dequantisation + F.2 smoothing
 pub mod lf_dequant;
 #[doc(hidden)] // internal: C.4 LfGlobal bundle parsing
@@ -2961,11 +2963,16 @@ pub fn decode_vardct_frame_with_refs(
             .as_ref()
             .expect("HfBlockContext presence checked above")
             .nb_block_ctx;
-        let hf_global_section = crate::hf_global_section::HfGlobalSection::read(
+        let raw_ctx = crate::hf_global::RawDequantContext {
+            num_lf_groups,
+            global_tree: lf_global.global_modular.global_tree.as_ref(),
+        };
+        let hf_global_section = crate::hf_global_section::HfGlobalSection::read_with_raw(
             &mut shared_br,
             num_groups,
             nb_block_ctx,
             fh.passes.num_passes,
+            Some(&raw_ctx),
         )?;
         // PassGroup continues on the same cursor (no byte alignment).
         (
@@ -3008,11 +3015,16 @@ pub fn decode_vardct_frame_with_refs(
             .nb_block_ctx;
         let hf_global_bytes = section_byte_range(hf_global_slot)?;
         let mut hg_br = BitReader::new_section(hf_global_bytes);
-        let hf_global_section = crate::hf_global_section::HfGlobalSection::read(
+        let raw_ctx = crate::hf_global::RawDequantContext {
+            num_lf_groups,
+            global_tree: lf_global.global_modular.global_tree.as_ref(),
+        };
+        let hf_global_section = crate::hf_global_section::HfGlobalSection::read_with_raw(
             &mut hg_br,
             num_groups,
             nb_block_ctx,
             fh.passes.num_passes,
+            Some(&raw_ctx),
         )?;
         // Each PassGroup is its own byte-aligned section slot, laid out
         // pass-major on the wire (§C.3.1); collect them per GROUP (one
@@ -3259,7 +3271,19 @@ pub fn probe_fdis(input: &[u8]) -> Result<HeadersFdis> {
         container::Signature::RawCodestream => probe_fdis_codestream(&input[2..], signature),
         container::Signature::Isobmff => {
             let codestream_owned = container::extract_codestream(input)?;
-            probe_fdis_codestream(&codestream_owned, signature)
+            let cs: &[u8] = &codestream_owned;
+            // The extracted codestream carries its own FF 0A signature;
+            // the header bits start after it (the decode paths already
+            // skip it — round 448 fixed this probe to match, previously
+            // the two signature bytes were parsed as SizeHeader bits and
+            // coincidentally yielded a plausible-but-wrong header for
+            // 256-px-tall images).
+            if cs.len() < 2 || cs[0] != 0xFF || cs[1] != 0x0A {
+                return Err(Error::InvalidData(
+                    "JXL ISOBMFF: jxlc/jxlp payload missing FF 0A codestream signature".into(),
+                ));
+            }
+            probe_fdis_codestream(&cs[2..], signature)
         }
     }
 }

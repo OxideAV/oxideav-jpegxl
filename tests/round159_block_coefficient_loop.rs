@@ -21,8 +21,10 @@ use oxideav_jpegxl::pass_group_hf::{
     read_non_zeros_and_decode_block, COEFF_FREQ_CONTEXT, COEFF_NUM_NONZERO_CONTEXT,
 };
 
-/// Listing C.14: at the first iteration (k == num_blocks), prev depends
-/// on `non_zeros > size / 16`.
+/// At the first iteration (k == num_blocks), prev depends on
+/// `non_zeros > size / 16` — with the 2024-IS polarity (I.4:
+/// `> → prev = 0`), wire-arbitrated byte-exactly in round 448; the
+/// 2021 FDIS Listing C.14 prints the inverse.
 #[test]
 fn prev_for_context_dct8x8_threshold_at_5() {
     // size / 16 = 4 for DCT8×8 → strictly-greater comparison so the
@@ -30,13 +32,13 @@ fn prev_for_context_dct8x8_threshold_at_5() {
     for nz in 0..=4 {
         assert_eq!(
             prev_for_context(1, 1, 64, nz, |_| panic!("never called")),
-            0
+            1
         );
     }
     for nz in 5..=63 {
         assert_eq!(
             prev_for_context(1, 1, 64, nz, |_| panic!("never called")),
-            1
+            0
         );
     }
 }
@@ -174,8 +176,8 @@ fn decode_block_coefficients_context_threading_matches_listings_c13_c14() {
     .unwrap();
     assert_eq!(seen_ctx.len(), 3);
 
-    // k=1: prev = 0 (non_zeros=1, 1>4 false).
-    let expect0 = coefficient_context(1, 1, num_blocks, size, 0, block_ctx, nb_block_ctx).unwrap();
+    // k=1: prev = 1 (non_zeros=1, 1>4 false; 2024-IS polarity).
+    let expect0 = coefficient_context(1, 1, num_blocks, size, 1, block_ctx, nb_block_ctx).unwrap();
     assert_eq!(seen_ctx[0], expect0);
     // k=2: prev = 0 (ucoeff at k=1 was zero).
     let expect1 = coefficient_context(2, 1, num_blocks, size, 0, block_ctx, nb_block_ctx).unwrap();

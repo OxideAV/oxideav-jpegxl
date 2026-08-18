@@ -203,8 +203,12 @@ pub fn block_context(
             lf_idx += 1;
         }
     }
-    // lf_idx ×= lf_thresholds[0].size() + 1
-    lf_idx *= (lf_thresholds[0].len() as u64) + 1;
+    // lf_idx ×= lf_thresholds[1].size() + 1 (I.4 BlockContext():
+    // the second rescale is by CHANNEL 1's threshold count — the
+    // rounds-355..447 code multiplied by channel 0's here, invisible
+    // on every stream whose channel-0/1 threshold counts coincide or
+    // are zero).
+    lf_idx *= (lf_thresholds[1].len() as u64) + 1;
     for &t in &lf_thresholds[1] {
         if qdc[1] > t {
             lf_idx += 1;
@@ -352,10 +356,22 @@ where
     F: Fn(u32) -> bool,
 {
     if k == num_blocks {
+        // EDITION DIVERGENCE, wire-arbitrated (round 448): the 2021
+        // FDIS Listing C.14 prints `non_zeros > size/16 → prev = 1`,
+        // the 2024 IS (I.4) prints `→ prev = 0`. The wire agrees with
+        // the 2024 text: on a lossless JPEG transcode whose first
+        // varblock declares 1 ≤ non_zeros ≤ size/16, the 2021 reading
+        // routes the block's FIRST coefficient read to the wrong
+        // cluster and every later read shuffles (bounded low-frequency
+        // garbage with the stream staying formally in sync) — the
+        // JPEG-side oracle pins the 2024 reading byte-exactly. Every
+        // pre-448 fixture left the two readings indistinguishable
+        // (blocks opened with non_zeros = 0 or > size/16, or the
+        // cluster map merged the two contexts).
         if non_zeros > size / 16 {
-            1
-        } else {
             0
+        } else {
+            1
         }
     } else if prev_nonzero(k - 1) {
         1
@@ -981,18 +997,20 @@ mod tests {
 
     #[test]
     fn prev_for_context_first_iteration_high_non_zeros() {
-        // k == num_blocks, non_zeros > size / 16 → prev = 1.
-        // For DCT8×8: num_blocks = 1, size = 64, size/16 = 4. With
-        // non_zeros = 5 the first read uses prev = 1.
-        assert_eq!(prev_for_context(1, 1, 64, 5, |_| panic!("never called")), 1);
+        // k == num_blocks, non_zeros > size / 16 → prev = 0 (the 2024
+        // IS reading, wire-arbitrated round 448; the 2021 FDIS prints
+        // the inverse). For DCT8×8: num_blocks = 1, size = 64,
+        // size/16 = 4. With non_zeros = 5 the first read uses prev = 0.
+        assert_eq!(prev_for_context(1, 1, 64, 5, |_| panic!("never called")), 0);
     }
 
     #[test]
     fn prev_for_context_first_iteration_low_non_zeros() {
-        // k == num_blocks, non_zeros <= size / 16 → prev = 0.
-        // For DCT8×8: non_zeros = 4 → 4 > 64 / 16 == 4 is false → prev = 0.
-        assert_eq!(prev_for_context(1, 1, 64, 4, |_| panic!("never called")), 0);
-        assert_eq!(prev_for_context(1, 1, 64, 0, |_| panic!("never called")), 0);
+        // k == num_blocks, non_zeros <= size / 16 → prev = 1 (2024
+        // reading, see above).
+        // For DCT8×8: non_zeros = 4 → 4 > 64 / 16 == 4 is false → prev = 1.
+        assert_eq!(prev_for_context(1, 1, 64, 4, |_| panic!("never called")), 1);
+        assert_eq!(prev_for_context(1, 1, 64, 0, |_| panic!("never called")), 1);
     }
 
     #[test]
@@ -1155,10 +1173,10 @@ mod tests {
         assert_eq!(seen_ctx.len(), 3);
 
         // k = 1, num_blocks = 1, non_zeros = 2. k == num_blocks → prev
-        // path is "non_zeros > size / 16 ? 1 : 0". 2 > 64/16=4 is false
-        // → prev = 0.
+        // path is "non_zeros > size / 16 ? 0 : 1" (2024 reading).
+        // 2 > 64/16=4 is false → prev = 1.
         let expected_ctx_0 =
-            coefficient_context(1, 2, num_blocks, size, 0, block_ctx, nb_block_ctx).unwrap();
+            coefficient_context(1, 2, num_blocks, size, 1, block_ctx, nb_block_ctx).unwrap();
         assert_eq!(seen_ctx[0], expected_ctx_0);
 
         // k = 2, non_zeros after first nonzero is 1. prev = 1 (the
@@ -1236,9 +1254,9 @@ mod tests {
         assert_eq!(non_zeros, 1);
 
         // The CoefficientContext closure saw the k=1, non_zeros=1
-        // formula with prev = 0 (1 > 64/16=4 is false).
+        // formula with prev = 1 (1 > 64/16=4 is false; 2024 reading).
         let expected_coeff_ctx =
-            coefficient_context(1, 1, 1, 64, 0, block_ctx, nb_block_ctx).unwrap();
+            coefficient_context(1, 1, 1, 64, 1, block_ctx, nb_block_ctx).unwrap();
         assert_eq!(saw_coeff_ctx, Some(expected_coeff_ctx));
         assert_eq!(decoded.coeffs_read, 1);
         assert_eq!(decoded.remaining_non_zeros, 0);
@@ -1428,14 +1446,14 @@ mod tests {
         for nz in 0..=16 {
             assert_eq!(
                 prev_for_context(4, 4, 256, nz, |_| panic!("never called")),
-                0,
+                1,
                 "DCT16×16 prev at nz={nz}",
             );
         }
         for nz in 17..=63 {
             assert_eq!(
                 prev_for_context(4, 4, 256, nz, |_| panic!("never called")),
-                1,
+                0,
                 "DCT16×16 prev at nz={nz}",
             );
         }

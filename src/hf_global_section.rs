@@ -160,6 +160,20 @@ impl HfGlobalSection {
         nb_block_ctx: u32,
         num_passes: u32,
     ) -> Result<Self> {
+        Self::read_with_raw(br, num_groups, nb_block_ctx, num_passes, None)
+    }
+
+    /// [`HfGlobalSection::read`] with the [`RawDequantContext`] that
+    /// lets §I.2.4 `RAW`-mode dequantization matrices decode (lossless
+    /// JPEG transcode streams signal their original JPEG quantization
+    /// tables this way). Without it a RAW slot refuses loudly.
+    pub fn read_with_raw(
+        br: &mut BitReader<'_>,
+        num_groups: u64,
+        nb_block_ctx: u32,
+        num_passes: u32,
+        raw_ctx: Option<&crate::hf_global::RawDequantContext<'_>>,
+    ) -> Result<Self> {
         if nb_block_ctx == 0 {
             return Err(Error::InvalidData(
                 "JXL HfGlobalSection: nb_block_ctx must be ≥ 1".into(),
@@ -172,7 +186,7 @@ impl HfGlobalSection {
         }
 
         // Step 1 — §I.2.4 dequant matrices + §I.2.6 num_hf_presets.
-        let hf_global = HfGlobal::read(br, num_groups)?;
+        let hf_global = HfGlobal::read_with_raw(br, num_groups, raw_ctx)?;
         let num_hf_presets = hf_global.num_hf_presets;
 
         // Step 2 — Table C.1 `hf_pass[num_passes]`: for each pass, the
