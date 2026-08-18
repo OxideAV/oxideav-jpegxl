@@ -556,10 +556,15 @@ max 4 (was max 7), `patches_vardct` MAD 1.91/0.85/0.91.
   splits the two contexts — exactly the near-uniform non-dyadic
   histograms of the r444 reproducers. Pinned byte-exactly by the
   JPEG-oracle fixtures; `r444_wave64` now closes cleanly at
-  MAD < 1.0 / max 2 (was one failed section, MAD < 6 / max 40). One
-  residual loud-refusal remains on noisy 4:4:4 transcode content
-  (`r448_noise444` — reconstruction refuses rather than emit a wrong
-  JPEG).
+  MAD < 1.0 / max 2 (was one failed section, MAD < 6 / max 40), and
+  the committed photo `vardct-256x256-d1` — the crate's
+  longest-standing accuracy tail — collapses from MAD
+  0.66 / 0.47 / 0.61 to **0.25 / 0.25 / 0.26 (max ≤ 3)** with clean
+  closure (ratchet tightened to 0.35). Residuals: the r437
+  `custom_orders_t256_e1` synthetic-edge stream keeps 48 walk
+  underruns (closure now clean), and noisy 4:4:4 transcode content
+  (`r448_noise444`) still desyncs — reconstruction refuses loudly
+  rather than emit a wrong JPEG.
 - **F.2 channel-scaling correction** (first reachable this round): a
   `jpeg_upsampling` value names that channel's sampling FACTORS and
   the channels stored subsampled are those BELOW the frame-wide

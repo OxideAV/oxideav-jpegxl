@@ -173,11 +173,12 @@ fn vardct_output_tracks_reference_within_hf_filter_gap() {
         );
         let mad = total_abs_err[k] as f64 / n as f64;
         assert!(
-            mad < 1.0,
-            "channel {k} MAD {mad:.2} exceeds the round-393 baseline bound of 1.0 \
-             (measured ≈ 0.66 / 0.47 / 0.61 after the §F.3 HfMul-divides erratum \
-             fix). A regression pushed it up — investigate before loosening this \
-             ratchet."
+            mad < 0.35,
+            "channel {k} MAD {mad:.2} exceeds the round-448 baseline bound of 0.35 \
+             (measured ≈ 0.25 / 0.25 / 0.26 after the Listing C.14 / I.4 prev \
+             edition fix closed the d1 entropy desync; was ≈ 0.66 / 0.47 / 0.61 \
+             at the round-393 baseline). A regression pushed it up — investigate \
+             before loosening this ratchet."
         );
     }
 }

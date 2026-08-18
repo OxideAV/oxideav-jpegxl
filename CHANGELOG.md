@@ -47,7 +47,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   wrong cluster wherever the cluster map splits the two contexts.
   Arbitrated byte-exactly by the JPEG-reconstruction oracles;
   `r444_wave64` now closes cleanly (MAD < 1.0 / max 2, pin
-  tightened per its own instruction). Also corrected: the I.4
+  tightened per its own instruction) and the committed photo
+  `vardct-256x256-d1` collapses from MAD 0.66/0.47/0.61 to
+  0.25/0.25/0.26 (max ≤ 3, ratchet tightened to 0.35). Also corrected: the I.4
   `BlockContext()` `lf_idx` rescale (channel 1's threshold count,
   not channel 0's — invisible on every committed stream).
 - Round 448 — **F.2 channel scaling for `jpeg_upsampling`**: the
