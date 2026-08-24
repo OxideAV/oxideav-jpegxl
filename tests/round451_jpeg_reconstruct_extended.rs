@@ -155,3 +155,39 @@ fn cnnc21_desync_48x48_byte_exact() {
 fn alias_exact_bucket_64x64_byte_exact() {
     assert_byte_exact("r451_noise64hist.jxl", "r451_noise64hist.jpg");
 }
+
+/// Noisy greyscale (96×80 plasma): the is_grey path over a stream
+/// that previously hit the §C.8.3 desync class (6 undelivered
+/// NonZeros mid-frame before the round-451 errata).
+#[test]
+fn greyscale_noise_byte_exact() {
+    assert_byte_exact("r451_grey.jxl", "r451_grey.jpg");
+}
+
+/// OPEN CORNER (round 451): one 64×64 noisy specimen still
+/// reconstructs with exactly two chroma coefficients off by one —
+/// both channel B, both the first HF position of their block, both
+/// predictions landing at −3.5047… where the byte-exact fixtures
+/// demand −3 while the identical rational at other cells (and its
+/// mirror +3.5047… in the same stream) demands the nearest value.
+/// No pure function of (tile, y·qY, qC, cf) fits all specimens, so
+/// the deviation is pinned loudly here (both a sequential and a
+/// progressive transcode of the same content deviate identically)
+/// until more specimens isolate the rule. These flip to
+/// `assert_byte_exact` when the corner closes.
+#[test]
+fn cfl_near_half_corner_still_open() {
+    for (jxl_name, jpg_name) in [
+        ("r451_icc.jxl", "r451_icc.jpg"),
+        ("r451_prog.jxl", "r451_prog.jpg"),
+    ] {
+        let jxl = fixture(jxl_name);
+        let jpg = fixture(jpg_name);
+        let out = reconstruct_jpeg(&jxl).unwrap_or_else(|e| panic!("{jxl_name}: {e:?}"));
+        assert!(
+            out != jpg,
+            "{jxl_name}: the open CfL near-half corner has CLOSED — flip this pin to \
+             assert_byte_exact"
+        );
+    }
+}

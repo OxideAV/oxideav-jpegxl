@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Round 451 — open corner, pinned loudly: ONE noisy 64×64 content
+  still reconstructs with exactly two chroma coefficients off by one
+  (both channel B, both a first HF position, both CfL predictions at
+  −3.5047… demanded as −3 while the same rational elsewhere demands
+  the nearest value — no pure per-coefficient rounding rule fits all
+  specimens). A sequential and a progressive transcode of the same
+  content (`r451_icc` / `r451_prog`) deviate identically; the pin
+  flips to byte-exact when the rule is isolated.
 - Round 451 — **the §C.8.3 noisy-content desync class is CLOSED** —
   two independent errata, both wire-arbitrated against a 18-stream
   noise ladder and the r448 photo fixture:
