@@ -20,9 +20,13 @@
 //! outcome — every committed fixture pins the output against the
 //! original JPEG bytes.
 //!
-//! Current scope: 3-component YCbCr without chroma subsampling
-//! (`jpeg_upsampling == [0, 0, 0]`), single-pass frames, sequential DCT
-//! scans. Everything else refuses loudly.
+//! Current scope: greyscale and 3-component YCbCr JPEGs (4:4:4,
+//! 4:2:0, 4:2:2, including MCU-padded dimensions via the §F.2 padded
+//! block grids), sequential AND progressive (SOF2) DCT scans, DRI
+//! restart markers, COM / APPn / ICC-profile APP2 / Exif / XMP
+//! segments — each pinned byte-exact against original-JPEG fixtures.
+//! Arithmetic coding (SOF9/SOF10) and single-pass-frame violations
+//! refuse loudly.
 
 use oxideav_core::{Error, Result};
 
@@ -546,8 +550,18 @@ pub fn decode_transcoded_coefficients(codestream: &[u8]) -> Result<TranscodedCoe
     // rounds TOWARD ZERO (2.5 → 2, −3.5 → −3) — not half-away (the
     // rounds-448..450 f64 `round()`, ±1 off on every tie), not
     // half-even (−3.5 would give −4).
-    let round_half_to_zero = |n: i64, d: i64| -> i32 {
-        debug_assert!(d > 0);
+    // Two-stage integer prediction, wire-arbitrated (round 451, 15
+    // specimens across eight noisy fixtures): first the exact product
+    // t × y × qY divides by qC TRUNCATING TOWARD ZERO (the icc-plasma
+    // specimen separates this from a single rational: −1472 / 5 must
+    // lose its fraction BEFORE the colour_factor division, else the
+    // half-way tie below never forms), then the colour_factor
+    // division rounds to nearest with half-way ties TOWARD ZERO
+    // (2.5 → 2, −3.5 → −3; half-even sends −3.5 to −4, half-away
+    // sends every tie outward).
+    let cfl_predict = |t: i64, dy: i64, qc: i64, cf: i64| -> i32 {
+        let n = t * dy;
+        let d = qc * cf;
         let q = (2 * n.abs() + d - 1) / (2 * d);
         (if n < 0 { -q } else { q }) as i32
     };
@@ -564,8 +578,8 @@ pub fn decode_transcoded_coefficients(codestream: &[u8]) -> Result<TranscodedCoe
                     continue;
                 }
                 let dy = (y as i64) * (quant[1][pos] as i64);
-                let px = round_half_to_zero(tx * dy, cf * quant[0][pos] as i64);
-                let pb = round_half_to_zero(tb * dy, cf * quant[2][pos] as i64);
+                let px = cfl_predict(tx, dy, quant[0][pos] as i64, cf);
+                let pb = cfl_predict(tb, dy, quant[2][pos] as i64, cf);
                 coeffs[0][base + pos] += px;
                 coeffs[2][base + pos] += pb;
             }

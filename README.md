@@ -437,7 +437,8 @@ and the Listing I.21 Squeeze tendency function.
   fixtures; the same /128 makes the VarDCT patches fixture's XYB
   dictionary land correctly.
 - **The round-437 "synthetic-content VarDCT accuracy deficiency" is
-  sharply characterised** (not yet fixed): isolated impulse content
+  sharply characterised** (root-caused round 444; the final residual
+  closed round 451 with the §C.8.3 errata): isolated impulse content
   (single-pixel dots) vanishes entirely on VarDCT frames with or
   without features. The dot blocks are Hornuss / DCT2×2 varblocks
   whose **declared NonZeros exceeds the decoded nonzero count** (e.g.
@@ -560,11 +561,9 @@ max 4 (was max 7), `patches_vardct` MAD 1.91/0.85/0.91.
   the committed photo `vardct-256x256-d1` — the crate's
   longest-standing accuracy tail — collapses from MAD
   0.66 / 0.47 / 0.61 to **0.25 / 0.25 / 0.26 (max ≤ 3)** with clean
-  closure (ratchet tightened to 0.35). Residuals: the r437
-  `custom_orders_t256_e1` synthetic-edge stream keeps 48 walk
-  underruns (closure now clean), and noisy 4:4:4 transcode content
-  (`r448_noise444`) still desyncs — reconstruction refuses loudly
-  rather than emit a wrong JPEG.
+  closure (ratchet tightened to 0.35). The two round-448 residuals —
+  the r437 `custom_orders_t256_e1` walk underruns and the
+  `r448_noise444` desync — were closed in round 451 (see below).
 - **F.2 channel-scaling correction** (first reachable this round): a
   `jpeg_upsampling` value names that channel's sampling FACTORS and
   the channels stored subsampled are those BELOW the frame-wide
@@ -577,6 +576,66 @@ max 4 (was max 7), `patches_vardct` MAD 1.91/0.85/0.91.
   parsed as SizeHeader bits and coincidentally yielded a plausible
   header for 256-px-tall images).
 
+### Round 451 — the noisy-content §C.8.3 desync class CLOSED (two errata) + Annex A reconstruction complete across greyscale / ICC / MCU-padded / progressive JPEGs
+
+Round 451 root-caused the desync class that had stalked every noisy
+4:4:4 stream since round 444 to **two independent errata**, each
+bisected on an 18-stream noise ladder against a test-side 10918-1
+sequential decode of the original JPEG bytes:
+
+- **`CoeffNumNonzeroContext[21]` transcription error.** Listing C.13
+  prints eight 152 entries (`non_zeros` 13..=20) and twelve 180
+  entries (21..=32); the in-crate table (rounds 159–450) carried a
+  ninth 152 at index 21. Invisible until a stream's cluster map
+  splits the 152-family coefficient contexts from the 180-family AND
+  a block's remaining count walks through exactly 21 — the
+  near-uniform histograms of noisy content — where the one misrouted
+  read desynced the shared ANS state. Bisected on a 48×48 stream
+  whose first luma block decodes k=1..11 exactly and diverges at
+  precisely the first read that consults `CNNC[21]`.
+- **Alias-map exactly-full buckets** (2024 IS C.2.6 arbitrating FDIS
+  Listing D.1): a bucket with `cutoffs[i] == bucket_size` goes on
+  NEITHER Vose worklist. The FDIS's plain `else` queues it as
+  underfull; popping it is a mass-free no-op that still consumes a
+  pump step and re-queues the overfull bucket, permuting every later
+  (overfull, underfull) pairing — a different alias table whose
+  redirected slices decode wrong symbols.
+
+With both landed: `r448_noise444` (256×256 noisy photo)
+reconstructs **byte-exact** (its loud-refusal pin flipped); all 18
+noise-ladder streams byte-exact; the r437 `custom_orders_t256_e1`
+"synthetic-content accuracy deficiency" (MAD ≈ 20/13/8) collapses to
+**0.55 / 0.46 / 0.76** with clean closure/underrun diagnostics
+(ratchet now 1.0).
+
+The same round found the **CfL tie-rounding erratum**: the integer
+chroma re-correlation `c += round(tile × y × qY / (cf × qC))` is an
+exact rational whose half-way values round TOWARD ZERO (13 tie
+specimens; rounds 448–450 used f64 `round()` — half-away — and
+emitted a silently wrong JPEG, ±1 on one chroma coefficient, on
+every tie). The inversion is now pure i64 arithmetic.
+
+Annex A reconstruction now covers, each pinned byte-exact on locally
+generated `cjxl` transcode pairs:
+
+- **greyscale JPEGs** (`is_grey` — single luma component mapping to
+  JXL channel 1, gradient + noisy specimens);
+- **ICC-carrying JPEGs** (A.9 kind 1 — the Annex B / E.4 encoded ICC
+  stream now decodes on the transcode path and re-chunks into
+  `ICC_PROFILE` APP2 segments);
+- **MCU-padded dimensions** (the §F.2 grid rule pads the
+  full-resolution channels' block grid to the MCU boundary — a
+  100×60 4:2:0 transcode stores a 14×8-block luma grid whose padded
+  blocks carry the JPEG dummy blocks' real coefficients;
+  non-interleaved scans walk the TRUE 10918-1 A.1.1 grid);
+- **progressive (SOF2) JPEGs** (the 10918-1 Annex G re-encode with
+  the A.6 amendments: DC first/refinement scans, AC first/refinement
+  scans with the shared EOB run and buffered correction bits,
+  `reset_points`-forced `Encode_EOBRUN`, restart-interval flushes —
+  pinned on 4:4:4, 4:2:0 MCU-padded, greyscale and
+  `jpegtran -restart` specimens). Arithmetic-coded JPEGs (SOF9/10)
+  refuse precisely.
+
 ### Not yet implemented
 
 - **Multi-preset / multi-pass §C.7 slices with `used_orders != 0`**
@@ -585,13 +644,17 @@ max 4 (was max 7), `patches_vardct` MAD 1.91/0.85/0.91.
   `progressive-ac-multipass` fixture — the per-preset repetition or
   per-pass slice layout hides one more wire divergence
   (`round437_custom_orders_boundary` pins the loud refusal).
-- **A residual §C.8.3 desync on noisy 4:4:4 transcode content**
-  (round 448, replacing the round-444 wave-leakage class that the
-  Listing C.14 / I.4 `prev` edition fix closed): the `r448_noise444`
-  transcode still under-delivers declared NonZeros mid-frame and
-  reconstruction refuses loudly (never a silently wrong JPEG). The
-  round-444 diagnostics (`section_closure_failures` /
-  `walk_underruns`) keep every desync loud.
+- **An open CfL near-half rounding corner** (round 451): one noisy
+  64×64 content reconstructs with exactly two chroma coefficients
+  off by one — both channel B, both a first HF position, both
+  predictions at −3.5047… demanded as −3 while the identical
+  rational elsewhere in the same stream (and its mirror +3.5047…)
+  demands the nearest value. No pure per-coefficient rounding rule
+  fits every wire specimen; a sequential and a progressive transcode
+  of the same content deviate identically (model-side, not
+  entropy-side — closure invariants pass). Pinned loudly
+  (`cfl_near_half_corner_still_open`) until more specimens isolate
+  the rule.
 - The residual sub-1/255 VarDCT accuracy tail (float rounding + §J
   filter differences) and `save_before_ct` pre-CT reference recording
   in the §C.2 composer. (The staged `progressive-ac-multipass`
@@ -621,9 +684,8 @@ max 4 (was max 7), `patches_vardct` MAD 1.91/0.85/0.91.
   decode paths carry no extra planes there yet). Splines on non-XYB
   Modular frames (the §K.3 coefficients are XYB-domain quantities;
   domain undetermined) and kNoise on Modular frames stay refused.
-- JPEG reconstruction of progressive (SOF2) and greyscale JPEGs,
-  ICC-carrying APP2 chains, and MCU-padded dimensions (image sizes
-  that are not a multiple of the MCU) — each refuses precisely.
+- Arithmetic-coded JPEG (SOF9/SOF10) reconstruction (refuses
+  precisely; no staged specimen — `cjxl` declines arithmetic input).
   Pixel-domain decode of YCbCr transcode frames (the registered
   decoder still refuses them; reconstruction is coefficient-level).
 - The LfFrame (`lf_level > 0`) dimension scaling `progressive-dc`
