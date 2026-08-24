@@ -43,3 +43,27 @@ fn greyscale_byte_exact() {
 fn sequential_444_byte_exact() {
     assert_byte_exact("r451_seq_g.jxl", "r451_seq_g.jpg");
 }
+
+/// 100×60 4:2:0 gradient — image dims not a multiple of the 16×16
+/// MCU. The F.2 rule ("size in blocks, divided rounding up by the
+/// maximum sampling factor, then multiplied by the channel's factor")
+/// pads the luma grid to 14×8 blocks; the padded blocks carry the
+/// JPEG MCU dummy blocks' real coefficients.
+#[test]
+fn mcu_padded_420_byte_exact() {
+    assert_byte_exact("r451_odd420_g.jxl", "r451_odd420_g.jpg");
+}
+
+/// The same geometry on noisy (plasma) content — denser HF streams
+/// across the padded grid.
+#[test]
+fn mcu_padded_420_noise_byte_exact() {
+    assert_byte_exact("r451_odd420.jxl", "r451_odd420.jpg");
+}
+
+/// MCU padding + DRI restart markers: per-interval byte alignment and
+/// DC prediction resets across a padded 4:2:0 walk.
+#[test]
+fn mcu_padded_420_restart_byte_exact() {
+    assert_byte_exact("r451_seq420_rst.jxl", "r451_seq420_rst.jpg");
+}

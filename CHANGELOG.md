@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Round 451 — **MCU-padded transcode dimensions** (§F.2): for a
+  subsampled frame the per-channel block grid is "divided (rounding
+  up) by the maximum subsampling factor across all channels, and then
+  multiplied by the subsampling factor for the current channel" —
+  which PADS the full-resolution channels up to the MCU boundary when
+  the image dims aren't a multiple of it (a 100×60 4:2:0 transcode's
+  luma grid is 14×8 blocks, not 13×8). The transcode decoder now pads
+  the frame dims to the MCU multiple before every grid derivation
+  (LfQuant shapes, HfMetadata nb_blocks, NonZeros lattices, group
+  rects), so the JPEG's MCU dummy blocks decode as real wire blocks;
+  non-interleaved scans still walk the component's TRUE 10918-1
+  A.1.1 block grid. Pinned byte-exact on gradient + noisy 100×60
+  4:2:0 pairs and a restart-interval variant
+  (`r451_odd420_g` / `r451_odd420` / `r451_seq420_rst`).
 - Round 451 — **greyscale JPEG reconstruction** (18181-2 Annex A): a
   jbrd bundle with `is_grey` maps its single luma component to JXL
   channel 1 (the codestream still decodes three channels; the chroma

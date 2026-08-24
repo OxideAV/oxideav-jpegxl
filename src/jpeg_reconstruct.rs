@@ -132,6 +132,30 @@ pub fn decode_transcoded_coefficients(codestream: &[u8]) -> Result<TranscodedCoe
     }
     let shifts = fh.jpeg_upsampling_shifts();
     let subsampled = shifts.iter().any(|&(h, v)| h != 0 || v != 0);
+    // F.2: "The horizontal and vertical size, in 8x8 blocks, of each
+    // channel is divided (rounding up) by the maximum subsampling
+    // factor across all channels, and then multiplied by the
+    // subsampling factor for the current channel." For a subsampled
+    // frame whose pixel dimensions are not a multiple of the MCU
+    // (8 × max_factor), that rule PADS the full-resolution channels'
+    // block grid up to the MCU boundary (wire-pinned on a 100×60
+    // 4:2:0 transcode: the luma grid is 14×8 blocks, not 13×8, and
+    // the padded blocks carry real coefficients — the JPEG MCU
+    // padding blocks). Padding the frame dims here makes every
+    // downstream grid derivation (LfQuant channel shapes, HfMetadata
+    // nb_blocks, NonZeros lattices, group rects) follow the same
+    // rule. Group / LfGroup / CfL-tile counts cannot change: the pad
+    // is < MCU ≤ 16 px and every such boundary is a multiple of 16.
+    let mut fh = fh;
+    if subsampled {
+        let max_hs = shifts.iter().map(|&(h, _)| h).max().unwrap_or(0);
+        let max_vs = shifts.iter().map(|&(_, v)| v).max().unwrap_or(0);
+        let mcu_w = 8u32 << max_hs;
+        let mcu_h = 8u32 << max_vs;
+        fh.width = fh.width.div_ceil(mcu_w) * mcu_w;
+        fh.height = fh.height.div_ceil(mcu_h) * mcu_h;
+    }
+    let fh = fh;
     if fh.upsampling != 1 {
         return Err(Error::Unsupported(
             "JXL jpeg_reconstruct: upsampling != 1 in a transcode frame".into(),
@@ -1180,10 +1204,15 @@ fn encode_sequential_scan(
     // Extra-zero-run lookup by block index in the current scan.
     let mut ezr_it = smi.extra_zero_runs.iter().peekable();
 
-    // MCU geometry (B.2.2): with 4:4:4 the MCU is one block per scan
-    // component; a single-component scan walks its own block grid.
+    // MCU geometry (B.2.2): a single-component scan walks its own
+    // TRUE block grid (10918-1 A.1.1: ceil(comp samples / 8), no MCU
+    // padding); an interleaved scan walks MCUs, whose per-component
+    // block spans exactly cover the F.2-padded channel grids.
     let (mcus_x, mcus_y) = if scomps.len() == 1 {
-        (scomps[0].width_blocks, scomps[0].height_blocks)
+        let sc = &scomps[0];
+        let sx = (tc.width as usize * sc.h as usize).div_ceil(h_max as usize);
+        let sy = (tc.height as usize * sc.v as usize).div_ceil(v_max as usize);
+        (sx.div_ceil(8), sy.div_ceil(8))
     } else {
         (
             (tc.width as usize).div_ceil(8 * h_max as usize),
@@ -1210,15 +1239,21 @@ fn encode_sequential_scan(
             #[allow(clippy::needless_range_loop)]
             for sc_i in 0..scomps.len() {
                 let (h, v) = (scomps[sc_i].h as usize, scomps[sc_i].v as usize);
+                // A non-interleaved scan (B.2.3) processes exactly one
+                // block per step regardless of the component's frame
+                // sampling factors.
+                let (h, v) = if scomps.len() == 1 { (1, 1) } else { (h, v) };
                 for by_in in 0..v {
                     for bx_in in 0..h {
                         let bx = mcu_x * h + bx_in;
                         let by = mcu_y * v + by_in;
                         let sc = &mut scomps[sc_i];
                         if bx >= sc.width_blocks || by >= sc.height_blocks {
-                            return Err(Error::Unsupported(
-                                "JXL jpeg_reconstruct: MCU padding blocks (image dims not a \
-                                 multiple of the MCU size) not yet handled"
+                            // Cannot happen: the F.2 padding rule makes
+                            // every channel grid cover its MCU span.
+                            return Err(Error::InvalidData(
+                                "JXL jpeg_reconstruct: MCU walk escaped the F.2-padded \
+                                 channel grid"
                                     .into(),
                             ));
                         }
