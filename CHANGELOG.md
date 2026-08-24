@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Round 451 — **greyscale JPEG reconstruction** (18181-2 Annex A): a
+  jbrd bundle with `is_grey` maps its single luma component to JXL
+  channel 1 (the codestream still decodes three channels; the chroma
+  planes carry all-zero coefficients) and the single-component scan
+  walks the luma block grid. Pinned byte-exact on a 96×80 greyscale
+  sequential transcode pair (`r451_grey_g`), alongside a 4:4:4 colour
+  control specimen (`r451_seq_g`).
+
 - Round 448 — the **complete ISO/IEC 18181-2:2024 file format layer**
   (`container`): Clause 8 box walk, byte-exact Signature / File Type
   validation, `jxll` Level box, `jxli` Frame Index parse (Table 9 +

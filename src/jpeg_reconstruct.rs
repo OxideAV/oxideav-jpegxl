@@ -736,9 +736,22 @@ fn frame_components(
         }
     };
     if d.is_grey {
-        return Err(Error::Unsupported(
-            "JXL jpeg_reconstruct: greyscale JPEG reconstruction not yet handled".into(),
-        ));
+        // A single luma component (Table 11 `is_grey`): the JXL frame
+        // still carries three channels (the chroma planes decode to
+        // all-zero coefficients), but the JPEG frame lists only the
+        // luma component, which maps to JXL channel 1 and is never
+        // subsampled relative to itself.
+        if d.component_ids.len() != 1 {
+            return Err(Error::InvalidData(format!(
+                "JXL jpeg_reconstruct: {} components for a greyscale JPEG",
+                d.component_ids.len()
+            )));
+        }
+        return Ok(vec![FrameComponent {
+            jxl_channel: 1,
+            h: 1,
+            v: 1,
+        }]);
     }
     if d.component_ids.len() != 3 {
         return Err(Error::InvalidData(format!(
