@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Round 451 — **xyb_encoded → Grey output hand-off** (C.4.8 /
+  §L.2.2): an xyb frame always carries the three (Y′, X′, B′)
+  channels even for `colour_space == kGrey`; the single grey output
+  plane is the GREEN channel of the inverse-XYB RGB (wire-arbitrated
+  pixel-wise, max ±1/255, on a locally generated 64×64 lossy-Modular
+  grey stream — `r451_grey_xyb`). Previously refused loudly at the
+  channel-count contract.
 - Round 451 — the r437 `custom_orders_t256_e1` accuracy deficiency
   (synthetic-edge content at MAD ≈ 20/13/8, best-effort-ratcheted at
   33/23/27 since round 444) was the SAME §C.8.3 desync class: with

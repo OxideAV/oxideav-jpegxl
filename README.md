@@ -674,10 +674,6 @@ generated `cjxl` transcode pairs:
   signalled/default transfer, sRGB, rather than the profile's
   gamma-2.2-class `kTRC` curve).
 
-- Output mapping for xyb_encoded Modular frames whose colour space is
-  Grey (3 XYB channels → 1 grey plane): the Modular + inverse-Squeeze
-  walk completes since round 420, the final XYB→grey hand-off is
-  unwired and errors loudly.
 - Patch alpha blend modes (kBlendAbove/Below, kAlphaWeightedAdd
   Above/Below) and extra-channel patch blending — parsed exactly,
   refused precisely at render (no specimen exercises them; the

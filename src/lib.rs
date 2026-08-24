@@ -1525,7 +1525,12 @@ fn decode_frame_body(
     let img = lf_global.global_modular.image;
     let n_chans = img.channels.len();
     let expected_chans = match metadata.colour_encoding.colour_space {
-        ColourSpace::Grey => 1,
+        // C.4.8: the modular colour-channel count is 1 only for
+        // `!do_YCbCr && !xyb_encoded && colour_space == kGrey`; an
+        // xyb_encoded frame ALWAYS carries the three (Y', X', B')
+        // channels even when the signalled colour space is Grey.
+        ColourSpace::Grey if !metadata.xyb_encoded && !fh.do_ycbcr => 1,
+        ColourSpace::Grey => 3,
         ColourSpace::Rgb => 3,
         _ => {
             return Err(Error::Unsupported(format!(
@@ -1563,7 +1568,7 @@ fn decode_frame_body(
                 metadata.bit_depth.bits_per_sample
             )));
         }
-        let (planes, pre_ct) = build_rgb_planes_from_xyb(
+        let (mut planes, pre_ct) = build_rgb_planes_from_xyb(
             &img,
             &lf_global.lf_dequant,
             metadata,
@@ -1576,6 +1581,17 @@ fn decode_frame_body(
                 want_pre_ct,
             },
         )?;
+        if metadata.colour_encoding.colour_space == ColourSpace::Grey {
+            // Grey output from an xyb_encoded frame: the §L.2.2
+            // inverse XYB produces (R, G, B); for kGrey the single
+            // output plane is the GREEN channel (the luminance-carrier
+            // of the opsin matrix — R = G = B for genuinely grey
+            // content up to quantisation), wire-arbitrated pixel-wise
+            // against the black-box reference decode of the committed
+            // grey lossy-Modular fixture.
+            planes.truncate(2);
+            planes.swap_remove(0);
+        }
         return Ok(DecodedFrame {
             frame: VideoFrame { pts, planes },
             is_last,
