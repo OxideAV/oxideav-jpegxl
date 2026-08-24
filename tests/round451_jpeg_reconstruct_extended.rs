@@ -77,3 +77,35 @@ fn mcu_padded_420_restart_byte_exact() {
 fn icc_app2_byte_exact() {
     assert_byte_exact("r451_icc_g.jxl", "r451_icc_g.jpg");
 }
+
+/// Progressive (SOF2) 4:4:4 colour: multi-scan spectral selection +
+/// successive approximation. Exercises DC first + refinement scans
+/// and AC first + refinement scans with the shared EOB-run state
+/// (10918-1 G.1.2) and buffered correction bits.
+#[test]
+fn progressive_444_byte_exact() {
+    assert_byte_exact("r451_prog_g.jxl", "r451_prog_g.jpg");
+}
+
+/// Progressive + 4:2:0 + MCU-padded dims (89×53): interleaved DC
+/// scans over the padded MCU grid, per-component AC scans over the
+/// TRUE (unpadded) component block grids.
+#[test]
+fn progressive_420_padded_byte_exact() {
+    assert_byte_exact("r451_prog420.jxl", "r451_prog420.jpg");
+}
+
+/// Progressive greyscale (72×40): single-component DC + AC scan
+/// ladder through the is_grey component mapping.
+#[test]
+fn progressive_greyscale_byte_exact() {
+    assert_byte_exact("r451_proggrey.jxl", "r451_proggrey.jpg");
+}
+
+/// Progressive with DRI restart markers (jpegtran -restart 2): the
+/// pending EOB run must flush before every RSTn, with byte alignment
+/// from the A.6 padding-bit source.
+#[test]
+fn progressive_restart_byte_exact() {
+    assert_byte_exact("r451_prog_rst.jxl", "r451_prog_rst.jpg");
+}

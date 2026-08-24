@@ -883,17 +883,20 @@ pub fn reconstruct_from_parts(
     let mut dc_tables: [Option<BuiltHuffman>; 4] = [None, None, None, None];
     let mut ac_tables: [Option<BuiltHuffman>; 4] = [None, None, None, None];
     let mut restart_interval_active = 0u32;
+    let mut is_progressive = false;
 
     for &marker in &d.markers {
         match marker {
             0xC0 | 0xC1 | 0xC2 | 0xC9 | 0xCA => {
                 // A.2 SOF.
-                if marker == 0xC2 || marker == 0xCA {
+                if marker == 0xC9 || marker == 0xCA {
                     return Err(Error::Unsupported(
-                        "JXL jpeg_reconstruct: progressive JPEG reconstruction not yet handled"
+                        "JXL jpeg_reconstruct: arithmetic-coded JPEG (SOF9/SOF10) \
+                         reconstruction not handled"
                             .into(),
                     ));
                 }
+                is_progressive = marker == 0xC2;
                 let nc = comps.len();
                 let len = 8 + 3 * nc;
                 out.extend_from_slice(&[0xFF, marker, (len >> 8) as u8, (len & 0xFF) as u8, 8]);
@@ -997,17 +1000,43 @@ pub fn reconstruct_from_parts(
                 out.push(((si.ah << 4) | si.al) as u8);
 
                 let mut bw = JpegBitWriter::new();
-                encode_sequential_scan(
-                    &mut bw,
-                    si,
-                    smi,
-                    &comps,
-                    tc,
-                    &dc_tables,
-                    &ac_tables,
-                    restart_interval_active,
-                    &mut padding,
-                )?;
+                if is_progressive {
+                    if si.ss == 0 {
+                        encode_progressive_dc_scan(
+                            &mut bw,
+                            si,
+                            smi,
+                            &comps,
+                            tc,
+                            &dc_tables,
+                            restart_interval_active,
+                            &mut padding,
+                        )?;
+                    } else {
+                        encode_progressive_ac_scan(
+                            &mut bw,
+                            si,
+                            smi,
+                            &comps,
+                            tc,
+                            &ac_tables,
+                            restart_interval_active,
+                            &mut padding,
+                        )?;
+                    }
+                } else {
+                    encode_sequential_scan(
+                        &mut bw,
+                        si,
+                        smi,
+                        &comps,
+                        tc,
+                        &dc_tables,
+                        &ac_tables,
+                        restart_interval_active,
+                        &mut padding,
+                    )?;
+                }
                 bw.pad_to_byte(&mut padding)?;
                 debug_assert_eq!(bw.nbits, 0);
                 out.extend_from_slice(&bw.out);
@@ -1409,6 +1438,456 @@ fn encode_sequential_block(
     }
     if remaining > 0 {
         ac_table.emit(bw, 0x00)?; // EOB
+    }
+    Ok(())
+}
+
+/// AC point transform (10918-1 A.4, G.1.2.2): signed integer division
+/// by `2^al` — sign-magnitude, NOT an arithmetic shift.
+fn pt_ac(v: i32, al: u32) -> i32 {
+    if v >= 0 {
+        v >> al
+    } else {
+        -((-v) >> al)
+    }
+}
+
+/// Pending end-of-band run state for progressive AC scans (10918-1
+/// G.1.2.2 "EOBRUN"): the count of consecutive fully-skipped blocks
+/// plus the correction bits (refinement scans) the decoder consumes
+/// while the run is active. Flushing emits the EOBn symbol, its
+/// `n` extension bits, then the buffered correction bits in order.
+#[derive(Default)]
+struct EobState {
+    run: u32,
+    corr: Vec<bool>,
+}
+
+impl EobState {
+    fn flush(&mut self, bw: &mut JpegBitWriter, ac: &BuiltHuffman) -> Result<()> {
+        if self.run > 0 {
+            let n = 31 - self.run.leading_zeros(); // floor(log2(run))
+            debug_assert!(n < 15);
+            ac.emit(bw, n << 4)?;
+            if n > 0 {
+                bw.put_bits(self.run - (1 << n), n);
+            }
+            self.run = 0;
+        }
+        for &b in &self.corr {
+            bw.put_bits(b as u32, 1);
+        }
+        self.corr.clear();
+        Ok(())
+    }
+}
+
+/// Emit buffered refinement correction bits behind a Huffman symbol
+/// (10918-1 G.1.2.3: each ZRL / newly-nonzero symbol is followed by
+/// the correction bits of the history-nonzero coefficients its run
+/// traversed).
+fn drain_corr(bw: &mut JpegBitWriter, corr: &mut Vec<bool>) {
+    for &b in corr.iter() {
+        bw.put_bits(b as u32, 1);
+    }
+    corr.clear();
+}
+
+/// Progressive DC scan (10918-1 G.1.2.1): first scans Huffman-code the
+/// point-transformed prediction differences (the DC point transform is
+/// an ARITHMETIC right shift); refinement scans emit one raw bit per
+/// block. The MCU walk is the same as the sequential one (interleaved
+/// scans include the F.2-padded MCU dummy blocks; a single-component
+/// scan walks its true block grid).
+#[allow(clippy::too_many_arguments)]
+fn encode_progressive_dc_scan(
+    bw: &mut JpegBitWriter,
+    si: &ScanInfo,
+    smi: &ScanMoreInfo,
+    comps: &[FrameComponent],
+    tc: &TranscodedCoefficients,
+    dc_tables: &[Option<BuiltHuffman>; 4],
+    restart_interval: u32,
+    padding: &mut PaddingBits<'_>,
+) -> Result<()> {
+    if si.se != 0 {
+        return Err(Error::InvalidData(
+            "JXL jpeg_reconstruct: progressive DC scan with Se != 0".into(),
+        ));
+    }
+    if !smi.reset_points.is_empty() || !smi.extra_zero_runs.is_empty() {
+        return Err(Error::InvalidData(
+            "JXL jpeg_reconstruct: reset points / extra zero runs in a DC scan".into(),
+        ));
+    }
+    let refining = si.ah != 0;
+    let h_max = comps.iter().map(|c| c.h).max().unwrap_or(1);
+    let v_max = comps.iter().map(|c| c.v).max().unwrap_or(1);
+
+    struct DcComp<'t> {
+        jxl_channel: usize,
+        h: u32,
+        v: u32,
+        width_blocks: usize,
+        height_blocks: usize,
+        dc: Option<&'t BuiltHuffman>,
+        pred: i32,
+    }
+    let mut scomps: Vec<DcComp<'_>> = Vec::with_capacity(si.components.len());
+    for csi in &si.components {
+        let fc = comps.get(csi.comp_idx as usize).ok_or_else(|| {
+            Error::InvalidData("JXL jpeg_reconstruct: scan comp_idx out of range".into())
+        })?;
+        let dc = if refining {
+            None
+        } else {
+            Some(dc_tables[csi.dc_tbl_idx as usize].as_ref().ok_or_else(|| {
+                Error::InvalidData(format!(
+                    "JXL jpeg_reconstruct: DC table {} not defined before the scan",
+                    csi.dc_tbl_idx
+                ))
+            })?)
+        };
+        let (cw, ch) = tc.cdims[fc.jxl_channel];
+        scomps.push(DcComp {
+            jxl_channel: fc.jxl_channel,
+            h: fc.h,
+            v: fc.v,
+            width_blocks: cw,
+            height_blocks: ch,
+            dc,
+            pred: 0,
+        });
+    }
+    let (mcus_x, mcus_y) = if scomps.len() == 1 {
+        let sc = &scomps[0];
+        let sx = (tc.width as usize * sc.h as usize).div_ceil(h_max as usize);
+        let sy = (tc.height as usize * sc.v as usize).div_ceil(v_max as usize);
+        (sx.div_ceil(8), sy.div_ceil(8))
+    } else {
+        (
+            (tc.width as usize).div_ceil(8 * h_max as usize),
+            (tc.height as usize).div_ceil(8 * v_max as usize),
+        )
+    };
+
+    let mut mcu_count = 0u32;
+    let mut rst_m = 0u8;
+    for mcu_y in 0..mcus_y {
+        for mcu_x in 0..mcus_x {
+            if restart_interval != 0 && mcu_count == restart_interval {
+                bw.pad_to_byte(padding)?;
+                bw.out.extend_from_slice(&[0xFF, 0xD0 + rst_m]);
+                rst_m = (rst_m + 1) & 7;
+                mcu_count = 0;
+                for sc in scomps.iter_mut() {
+                    sc.pred = 0;
+                }
+            }
+            #[allow(clippy::needless_range_loop)]
+            for sc_i in 0..scomps.len() {
+                let (h, v) = (scomps[sc_i].h as usize, scomps[sc_i].v as usize);
+                let (h, v) = if scomps.len() == 1 { (1, 1) } else { (h, v) };
+                for by_in in 0..v {
+                    for bx_in in 0..h {
+                        let bx = mcu_x * h + bx_in;
+                        let by = mcu_y * v + by_in;
+                        let sc = &mut scomps[sc_i];
+                        if bx >= sc.width_blocks || by >= sc.height_blocks {
+                            return Err(Error::InvalidData(
+                                "JXL jpeg_reconstruct: DC scan walk escaped the channel grid"
+                                    .into(),
+                            ));
+                        }
+                        let dc = tc.coeffs[sc.jxl_channel][(by * sc.width_blocks + bx) * 64];
+                        if refining {
+                            // G.1.2.1 refinement: the next lower bit of
+                            // the point-transformed DC, raw.
+                            bw.put_bits(((dc >> si.al) & 1) as u32, 1);
+                        } else {
+                            let ptv = dc >> si.al; // arithmetic shift
+                            let diff = ptv - sc.pred;
+                            sc.pred = ptv;
+                            let s = if diff == 0 { 0 } else { category(diff) };
+                            sc.dc.expect("first-scan table").emit(bw, s)?;
+                            if s > 0 {
+                                bw.put_bits(value_bits(diff, s), s);
+                            }
+                        }
+                    }
+                }
+            }
+            mcu_count += 1;
+        }
+    }
+    Ok(())
+}
+
+/// Progressive AC scan (10918-1 G.1.2.2 first scans / G.1.2.3
+/// refinement), with the 18181-2 A.6 amendments: `Encode_EOBRUN` is
+/// forced before every block listed in `smi.reset_points`, and
+/// `ezr.num_runs` extra ZRL symbols are emitted before the end-of-band
+/// bookkeeping of the block `ezr.block_idx` names. AC scans are
+/// non-interleaved: the walk covers the component's TRUE block grid
+/// (10918-1 A.1.1), which the F.2-padded coefficient planes contain.
+#[allow(clippy::too_many_arguments)]
+fn encode_progressive_ac_scan(
+    bw: &mut JpegBitWriter,
+    si: &ScanInfo,
+    smi: &ScanMoreInfo,
+    comps: &[FrameComponent],
+    tc: &TranscodedCoefficients,
+    ac_tables: &[Option<BuiltHuffman>; 4],
+    restart_interval: u32,
+    padding: &mut PaddingBits<'_>,
+) -> Result<()> {
+    if si.components.len() != 1 {
+        return Err(Error::InvalidData(
+            "JXL jpeg_reconstruct: progressive AC scan must be non-interleaved".into(),
+        ));
+    }
+    if si.ss < 1 || si.se > 63 || si.se < si.ss {
+        return Err(Error::InvalidData(format!(
+            "JXL jpeg_reconstruct: invalid AC spectral band {}..{}",
+            si.ss, si.se
+        )));
+    }
+    let csi = &si.components[0];
+    let fc = comps.get(csi.comp_idx as usize).ok_or_else(|| {
+        Error::InvalidData("JXL jpeg_reconstruct: scan comp_idx out of range".into())
+    })?;
+    let ac = ac_tables[csi.ac_tbl_idx as usize].as_ref().ok_or_else(|| {
+        Error::InvalidData(format!(
+            "JXL jpeg_reconstruct: AC table {} not defined before the scan",
+            csi.ac_tbl_idx
+        ))
+    })?;
+    let h_max = comps.iter().map(|c| c.h).max().unwrap_or(1);
+    let v_max = comps.iter().map(|c| c.v).max().unwrap_or(1);
+    let bx_n = ((tc.width as usize * fc.h as usize).div_ceil(h_max as usize)).div_ceil(8);
+    let by_n = ((tc.height as usize * fc.v as usize).div_ceil(v_max as usize)).div_ceil(8);
+    let (cw, _) = tc.cdims[fc.jxl_channel];
+    let refining = si.ah != 0;
+
+    let mut eob = EobState::default();
+    let mut ezr_it = smi.extra_zero_runs.iter().peekable();
+    let mut rp_it = smi.reset_points.iter().peekable();
+    let mut block_idx: u32 = 0;
+    let mut mcu_count = 0u32;
+    let mut rst_m = 0u8;
+
+    for by in 0..by_n {
+        for bx in 0..bx_n {
+            if restart_interval != 0 && mcu_count == restart_interval {
+                eob.flush(bw, ac)?;
+                bw.pad_to_byte(padding)?;
+                bw.out.extend_from_slice(&[0xFF, 0xD0 + rst_m]);
+                rst_m = (rst_m + 1) & 7;
+                mcu_count = 0;
+            }
+            if let Some(&&rp) = rp_it.peek() {
+                if rp == block_idx {
+                    eob.flush(bw, ac)?;
+                    rp_it.next();
+                }
+            }
+            let mut extra_runs = 0u32;
+            if let Some(ezr) = ezr_it.peek() {
+                if ezr.block_idx == block_idx {
+                    extra_runs = ezr.num_runs;
+                    ezr_it.next();
+                }
+            }
+            let base = (by * cw + bx) * 64;
+            let block = &tc.coeffs[fc.jxl_channel][base..base + 64];
+            if refining {
+                encode_refine_ac_block(bw, ac, block, si, extra_runs, &mut eob)?;
+            } else {
+                encode_first_ac_block(bw, ac, block, si, extra_runs, &mut eob)?;
+            }
+            // G.1.2.2: the run length caps at 32767.
+            if eob.run == 32767 {
+                eob.flush(bw, ac)?;
+            }
+            block_idx += 1;
+            mcu_count += 1;
+        }
+    }
+    eob.flush(bw, ac)?;
+    if ezr_it.peek().is_some() || rp_it.peek().is_some() {
+        return Err(Error::InvalidData(
+            "JXL jpeg_reconstruct: unused extra-zero-run / reset-point entries after the scan"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+/// One block of a progressive AC FIRST scan (`Ah == 0`), 10918-1
+/// G.1.2.2: point-transformed band coefficients as (run, size) symbols;
+/// the trailing zeros defer into the shared EOB run.
+fn encode_first_ac_block(
+    bw: &mut JpegBitWriter,
+    ac: &BuiltHuffman,
+    block: &[i32],
+    si: &ScanInfo,
+    extra_runs: u32,
+    eob: &mut EobState,
+) -> Result<()> {
+    let (ss, se) = (si.ss as usize, si.se as usize);
+    let mut vals = [0i32; 64];
+    let mut k_last = 0usize;
+    let mut has_nonzero = false;
+    for k in ss..=se {
+        let v = pt_ac(block[ZIGZAG[k]], si.al);
+        vals[k] = v;
+        if v != 0 {
+            k_last = k;
+            has_nonzero = true;
+        }
+    }
+    // Any in-block symbol requires the pending EOB run flushed first
+    // (the decoder skips whole blocks while its EOBRUN is non-zero).
+    if has_nonzero || extra_runs > 0 {
+        eob.flush(bw, ac)?;
+    }
+    let mut run = 0u32;
+    if has_nonzero {
+        for &v in &vals[ss..=k_last] {
+            if v == 0 {
+                run += 1;
+                continue;
+            }
+            while run > 15 {
+                ac.emit(bw, 0xF0)?;
+                run -= 16;
+            }
+            let s = category(v);
+            ac.emit(bw, (run << 4) | s)?;
+            bw.put_bits(value_bits(v, s), s);
+            run = 0;
+        }
+    }
+    let mut remaining: i32 = if has_nonzero {
+        (se - k_last) as i32
+    } else {
+        (se - ss + 1) as i32
+    };
+    for _ in 0..extra_runs {
+        ac.emit(bw, 0xF0)?;
+        remaining -= 16;
+        if remaining < 0 {
+            return Err(Error::InvalidData(
+                "JXL jpeg_reconstruct: extra zero runs exceed the band's trailing zeros".into(),
+            ));
+        }
+    }
+    if remaining > 0 {
+        eob.run += 1;
+    }
+    Ok(())
+}
+
+/// One block of a progressive AC REFINEMENT scan (`Ah != 0`), 10918-1
+/// G.1.2.3: history-nonzero coefficients contribute correction bits
+/// (buffered behind the next emitted symbol, or behind the EOB run);
+/// newly-nonzero coefficients (magnitude exactly 1 at this precision)
+/// are (run, 1) symbols whose run counts only zero-history positions.
+fn encode_refine_ac_block(
+    bw: &mut JpegBitWriter,
+    ac: &BuiltHuffman,
+    block: &[i32],
+    si: &ScanInfo,
+    extra_runs: u32,
+    eob: &mut EobState,
+) -> Result<()> {
+    let (ss, se) = (si.ss as usize, si.se as usize);
+    let (ah, al) = (si.ah, si.al);
+    // Last newly-nonzero band position, if any.
+    let mut k_last_new: Option<usize> = None;
+    for k in ss..=se {
+        let mag = block[ZIGZAG[k]].unsigned_abs();
+        if (mag >> ah) == 0 && (mag >> al) != 0 {
+            k_last_new = Some(k);
+        }
+    }
+    if k_last_new.is_some() || extra_runs > 0 {
+        eob.flush(bw, ac)?;
+    }
+    let mut run = 0u32;
+    let mut corr: Vec<bool> = Vec::new();
+    let mut k = ss;
+    if let Some(last) = k_last_new {
+        while k <= last {
+            let v = block[ZIGZAG[k]];
+            let mag = v.unsigned_abs();
+            if (mag >> ah) != 0 {
+                corr.push(((mag >> al) & 1) != 0);
+            } else if (mag >> al) == 0 {
+                run += 1;
+                while run > 15 {
+                    // A full run of 16 zero-history positions: ZRL,
+                    // then the correction bits it traversed.
+                    ac.emit(bw, 0xF0)?;
+                    drain_corr(bw, &mut corr);
+                    run -= 16;
+                }
+            } else {
+                if mag >> al != 1 {
+                    return Err(Error::InvalidData(
+                        "JXL jpeg_reconstruct: newly-nonzero refinement magnitude > 1".into(),
+                    ));
+                }
+                while run > 15 {
+                    ac.emit(bw, 0xF0)?;
+                    drain_corr(bw, &mut corr);
+                    run -= 16;
+                }
+                ac.emit(bw, (run << 4) | 1)?;
+                bw.put_bits(u32::from(v > 0), 1);
+                drain_corr(bw, &mut corr);
+                run = 0;
+            }
+            k += 1;
+        }
+    }
+    // Tail: extra ZRL symbols each consume 16 zero-history positions
+    // (correction bits traversed emit right after each symbol); then
+    // whatever remains defers into the shared EOB run, its correction
+    // bits buffered for the flush.
+    for _ in 0..extra_runs {
+        ac.emit(bw, 0xF0)?;
+        let mut zeros = 0u32;
+        // Consume the local `run` surplus first (zero-history
+        // positions already walked past the last newly-nonzero
+        // coefficient cannot exist here — the walk above stops AT the
+        // last newly-nonzero position — so `run` is 0 on entry).
+        while zeros < 16 {
+            if k > se {
+                return Err(Error::InvalidData(
+                    "JXL jpeg_reconstruct: extra zero run exceeds the refinement band".into(),
+                ));
+            }
+            let mag = block[ZIGZAG[k]].unsigned_abs();
+            if (mag >> ah) != 0 {
+                corr.push(((mag >> al) & 1) != 0);
+            } else {
+                debug_assert_eq!(mag >> al, 0);
+                zeros += 1;
+            }
+            k += 1;
+        }
+        drain_corr(bw, &mut corr);
+    }
+    if k <= se {
+        eob.run += 1;
+        while k <= se {
+            let mag = block[ZIGZAG[k]].unsigned_abs();
+            if (mag >> ah) != 0 {
+                eob.corr.push(((mag >> al) & 1) != 0);
+            }
+            k += 1;
+        }
     }
     Ok(())
 }

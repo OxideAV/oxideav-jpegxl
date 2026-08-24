@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Round 451 — **progressive (SOF2) JPEG reconstruction** (10918-1
+  Annex G re-encode with the 18181-2 A.6 amendments): DC first scans
+  (arithmetic-shift point transform, interleaved MCU walk) and DC
+  refinement scans (one raw bit per block); AC first scans
+  (G.1.2.2 — non-interleaved band coding with the shared EOB run,
+  extra ZRLs consumed before the end-of-band bookkeeping) and AC
+  refinement scans (G.1.2.3 — newly-nonzero (run, 1) symbols whose
+  runs count only zero-history positions, correction bits buffered
+  behind each emitted symbol and behind the EOB-run flush);
+  `smi.reset_points` force `Encode_EOBRUN` before the named blocks,
+  the run caps at 32767, and every RSTn flushes the run and
+  byte-aligns from the A.6 padding-bit source. Arithmetic-coded
+  JPEGs (SOF9/SOF10) refuse precisely. Pinned byte-exact on four
+  transcode pairs: 64×64 4:4:4 (`r451_prog_g`), 89×53 4:2:0
+  MCU-padded (`r451_prog420`), 72×40 greyscale (`r451_proggrey`) and
+  a jpegtran restart-interval stream (`r451_prog_rst`).
 - Round 451 — **ICC-carrying JPEG reconstruction** (A.9 kind 1): a
   transcode of a JPEG with `ICC_PROFILE` APP2 markers signals
   `want_icc`; the Annex B / E.4 encoded ICC stream (between
