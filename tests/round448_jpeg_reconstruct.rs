@@ -119,18 +119,16 @@ fn docs_photo_transcode_byte_exact() {
     assert_byte_exact("jpeg_transcode.jxl", "jpeg_transcode_original.jpg");
 }
 
-/// Noisy 4:4:4 content still hits the round-444 open §C.7.2 desync
-/// class (near-uniform non-dyadic histograms): the walk
-/// under-delivers declared NonZeros. Reconstruction must refuse
-/// LOUDLY — a silently wrong JPEG is never acceptable output. This
-/// pin flips to a byte-exact assertion when the desync class closes.
+/// Noisy 4:4:4 content — the round-444/448 "near-uniform non-dyadic
+/// histograms" desync class, CLOSED round 451 by two errata: the
+/// `CoeffNumNonzeroContext[21]` transcription error (a ninth 152
+/// where Listing C.13 prints the first 180) and the alias-map
+/// exactly-full-bucket rule (2024 IS C.2.6: a bucket with
+/// `cutoffs[i] == bucket_size` goes on NEITHER worklist; queueing it
+/// as underfull permutes every later Vose pairing). This pin was a
+/// loud-refusal assertion for three rounds; it now asserts the
+/// byte-exact reconstruction the class always owed.
 #[test]
-fn noisy_photo_refuses_loudly() {
-    let jxl = fixture("r448_noise444.jxl");
-    let err = reconstruct_jpeg(&jxl).expect_err("desynced stream must not reconstruct");
-    let msg = format!("{err:?}");
-    assert!(
-        msg.contains("undelivered NonZeros") || msg.contains("desync"),
-        "unexpected refusal shape: {msg}"
-    );
+fn noisy_photo_byte_exact() {
+    assert_byte_exact("r448_noise444.jxl", "r448_noise444.jpg");
 }

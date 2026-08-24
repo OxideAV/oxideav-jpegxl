@@ -9,6 +9,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Round 451 — **the §C.8.3 noisy-content desync class is CLOSED** —
+  two independent errata, both wire-arbitrated against a 18-stream
+  noise ladder and the r448 photo fixture:
+  * **`CoeffNumNonzeroContext[21]` transcription error**: Listing
+    C.13 prints eight 152 entries (`non_zeros` 13..=20) and twelve
+    180 entries (21..=32); the in-crate table (rounds 159–450)
+    carried a ninth 152 at index 21. Invisible until a stream's
+    cluster map splits the 152-family contexts from the 180-family
+    AND a block's remaining count walks through exactly 21 — the
+    near-uniform histograms of noisy content — where the misrouted
+    read desynced the shared ANS state (the r444/r448 walk-underrun
+    class).
+  * **Alias-map exactly-full buckets** (2024 IS C.2.6 vs FDIS
+    Listing D.1): a bucket with `cutoffs[i] == bucket_size` goes on
+    NEITHER Vose worklist. The FDIS's plain `else` queues it as
+    underfull; popping it is a mass-free no-op that still consumes a
+    pump step and re-queues the overfull bucket, permuting every
+    later pairing — a different alias table whose redirected slices
+    decode wrong symbols. Reachable only through histograms with an
+    exactly-bucket-size entry.
+
+  `r448_noise444` (256×256 noisy photo) now reconstructs BYTE-EXACT
+  (its three-round-old loud-refusal pin is flipped), as does every
+  stream of the 18-fixture noise ladder; new direct pins
+  `r451_noise48` (CNNC[21]) and `r451_noise64hist` (alias buckets).
 - Round 451 — **the CfL tie-rounding erratum** (§C.4.4 / I.6 integer
   chroma re-correlation): the stored chroma re-correlates as
   `c += round(tile × y × qY / (cf × qC))` — an EXACT rational — and

@@ -82,10 +82,18 @@ pub const COEFF_FREQ_CONTEXT: [u32; 64] = [
 ];
 
 /// `CoeffNumNonzeroContext[k]` — Listing C.13 prelude. Indexed by
-/// the *remaining* `non_zeros` count.
+/// the *remaining* `non_zeros` count. Bucket runs (Listing C.13):
+/// 152 covers `non_zeros` 13..=20 (EIGHT entries) and 180 covers
+/// 21..=32 (twelve) — the rounds-159..450 transcription carried a
+/// ninth 152 at index 21, shifting that one bucket. The error is
+/// invisible until a stream's cluster map splits the 152-family
+/// contexts from the 180-family AND a block's remaining count walks
+/// through exactly 21 — near-uniform noisy content — where the
+/// misrouted read desyncs the shared ANS state (the round-444/448
+/// "noisy 4:4:4" walk-underrun class, closed round 451).
 pub const COEFF_NUM_NONZERO_CONTEXT: [u32; 64] = [
     0, 0, 31, 62, 62, 93, 93, 93, 93, 123, 123, 123, 123, 152, 152, 152, 152, 152, 152, 152, 152,
-    152, 180, 180, 180, 180, 180, 180, 180, 180, 180, 180, 180, 206, 206, 206, 206, 206, 206, 206,
+    180, 180, 180, 180, 180, 180, 180, 180, 180, 180, 180, 180, 206, 206, 206, 206, 206, 206, 206,
     206, 206, 206, 206, 206, 206, 206, 206, 206, 206, 206, 206, 206, 206, 206, 206, 206, 206, 206,
     206, 206, 206, 206, 206,
 ];

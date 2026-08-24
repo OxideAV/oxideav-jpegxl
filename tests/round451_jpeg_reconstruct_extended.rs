@@ -127,3 +127,31 @@ fn cfl_tie_rounding_16x16_byte_exact() {
 fn cfl_tie_rounding_64x64_byte_exact() {
     assert_byte_exact("r451_noise64.jxl", "r451_noise64.jpg");
 }
+
+/// The round-451 `CoeffNumNonzeroContext[21]` erratum, direct pin: a
+/// 48×48 noisy 4:4:4 transcode whose first luma block walks its
+/// remaining-NonZeros count through exactly 21 while the stream's
+/// cluster map splits the 152-family coefficient contexts from the
+/// 180-family. The in-crate table carried a ninth 152 at index 21
+/// (Listing C.13 prints eight: 152 covers 13..=20, 180 covers
+/// 21..=32); the misrouted read desynced the shared ANS state and the
+/// walk under-delivered its declared NonZeros (the r444/r448 loud
+/// class).
+#[test]
+fn cnnc21_desync_48x48_byte_exact() {
+    assert_byte_exact("r451_noise48.jxl", "r451_noise48.jpg");
+}
+
+/// The round-451 alias-map exactly-full-bucket erratum, direct pin
+/// (2024 IS C.2.6): a bucket holding exactly `bucket_size` mass goes
+/// on NEITHER Vose worklist; the FDIS Listing D.1's plain `else`
+/// queues it as underfull, and popping it permutes every later
+/// (overfull, underfull) pairing — a different alias table whose
+/// redirected slices decode wrong symbols. Reachable only through
+/// histograms with an exactly-bucket-size entry — the near-uniform
+/// non-dyadic shapes of noisy content. This 64×64 specimen previously
+/// desynced into a Huffman-table refusal mid-reconstruction.
+#[test]
+fn alias_exact_bucket_64x64_byte_exact() {
+    assert_byte_exact("r451_noise64hist.jxl", "r451_noise64hist.jpg");
+}

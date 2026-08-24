@@ -122,9 +122,21 @@ impl AliasTable {
             cutoffs[i] = d[i];
             if d[i] as u32 > bucket_size {
                 overfull.push(i);
-            } else {
+            } else if (d[i] as u32) < bucket_size {
                 underfull.push(i);
             }
+            // An EXACTLY-full bucket (d[i] == bucket_size) goes on
+            // NEITHER list (2024 IS C.2.6: `else if (cutoffs[i] <
+            // bucket_size) underfull.push_back(i)`). The 2021 FDIS
+            // Listing D.1 prints a plain `else` that also queues
+            // exactly-full buckets as underfull; popping one is a
+            // no-op transfer (`by == 0`) but it CONSUMES a pump step
+            // and re-queues the overfull bucket, PERMUTING every
+            // later (overfull, underfull) pairing — a different
+            // alias table, wrong symbols on the redirected slices.
+            // Invisible unless some d[i] == bucket_size, i.e. the
+            // near-uniform non-dyadic histograms of noisy content —
+            // the round-444/448 residual desync class.
         }
         for (i, slot) in cutoffs
             .iter_mut()
