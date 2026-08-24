@@ -67,3 +67,13 @@ fn mcu_padded_420_noise_byte_exact() {
 fn mcu_padded_420_restart_byte_exact() {
     assert_byte_exact("r451_seq420_rst.jxl", "r451_seq420_rst.jpg");
 }
+
+/// Embedded ICC profile (A.9 kind 1): the codestream signals
+/// `want_icc`, the Annex B / E.4 encoded ICC stream sits between
+/// ImageMetadata and the frame, and reconstruction re-chunks the
+/// decoded profile into `ICC_PROFILE` APP2 segments (chunk index /
+/// count bytes, `am.length - 17` profile bytes per marker).
+#[test]
+fn icc_app2_byte_exact() {
+    assert_byte_exact("r451_icc_g.jxl", "r451_icc_g.jpg");
+}

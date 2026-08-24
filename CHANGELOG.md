@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Round 451 — **ICC-carrying JPEG reconstruction** (A.9 kind 1): a
+  transcode of a JPEG with `ICC_PROFILE` APP2 markers signals
+  `want_icc`; the Annex B / E.4 encoded ICC stream (between
+  ImageMetadata and the frame, at the very next bit) now decodes on
+  the transcode path, and A.9 re-chunks the profile into APP2
+  segments — `{0xE2, len}` + zero-terminated `ICC_PROFILE` + 1-based
+  chunk index + chunk count + the next `am.length − 17` profile
+  bytes. Pinned byte-exact on a 64×64 sRGB-profile transcode
+  (`r451_icc_g`).
 - Round 451 — **MCU-padded transcode dimensions** (§F.2): for a
   subsampled frame the per-channel block grid is "divided (rounding
   up) by the maximum subsampling factor across all channels, and then

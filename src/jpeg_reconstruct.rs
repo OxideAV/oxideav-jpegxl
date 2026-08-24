@@ -84,6 +84,10 @@ pub struct TranscodedCoefficients {
     pub tw: usize,
     /// §C.4.4 colour correlation constants.
     pub colour_factor: u32,
+    /// The decoded ICC profile (Annex B), when the codestream carries
+    /// one (`want_icc`). A.9 splits it back into `ICC_PROFILE` APP2
+    /// chunks during reconstruction.
+    pub icc_profile: Option<Vec<u8>>,
 }
 
 /// Decode the quantized DCT coefficients of a single-frame VarDCT
@@ -98,6 +102,23 @@ pub fn decode_transcoded_coefficients(codestream: &[u8]) -> Result<TranscodedCoe
             "JXL jpeg_reconstruct: frame is xyb_encoded (not a JPEG transcode)".into(),
         ));
     }
+    // A transcode of an ICC-carrying JPEG signals `want_icc`: the
+    // encoded ICC stream (Annex B / E.4) sits between ImageMetadata
+    // and the frame, at the very next bit (no ZeroPadToByte — the
+    // round-408 finding). Decode it both to advance the reader and to
+    // recover the profile bytes A.9 re-chunks into APP2 segments.
+    let icc_profile = if metadata.colour_encoding.want_icc {
+        let encoded = crate::icc::decode_encoded_icc_stream(&mut br)?;
+        let profile = crate::icc::reconstruct_icc_profile(&encoded)?;
+        if profile.len() >= 40 && &profile[36..40] != b"acsp" {
+            return Err(Error::InvalidData(
+                "JXL jpeg_reconstruct: decoded ICC profile lacks 'acsp' magic".into(),
+            ));
+        }
+        Some(profile)
+    } else {
+        None
+    };
     // Headers → frame boundary is byte-aligned (§6.3).
     br.pu()?;
 
@@ -574,6 +595,7 @@ pub fn decode_transcoded_coefficients(codestream: &[u8]) -> Result<TranscodedCoe
         b_from_y,
         tw: ftw,
         colour_factor: cfl.colour_factor,
+        icc_profile,
     })
 }
 
@@ -850,6 +872,12 @@ pub fn reconstruct_from_parts(
         has_padding: d.has_padding,
     };
 
+    // A.9 kind-1 (ICC) chunk state: chunk index / total among the
+    // type-1 app markers, and a cursor into the decoded profile.
+    let icc_total = d.app_markers.iter().filter(|a| a.kind == 1).count();
+    let mut icc_idx = 0usize;
+    let mut icc_pos = 0usize;
+
     // Entropy-coding state that persists across segments.
     // dc/ac tables by (class, id).
     let mut dc_tables: [Option<BuiltHuffman>; 4] = [None, None, None, None];
@@ -1085,11 +1113,47 @@ pub fn reconstruct_from_parts(
                         }
                     }
                     1 => {
-                        return Err(Error::Unsupported(
-                            "JXL jpeg_reconstruct: ICC-profile APP2 reconstruction not yet \
-                             handled"
-                                .into(),
-                        ));
+                        // A.9: {0xE2, len_hi, len_lo} with
+                        // len = am.length - 1, the zero-terminated
+                        // string "ICC_PROFILE", the u8 1-based chunk
+                        // index among the type-1 markers, the u8 total
+                        // count, then the next am.length - 17 bytes of
+                        // the decoded ICC profile (Annex B / E.4).
+                        let profile = tc.icc_profile.as_deref().ok_or_else(|| {
+                            Error::InvalidData(
+                                "JXL jpeg_reconstruct: ICC app marker but the codestream \
+                                 carries no ICC profile"
+                                    .into(),
+                            )
+                        })?;
+                        if am.length < 17 {
+                            return Err(Error::InvalidData(format!(
+                                "JXL jpeg_reconstruct: ICC app marker length {} too short",
+                                am.length
+                            )));
+                        }
+                        if icc_total > 255 {
+                            return Err(Error::InvalidData(
+                                "JXL jpeg_reconstruct: more than 255 ICC app markers".into(),
+                            ));
+                        }
+                        let frag_len = (am.length - 17) as usize;
+                        let frag = profile.get(icc_pos..icc_pos + frag_len).ok_or_else(|| {
+                            Error::InvalidData(
+                                "JXL jpeg_reconstruct: ICC chunks overrun the decoded \
+                                     profile"
+                                    .into(),
+                            )
+                        })?;
+                        icc_pos += frag_len;
+                        icc_idx += 1;
+                        let len_field = am.length - 1;
+                        out.push(0xE2);
+                        out.extend_from_slice(&(len_field as u16).to_be_bytes());
+                        out.extend_from_slice(b"ICC_PROFILE\0");
+                        out.push(icc_idx as u8);
+                        out.push(icc_total as u8);
+                        out.extend_from_slice(frag);
                     }
                     k => {
                         return Err(Error::InvalidData(format!(
