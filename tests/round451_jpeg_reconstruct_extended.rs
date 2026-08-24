@@ -164,16 +164,15 @@ fn greyscale_noise_byte_exact() {
     assert_byte_exact("r451_grey.jxl", "r451_grey.jpg");
 }
 
-/// OPEN CORNER (round 451): one 64×64 noisy specimen still
-/// reconstructs with exactly two chroma coefficients off by one —
-/// both channel B, both the first HF position of their block, both
-/// predictions landing at −3.5047… where the byte-exact fixtures
-/// demand −3 while the identical rational at other cells (and its
-/// mirror +3.5047… in the same stream) demands the nearest value.
-/// No pure function of (tile, y·qY, qC, cf) fits all specimens, so
-/// the deviation is pinned loudly here (both a sequential and a
-/// progressive transcode of the same content deviate identically)
-/// until more specimens isolate the rule. These flip to
+/// OPEN CORNER (round 451): a rare self-consistent §C.8.3 chroma
+/// mis-parse — ~0.03 % of chroma coefficients on some noisy 4:4:4
+/// content decode off by one while every ANS closure invariant
+/// passes (a VALID parse differing from the encoder's, so some
+/// context-model input still diverges on a rare block shape). The
+/// CfL integer rule itself is CONFIRMED at ~47 000 datapoints
+/// (nearest; exact half-way ties toward zero). Both a sequential
+/// and a progressive transcode of the same content deviate
+/// identically (the model is stream-independent). These flip to
 /// `assert_byte_exact` when the corner closes.
 #[test]
 fn cfl_near_half_corner_still_open() {

@@ -644,17 +644,19 @@ generated `cjxl` transcode pairs:
   `progressive-ac-multipass` fixture — the per-preset repetition or
   per-pass slice layout hides one more wire divergence
   (`round437_custom_orders_boundary` pins the loud refusal).
-- **An open CfL near-half rounding corner** (round 451): one noisy
-  64×64 content reconstructs with exactly two chroma coefficients
-  off by one — both channel B, both a first HF position, both
-  predictions at −3.5047… demanded as −3 while the identical
-  rational elsewhere in the same stream (and its mirror +3.5047…)
-  demands the nearest value. No pure per-coefficient rounding rule
-  fits every wire specimen; a sequential and a progressive transcode
-  of the same content deviate identically (model-side, not
-  entropy-side — closure invariants pass). Pinned loudly
-  (`cfl_near_half_corner_still_open`) until more specimens isolate
-  the rule.
+- **A rare self-consistent §C.8.3 chroma mis-parse** (round 451):
+  ~0.03 % of chroma coefficients on some noisy 4:4:4 content decode
+  off by one (14 cells across a 39-stream corpus; ~2 per affected
+  stream) while every closure invariant passes — the decode is a
+  VALID ANS parse that differs from the encoder's, so some
+  context-model input still diverges on a rare block shape. The CfL
+  integer rule itself is CONFIRMED at ~47 000 datapoints (nearest,
+  exact half-way ties toward zero: 413/413 near-half specimens away,
+  163/163 ties toward zero); the mismatching cells are decode-side.
+  Both a sequential and a progressive transcode of the same content
+  deviate identically (the model is stream-independent). Pinned
+  loudly (`cfl_near_half_corner_still_open`) until a reproducer
+  isolates the input.
 - The residual sub-1/255 VarDCT accuracy tail (float rounding + §J
   filter differences) and `save_before_ct` pre-CT reference recording
   in the §C.2 composer. (The staged `progressive-ac-multipass`

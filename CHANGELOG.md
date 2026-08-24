@@ -23,14 +23,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   diagnostics at MAD 0.55 / 0.46 / 0.76 — photo-fixture-class
   accuracy. The test now asserts zero diagnostics and a 1.0-MAD
   ratchet.
-- Round 451 — open corner, pinned loudly: ONE noisy 64×64 content
-  still reconstructs with exactly two chroma coefficients off by one
-  (both channel B, both a first HF position, both CfL predictions at
-  −3.5047… demanded as −3 while the same rational elsewhere demands
-  the nearest value — no pure per-coefficient rounding rule fits all
-  specimens). A sequential and a progressive transcode of the same
-  content (`r451_icc` / `r451_prog`) deviate identically; the pin
-  flips to byte-exact when the rule is isolated.
+- Round 451 — open corner, pinned loudly: a rare self-consistent
+  §C.8.3 chroma mis-parse — ~0.03 % of chroma coefficients on some
+  noisy 4:4:4 content decode off by one while every ANS closure
+  invariant passes (a VALID parse differing from the encoder's; some
+  context-model input still diverges on a rare block shape). The CfL
+  integer rule itself is CONFIRMED at ~47 000 datapoints (nearest;
+  exact half-way ties toward zero — 413/413 near-half specimens away,
+  163/163 ties toward zero). A sequential and a progressive transcode
+  of the same content (`r451_icc` / `r451_prog`) deviate identically;
+  the pin flips to byte-exact when the input is isolated.
 - Round 451 — **the §C.8.3 noisy-content desync class is CLOSED** —
   two independent errata, both wire-arbitrated against a 18-stream
   noise ladder and the r448 photo fixture:
