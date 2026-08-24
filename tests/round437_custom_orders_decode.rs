@@ -65,27 +65,25 @@ fn custom_orders_stream_decodes_end_to_end() {
     let frame = oxideav_jpegxl::decode_one_frame(jxl, None)
         .expect("used_orders != 0 stream must decode (round 437 per-channel layout)");
     assert_eq!(frame.planes.len(), 3);
-    // Round-444 recharacterisation: this stream is in the OPEN
-    // §C.8.3 desync class (same family as `r444_wave64` — see
-    // `round444_impulse_and_scale.rs`): the decode is best-effort and
-    // the desync is now DIAGNOSED loudly rather than silently folded
-    // into pixel error. The round-437 "structurally exact, MAD ≈ 20"
-    // reading was measured on the pre-444 walk (raw tokens, no
-    // per-section ANS re-init, transposed square IDCT, missing
-    // 2^16/global_scale) whose errors partially cancelled on this
-    // stream; the corrected walk decodes the same desynced stream on
-    // a different trajectory.
+    // Round-451 closure: the §C.8.3 desync class this stream sat in
+    // for three rounds (r437's "MAD ≈ 20 accuracy deficiency", then
+    // r444's loud diagnosis) was root-caused as the
+    // `CoeffNumNonzeroContext[21]` transcription error plus the
+    // alias-map exactly-full-bucket rule (see
+    // `round451_jpeg_reconstruct_extended.rs`). The stream now
+    // decodes with CLEAN diagnostics and photo-fixture-class accuracy
+    // (measured 0.55 / 0.46 / 0.76 MAD, the residual being the usual
+    // sub-1/255 float/§J tail on synthetic edges).
     let closure_failures = oxideav_jpegxl::hf_coefficient_histograms::section_closure_failures();
     let underruns = oxideav_jpegxl::pass_group_hf::walk_underruns();
-    assert!(
-        closure_failures + underruns > 0,
-        "the stream's desync must be diagnosed (closure {closure_failures}, \
-         underruns {underruns}) — if both are 0 the desync is FIXED: tighten \
-         this test to a reference band"
+    assert_eq!(
+        closure_failures + underruns,
+        0,
+        "the round-451 §C.8.3 errata closed this stream's desync (closure \
+         {closure_failures}, underruns {underruns} must both be 0)"
     );
-    // Regression ratchet at the round-444 best-effort level. Drive
-    // DOWN when the §C.8.3 desync class is root-caused; never up.
-    let bounds = [33.0, 23.0, 27.0];
+    // Regression ratchet at the round-451 clean-decode level.
+    let bounds = [1.0, 1.0, 1.0];
     for (c, mad_max) in bounds.iter().enumerate() {
         let plane = &frame.planes[c];
         let mut sum = 0u64;

@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Round 451 — the r437 `custom_orders_t256_e1` accuracy deficiency
+  (synthetic-edge content at MAD ≈ 20/13/8, best-effort-ratcheted at
+  33/23/27 since round 444) was the SAME §C.8.3 desync class: with
+  the two errata the stream decodes with clean closure/underrun
+  diagnostics at MAD 0.55 / 0.46 / 0.76 — photo-fixture-class
+  accuracy. The test now asserts zero diagnostics and a 1.0-MAD
+  ratchet.
 - Round 451 — open corner, pinned loudly: ONE noisy 64×64 content
   still reconstructs with exactly two chroma coefficients off by one
   (both channel B, both a first HF position, both CfL predictions at
