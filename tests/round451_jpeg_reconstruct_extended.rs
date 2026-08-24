@@ -109,3 +109,21 @@ fn progressive_greyscale_byte_exact() {
 fn progressive_restart_byte_exact() {
     assert_byte_exact("r451_prog_rst.jxl", "r451_prog_rst.jpg");
 }
+
+/// The round-451 CfL tie-rounding erratum, minimal specimen: a 16×16
+/// noisy 4:4:4 transcode whose Cb prediction `tile × y × qY / (cf ×
+/// qC)` lands EXACTLY on a half-way value (840/336 = 2.5). The wire
+/// rounds ties TOWARD ZERO; rounds 448–450 used `f64::round`
+/// (half-away) and reconstructed a silently wrong JPEG (±1 on one
+/// chroma coefficient) that still passed every loudness guard.
+#[test]
+fn cfl_tie_rounding_16x16_byte_exact() {
+    assert_byte_exact("r451_noise16.jxl", "r451_noise16.jpg");
+}
+
+/// Six tie hits across BOTH chroma channels (X and B) of a 64×64
+/// noisy 4:4:4 transcode, positive and negative predictions.
+#[test]
+fn cfl_tie_rounding_64x64_byte_exact() {
+    assert_byte_exact("r451_noise64.jxl", "r451_noise64.jpg");
+}

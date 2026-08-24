@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Round 451 — **the CfL tie-rounding erratum** (§C.4.4 / I.6 integer
+  chroma re-correlation): the stored chroma re-correlates as
+  `c += round(tile × y × qY / (cf × qC))` — an EXACT rational — and
+  the wire rounds half-way values TOWARD ZERO (2.5 → 2, −3.5 → −3;
+  13 tie specimens across seven noisy fixtures, both chroma
+  channels, both signs). Rounds 448–450 computed the prediction in
+  f64 with `round()` (half-away) and reconstructed a **silently
+  wrong JPEG** (±1 on one chroma coefficient) whenever noisy content
+  produced a tie — the desync guards never fired because the stream
+  stayed in sync. The inversion is now pure integer arithmetic.
+  Pinned byte-exact on the minimal 16×16 tie specimen
+  (`r451_noise16`) and a 64×64 six-tie specimen (`r451_noise64`).
 - Round 451 — **progressive (SOF2) JPEG reconstruction** (10918-1
   Annex G re-encode with the 18181-2 A.6 amendments): DC first scans
   (arithmetic-shift point transform, interleaved MCU walk) and DC

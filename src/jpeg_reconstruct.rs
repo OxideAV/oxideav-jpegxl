@@ -539,21 +539,33 @@ pub fn decode_transcoded_coefficients(codestream: &[u8]) -> Result<TranscodedCoe
     // I.6: "This clause is skipped if any channel is subsampled" — no
     // CfL inversion for 4:2:0 / 4:2:2 frames.
     let cfl_blocks = if subsampled { 0 } else { fbh };
-    let cf = cfl.colour_factor as f64;
+    // The prediction round(k × y × qY / qC) with k = tile / cf is an
+    // EXACT rational n / d (n = tile × y × qY, d = cf × qC): compute
+    // it in integers. Wire-arbitrated tie rule (round 451, 13 tie
+    // specimens across seven noisy fixtures): a half-way value
+    // rounds TOWARD ZERO (2.5 → 2, −3.5 → −3) — not half-away (the
+    // rounds-448..450 f64 `round()`, ±1 off on every tie), not
+    // half-even (−3.5 would give −4).
+    let round_half_to_zero = |n: i64, d: i64| -> i32 {
+        debug_assert!(d > 0);
+        let q = (2 * n.abs() + d - 1) / (2 * d);
+        (if n < 0 { -q } else { q }) as i32
+    };
+    let cf = cfl.colour_factor as i64;
     for by in 0..cfl_blocks {
         for bx in 0..fbw {
             let tile = (by / 8).min(fth - 1) * ftw + (bx / 8).min(ftw - 1);
-            let kx = cfl.base_correlation_x as f64 + (x_from_y[tile] as f64) / cf;
-            let kb = cfl.base_correlation_b as f64 + (b_from_y[tile] as f64) / cf;
+            let tx = x_from_y[tile] as i64;
+            let tb = b_from_y[tile] as i64;
             let base = (by * fbw + bx) * 64;
             for pos in 1..64usize {
                 let y = coeffs[1][base + pos];
                 if y == 0 {
                     continue;
                 }
-                let dy = (y as f64) * (quant[1][pos] as f64);
-                let px = (kx * dy / (quant[0][pos] as f64)).round() as i32;
-                let pb = (kb * dy / (quant[2][pos] as f64)).round() as i32;
+                let dy = (y as i64) * (quant[1][pos] as i64);
+                let px = round_half_to_zero(tx * dy, cf * quant[0][pos] as i64);
+                let pb = round_half_to_zero(tb * dy, cf * quant[2][pos] as i64);
                 coeffs[0][base + pos] += px;
                 coeffs[2][base + pos] += pb;
             }
