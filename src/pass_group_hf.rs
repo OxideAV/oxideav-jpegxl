@@ -146,10 +146,11 @@ impl PassGroupHfHeader {
         })
     }
 
-    /// Look up the coefficient orders for this group's chosen pass
-    /// preset. The caller passes the per-pass [`HfPass`] vector that
-    /// [`crate::hf_pass::read_hf_pass_sequence`] returned for the
-    /// current pass.
+    /// Legacy hfp-indexed [`HfPass`] lookup. Round 454: the I.4 `hfp`
+    /// field selects a HISTOGRAM offset, never an order set (the
+    /// coefficient orders are per pass — one bundle each — not per
+    /// preset), so the decode paths no longer route orders through
+    /// this helper; it remains as a bounds-checked slice lookup.
     pub fn select_pass<'a>(&self, passes: &'a [HfPass]) -> Result<&'a HfPass> {
         passes.get(self.hfp as usize).ok_or_else(|| {
             Error::InvalidData(format!(
@@ -952,7 +953,10 @@ mod tests {
         // Build dummy passes by reading two used_orders=0 HfPass bundles.
         let bytes2 = pack_lsb(&[(2, 2), (2, 2)]);
         let mut br2 = BitReader::new(&bytes2);
-        let passes = crate::hf_pass::read_hf_pass_sequence(&mut br2, 2, 1).unwrap();
+        let passes = vec![
+            crate::hf_pass::HfPass::read(&mut br2, 2, 1).unwrap(),
+            crate::hf_pass::HfPass::read(&mut br2, 2, 1).unwrap(),
+        ];
         let chosen = h.select_pass(&passes).unwrap();
         // Either preset's `used_orders` is 0 → same num_histogram_distributions.
         assert_eq!(chosen.used_orders, 0);
@@ -968,7 +972,7 @@ mod tests {
         };
         let bytes = pack_lsb(&[(2, 2)]);
         let mut br = BitReader::new(&bytes);
-        let passes = crate::hf_pass::read_hf_pass_sequence(&mut br, 1, 1).unwrap();
+        let passes = vec![crate::hf_pass::HfPass::read(&mut br, 1, 1).unwrap()];
         assert!(h.select_pass(&passes).is_err());
     }
 

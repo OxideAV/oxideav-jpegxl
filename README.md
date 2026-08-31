@@ -34,8 +34,13 @@ decode; §C.5 multi-LfGroup (> 2048 px) framing + LZ77 TOC permutations
 landed round 393 and are pinned on `large-3072x2048-multigroup`.
 Round 437 resolved the §C.7.1 `used_orders != 0` boundary for
 single-preset single-pass frames (the Listing C.12 per-channel
-permutation layout erratum — see below); multi-preset / multi-pass
-§C.7 slices still refuse loudly. Multi-frame
+permutation layout erratum — see below); round 454 closed the
+multi-preset / multi-pass residue (the FDIS "read `num_hf_presets`
+times" lead-in is superseded by 2024 §I.3.1's one-order-bundle-PER-PASS
+layout — presets multiply only the histogram block and the I.4 `hfp`
+offset), so the staged 3-pass × 2-preset progressive stream and the
+2-preset permuted-TOC 12×8-group stream both decode end to end
+(MAD 1.97/1.36/0.68 and 0.60/0.41/0.47 vs black-box reference). Multi-frame
 codestreams compose per §C.2 (Reference slots + Table C.8 blending,
 incl. round-393 kBlend / kAlphaWeightedAdd alpha modes) in
 `decode_all_frames`. Programs that only need probe-level information
@@ -638,12 +643,6 @@ generated `cjxl` transcode pairs:
 
 ### Not yet implemented
 
-- **Multi-preset / multi-pass §C.7 slices with `used_orders != 0`**
-  (the round-437 residual): after preset 0's per-channel Listing C.12
-  bundles, the next preset's fields still misparse on the staged
-  `progressive-ac-multipass` fixture — the per-preset repetition or
-  per-pass slice layout hides one more wire divergence
-  (`round437_custom_orders_boundary` pins the loud refusal).
 - **A rare self-consistent §C.8.3 chroma mis-parse** (round 451):
   ~0.03 % of chroma coefficients on some noisy 4:4:4 content decode
   off by one (14 cells across a 39-stream corpus; ~2 per affected
@@ -659,10 +658,10 @@ generated `cjxl` transcode pairs:
   isolates the input.
 - The residual sub-1/255 VarDCT accuracy tail (float rounding + §J
   filter differences) and `save_before_ct` pre-CT reference recording
-  in the §C.2 composer. (The staged `progressive-ac-multipass`
-  fixture now exists and reaches the multi-preset §C.7 boundary
-  above; the end-to-end multi-pass pixel pin lands when that boundary
-  closes.)
+  in the §C.2 composer. The first multi-pass decode (round 454,
+  `progressive-ac-multipass`) sits above that band (MAD
+  1.97/1.36/0.68, ratcheted at 3.0) — the cross-pass accumulation
+  accuracy tail is follow-up material.
 - ColorEncoding / ToneMapping fuller decode, preview / animation /
   intrinsic-size sub-bundles (parsing stops cleanly at the `have_*`
   flags).
@@ -692,6 +691,37 @@ generated `cjxl` transcode pairs:
 
 Unsupported inputs surface as `Error::Unsupported` rather than a silent
 misparse.
+
+## Fuzzing
+
+The crate carries a `cargo-fuzz` battery under `fuzz/` (nightly-only
+sub-package, excluded from the umbrella build), run daily by the Fuzz
+workflow via the fleet's reusable `crate-fuzz.yml` (corpus cached
+across runs, crashing inputs uploaded as artifacts):
+
+| target | surface |
+|---|---|
+| `parse_headers` | signature detect + SizeHeader / ImageMetadata probes (committee-draft AND full FDIS Table A.16 layouts) |
+| `parse_icc` | Annex B / E.4 encoded-ICC entropy decode + E.4.2..E.4.5 profile reconstruction |
+| `container_walk` | 18181-2 box walk: `BoxIter`, `JxlFile::parse`, `jxli`, capped `brob` unwrap, codestream extraction |
+| `decode_full` | geometry-capped `decode_all_frames` (whole multi-frame decode surface) |
+| `decode_vardct` | geometry-capped first-frame decode, seeded with VarDCT streams |
+| `decode_modular` | structure-aware single-channel Modular decode (header + MA tree + pixel loop) under fuzz-chosen geometry |
+| `jpeg_recon` | Annex A JPEG bitstream reconstruction over container + `jbrd` |
+| `decode_partial` | truncation driver: the capped decode over fuzz-chosen prefixes of valid streams |
+
+Decode harnesses pre-probe the preamble and skip inputs declaring more
+than 2^20 pixels or more than 4 extra channels (a JXL SizeHeader can
+declare 2^30-px dimensions from a handful of bytes); below those caps
+every failure must be a clean `Err`. Round-454 findings — an MA-tree
+decision property indexed past the caller's property table, an
+`extension_bits` sum overflow, an E.4.5 `Shuffle` read one past the
+input on shapes with more than one missing matrix cell, an i32
+overflow in the Modular derived property bounds under full-range
+channel headers, a `+ 1` overflow on a u32::MAX cluster index, and an
+unfenced 64 MiB `jbrd` Brotli transient (now capped at the exact
+Table 11 declared total) — are fixed with regression pins in
+`tests/r454_fuzz_regressions.rs`.
 
 ### History
 

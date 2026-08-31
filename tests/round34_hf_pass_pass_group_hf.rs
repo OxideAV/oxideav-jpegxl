@@ -28,7 +28,7 @@
 
 use oxideav_jpegxl::bitreader::BitReader;
 use oxideav_jpegxl::coeff_order::{natural_coeff_order, OrderId, NUM_ORDERS};
-use oxideav_jpegxl::hf_pass::{read_hf_pass_sequence, HfPass, ORDER_COEFFICIENT_COUNTS};
+use oxideav_jpegxl::hf_pass::{HfPass, ORDER_COEFFICIENT_COUNTS};
 use oxideav_jpegxl::lf_global::HfBlockContext;
 use oxideav_jpegxl::pass_group_hf::{
     block_context, coefficient_context, non_zeros_context, predicted_non_zeros, PassGroupHfHeader,
@@ -100,13 +100,14 @@ fn hf_pass_used_orders_nonzero_unsupported_round_90() {
 }
 
 #[test]
-fn read_hf_pass_sequence_threads_through_n_presets() {
-    // Three consecutive presets, each with used_orders = 0.
+fn hf_pass_bundles_chain_on_one_cursor() {
+    // Round 454: the orders bundle is per PASS (2024 I.3.1), not per
+    // preset — but consecutive bundles (e.g. across passes) still
+    // chain on one bit cursor.
     let bytes = pack_lsb(&[(2, 2), (2, 2), (2, 2)]);
     let mut br = BitReader::new(&bytes);
-    let v = read_hf_pass_sequence(&mut br, 3, 15).unwrap();
-    assert_eq!(v.len(), 3);
-    for hp in &v {
+    for _ in 0..3 {
+        let hp = HfPass::read(&mut br, 3, 15).unwrap();
         assert_eq!(hp.used_orders, 0);
     }
 }
@@ -199,7 +200,10 @@ fn pass_group_hf_select_pass_from_hf_pass_sequence() {
     let h = PassGroupHfHeader::read(&mut br, 2, 1).unwrap();
     let bytes2 = pack_lsb(&[(2, 2), (2, 2)]);
     let mut br2 = BitReader::new(&bytes2);
-    let passes = read_hf_pass_sequence(&mut br2, 2, 1).unwrap();
+    let passes = vec![
+        HfPass::read(&mut br2, 2, 1).unwrap(),
+        HfPass::read(&mut br2, 2, 1).unwrap(),
+    ];
     let chosen = h.select_pass(&passes).unwrap();
     assert_eq!(chosen.used_orders, 0);
 }

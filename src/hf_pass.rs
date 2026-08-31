@@ -3,8 +3,16 @@
 //! ## Scope (round 90)
 //!
 //! Round 90 lands the **structural** parse for the HfPass section of
-//! the codestream. The HfPass data, per §C.7.1 first sentence, is
-//! read `num_hf_presets` times (once per preset, in ascending order).
+//! the codestream. Round 454 corrects the multiplicity: the FDIS
+//! §C.7.1 first sentence ("read `num_hf_presets` times, once for each
+//! preset") is SUPERSEDED by ISO/IEC 18181-1:2024 §I.3.1, which reads
+//! the coefficient orders `order[p][b][c]` ONCE PER PASS with no
+//! preset dimension — `num_hf_presets` multiplies only the §C.7.2 /
+//! I.3.3 histogram count and the I.4 `hfp` histogram-offset range.
+//! Wire-arbitrated on both staged 2-preset streams (single- and
+//! 3-pass): one bundle per pass consumes the HfGlobal section to its
+//! byte-padded end with every D.3.3 ANS closure passing; every
+//! per-preset repetition variant misparses.
 //!
 //! ### Per-preset wire format (§C.7.1 Listing C.12)
 //!
@@ -55,11 +63,11 @@
 //!
 //! ### What this parser exposes
 //!
-//! * [`HfPass`] — one per HfGlobal preset; stores `used_orders`, the
-//!   13 final coefficient orders (natural or permuted), and the
-//!   histogram-size invariants the next round will consume.
-//! * [`read_hf_pass_sequence`] — read `num_hf_presets` consecutive
-//!   `HfPass` bundles per §C.7.1 first sentence.
+//! * [`HfPass`] — ONE per pass (round-454 erratum; the FDIS's
+//!   one-per-preset lead-in is superseded by 2024 §I.3.1); stores
+//!   `used_orders`, the 13 per-channel final coefficient orders
+//!   (natural or permuted), and the histogram-size invariants the
+//!   §C.7.2 read consumes.
 
 use oxideav_core::{Error, Result};
 
@@ -71,7 +79,9 @@ use crate::coeff_order::{
 };
 use crate::modular_fdis::EntropyStream;
 
-/// `HfPass` bundle for a single preset (§C.7.1 + §C.7.2).
+/// `HfPass` bundle for a single PASS (§C.7.1 / 2024 §I.3.1 + §C.7.2)
+/// — shared by every preset of that pass (round-454 erratum; see the
+/// module notes).
 #[derive(Debug, Clone)]
 pub struct HfPass {
     /// `used_orders` (Listing C.12, 13-bit mask). Bit `b` set means
@@ -107,7 +117,8 @@ pub struct HfPass {
 }
 
 impl HfPass {
-    /// Parse a single HfPass preset per Listing C.12 + §C.7.2.
+    /// Parse a single per-pass HfPass bundle per Listing C.12 / 2024
+    /// §I.3.1 + §C.7.2.
     ///
     /// * `br` must be positioned at the start of the preset's
     ///   wire-format bits.
@@ -314,25 +325,6 @@ fn build_permuted_orders(
     Ok(orders)
 }
 
-/// Read all `num_hf_presets` HfPass bundles per §C.7.1 opening
-/// sentence ("read num_hf_presets times").
-pub fn read_hf_pass_sequence(
-    br: &mut BitReader<'_>,
-    num_hf_presets: u32,
-    nb_block_ctx: u32,
-) -> Result<Vec<HfPass>> {
-    if num_hf_presets == 0 {
-        return Err(Error::InvalidData(
-            "JXL HfPass: num_hf_presets = 0 is invalid (HfGlobal §I.2.6 guarantees ≥ 1)".into(),
-        ));
-    }
-    let mut v = Vec::with_capacity(num_hf_presets as usize);
-    for _ in 0..num_hf_presets {
-        v.push(HfPass::read(br, num_hf_presets, nb_block_ctx)?);
-    }
-    Ok(v)
-}
-
 /// `bwidth × bheight` totals for the 13 orders, re-exported for
 /// downstream §C.8.3 callers that iterate over the per-block
 /// coefficient count.
@@ -426,27 +418,14 @@ mod tests {
     }
 
     #[test]
-    fn read_hf_pass_sequence_three_presets() {
-        // Three HfPass presets, every one with used_orders = 0.
-        let mut bits: Vec<(u32, u32)> = Vec::new();
-        for _ in 0..3 {
-            bits.push((2, 2)); // selector 2 → Val(0)
-        }
-        let bytes = pack_lsb(&bits);
-        let mut br = BitReader::new(&bytes);
-        let v = read_hf_pass_sequence(&mut br, 3, 1).unwrap();
-        assert_eq!(v.len(), 3);
-        for hp in &v {
-            assert_eq!(hp.used_orders, 0);
-            assert_eq!(hp.num_histogram_distributions, 495 * 3);
-        }
-    }
-
-    #[test]
-    fn read_hf_pass_sequence_zero_presets_rejected() {
+    fn hf_pass_read_zero_presets_still_sizes_histograms_safely() {
+        // num_hf_presets = 0 is rejected by the histogram sizing
+        // primitive (HfGlobal §I.2.6 guarantees ≥ 1); HfPass::read
+        // surfaces that as InvalidData rather than a zero-sized
+        // histogram contract.
         let bytes = pack_lsb(&[(2, 2)]);
         let mut br = BitReader::new(&bytes);
-        let r = read_hf_pass_sequence(&mut br, 0, 1);
+        let r = HfPass::read(&mut br, 0, 1);
         assert!(matches!(r, Err(Error::InvalidData(_))));
     }
 

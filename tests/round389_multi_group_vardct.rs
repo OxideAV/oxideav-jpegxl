@@ -110,13 +110,9 @@ fn hf_global_section_parses_within_33_bytes() {
     let hg = oxideav_jpegxl::hf_global::HfGlobal::read(&mut hg_br, fh.num_groups())
         .expect("HfGlobal (dequant + num_hf_presets) parses");
     assert_eq!(hg.num_hf_presets, 1);
-    let hf_passes = oxideav_jpegxl::hf_pass::read_hf_pass_sequence(
-        &mut hg_br,
-        hg.num_hf_presets,
-        hbc.nb_block_ctx,
-    )
-    .expect("§C.7.1 coefficient orders parse");
-    assert_eq!(hf_passes.len(), 1);
+    let _hf_pass =
+        oxideav_jpegxl::hf_pass::HfPass::read(&mut hg_br, hg.num_hf_presets, hbc.nb_block_ctx)
+            .expect("§C.7.1 / I.3.1 coefficient orders parse (one bundle per pass)");
     let histos =
         oxideav_jpegxl::hf_coefficient_histograms::HfCoefficientHistograms::read_after_hf_pass_sequence(
             &mut hg_br,

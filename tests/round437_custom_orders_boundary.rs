@@ -1,73 +1,89 @@
-//! Round 437 — the residual `used_orders != 0` refusal boundary:
-//! multi-preset / multi-pass §C.7 streams.
+//! Round 437 → round 454 — the multi-preset §C.7 boundary is CLOSED.
 //!
-//! The round-437 forensics resolved the §C.3.2/§C.7.1 chain for
-//! single-preset single-pass streams (see
-//! `round437_custom_orders_decode`): the per-entry context question of
-//! fdis-errata.md Part 8.3 was walked as prescribed (no grid point
-//! closes under the printed one-permutation-per-bit layout), and the
-//! actual erratum turned out to be the LAYOUT — Listing C.12 carries
-//! THREE `DecodePermutation()` per set bit (one per colour channel in
-//! §C.8.3 Y, X, B sequence), after which the shipped
-//! `PermStreamConfig` default closes both oracles (the patches-fixture
-//! trace bit-boundaries and the D.3.3 ANS final state).
+//! Round 437 resolved the §C.3.2/§C.7.1 chain for single-preset
+//! single-pass streams (`round437_custom_orders_decode`) and left the
+//! multi-preset (`num_hf_presets > 1`) / multi-pass §C.7 slice as a
+//! loud refusal pinned here. Round 454 found the remaining wire
+//! divergence: the FDIS §C.7.1 lead-in "read `num_hf_presets` times"
+//! is SUPERSEDED by ISO/IEC 18181-1:2024 §I.3.1, which reads the HF
+//! coefficient orders `order[p][b][c]` ONCE PER PASS with no preset
+//! dimension at all — `num_hf_presets` multiplies only the §C.7.2 /
+//! I.3.3 histogram count and the I.4 `hfp` histogram-offset
+//! selection. With one order bundle per pass the staged
+//! `progressive-ac-multipass` fixture (2560×1440, 60 groups, 3
+//! passes × 2 presets, `used_orders = 0x5F`) consumes its HfGlobal
+//! section to the byte-padded end (slack 6 bits) with every D.3.3
+//! ANS closure passing, and the frame decodes END TO END — the first
+//! full multi-pass pixel decode.
 //!
-//! What still refuses — loudly, at a precise position — is the
-//! multi-preset (`num_hf_presets > 1`) and/or multi-pass §C.7 slice
-//! walk exercised by the staged `progressive-ac-multipass` fixture
-//! (3 passes × 2 presets, `used_orders = 0x5F` / `0xE40`-class
-//! bundles): after preset 0's per-channel bundles the next preset's
-//! fields still misparse, so either the per-preset repetition or the
-//! per-pass slice layout hides one more wire divergence. This test
-//! pins that boundary:
+//! This file now pins that decode:
 //!
-//! 1. The frame-level multi-pass gate stays GONE (the decode reaches
-//!    the §C.7 walk rather than refusing at `num_passes > 1`).
-//! 2. The refusal is loud — never a silent misparse — under the
-//!    shipped default AND under every Part 8.3 grid point (no
-//!    candidate silently "succeeds" with garbage output).
-use oxideav_jpegxl::coeff_order::{
-    set_perm_stream_config_override, PermPrevContext, PermStreamConfig,
-};
+//! 1. Pixel ratchet against the staged black-box reference decode
+//!    (`progressive_ac_multipass_expected.png`).
+//! 2. The §C.8.3 loudness diagnostics stay ZERO across the decode
+//!    (no silently-accepted section desync or walk underrun).
+//! 3. The round-437 Part 8.3 survivor `PermStreamConfig` remains the
+//!    shipped default.
+use std::io::Cursor;
+
+use oxideav_jpegxl::coeff_order::{PermPrevContext, PermStreamConfig};
 
 const FIXTURE: &[u8] = include_bytes!("fixtures/progressive_ac_multipass.jxl");
+const EXPECTED: &[u8] = include_bytes!("fixtures/progressive_ac_multipass_expected.png");
 
-#[test]
-fn multipass_fixture_reaches_the_c71_boundary_and_refuses_loudly() {
-    let err = oxideav_jpegxl::decode_one_frame(FIXTURE, None)
-        .expect_err("multi-preset multi-pass used_orders fixture must refuse until the §C.7 preset/pass slice layout is resolved");
-    let msg = format!("{err}");
-    // The refusal must NOT be the old blanket multi-pass gate — the
-    // frame-level multi-pass framing is wired (round 389) and the
-    // decode must get past FrameHeader recognition into the HfGlobal
-    // section before stopping.
-    assert!(
-        !msg.contains("num_passes"),
-        "multi-pass frames must not be gated on pass count any more, got: {msg}"
-    );
+fn png_rgb(bytes: &[u8]) -> (usize, usize, Vec<u8>) {
+    let decoder = png::Decoder::new(Cursor::new(bytes));
+    let mut reader = decoder.read_info().unwrap();
+    let mut buf = vec![0u8; reader.output_buffer_size().unwrap()];
+    let info = reader.next_frame(&mut buf).unwrap();
+    buf.truncate(info.buffer_size());
+    assert_eq!(info.color_type, png::ColorType::Rgb);
+    (info.width as usize, info.height as usize, buf)
 }
 
+/// The multi-preset multi-pass fixture decodes end to end within a
+/// pixel ratchet, with zero §C.8.3 loudness diagnostics.
+///
+/// Ratchet: measured at MAD 1.97 / 1.36 / 0.68 on landing (round
+/// 454) — the first multi-pass decode; the residual (vs the sub-1
+/// single-pass band) is cross-pass accumulation accuracy, a
+/// follow-up, bounded here at 3.0 so a regression to the old
+/// misparse (MAD ≈ tens) can never pass.
 #[test]
-fn every_bisection_grid_point_fails_loudly_on_the_multipass_fixture() {
-    for reading in [
-        PermPrevContext::LehmerValue,
-        PermPrevContext::PrevToken,
-        PermPrevContext::GetContextOfValue,
-    ] {
-        for num_dists in [8u32, 9u32] {
-            set_perm_stream_config_override(Some(PermStreamConfig {
-                prev_context: reading,
-                num_dists,
-            }));
-            let r = oxideav_jpegxl::decode_one_frame(FIXTURE, None);
-            set_perm_stream_config_override(None);
-            assert!(
-                r.is_err(),
-                "grid point {reading:?}/{num_dists} unexpectedly decoded the \
-                 multi-preset multi-pass fixture — if the remaining §C.7 slice \
-                 layout has been resolved, rewrite this test into a pixel ratchet"
-            );
+fn multipass_fixture_decodes_within_ratchet() {
+    oxideav_jpegxl::hf_coefficient_histograms::reset_section_closure_failures();
+    oxideav_jpegxl::pass_group_hf::reset_walk_underruns();
+
+    let (w, h, reference) = png_rgb(EXPECTED);
+    let frame = oxideav_jpegxl::decode_one_frame(FIXTURE, None)
+        .expect("round 454: the multi-preset multi-pass fixture decodes (2024 I.3.1 layout)");
+    assert_eq!(frame.planes.len(), 3);
+
+    assert_eq!(
+        oxideav_jpegxl::hf_coefficient_histograms::section_closure_failures(),
+        0,
+        "no PassGroup section may end off its D.3.3 final state"
+    );
+    assert_eq!(
+        oxideav_jpegxl::pass_group_hf::walk_underruns(),
+        0,
+        "no varblock walk may under-deliver its declared NonZeros"
+    );
+
+    for c in 0..3usize {
+        let plane = &frame.planes[c];
+        let mut sum = 0u64;
+        for y in 0..h {
+            for x in 0..w {
+                let d = plane.data[y * plane.stride + x].abs_diff(reference[(y * w + x) * 3 + c]);
+                sum += d as u64;
+            }
         }
+        let mad = sum as f64 / (w * h) as f64;
+        assert!(
+            mad < 3.0,
+            "channel {c}: MAD {mad:.3} exceeds the round-454 landing ratchet 3.0"
+        );
     }
 }
 

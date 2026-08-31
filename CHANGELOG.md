@@ -9,6 +9,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Round 454 — **cargo-fuzz battery + daily Fuzz workflow**: eight
+  libFuzzer targets under `fuzz/` (header/ICC parse, 18181-2 box
+  walk, geometry-capped full / VarDCT / partial-input decodes,
+  structure-aware Modular single-channel decode, Annex A JPEG
+  reconstruction), seeded from the staged fixtures and wired to the
+  fleet's reusable `crate-fuzz.yml`.
+- Round 454 — **§C.7.1 multiplicity erratum (multi-preset streams
+  DECODE)**: the FDIS §C.7.1 lead-in "read `num_hf_presets` times" is
+  superseded by ISO/IEC 18181-1:2024 §I.3.1 — the HF coefficient
+  orders `order[p][b][c]` are read ONCE PER PASS with no preset
+  dimension; `num_hf_presets` multiplies only the §C.7.2 / I.3.3
+  histogram count and the I.4 `hfp` histogram-offset selection.
+  Wire-arbitrated on both staged 2-preset streams: the
+  one-bundle-per-pass layout consumes each HfGlobal section to its
+  byte-padded end (slack 7 and 6 bits) with every D.3.3 ANS closure
+  passing, while every per-preset repetition variant misparses.
+  `read_hf_pass_sequence` is removed; `HfPassData` carries the pass's
+  single `orders` bundle and `hfp` routes histogram offsets only.
+
+### Fixed
+
+- Round 454 (fuzz findings, each pinned in
+  `tests/r454_fuzz_regressions.rs`):
+  - `matree`: a decision node naming a property beyond the
+    caller-supplied table (the BEGABRAC1 read spans
+    `[0, n_props + 12)`) now rejects as `InvalidData` instead of
+    indexing out of bounds.
+  - `Extensions::payload_bits`: saturating sum — a hostile
+    `extension_bits` vector no longer add-overflows (debug panic);
+    the saturated total fails the existing `skip_payload` bound.
+  - ICC `Shuffle` (E.4.5): shapes whose matrix is missing more than
+    one element read one byte past the input under the uniform
+    row indexing; rows after `last_col_filled_rows` now start one
+    element earlier, matching the spec's "concatenation of all rows
+    excluding the possibly missing last element of each row".
+  - `modular::property_ranges`: full-range i32 channel headers
+    overflowed the derived `2·min − max` property bounds (debug
+    panic); computed in i64 and clamped.
+  - `ans::cluster::num_clusters`: a general-clustering stream
+    decoding a cluster index of `u32::MAX` overflowed the `+ 1`;
+    saturating, with the existing `num_clusters ≤ num_distributions`
+    validation rejecting the stream.
+  - `jbrd` Brotli transient fenced: the trailing-stream decompressor
+    now caps output at the exact Table 11 declared total (sum of
+    verbatim segment lengths + tail) instead of always allowing the
+    full 64 MiB — a tiny hostile payload can no longer force a
+    64 MiB transient per parse.
+
+### Added
+
 - Round 451 — **xyb_encoded → Grey output hand-off** (C.4.8 /
   §L.2.2): an xyb frame always carries the three (Y′, X′, B′)
   channels even for `colour_space == kGrey`; the single grey output

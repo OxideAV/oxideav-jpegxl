@@ -9,10 +9,19 @@
 //! 1. **§I.2.4 + §I.2.6 dequant-matrix bundle + `num_hf_presets`** —
 //!    parsed by [`HfGlobal::read`]. The bit cursor stops immediately
 //!    after `num_hf_presets_minus_1`.
-//! 2. **§C.7.1 HfPass sequence** — `num_hf_presets` consecutive
-//!    [`HfPass`] bundles (Listing C.12: `used_orders` selector + the
-//!    permuted / natural coefficient orders), parsed by
-//!    [`read_hf_pass_sequence`].
+//! 2. **§C.7.1 / I.3.1 HfPass bundle** — ONE [`HfPass`] bundle
+//!    (Listing C.12: `used_orders` selector + the permuted / natural
+//!    coefficient orders). **Round-454 erratum**: the FDIS §C.7.1
+//!    lead-in "read `num_hf_presets` times" is superseded — ISO/IEC
+//!    18181-1:2024 §I.3.1 reads the orders `order[p][b][c]` once per
+//!    PASS with no per-preset dimension at all; `num_hf_presets`
+//!    multiplies only the §C.7.2 / I.3.3 histogram count and the I.4
+//!    `hfp` offset selection. Wire-arbitrated on the two staged
+//!    2-preset streams (`large-3072x2048-multigroup`, 1 pass, and
+//!    `progressive-ac-multipass`, 3 passes): the one-bundle-per-pass
+//!    layout consumes each HfGlobal section to its byte-padded end
+//!    with every D.3.3 ANS closure passing, while every per-preset
+//!    variant misparses.
 //! 3. **§C.7.2 HF-coefficient histograms** — the
 //!    `495 × num_hf_presets × nb_block_ctx` clustered-distribution
 //!    entropy block ([`HfCoefficientHistograms::read`]).
@@ -59,21 +68,24 @@ use oxideav_core::{Error, Result};
 use crate::bitreader::BitReader;
 use crate::hf_coefficient_histograms::HfCoefficientHistograms;
 use crate::hf_global::HfGlobal;
-use crate::hf_pass::{read_hf_pass_sequence, HfPass};
+use crate::hf_pass::HfPass;
 use crate::multi_pass_hf_header::PerPassHfHeaders;
 use crate::multi_pass_hf_histogram_decoder::HfHistogramDecodeContext;
 
 /// One pass's slice of the HfGlobal section (Table C.1 lists `HfPass
-/// hf_pass[num_passes]` after HfGlobal): the §C.7.1 per-preset
-/// coefficient-order bundles (Listing C.12, read `num_hf_presets`
-/// times) followed by that pass's §C.7.2 HF-coefficient histogram
+/// hf_pass[num_passes]` after HfGlobal): the pass's SINGLE §C.7.1 /
+/// I.3.1 coefficient-order bundle (Listing C.12 — one per pass, NOT
+/// per preset; see the round-454 erratum in the module notes)
+/// followed by that pass's §C.7.2 / I.3.3 HF-coefficient histogram
 /// block (`495 × num_hf_presets × nb_block_ctx` clustered
 /// distributions).
 #[derive(Debug)]
 pub struct HfPassData {
-    /// §C.7.1 per-preset coefficient-order bundles. Length =
-    /// `num_hf_presets`.
-    pub presets: Vec<HfPass>,
+    /// The pass's §C.7.1 / I.3.1 coefficient-order bundle
+    /// (`order[p][b][c]` — every preset of this pass shares it; the
+    /// I.4 `hfp` header selects a histogram offset, never an order
+    /// set).
+    pub orders: HfPass,
     /// §C.7.2 HF-coefficient histogram entropy block for this pass.
     /// The per-stream ANS state initialiser is **not** yet read — each
     /// PassGroup section is its own entropy stream, so the caller
@@ -86,9 +98,10 @@ pub struct HfPassData {
 impl HfPassData {
     /// Build the single-pass histogram decode context a `(pass,
     /// group)` PassGroup section decodes against: this pass's §C.7.2
-    /// histograms bound to the section's `hfp` selection, with the
-    /// `hfp`-selected §C.7.1 coefficient orders attached. The caller
-    /// has already read the section's ANS state init.
+    /// histograms bound to the section's `hfp` selection (histogram
+    /// offset only), with the pass's single §C.7.1 / I.3.1
+    /// coefficient-order bundle attached. The caller has already read
+    /// the section's ANS state init.
     pub fn single_pass_context<'a>(
         &'a mut self,
         headers: &PerPassHfHeaders,
@@ -100,19 +113,12 @@ impl HfPassData {
                 headers.num_passes()
             )));
         }
-        let Self {
-            presets,
-            histograms,
-        } = self;
+        let Self { orders, histograms } = self;
         let mut ctx = HfHistogramDecodeContext::new(histograms, headers)?;
-        let hfp = headers.hfp(0)? as usize;
-        let preset = presets.get(hfp).ok_or_else(|| {
-            Error::InvalidData(format!(
-                "JXL HfPassData: hfp {hfp} out of {} preset bundles",
-                presets.len()
-            ))
-        })?;
-        ctx.set_pass_orders(vec![preset])?;
+        // I.4: `hfp` picks the histogram offset (validated inside
+        // HfHistogramDecodeContext::new); the coefficient orders are
+        // the pass's own single bundle regardless of `hfp`.
+        ctx.set_pass_orders(vec![&*orders])?;
         Ok(ctx)
     }
 }
@@ -209,23 +215,23 @@ impl HfGlobalSection {
         // were the same cursor position.
         let mut passes = Vec::with_capacity(num_passes as usize);
         for _ in 0..num_passes {
-            let presets = read_hf_pass_sequence(br, num_hf_presets, nb_block_ctx)?;
+            // Round-454 erratum (module notes): ONE order bundle per
+            // pass — the FDIS "read num_hf_presets times" lead-in is
+            // superseded by 2024 §I.3.1's `order[p][b][c]`.
+            let orders = HfPass::read(br, num_hf_presets, nb_block_ctx)?;
             let histograms = HfCoefficientHistograms::read_after_hf_pass_sequence(
                 br,
                 num_hf_presets,
                 nb_block_ctx,
             )?;
-            passes.push(HfPassData {
-                presets,
-                histograms,
-            });
+            passes.push(HfPassData { orders, histograms });
         }
 
         Ok(Self { hf_global, passes })
     }
 
-    /// `num_hf_presets` (§I.2.6) — also the length of every pass's
-    /// preset list.
+    /// `num_hf_presets` (§I.2.6) — the preset dimension of every
+    /// pass's §C.7.2 histogram block (and of the I.4 `hfp` range).
     pub fn num_hf_presets(&self) -> u32 {
         self.hf_global.num_hf_presets
     }
@@ -247,15 +253,19 @@ impl HfGlobalSection {
         })
     }
 
-    /// Pass-0 per-preset [`HfPass`] lookup. Returns
-    /// [`Error::InvalidData`] when `preset >= num_hf_presets`.
-    pub fn hf_pass(&self, preset: u32) -> Result<&HfPass> {
-        self.passes[0].presets.get(preset as usize).ok_or_else(|| {
-            Error::InvalidData(format!(
-                "JXL HfGlobalSection: preset index {preset} out of {} HfPass bundles",
-                self.passes[0].presets.len()
-            ))
-        })
+    /// Per-pass [`HfPass`] order-bundle lookup (one bundle per pass —
+    /// round-454 erratum). Returns [`Error::InvalidData`] when
+    /// `pass >= num_passes`.
+    pub fn hf_pass(&self, pass: u32) -> Result<&HfPass> {
+        self.passes
+            .get(pass as usize)
+            .map(|p| &p.orders)
+            .ok_or_else(|| {
+                Error::InvalidData(format!(
+                    "JXL HfGlobalSection: pass index {pass} out of {} HfPass slices",
+                    self.passes.len()
+                ))
+            })
     }
 
     /// Borrow the pass-0 §C.7.2 histogram block. Mutable so the caller
@@ -285,12 +295,13 @@ impl HfGlobalSection {
     /// the per-symbol ANS decode state), so the section is borrowed for
     /// the lifetime of the decode.
     ///
-    /// The context also carries the per-pass §C.7.1 coefficient-order
-    /// sources: for each pass `p`, the `headers.hfp(p)`-selected
-    /// [`crate::hf_pass::HfPass`] bundle from this section, so the
-    /// §C.8.3 Listing C.14 `coeffs[order[k]]` placement uses the
-    /// signalled (possibly permuted) order rather than the bare natural
-    /// order.
+    /// The context also carries the per-pass §C.7.1 / I.3.1
+    /// coefficient-order sources: pass 0's single bundle for every
+    /// header pass (this binding routes through pass 0 only — see the
+    /// guard), so the §C.8.3 Listing C.14 `coeffs[order[k]]` placement
+    /// uses the signalled (possibly permuted) order rather than the
+    /// bare natural order. `hfp` selects a histogram offset, never an
+    /// order set (I.4).
     /// NOTE: this binding routes every header pass through the
     /// **pass-0** histogram block, which is only correct for
     /// single-pass frames (each pass owns its own §C.7.2 block —
@@ -311,23 +322,11 @@ impl HfGlobalSection {
             )));
         }
         let pass0 = &mut self.passes[0];
-        let HfPassData {
-            presets,
-            histograms,
-        } = pass0;
+        let HfPassData { orders, histograms } = pass0;
         let mut ctx = HfHistogramDecodeContext::new(histograms, headers)?;
-        let mut orders = Vec::with_capacity(headers.num_passes() as usize);
-        for p in 0..headers.num_passes() {
-            let hfp = headers.hfp(p)? as usize;
-            let hf_pass = presets.get(hfp).ok_or_else(|| {
-                Error::InvalidData(format!(
-                    "JXL HfGlobalSection: pass {p} hfp {hfp} out of {} HfPass bundles",
-                    presets.len()
-                ))
-            })?;
-            orders.push(hf_pass);
-        }
-        ctx.set_pass_orders(orders)?;
+        let bundle: &HfPass = orders;
+        let per_pass = vec![bundle; headers.num_passes() as usize];
+        ctx.set_pass_orders(per_pass)?;
         Ok(ctx)
     }
 }
@@ -388,7 +387,6 @@ mod tests {
 
         // HfPass[0]: used_orders == 0 → every order is the natural order.
         assert_eq!(section.passes.len(), 1);
-        assert_eq!(section.passes[0].presets.len(), 1);
         assert_eq!(section.hf_pass(0).unwrap().used_orders, 0);
         assert!(section.hf_pass(1).is_err());
 
@@ -408,8 +406,6 @@ mod tests {
     fn cursor_matches_independent_piecewise_read() {
         use crate::hf_coefficient_histograms::HfCoefficientHistograms;
         use crate::hf_global::HfGlobal;
-        use crate::hf_pass::read_hf_pass_sequence;
-
         let mut parts: Vec<(u32, u32)> = vec![(1, 1), (2, 2)];
         parts.extend(histogram_prelude_parts());
         let bytes = pack_lsb(&parts);
@@ -424,7 +420,7 @@ mod tests {
         // part of the HfGlobal section — see the module notes.)
         let mut br_pieces = BitReader::new(&bytes);
         let hg = HfGlobal::read(&mut br_pieces, 1).unwrap();
-        let _passes = read_hf_pass_sequence(&mut br_pieces, hg.num_hf_presets, 1).unwrap();
+        let _orders = HfPass::read(&mut br_pieces, hg.num_hf_presets, 1).unwrap();
         let _histos =
             HfCoefficientHistograms::read_after_hf_pass_sequence(&mut br_pieces, 1, 1).unwrap();
         let pieces_bits = br_pieces.bits_read();
@@ -500,7 +496,6 @@ mod tests {
     fn two_pass_section_reads_two_hf_pass_slices() {
         use crate::hf_coefficient_histograms::HfCoefficientHistograms;
         use crate::hf_global::HfGlobal;
-        use crate::hf_pass::read_hf_pass_sequence;
 
         let mut parts: Vec<(u32, u32)> = vec![
             (1, 1), // HfGlobal: dequant_default = 1; num_groups == 1 → 0 preset bits
@@ -517,7 +512,7 @@ mod tests {
         let section = HfGlobalSection::read(&mut br, 1, 1, 2).unwrap();
         assert_eq!(section.passes.len(), 2);
         for p in &section.passes {
-            assert_eq!(p.presets.len(), 1);
+            assert_eq!(p.orders.used_orders, 0);
             assert_eq!(p.histograms.num_distributions(), 495);
         }
         let bundle_bits = br.bits_read();
@@ -526,14 +521,14 @@ mod tests {
         let mut br2 = BitReader::new(&bytes);
         let hg = HfGlobal::read(&mut br2, 1).unwrap();
         for _ in 0..2 {
-            let _ = read_hf_pass_sequence(&mut br2, hg.num_hf_presets, 1).unwrap();
+            let _ = HfPass::read(&mut br2, hg.num_hf_presets, 1).unwrap();
             let _ = HfCoefficientHistograms::read_after_hf_pass_sequence(&mut br2, 1, 1).unwrap();
         }
         assert_eq!(bundle_bits, br2.bits_read());
     }
 
     /// `HfPassData::single_pass_context` binds one pass's histograms +
-    /// the hfp-selected orders; a multi-pass header is rejected.
+    /// that pass's own order bundle; a multi-pass header is rejected.
     #[test]
     fn single_pass_context_binds_one_pass() {
         use crate::multi_pass_hf_header::PerPassHfHeaders;

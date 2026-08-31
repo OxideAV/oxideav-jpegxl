@@ -147,29 +147,41 @@ fn both_lf_groups_parse_at_permuted_offsets() {
     }
 }
 
-/// The full decode currently stops — loudly — at the §C.7.1
-/// `used_orders = 0x5F` custom-coefficient-order sub-stream, whose
-/// exact reading is the round-393 docs-gap. Everything before it
-/// (permuted TOC, §C.5 framing, both LfGroups, frame-level assembly)
-/// is validated by the tests above. Replace this with the pixel-MAD
-/// ratchet against `expected.png` once the §C.7.1 trace is staged.
+/// Round 454: the §C.7.1 multi-preset boundary is CLOSED (the FDIS
+/// "read `num_hf_presets` times" lead-in is superseded by 2024
+/// §I.3.1's one-order-bundle-per-pass layout — see
+/// `round437_custom_orders_boundary`), so this 2-preset stream now
+/// decodes end to end. Pixel ratchet against the staged black-box
+/// reference decode: measured at MAD 0.60 / 0.41 / 0.47 on landing —
+/// the same sub-1/255 band as the other photo VarDCT fixtures.
 #[test]
-fn full_decode_stops_at_c71_custom_orders() {
-    let r = oxideav_jpegxl::decode_vardct_frame_from_codestream(JXL, None);
-    let err = match r {
-        Ok(_) => panic!(
-            "decode unexpectedly SUCCEEDED — the §C.7.1 gap must have been resolved; \
-             replace this pin with the expected.png pixel ratchet"
-        ),
-        Err(e) => e,
-    };
-    let msg = format!("{err:?}");
-    assert!(
-        !msg.contains("multi-LfGroup") && !msg.contains("num_lf_groups"),
-        "must not fail at the (landed) multi-LfGroup framing: {msg}"
-    );
-    assert!(
-        !msg.contains("permutation: LZ77"),
-        "must not fail at the (landed) LZ77 TOC permutation: {msg}"
-    );
+fn full_decode_within_pixel_ratchet() {
+    use std::io::Cursor;
+    let expected = include_bytes!("fixtures/large_3072x2048_multigroup_expected.png");
+    let decoder = png::Decoder::new(Cursor::new(&expected[..]));
+    let mut reader = decoder.read_info().unwrap();
+    let mut buf = vec![0u8; reader.output_buffer_size().unwrap()];
+    let info = reader.next_frame(&mut buf).unwrap();
+    buf.truncate(info.buffer_size());
+    assert_eq!(info.color_type, png::ColorType::Rgb);
+    let (w, h) = (info.width as usize, info.height as usize);
+
+    let frame = oxideav_jpegxl::decode_vardct_frame_from_codestream(JXL, None)
+        .expect("round 454: the permuted-TOC 2-preset stream decodes end to end");
+    assert_eq!(frame.planes.len(), 3);
+    for c in 0..3usize {
+        let plane = &frame.planes[c];
+        let mut sum = 0u64;
+        for y in 0..h {
+            for x in 0..w {
+                let d = plane.data[y * plane.stride + x].abs_diff(buf[(y * w + x) * 3 + c]);
+                sum += d as u64;
+            }
+        }
+        let mad = sum as f64 / (w * h) as f64;
+        assert!(
+            mad < 1.0,
+            "channel {c}: MAD {mad:.3} exceeds the sub-1/255 photo band ratchet"
+        );
+    }
 }

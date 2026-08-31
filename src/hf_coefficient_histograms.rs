@@ -45,9 +45,10 @@
 //!   [`crate::modular_fdis::EntropyStream::read`] call.
 //! * [`HfCoefficientHistograms::read_after_hf_pass_sequence`] — the
 //!   §C.7.1 → §C.7.2 transition convenience: a caller that has just
-//!   walked [`crate::hf_pass::read_hf_pass_sequence`] for the same
-//!   `(num_hf_presets, nb_block_ctx)` invokes this helper directly
-//!   against the same [`BitReader`].
+//!   read the pass's [`crate::hf_pass::HfPass`] order bundle (one per
+//!   pass — round-454 erratum) invokes this helper directly against
+//!   the same [`BitReader`] with the same
+//!   `(num_hf_presets, nb_block_ctx)`.
 //!
 //! ## What this round is **not**
 //!
@@ -122,14 +123,15 @@ impl HfCoefficientHistograms {
     /// §C.7.1 → §C.7.2 transition convenience. Constructs the
     /// [`HfCoefficientHistogramSize`] from `num_hf_presets +
     /// nb_block_ctx` (the same two inputs the caller already passes
-    /// to [`crate::hf_pass::read_hf_pass_sequence`]) and reads the
-    /// §C.7.2 block from the same [`BitReader`] without a separate
+    /// to [`crate::hf_pass::HfPass::read`]) and reads the §C.7.2
+    /// block from the same [`BitReader`] without a separate
     /// constructor call.
     ///
-    /// The §C.7.1 `read_hf_pass_sequence` advances `br` past the
-    /// per-preset [`crate::hf_pass::HfPass`] bundles; the caller then
-    /// invokes `read_after_hf_pass_sequence` on the same `br` for the
-    /// §C.7.2 step.
+    /// The §C.7.1 / I.3.1 [`crate::hf_pass::HfPass::read`] advances
+    /// `br` past the pass's single order bundle (round-454 erratum:
+    /// one per pass, not per preset); the caller then invokes
+    /// `read_after_hf_pass_sequence` on the same `br` for the §C.7.2
+    /// step.
     pub fn read_after_hf_pass_sequence(
         br: &mut BitReader<'_>,
         num_hf_presets: u32,
