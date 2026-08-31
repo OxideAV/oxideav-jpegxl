@@ -378,9 +378,14 @@ pub fn property_ranges(
             max: (width as i32) - 1,
         }); // x
     }
-    let two_min_minus_max = 2 * channel_min - channel_max;
-    let two_max_minus_min = 2 * channel_max - channel_min;
-    let span = channel_max - channel_min;
+    // Hostile-input fence (r454 fuzz): a channel header can declare
+    // full-range i32 min/max, overflowing the plain i32 forms of these
+    // derived bounds (debug panic). Compute in i64 and clamp — the
+    // clamp is unobservable for any stream whose samples fit i32.
+    let clamp_i32 = |v: i64| -> i32 { v.clamp(i32::MIN as i64, i32::MAX as i64) as i32 };
+    let two_min_minus_max = clamp_i32(2 * channel_min as i64 - channel_max as i64);
+    let two_max_minus_min = clamp_i32(2 * channel_max as i64 - channel_min as i64);
+    let span = clamp_i32(channel_max as i64 - channel_min as i64);
     ranges.push(PropRange {
         min: two_min_minus_max,
         max: two_max_minus_min,

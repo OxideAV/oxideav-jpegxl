@@ -426,8 +426,31 @@ impl JpegBitstreamData {
         }
 
         // The single Brotli stream follows at the next byte boundary.
+        //
+        // Hostile-input fence (r454 fuzz): the exact decompressed size
+        // is already determined by the Table 11 fields — the sum of
+        // every verbatim segment length plus the post-EOI tail — and
+        // the split loop below rejects any surplus anyway. Cap the
+        // decompressor at that exact total (bounded by
+        // MAX_BROTLI_OUTPUT) instead of always allowing the full
+        // 64 MiB, so a tiny hostile payload cannot force a
+        // multi-megabyte transient allocation per parse.
+        let expected_total: u64 = app_markers
+            .iter()
+            .filter(|am| am.kind == 0)
+            .map(|am| am.length as u64)
+            .sum::<u64>()
+            + com_lengths.iter().map(|&l| l as u64).sum::<u64>()
+            + intermarker_lengths.iter().map(|&l| l as u64).sum::<u64>()
+            + tail_data_length as u64;
+        if expected_total > MAX_BROTLI_OUTPUT as u64 {
+            return Err(Error::InvalidData(format!(
+                "JXL jbrd: declared trailing streams total {expected_total} bytes \
+                 (cap {MAX_BROTLI_OUTPUT})"
+            )));
+        }
         let brotli_offset = r.bits_read().div_ceil(8);
-        let decompressed = brotli_decompress(&payload[brotli_offset..], MAX_BROTLI_OUTPUT)?;
+        let decompressed = brotli_decompress(&payload[brotli_offset..], expected_total as usize)?;
 
         // Split it: unknown-APPn payloads, COM payloads, unrecognized
         // segment data, then the post-EOI tail (§9.11).

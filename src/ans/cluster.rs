@@ -89,7 +89,16 @@ pub fn read_simple_clustering(
 /// for empty input). Used by the caller to decide how many ANS
 /// histograms to read after the clustering map.
 pub fn num_clusters(clusters: &[u32]) -> u32 {
-    clusters.iter().copied().max().map(|m| m + 1).unwrap_or(0)
+    // Hostile-input fence (r454 fuzz): a general-clustering stream can
+    // decode a cluster index of u32::MAX, whose `+ 1` overflows (debug
+    // panic). Saturate — the caller's `num_clusters ≤ num_distributions`
+    // validation then rejects the stream as the invalid data it is.
+    clusters
+        .iter()
+        .copied()
+        .max()
+        .map(|m| m.saturating_add(1))
+        .unwrap_or(0)
 }
 
 /// Read the general clustering map (the `is_simple == 0` branch of

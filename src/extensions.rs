@@ -64,7 +64,14 @@ impl Extensions {
     /// Sum of `extension_bits[i]` — total payload bits we still need to
     /// consume after the mask + per-extension bit-count fields.
     pub fn payload_bits(&self) -> u64 {
-        self.extension_bits.iter().copied().sum()
+        // Hostile-input fence (r454 fuzz): each entry is a full-range
+        // U64, so a corrupt mask can declare counts whose plain sum
+        // overflows in debug builds. Saturate instead — the saturated
+        // total then trivially exceeds `bits_remaining` and
+        // [`Self::skip_payload`] rejects it as the invalid data it is.
+        self.extension_bits
+            .iter()
+            .fold(0u64, |acc, &b| acc.saturating_add(b))
     }
 
     /// Skip the extension payload (`sum(extension_bits)` bits). The

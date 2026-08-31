@@ -818,14 +818,21 @@ fn shuffle(bytes: &mut [u8], width: usize) {
     let last_col_filled_rows = n - (cols - 1) * width;
     let src: Vec<u8> = bytes.to_vec();
     let mut out_pos = 0usize;
+    // Row `r` start offset in the INPUT byte order: the input is "the
+    // concatenation of all rows excluding the possibly missing last
+    // element of each row" (E.4.5) — rows below `last_col_filled_rows`
+    // are one element short, so later rows start earlier than the
+    // uniform `r * cols`. The old uniform indexing read one byte past
+    // the input for shapes with more than one missing element
+    // (r454 fuzz finding: len 114, width 4 → rows 2..4 are short).
+    let row_start = |r: usize| -> usize { r * cols - r.saturating_sub(last_col_filled_rows) };
     for c in 0..cols {
         for r in 0..width {
             // Skip missing elements at the bottom of the last column.
             if c == cols - 1 && r >= last_col_filled_rows {
                 continue;
             }
-            // Source position: row-major matrix index.
-            let in_index = r * cols + c;
+            let in_index = row_start(r) + c;
             bytes[out_pos] = src[in_index];
             out_pos += 1;
         }

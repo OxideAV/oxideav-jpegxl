@@ -239,7 +239,17 @@ fn decode_subtree(
         return Ok(my_idx);
     }
     let prop_idx = property as usize;
-    let pr = ranges[prop_idx];
+    // Hostile-input fence (r454 fuzz): the BEGABRAC1 read above spans
+    // `[0, n_props + 12)` — wider than the caller-supplied property
+    // table — so a corrupt stream can name a property this decode has
+    // no range for. Reject it as data instead of indexing out of
+    // bounds; every staged fixture stays within `ranges`.
+    let Some(&pr) = ranges.get(prop_idx) else {
+        return Err(Error::InvalidData(format!(
+            "JXL MA tree: decision property {prop_idx} out of range ({} properties available)",
+            ranges.len()
+        )));
+    };
     if pr.min >= pr.max {
         return Err(Error::InvalidData(
             "JXL MA tree: degenerate property range at decision node".into(),
