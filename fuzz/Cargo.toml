@@ -1,0 +1,122 @@
+[package]
+name = "oxideav-jpegxl-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Standalone sub-package owned by cargo-fuzz. Lives outside the umbrella
+# `[workspace] members = ["crates/*"]` glob via `[workspace]` of its own
+# so the umbrella's `cargo build` doesn't try to compile the libFuzzer
+# harnesses (which require nightly + libfuzzer_sys runtime).
+[workspace]
+
+[package.metadata]
+cargo-fuzz = true
+
+# JPEG XL's wire format is a layered parse, and every byte along every
+# layer is attacker-controlled when a third party hands us a `.jxl`
+# sample:
+#
+# * the 18181-2 box file format (signature / ftyp / jxll / jxlc / jxlp /
+#   jxli / jbrd / Exif / xml / jumb, with `brob` Brotli re-wrapping);
+# * the 18181-1 codestream preamble (SizeHeader, the full Table A.16
+#   ImageMetadata bundle, the Annex B / E.4 encoded ICC stream);
+# * the frame layer (FrameHeader, permuted LZ77 TOCs, LfGlobal,
+#   Modular MA trees + sub-bitstreams, the VarDCT §C.6/§C.7 HfGlobal
+#   section, per-(pass, group) §C.8.3 entropy streams, §K image
+#   features) and the Annex A JPEG bitstream reconstruction driven by
+#   the `jbrd` box.
+#
+# This fuzz battery is oracle-free: feed arbitrary (or
+# structure-nudged) bytes to the public entry points and assert every
+# call returns a `Result` rather than panicking, integer-overflowing
+# (debug), indexing out of bounds, or allocating an attacker-controlled
+# buffer. Headers can declare huge dimensions, so the decode harnesses
+# pre-probe the SizeHeader and skip inputs whose declared pixel area or
+# extra-channel count exceeds a documented cap — the library itself
+# must still fail cleanly on anything below those caps.
+#
+# Targets:
+# * `parse_headers`   — signature detect + SizeHeader/ImageMetadata
+#                       probes (committee-draft and FDIS layouts);
+# * `parse_icc`       — the Annex B / E.4 encoded-ICC entropy decode
+#                       and the E.4.2..E.4.5 profile reconstruction;
+# * `container_walk`  — the 18181-2 box walk: BoxIter, JxlFile::parse,
+#                       jxli parse, capped `brob` unwrapping,
+#                       codestream extraction;
+# * `decode_full`     — geometry-capped `decode_all_frames` (the whole
+#                       multi-frame decode surface);
+# * `decode_vardct`   — geometry-capped first-frame decode (the VarDCT
+#                       pipeline entry, seeded with VarDCT streams);
+# * `decode_modular`  — structure-aware single-channel Modular decode
+#                       (channel header + MA tree + pixel loop) under
+#                       fuzz-chosen geometry;
+# * `jpeg_recon`      — the Annex A JPEG bitstream reconstruction
+#                       (`reconstruct_jpeg` over container + jbrd);
+# * `decode_partial`  — progressive/partial-input behaviour: the same
+#                       capped decode over a fuzz-chosen prefix
+#                       truncation, asserting truncation never panics.
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.oxideav-jpegxl]
+path = ".."
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "parse_headers"
+path = "fuzz_targets/parse_headers.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "parse_icc"
+path = "fuzz_targets/parse_icc.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "container_walk"
+path = "fuzz_targets/container_walk.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decode_full"
+path = "fuzz_targets/decode_full.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decode_vardct"
+path = "fuzz_targets/decode_vardct.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decode_modular"
+path = "fuzz_targets/decode_modular.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "jpeg_recon"
+path = "fuzz_targets/jpeg_recon.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decode_partial"
+path = "fuzz_targets/decode_partial.rs"
+test = false
+doc = false
+bench = false
