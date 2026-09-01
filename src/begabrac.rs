@@ -87,7 +87,14 @@ impl Begabrac {
         } else {
             sign = 1;
         }
-        let max = if sign == 1 { upper } else { -lower } as i64;
+        // Hostile-input fence (r454 fuzz): `lower` can be i32::MIN on a
+        // corrupt header, whose i32 negation overflows (debug panic).
+        // Negate in i64.
+        let max = if sign == 1 {
+            upper as i64
+        } else {
+            -(lower as i64)
+        };
         if max <= 0 {
             // Defensive: range was effectively zero on this side.
             return Err(Error::InvalidData(

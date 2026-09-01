@@ -170,19 +170,24 @@ pub fn decode_channel_header(br: &mut BitReader<'_>) -> Result<ChannelHeader> {
     // min == 1 (with the actual `min - 1` following). We accept the
     // simpler always-non-negative reading for fixtures we currently
     // support (signed channels with min < 0 use the natural form).
-    let v0 = br.read_varint()? as i64;
-    let min: i64 = if v0 == 0 {
+    // Hostile-input fence (r454 fuzz): the Varint fields span the full
+    // u64 range, so the derived forms (m1 + 1, 1 - v0, min + span)
+    // overflow i64 on extreme values (debug panic). Do the arithmetic
+    // in i128 — the i32 range check below rejects anything a real
+    // stream can't mean.
+    let v0 = br.read_varint()? as i128;
+    let min: i128 = if v0 == 0 {
         // min is strictly positive; second Varint() carries (min - 1).
-        let m1 = br.read_varint()? as i64;
+        let m1 = br.read_varint()? as i128;
         m1 + 1
     } else {
         // v0 = 1 - min  →  min = 1 - v0.
         1 - v0
     };
-    let span = br.read_varint()? as i64;
+    let span = br.read_varint()? as i128;
     let max = min + span;
 
-    if min < i32::MIN as i64 || max > i32::MAX as i64 {
+    if min < i32::MIN as i128 || max > i32::MAX as i128 || min > max {
         return Err(Error::InvalidData(
             "JXL Modular: channel min/max out of i32 range".into(),
         ));
@@ -458,7 +463,10 @@ pub fn decode_channel_pixels(
             let leaf_max = (channel.max as i64 - predicted as i64) as i32;
             let bg = tree.leaf_mut(leaf_idx);
             let diff = bg.decode(coder, leaf_min, leaf_max)?;
-            channel.set(x, y, predicted + diff);
+            // i64+clamp fence (r454 fuzz): predicted + diff can cross
+            // the i32 boundary on hostile ranges.
+            let v = (predicted as i64 + diff as i64).clamp(i32::MIN as i64, i32::MAX as i64);
+            channel.set(x, y, v as i32);
         }
     }
     Ok(())

@@ -56,6 +56,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     verbatim segment lengths + tail) instead of always allowing the
     full 64 MiB — a tiny hostile payload can no longer force a
     64 MiB transient per parse.
+  - Committee-draft Modular arithmetic fences (findings 7–9, the
+    later fuzz waves + the first CI Fuzz leg): the D.7.2 gradient
+    properties, the channel-header Varint forms (`m1 + 1`, `1 − v0`,
+    `min + span`), the BEGABRAC signed-range negation at
+    `lower == i32::MIN`, the Gradient predictor sum, and the
+    `predicted + diff` pixel write all computed at i32 and
+    overflowed (debug panic) on hostile extremes; each now computes
+    wide and clamps (or checks), pinned with its minimized artifact.
 
 ### Added
 

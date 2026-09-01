@@ -61,7 +61,15 @@ impl Predictor {
             // (round 406 — floor division diverges on negative sums;
             // pinned by the 18181-3 sunset_logo generative stream).
             Self::Average => ((left as i64 + top as i64) / 2) as i32,
-            Self::Gradient => median3(left + top - topleft, left, top),
+            // Hostile-input fence (r454 fuzz): neighbours at i32
+            // extremes overflow the i32 gradient sum (debug panic);
+            // compute in i64 and clamp.
+            Self::Gradient => median3(
+                (left as i64 + top as i64 - topleft as i64).clamp(i32::MIN as i64, i32::MAX as i64)
+                    as i32,
+                left,
+                top,
+            ),
             Self::Left => left,
             Self::Top => top,
         }

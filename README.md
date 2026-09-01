@@ -718,10 +718,13 @@ decision property indexed past the caller's property table, an
 `extension_bits` sum overflow, an E.4.5 `Shuffle` read one past the
 input on shapes with more than one missing matrix cell, an i32
 overflow in the Modular derived property bounds under full-range
-channel headers, a `+ 1` overflow on a u32::MAX cluster index, and an
+channel headers, a `+ 1` overflow on a u32::MAX cluster index, an
 unfenced 64 MiB `jbrd` Brotli transient (now capped at the exact
-Table 11 declared total) — are fixed with regression pins in
-`tests/r454_fuzz_regressions.rs`.
+Table 11 declared total), and a family of committee-draft Modular
+arithmetic overflows on hostile extremes (D.7.2 gradient properties,
+channel-header Varint forms, BEGABRAC signed-range negation, the
+Gradient predictor, the pixel write) — are fixed with regression pins
+in `tests/r454_fuzz_regressions.rs`.
 
 ### History
 

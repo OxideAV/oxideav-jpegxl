@@ -133,3 +133,29 @@ fn property_gradient_extremes_no_overflow() {
     let (w, h, payload) = modular_geometry(PROPERTY_GRADIENT_OVERFLOW);
     let _ = oxideav_jpegxl::modular::decode_single_channel(payload, w, h, 4);
 }
+
+/// r454 fuzz artifact for finding 8 (decode_modular target, fourth
+/// wave): a channel header with `lower == i32::MIN` overflowed the
+/// i32 negation in the BEGABRAC signed-range split.
+const BEGABRAC_NEG_OVERFLOW: &[u8] = &[
+    96, 65, 7, 4, 0, 255, 255, 65, 255, 255, 255, 255, 7, 4, 0, 255, 214, 7, 255, 13,
+];
+
+#[test]
+fn begabrac_neg_extreme_no_overflow() {
+    let (w, h, payload) = modular_geometry(BEGABRAC_NEG_OVERFLOW);
+    let _ = oxideav_jpegxl::modular::decode_single_channel(payload, w, h, 4);
+}
+
+/// r454 fuzz artifact for finding 9 (decode_modular target, soak
+/// wave): neighbours at i32 extremes overflowed the Gradient
+/// predictor's i32 sum.
+const GRADIENT_PREDICTOR_OVERFLOW: &[u8] = &[
+    96, 65, 142, 1, 8, 252, 128, 192, 230, 4, 154, 10, 190, 127, 127, 192, 197, 58, 29, 255,
+];
+
+#[test]
+fn gradient_predictor_extremes_no_overflow() {
+    let (w, h, payload) = modular_geometry(GRADIENT_PREDICTOR_OVERFLOW);
+    let _ = oxideav_jpegxl::modular::decode_single_channel(payload, w, h, 4);
+}
