@@ -7,6 +7,77 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.13](https://github.com/OxideAV/oxideav-jpegxl/compare/v0.0.12...v0.0.13) - 2026-09-01
+
+### Other
+
+- r454 findings 8-9 + CI-leg crash - wide-arithmetic fences across the committee-draft Modular path
+- r454 finding 7 - i64+clamp fence on the D.7.2 gradient properties
+- SS C.7.1 multiplicity erratum - one order bundle per PASS; multi-preset streams decode
+- r454 fuzz findings - six hostile-input fixes, regression-pinned
+- r454 battery standup - eight libFuzzer targets + daily Fuzz workflow
+- recharacterise the open corner - decode-side, CfL rule CONFIRMED
+- xyb_encoded -> Grey output hand-off (C.4.8 / SS L.2.2)
+- round 451 - SS C.8.3 desync class closed, Annex A recon complete
+- custom_orders_t256_e1 tightened to the clean-decode band
+- grey-noise byte-exact pin + the open CfL near-half corner
+- close the noisy-content SS C.8.3 desync class - two errata
+- CfL tie-rounding erratum - halves round TOWARD ZERO
+- progressive (SOF2) JPEG reconstruction
+- ICC-profile APP2 reconstruction (A.9 kind 1)
+- MCU-padded transcode dimensions (F.2 padded block grids)
+- greyscale JPEG reconstruction (18181-2 Annex A, is_grey)
+- round-448 followthrough: d1 ratchet tightened to 0.35 (MAD 0.25/0.25/0.26 after the prev fix)
+- round-448 README + CHANGELOG: 18181-2 file format + byte-exact JPEG reconstruction, wave-leakage desync closed
+- sec F.2/I.4/I.6 subsampled transcodes byte-exact; round-444 wave64 desync CLOSED
+- sec I.2.4 RAW + I.4 prev + 18181-2 Annex A: JPEG reconstruction lands byte-exact
+- sec 18181-2 clauses 5/8/9 + sec 9.11: typed box layer + jbrd bundle parse
+- round-444 README + CHANGELOG: impulse deficiency closed, two new FDIS errata recorded, open desync class documented
+- sec C.8.3/D.3.6 + I.4 + F.3 + I.16 + C.7.1: the impulse deficiency root-caused - six wire-arbitrated fixes
+- round-441 README + CHANGELOG: patches/splines wired, two new FDIS errata recorded
+- round-441 fixtures + pins: patches bit-exact, spline wire fixture, modular-XYB band
+- sec C.4.5/K.2 + K.3: patches decode + render; splines wired into the decode path
+- sec C.4.6: Listing C.3 field-order erratum - quant_adjust follows the start-point loop
+- sec L.2: kModular XYB rescale erratum - the multiply by m divides by 128
+- round-437 README: used_orders per-channel layout, kNoise, kModular EPF posture, multi-pass gate; refresh Not-yet-implemented
+- sec C.7.1: Listing C.12 per-channel permutation layout erratum - used_orders streams decode
+- sec K.4: kNoise image feature decodes end to end (C.4.7 LUT + per-group XorShift128Plus + Listing K.5 injection)
+- sec J.3 kModular: resolve the Part 9 sample-domain + grey-mapping SPECGAP by the prescribed grid bisection
+- sec C.7.1: exhaust the Part 8.3 six-way bisection; lift the multi-pass gate; enforce D.3.3 closure on the C.3.2 stream
+- round-420 README + CHANGELOG: multi-group Squeeze tail closed, Modular restoration filters
+- sec J: wire Gaborish + EPF into the registered Modular decode path
+- sec J.2: EPF weight-sign erratum - Weight() must DECREASE with distance
+- sec I.3: coded-domain forward-Squeeze oracle closes the multi-group residual tail
+- doc(hidden) internal decode plumbing so semver-checks sees only the stable API
+- round-408 second-block README + CHANGELOG (Squeeze + multi-LfGroup)
+- sq_32 bit-exact + sq_512 / grayscale_public_university ratchets
+- Listing I.19 default params, I.21 tendency floor erratum, D.8 rleft=0; single-group Squeeze bit-exact
+- sec C.5.2 ModularLfGroup: multi-LfGroup Modular frames decode; group slices clamp to channel extent
+- round-408 README + CHANGELOG rollup
+- sec C.3.2: end is the count of coded Lehmer entries, not an endpoint (C.7.1 gap narrowed)
+- Annex B ICC decode: unaligned enc_size, Listing B.1 digit class, simple-prefix first-symbol codes; grayscale conformance ICC decodes
+- sec A.6 Table A.16 tail: unconditional default_transform, inverted gating (SPECGAP resolved) + metadata-tail gating trace
+- README — round-406 conformance status + ICC/multi-LfGroup gap notes
+- sec 5.2 Idiv — Listing C.16 averaging predictors + I.21 tendency round toward zero; sunset_logo bit-exact
+- sec C.2 conformance composition — 18181-3 alpha/blendmodes bit-exact, signed crops, orientation
+- round-393 README + CHANGELOG rollup
+- sec C.5 multi-LfGroup framing + LZ77 TOC permutation + full-D.3 clustering sub-streams
+- sec C.2 kBlend / kAlphaWeightedAdd — alpha blending in frame composition
+- sec F.2 LF-smoothing ramp arbitrated — erratum candidate 4 resolved on the flat-content fixture
+- sec F.3 HfMul divides — erratum candidate closes the d1 HF accuracy tail
+- add CI / crates.io / docs.rs / MIT-license badges
+- round-389 README + CHANGELOG rollup
+- sec C.2 frame composition — Reference slots + Table C.8 blending in decode_all_frames
+- real sec C.8.3 qdc[3] lookup — lf_thresholds block-context gate removed
+- sec C.8.3 multi-pass framing — per-pass HfPass slices + pass-major PassGroup loop
+- lift the public-path VarDCT pixel withhold — decode_one_frame returns pixels
+- save_before_ct shares save_as_reference's !is_last gate — d3 decodes at MAD <1
+- Table A.10 transfer encoding on XYB output — sRGB bytes, d2 MAD 0.5/255
+- multi-group VarDCT framing — 12-section PassGroup decode lands reference-exact XYB
+- sec C.8.1 group-rect views — grid/LF/CfL-tile slicing for multi-group frames
+- ANS-state init moved to the PassGroup stream (D.3.3 per-stream read)
+- D.3.5 general clustering — drop the bits-remaining mis-heuristic
+
 ### Added
 
 - Round 454 — **cargo-fuzz battery + daily Fuzz workflow**: eight
