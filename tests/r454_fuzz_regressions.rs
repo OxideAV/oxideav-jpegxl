@@ -118,3 +118,18 @@ fn cluster_index_saturates_no_overflow() {
     let mut br = oxideav_jpegxl::bitreader::BitReader::new(CLUSTER_INDEX_OVERFLOW);
     let _ = oxideav_jpegxl::icc::decode_encoded_icc_stream(&mut br);
 }
+
+/// r454 fuzz artifact for finding 7 (decode_modular target, third
+/// wave; also reproduced by the first CI Fuzz leg): decoded
+/// neighbour samples at i32 extremes overflowed the additive
+/// gradient properties in `compute_properties` (D.7.2).
+const PROPERTY_GRADIENT_OVERFLOW: &[u8] = &[
+    96, 65, 7, 4, 0, 255, 249, 255, 255, 7, 255, 255, 65, 255, 255, 255, 129, 4, 28, 255, 255, 70,
+    31, 0, 173, 129, 93, 0, 0, 75, 192, 199, 47, 96, 119, 13,
+];
+
+#[test]
+fn property_gradient_extremes_no_overflow() {
+    let (w, h, payload) = modular_geometry(PROPERTY_GRADIENT_OVERFLOW);
+    let _ = oxideav_jpegxl::modular::decode_single_channel(payload, w, h, 4);
+}

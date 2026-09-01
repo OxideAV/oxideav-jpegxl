@@ -258,11 +258,20 @@ pub fn compute_properties(
         } else {
             rleft
         };
-        let rp = median3(rleft + rtop - rtopleft, rleft, rtop);
-        extras.push(rv.abs());
+        // Hostile-input fence (r454 fuzz): extreme sample values from a
+        // corrupt prior channel overflow the i32 gradient forms (debug
+        // panic). Compute in i64 and clamp — unobservable for sane
+        // sample ranges.
+        let cl = |v: i64| -> i32 { v.clamp(i32::MIN as i64, i32::MAX as i64) as i32 };
+        let rp = median3(
+            cl(rleft as i64 + rtop as i64 - rtopleft as i64),
+            rleft,
+            rtop,
+        );
+        extras.push(rv.saturating_abs());
         extras.push(rv);
-        extras.push((rv - rp).abs());
-        extras.push(rv - rp);
+        extras.push(cl((rv as i64 - rp as i64).abs()));
+        extras.push(cl(rv as i64 - rp as i64));
     }
     let n = extras.len();
 
@@ -285,18 +294,21 @@ pub fn compute_properties(
 
     let mut props: PropertyVec = Vec::with_capacity(n + 12);
     props.extend_from_slice(&extras);
-    props.push(top.abs()); // n+0
-    props.push(left.abs()); // n+1
+    props.push(top.saturating_abs()); // n+0
+    props.push(left.saturating_abs()); // n+1
     props.push(top); // n+2
     props.push(left); // n+3
     props.push(y as i32); // n+4
     props.push(x as i32); // n+5
-    props.push(left + top - topleft); // n+6
-    props.push(topleft + topright - top); // n+7
-    props.push(left - topleft); // n+8
-    props.push(topleft - top); // n+9
-    props.push(top - toptop); // n+10  (per spec text; table has typo)
-    props.push(left - leftleft); // n+11
+                          // Same i64+clamp fence as the extra-channel gradients above: the
+                          // decoded neighbours can sit at i32 extremes on hostile streams.
+    let cl = |v: i64| -> i32 { v.clamp(i32::MIN as i64, i32::MAX as i64) as i32 };
+    props.push(cl(left as i64 + top as i64 - topleft as i64)); // n+6
+    props.push(cl(topleft as i64 + topright as i64 - top as i64)); // n+7
+    props.push(cl(left as i64 - topleft as i64)); // n+8
+    props.push(cl(topleft as i64 - top as i64)); // n+9
+    props.push(cl(top as i64 - toptop as i64)); // n+10  (per spec text; table has typo)
+    props.push(cl(left as i64 - leftleft as i64)); // n+11
     props
 }
 
