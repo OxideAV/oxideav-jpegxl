@@ -5,6 +5,7 @@ edition = "2021"
 rust-version = "1.80"
 license = "MIT"
 repository = "https://github.com/OxideAV/oxideav-jpegxl"
+exclude = ["/tests", "/fuzz", "/round*-d1-*.md"]
 authors = ["Mark Karpeles"]
 description = "Pure-Rust clean-room JPEG XL (JXL, ISO/IEC 18181) decoder for the oxideav framework: Modular + VarDCT decode paths, the 18181-2 box file format, and byte-exact JPEG bitstream reconstruction from lossless JPEG transcodes."
 
