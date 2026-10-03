@@ -849,9 +849,9 @@ impl MaTreeFdis {
     /// per-context clustered distributions for the symbol stream.
     ///
     /// Hard caps:
-    /// * tree size is capped at 1024 nodes (spec gives 1 << 26 — way
-    ///   above what any realistic image needs). 1024 covers every
-    ///   real-world cjxl emission.
+    /// * tree size is capped at the D.4.2 bound of `1 << 26` nodes and,
+    ///   as a hostile-input budget, at 64 nodes per remaining
+    ///   codestream byte (+ 2^16) — see the body.
     /// * `mul_log` is bounded at 30, `mul_bits` at `(1 << (31 -
     ///   mul_log)) - 2`, both per the spec.
     pub fn read(br: &mut BitReader<'_>) -> Result<Self> {
@@ -870,20 +870,34 @@ impl MaTreeFdis {
         // D.4.2 last paragraph: `tree.size() <= (1 << 26)`. The
         // earlier 1024 working cap rejected real encoder output — a
         // 2880-px lossless weighted-predictor Squeeze stream signals a
-        // > 1024-node global tree (round 420). Allocation stays
-        // bounded: each node is decoded from the stream, so a
-        // malformed stream still cannot allocate past the spec bound.
-        const MAX_NODES: usize = 1 << 26;
+        // > 1024-node global tree (round 420).
+        //
+        // Hostile-input budget (round 469 fuzz OOM): with LZ77 enabled
+        // on the tree sub-stream a handful of bytes can legally repeat
+        // a node pattern millions of times, and growing the node vector
+        // to the 2^26 spec bound costs well over a gibibyte before the
+        // bound fires. The tree is therefore additionally capped at 64
+        // nodes per remaining codestream byte (+ 2^16 slack) — eighteen
+        // times the densest LZ77-free packing (at least 2 bits per
+        // decision node and 5 per leaf), so no stream a real encoder
+        // produces comes near it, while a 68-byte fuzz input is held to
+        // ~70 k nodes.
+        const SPEC_MAX_NODES: usize = 1 << 26;
+        let max_nodes = (br.bits_remaining() / 8)
+            .saturating_mul(64)
+            .saturating_add(1 << 16)
+            .min(SPEC_MAX_NODES);
 
         // Local hybrid state for the tree sub-stream (LZ77 + window).
         let mut tree_hybrid = HybridUintState::new(tree_stream.lz77, tree_stream.lz_len_conf);
 
         while nodes_left > 0 {
-            if nodes.len() >= MAX_NODES {
+            if nodes.len() >= max_nodes {
                 return Err(Error::InvalidData(format!(
-                    "JXL MA tree: {} nodes exceeds round-3 cap {}",
+                    "JXL MA tree: {} nodes exceeds the tree budget {} (spec bound {})",
                     nodes.len(),
-                    MAX_NODES
+                    max_nodes,
+                    SPEC_MAX_NODES
                 )));
             }
             let property_plus_1 = decode_uint_in(&mut tree_hybrid, &mut tree_stream, br, 1)?;

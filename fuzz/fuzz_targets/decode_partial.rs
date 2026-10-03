@@ -33,5 +33,5 @@ fuzz_target!(|data: &[u8]| {
     if area > MAX_AREA || headers.metadata.num_extra_channels > MAX_EXTRA {
         return;
     }
-    let _ = oxideav_jpegxl::decode_all_frames(prefix, None);
+    let _ = oxideav_jpegxl::decode_all(prefix);
 });

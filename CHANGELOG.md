@@ -56,6 +56,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The decoded ICC profile is now surfaced (`JxlImage::metadata.icc`)
   instead of being validated and dropped.
 
+### Fixed
+
+- Two round-469 fuzz findings, regression-pinned
+  (`tests/r469_fuzz_regressions.rs`): a 68-byte stream whose
+  LZ77-driven MA tree grew to the D.4.2 `2^26` node bound and cost
+  > 2 GiB before rejection (the tree is now also budgeted at 64 nodes
+  per remaining codestream byte + 2^16), and a 75-byte 64×64 stream
+  whose 217 × 217-control-point spline dictionary rendered for 65 s (the
+  Annex M Table M.1 `num_splines`, total-control-point and
+  `estimated_area_reached` bounds are now enforced before rendering,
+  level 5 by default and level 10 when the `jxll` box signals it).
+
 ### Deprecated
 
 - `decode_one_frame`, `decode_all_frames`,

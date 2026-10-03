@@ -1,7 +1,7 @@
 #![no_main]
 
 //! Panic-free fuzz target for the end-to-end multi-frame decode
-//! ([`oxideav_jpegxl::decode_all_frames`]): container strip, preamble
+//! ([`oxideav_jpegxl::decode_all`]): container strip, preamble
 //! + ICC, then the §C.1 frame loop — FrameHeader (both
 //! RestorationFilter editions), permuted/LZ77 TOCs, the Modular and
 //! VarDCT paths, §C.2 composition/blending, reference frames, and the
@@ -42,5 +42,11 @@ fuzz_target!(|data: &[u8]| {
     if area > MAX_AREA || headers.metadata.num_extra_channels > MAX_EXTRA {
         return;
     }
-    let _ = oxideav_jpegxl::decode_all_frames(data, None);
+    // Contract `decode_all` (default limits, coalesced) and the
+    // un-composed layers walk; both must fail cleanly or succeed.
+    let _ = oxideav_jpegxl::decode_all(data);
+    let _ = oxideav_jpegxl::decode_all_with(
+        data,
+        &oxideav_jpegxl::DecodeOptions::default().with_coalesce(false),
+    );
 });

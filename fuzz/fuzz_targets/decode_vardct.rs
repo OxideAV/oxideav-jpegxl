@@ -1,7 +1,7 @@
 #![no_main]
 
 //! Panic-free fuzz target for the first-frame decode entry
-//! ([`oxideav_jpegxl::decode_vardct_frame_from_codestream`]) — the
+//! ([`oxideav_jpegxl::decode`]) — the
 //! VarDCT pipeline surface: LfGlobal (Quantizer / HfBlockContext /
 //! LfChannelCorrelation), LfGroup LF coefficients + HfMetadata, the
 //! §C.6/§C.7 HfGlobal section (dequant matrices, per-preset
@@ -33,5 +33,11 @@ fuzz_target!(|data: &[u8]| {
     if area > MAX_AREA || headers.metadata.num_extra_channels > MAX_EXTRA {
         return;
     }
-    let _ = oxideav_jpegxl::decode_vardct_frame_from_codestream(data, None);
+    // Contract `decode` (first presented frame, composed) in lenient
+    // and strict modes.
+    let _ = oxideav_jpegxl::decode(data);
+    let _ = oxideav_jpegxl::decode_with(
+        data,
+        &oxideav_jpegxl::DecodeOptions::default().with_strict(true),
+    );
 });

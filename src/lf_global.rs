@@ -388,6 +388,21 @@ impl LfGlobal {
         fh: &FrameHeader,
         metadata: &ImageMetadataFdis,
     ) -> Result<Self> {
+        // Annex M: "Unless signalled otherwise, a JPEG XL codestream is
+        // assumed to be conforming to the Main profile, level 5."
+        Self::read_with_level(br, fh, metadata, 5)
+    }
+
+    /// [`LfGlobal::read`] with the container-signalled profile level
+    /// (`jxll` box; 5 when absent), which sizes the Annex M spline
+    /// bounds enforced on the §C.4.6 dictionary.
+    pub fn read_with_level(
+        br: &mut BitReader<'_>,
+        fh: &FrameHeader,
+        metadata: &ImageMetadataFdis,
+        level: u8,
+    ) -> Result<Self> {
+        let spline_limits = crate::splines::SplineLimits::for_level(level, fh.width, fh.height);
         // §C.4.5 Patches (Table C.10 row 1).
         let patches = if (fh.flags & flags::PATCHES) != 0 {
             let num_alpha = metadata
@@ -408,7 +423,10 @@ impl LfGlobal {
         // §C.4.6 Splines (Table C.10 row 2) — raw parse; finalized
         // below once the base correlations are known.
         let splines_raw = if (fh.flags & flags::SPLINES) != 0 {
-            Some(crate::splines::decode_splines_raw(br)?)
+            Some(crate::splines::decode_splines_raw_limited(
+                br,
+                Some(&spline_limits),
+            )?)
         } else {
             None
         };
@@ -443,6 +461,12 @@ impl LfGlobal {
         let splines = match splines_raw {
             Some(raw) => {
                 let cfl = lf_channel_correlation.unwrap_or_default();
+                crate::splines::check_spline_area(
+                    &raw,
+                    &spline_limits,
+                    cfl.base_correlation_x,
+                    cfl.base_correlation_b,
+                )?;
                 Some(crate::splines::finalize_splines(
                     &raw,
                     cfl.base_correlation_x,

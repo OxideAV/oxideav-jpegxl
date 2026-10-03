@@ -741,17 +741,30 @@ pub(crate) struct Prelude {
     pub metadata: ImageMetadataFdis,
     pub icc: Option<Vec<u8>>,
     pub frames_offset: usize,
+    /// Annex M profile level: the container's `jxll` box, 5 otherwise
+    /// ("unless signalled otherwise, … level 5").
+    pub level: u8,
 }
 
-/// Read the prelude of a stripped codestream (see [`open`]).
-pub(crate) fn read_prelude(codestream: &[u8]) -> Result<Prelude> {
+/// Read the prelude of a stripped codestream (see [`open`]) recording
+/// the container-signalled profile level (`Opened::level`).
+pub(crate) fn read_prelude_at_level(codestream: &[u8], level: u8) -> Result<Prelude> {
     let (br, size, metadata, icc) = read_codestream_prelude(codestream)?;
     Ok(Prelude {
         size,
         metadata,
         icc,
         frames_offset: br.bytes_consumed(),
+        level,
     })
+}
+
+impl Opened<'_> {
+    /// The Annex M profile level the container signals (5 when raw or
+    /// when the `jxll` box is absent).
+    pub(crate) fn level(&self) -> u8 {
+        self.file.as_ref().map(|f| f.level).unwrap_or(5)
+    }
 }
 
 /// How [`decode_sequence`] walks the frame array.
@@ -879,7 +892,7 @@ pub(crate) fn walk_frame_headers(codestream: &[u8], prelude: &Prelude) -> Result
 #[doc(hidden)]
 pub fn decode_planar(input: &[u8], pts: Option<i64>) -> Result<RawFrame> {
     let opened = open(input)?;
-    let prelude = read_prelude(&opened.codestream)?;
+    let prelude = read_prelude_at_level(&opened.codestream, opened.level())?;
     let mut seq = decode_sequence(&opened.codestream, &prelude, pts, SequenceMode::FirstFrame)?;
     match seq.frames.pop() {
         Some(f) => Ok(f.frame),
@@ -898,7 +911,7 @@ pub fn decode_planar(input: &[u8], pts: Option<i64>) -> Result<RawFrame> {
 #[doc(hidden)]
 pub fn decode_all_planar(input: &[u8], pts: Option<i64>) -> Result<Vec<RawFrame>> {
     let opened = open(input)?;
-    let prelude = read_prelude(&opened.codestream)?;
+    let prelude = read_prelude_at_level(&opened.codestream, opened.level())?;
     let seq = decode_sequence(&opened.codestream, &prelude, pts, SequenceMode::Coalesced)?;
     Ok(seq.frames.into_iter().map(|f| f.frame).collect())
 }
@@ -972,8 +985,15 @@ pub(crate) fn decode_sequence(
         // absolute codestream offset.
         let frame_slice = &codestream[offset..];
         let mut br = BitReader::new(frame_slice);
-        let mut decoded =
-            decode_frame_body(&mut br, frame_slice, size, metadata, frame_pts, &refs)?;
+        let mut decoded = decode_frame_body(
+            &mut br,
+            frame_slice,
+            size,
+            metadata,
+            frame_pts,
+            &refs,
+            prelude.level,
+        )?;
         let is_last = decoded.is_last;
         let next_rel = decoded.next_frame_offset;
         let this_index = index;
@@ -1275,6 +1295,7 @@ fn decode_frame_body(
     metadata: &ImageMetadataFdis,
     pts: Option<i64>,
     refs: &crate::patches::ReferenceFrames,
+    level: u8,
 ) -> Result<DecodedFrame> {
     // 5. FrameHeader (FDIS C.2).
     let fh_params = FrameDecodeParams {
@@ -1515,7 +1536,7 @@ fn decode_frame_body(
     let lf_global_bytes = section_byte_range(lf_global_slot)?;
     let mut lf_global = {
         let mut lf_br = BitReader::new_section(lf_global_bytes);
-        LfGlobal::read(&mut lf_br, &fh, metadata)?
+        LfGlobal::read_with_level(&mut lf_br, &fh, metadata, level)?
     };
 
     // 8b. LfGroups (slots 1..1+num_lf_groups) — §C.5.2 ModularLfGroup:

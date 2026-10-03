@@ -538,6 +538,21 @@ pub struct RawSpline {
     pub control_points: Vec<Point>,
     /// Quantised DCT32 coefficients in wire order: X, Y, B, σ.
     pub raw_dct: [[i32; SPLINE_DCT_LEN]; 4],
+    /// K.4.1 `manhattan_distance` — Σ |current_delta| of the
+    /// double-delta walk over both axes (the Annex M area estimate).
+    pub manhattan_distance: u64,
+}
+
+/// K.4.1: the `manhattan_distance` contribution of one axis' second-order
+/// deltas — the sum of `|current_delta|` as `DecodeDoubleDelta` walks.
+fn manhattan_of_deltas(deltas: &[i64]) -> u64 {
+    let mut current_delta: i64 = 0;
+    let mut total: u64 = 0;
+    for &d in deltas {
+        current_delta = current_delta.saturating_add(d);
+        total = total.saturating_add(current_delta.unsigned_abs());
+    }
+    total
 }
 
 /// The §C.4.6 wire structure before dequantisation: `quant_adjust` plus
@@ -581,10 +596,144 @@ pub fn finalize_splines(
     Ok(out)
 }
 
+/// Annex M (Table M.1) conformance bounds on one frame's spline
+/// dictionary — the normative hostile-input budget for §K.4: a stream
+/// past them is non-conforming at every level and is rejected before
+/// the spline renderer runs (a 75-byte fuzz input otherwise rendered
+/// 217 splines × 217 far-flung control points for over a minute).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SplineLimits {
+    /// `Maximum num_splines`: `min(1 << 24, fwidth × fheight / 4)`.
+    pub max_splines: u64,
+    /// `Maximum total num_control_points`:
+    /// `min(1 << 20, fwidth × fheight / 2)`.
+    pub max_control_points: u64,
+    /// `Maximum total estimated_area_reached` — level 5:
+    /// `min(8 × fwidth × fheight + 2^25, 2^30)`; level 10:
+    /// `min(1024 × fwidth × fheight + 2^32, 2^42)`.
+    pub max_area: u64,
+}
+
+impl SplineLimits {
+    /// The Table M.1 bounds for a `fwidth × fheight` frame at `level`
+    /// (5 unless the container's `jxll` box says 10; every other value
+    /// is treated as 10, the broadest profile).
+    pub fn for_level(level: u8, fwidth: u32, fheight: u32) -> Self {
+        let area = u64::from(fwidth) * u64::from(fheight);
+        let max_area = if level == 5 {
+            (8 * area + (1 << 25)).min(1 << 30)
+        } else {
+            (1024 * area + (1 << 32)).min(1 << 42)
+        };
+        Self {
+            max_splines: (1u64 << 24).min(area / 4),
+            max_control_points: (1u64 << 20).min(area / 2),
+            max_area,
+        }
+    }
+}
+
+/// K.4.1 `ceil(abs(q) / qa)` in integer arithmetic, with `qa` the
+/// rational `1 + quant_adjust / 8` (`quant_adjust ≥ 0`) or
+/// `1 / (1 − quant_adjust / 8)` (`quant_adjust < 0`).
+fn ceil_div_qa(q: i32, quant_adjust: i32) -> u64 {
+    let q = u64::from(q.unsigned_abs());
+    if quant_adjust >= 0 {
+        // |q| / (1 + qa/8) = 8|q| / (8 + qa)
+        let den = 8 + u64::from(quant_adjust.unsigned_abs());
+        (8 * q).div_ceil(den)
+    } else {
+        // |q| / (8 / (8 − qa)) = |q| (8 − qa) / 8   (qa < 0 ⇒ 8 − qa > 8)
+        let num = q * (8 + u64::from(quant_adjust.unsigned_abs()));
+        num.div_ceil(8)
+    }
+}
+
+/// K.4.1 `estimated_area_reached` of one spline: `width_estimate ×
+/// manhattan_distance`, computed in integer arithmetic from the
+/// quantised coefficients (the NOTE in K.4.1 says it can be). The
+/// `base_correlation_{x,b}` terms use the Table C.13 defaults
+/// (`0`, `1`) when the frame's LfChannelCorrelation is not yet known,
+/// which only lowers the estimate for X (and leaves B exact).
+pub fn estimated_area_reached(
+    raw: &RawSpline,
+    quant_adjust: i32,
+    manhattan_distance: u64,
+    base_correlation_x: f32,
+    base_correlation_b: f32,
+) -> u64 {
+    let mut color = [0u64; 3];
+    for (c, chan) in raw.raw_dct[..3].iter().enumerate() {
+        for &q in chan {
+            color[c] = color[c].saturating_add(ceil_div_qa(q, quant_adjust));
+        }
+    }
+    let cx = base_correlation_x.abs().ceil() as u64;
+    let cb = base_correlation_b.abs().ceil() as u64;
+    color[0] = color[0].saturating_add(cx.saturating_mul(color[1]));
+    color[2] = color[2].saturating_add(cb.saturating_mul(color[1]));
+    let max_color = color.iter().copied().max().unwrap_or(0);
+    // logcolor = max(1, ceil(log2(1 + max_color)))
+    let logcolor = u64::from(
+        (max_color.saturating_add(1))
+            .next_power_of_two()
+            .trailing_zeros(),
+    )
+    .max(1);
+    let mut width_estimate: u64 = 0;
+    for &q in &raw.raw_dct[3] {
+        let weight = ceil_div_qa(q, quant_adjust).max(1);
+        width_estimate =
+            width_estimate.saturating_add(weight.saturating_mul(weight).saturating_mul(logcolor));
+    }
+    width_estimate.saturating_mul(manhattan_distance)
+}
+
+/// Enforce [`SplineLimits::max_area`] over a decoded dictionary (the
+/// count bounds are enforced while parsing).
+pub fn check_spline_area(
+    raw: &RawSplines,
+    limits: &SplineLimits,
+    base_correlation_x: f32,
+    base_correlation_b: f32,
+) -> Result<()> {
+    let mut total: u64 = 0;
+    for sp in &raw.splines {
+        total = total.saturating_add(estimated_area_reached(
+            sp,
+            raw.quant_adjust,
+            sp.manhattan_distance,
+            base_correlation_x,
+            base_correlation_b,
+        ));
+        if total > limits.max_area {
+            return Err(Error::InvalidData(format!(
+                "JXL splines: total estimated_area_reached {total} exceeds the Annex M bound {}",
+                limits.max_area
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// FDIS §C.4.6 — the Listing C.3 / Listing C.4 wire parse against an
 /// abstract `ReadHybridVarLenUint(ctx)` source, stopping short of
-/// dequantisation (see [`RawSpline`] for why).
-pub fn decode_splines_raw_with<F>(mut read_uint: F) -> Result<RawSplines>
+/// dequantisation (see [`RawSpline`] for why). No Annex M bounds; see
+/// [`decode_splines_raw_with_limits`].
+pub fn decode_splines_raw_with<F>(read_uint: F) -> Result<RawSplines>
+where
+    F: FnMut(u32) -> Result<u32>,
+{
+    decode_splines_raw_with_limits(read_uint, None)
+}
+
+/// [`decode_splines_raw_with`] enforcing the Annex M `num_splines` and
+/// total-control-point bounds while parsing (before the control-point
+/// vectors are allocated).
+pub fn decode_splines_raw_with_limits<F>(
+    mut read_uint: F,
+    limits: Option<&SplineLimits>,
+) -> Result<RawSplines>
 where
     F: FnMut(u32) -> Result<u32>,
 {
@@ -593,6 +742,15 @@ where
         .checked_add(1)
         .ok_or_else(|| Error::InvalidData("JXL splines: num_splines overflow".into()))?
         as usize;
+    if let Some(l) = limits {
+        if num_splines as u64 > l.max_splines {
+            return Err(Error::InvalidData(format!(
+                "JXL splines: num_splines {num_splines} exceeds the Annex M bound {}",
+                l.max_splines
+            )));
+        }
+    }
+    let mut total_control_points: u64 = 0;
 
     // Listing C.3 — starting coordinates (delta-coded after the first).
     let mut start = Vec::with_capacity(num_splines.min(1024));
@@ -638,6 +796,16 @@ where
         let num_cp = (read_uint(3)? as usize)
             .checked_add(1)
             .ok_or_else(|| Error::InvalidData("JXL splines: num_control_points overflow".into()))?;
+        total_control_points = total_control_points.saturating_add(num_cp as u64);
+        if let Some(l) = limits {
+            if total_control_points > l.max_control_points {
+                return Err(Error::InvalidData(format!(
+                    "JXL splines: total num_control_points {total_control_points} exceeds the \
+                     Annex M bound {}",
+                    l.max_control_points
+                )));
+            }
+        }
         // Interleaved (x1, y1, x2, y2, …) second-order deltas.
         let mut dx = Vec::with_capacity((num_cp - 1).min(1 << 20));
         let mut dy = Vec::with_capacity((num_cp - 1).min(1 << 20));
@@ -645,6 +813,8 @@ where
             dx.push(unpack_signed(read_uint(4)?) as i64);
             dy.push(unpack_signed(read_uint(4)?) as i64);
         }
+        // K.4.1 manhattan_distance: Σ |current_delta| over both axes.
+        let manhattan_distance = manhattan_of_deltas(&dx).saturating_add(manhattan_of_deltas(&dy));
         let cx = decode_double_delta(sp_x, &dx);
         let cy = decode_double_delta(sp_y, &dy);
         let control_points: Vec<Point> = cx
@@ -663,6 +833,7 @@ where
         out.push(RawSpline {
             control_points,
             raw_dct: raw,
+            manhattan_distance,
         });
     }
     Ok(RawSplines {
@@ -693,13 +864,23 @@ pub fn decode_splines(
 /// invariant is enforced (a misparse guard; prefix-coded streams carry
 /// no ANS state and skip the check).
 pub fn decode_splines_raw(br: &mut crate::bitreader::BitReader<'_>) -> Result<RawSplines> {
+    decode_splines_raw_limited(br, None)
+}
+
+/// [`decode_splines_raw`] with the Annex M count bounds enforced while
+/// parsing.
+pub fn decode_splines_raw_limited(
+    br: &mut crate::bitreader::BitReader<'_>,
+    limits: Option<&SplineLimits>,
+) -> Result<RawSplines> {
     use crate::modular_fdis::{decode_uint_in_with_dist_pub, EntropyStream};
     let mut entropy = EntropyStream::read(br, SPLINE_NUM_CONTEXTS)?;
     entropy.read_ans_state_init(br)?;
     let mut hybrid = crate::ans::hybrid::HybridUintState::new(entropy.lz77, entropy.lz_len_conf);
-    let raw = decode_splines_raw_with(|ctx| {
-        decode_uint_in_with_dist_pub(&mut hybrid, &mut entropy, br, ctx, 0)
-    })?;
+    let raw = decode_splines_raw_with_limits(
+        |ctx| decode_uint_in_with_dist_pub(&mut hybrid, &mut entropy, br, ctx, 0),
+        limits,
+    )?;
     if let Some(dec) = entropy.ans_state.as_ref() {
         if !dec.final_state() {
             return Err(Error::InvalidData(

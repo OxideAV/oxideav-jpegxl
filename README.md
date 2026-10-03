@@ -187,6 +187,14 @@ still image that is the finished picture, not the bare first layer.
 * `info` may succeed on geometry that cannot be allocated; `decode`
   then fails with `LimitExceeded` (default limits) or `Unsupported`
   (unlimited, `usize` overflow).
+* Fixed hostile-input budgets (independent of `DecodeOptions`): the
+  Annex M (Table M.1) spline bounds — `num_splines ≤ min(2^24,
+  fw·fh/4)`, total control points `≤ min(2^20, fw·fh/2)`, total
+  `estimated_area_reached` at level 5 (`min(8·fw·fh + 2^25, 2^30)`) or
+  level 10 when the container's `jxll` box says so — are enforced
+  before the §K.4 renderer runs; an MA tree is capped at the D.4.2
+  bound of 2^26 nodes and at 64 nodes per remaining codestream byte
+  (+ 2^16), far above any LZ77-free packing. Both are `InvalidData`.
 
 ## Format specifics
 

@@ -15,8 +15,8 @@ use crate::metadata_fdis::{
 };
 use crate::options::{DecodeOptions, EncodeOptions};
 use crate::{
-    decode_sequence, frame_params, open, read_prelude, walk_frame_headers, Opened, Prelude,
-    SequenceFrame, SequenceMode,
+    decode_sequence, frame_params, open, read_prelude_at_level, walk_frame_headers, Opened,
+    Prelude, SequenceFrame, SequenceMode,
 };
 
 /// Cap on a Brotli-compressed (`brob`) metadata box's decompressed
@@ -128,7 +128,7 @@ pub fn probe(bytes: &[u8]) -> bool {
 /// Header-only inspection (see [`ImageInfo`]).
 pub fn info(bytes: &[u8]) -> Result<ImageInfo> {
     let opened = open(bytes)?;
-    let prelude = read_prelude(&opened.codestream)?;
+    let prelude = read_prelude_at_level(&opened.codestream, opened.level())?;
     let md = &prelude.metadata;
     let (width, height) = oriented_size(&prelude);
     // The sample layout depends on the first frame's encoding: VarDCT
@@ -198,7 +198,7 @@ pub fn decode(bytes: &[u8]) -> Result<JxlImage> {
 /// [`decode`] with limits / strictness.
 pub fn decode_with(bytes: &[u8], opts: &DecodeOptions) -> Result<JxlImage> {
     let opened = open(bytes)?;
-    let prelude = read_prelude(&opened.codestream)?;
+    let prelude = read_prelude_at_level(&opened.codestream, opened.level())?;
     check_limits(&prelude, opts)?;
     if opts.strict {
         check_trailing(&opened, &prelude)?;
@@ -253,7 +253,7 @@ pub fn decode_all(bytes: &[u8]) -> Result<Vec<Frame>> {
 /// frame-rectangle geometry (see [`Frame::x`]).
 pub fn decode_all_with(bytes: &[u8], opts: &DecodeOptions) -> Result<Vec<Frame>> {
     let opened = open(bytes)?;
-    let prelude = read_prelude(&opened.codestream)?;
+    let prelude = read_prelude_at_level(&opened.codestream, opened.level())?;
     check_limits(&prelude, opts)?;
     if opts.strict {
         check_trailing(&opened, &prelude)?;

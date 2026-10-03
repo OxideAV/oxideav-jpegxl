@@ -38,13 +38,13 @@ cargo-fuzz = true
 #
 # Targets:
 # * `parse_headers`   — signature detect + SizeHeader/ImageMetadata
-#                       probes (committee-draft and FDIS layouts);
+#                       probes (committee-draft and FDIS layouts) + `probe` / `info`;
 # * `parse_icc`       — the Annex B / E.4 encoded-ICC entropy decode
 #                       and the E.4.2..E.4.5 profile reconstruction;
 # * `container_walk`  — the 18181-2 box walk: BoxIter, JxlFile::parse,
 #                       jxli parse, capped `brob` unwrapping,
 #                       codestream extraction;
-# * `decode_full`     — geometry-capped `decode_all_frames` (the whole
+# * `decode_full`     — geometry-capped `decode_all` (the whole
 #                       multi-frame decode surface);
 # * `decode_vardct`   — geometry-capped first-frame decode (the VarDCT
 #                       pipeline entry, seeded with VarDCT streams);

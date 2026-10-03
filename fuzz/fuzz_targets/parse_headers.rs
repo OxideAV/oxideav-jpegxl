@@ -1,7 +1,7 @@
 #![no_main]
 
 //! Panic-free fuzz target for the codestream-preamble probes:
-//! [`oxideav_jpegxl::probe`] (committee-draft `SizeHeader` +
+//! [`oxideav_jpegxl::headers`] (committee-draft `SizeHeader` +
 //! `ImageMetadata` layout) and [`oxideav_jpegxl::probe_fdis`] (the
 //! full FDIS Table A.3 + Table A.16 bundle, including the BitDepth /
 //! ExtraChannelInfo / ColourEncoding / ToneMapping / extensions tail
@@ -26,6 +26,11 @@ fuzz_target!(|data: &[u8]| {
     if data.len() > MAX_INPUT_BYTES {
         return;
     }
+    // Contract surface: the total signature sniff and the header-only
+    // `info` (SizeHeader + ImageMetadata + ICC + frame-header walk for
+    // animations), plus the two depth header parsers.
     let _ = oxideav_jpegxl::probe(data);
+    let _ = oxideav_jpegxl::info(data);
+    let _ = oxideav_jpegxl::headers(data);
     let _ = oxideav_jpegxl::probe_fdis(data);
 });
