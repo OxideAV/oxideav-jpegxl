@@ -20,7 +20,7 @@
 //! round-13 pipeline has parsed and dequantised all the LF data.
 
 use oxideav_jpegxl::dct_select::{derive_dct_select, DctSelectCell, TransformType};
-use oxideav_jpegxl::decode_one_frame;
+use oxideav_jpegxl::decode_planar;
 use oxideav_jpegxl::lf_group::HfMetadata;
 
 const PIXEL_1X1_JXL: &[u8] = include_bytes!("fixtures/pixel_1x1.jxl");
@@ -44,7 +44,7 @@ fn five_small_lossless_fixtures_still_decode_round_13() {
         ("palette_32x32", PALETTE_JXL),
         ("grey_8x8", GREY_8X8_JXL),
     ] {
-        let vf = decode_one_frame(bytes, None);
+        let vf = decode_planar(bytes, None);
         assert!(
             vf.is_ok(),
             "round-13 regression: {name} should still decode (round-10 baseline); got {:?}",
@@ -72,16 +72,16 @@ fn five_small_lossless_fixtures_still_decode_round_13() {
 // integrated decode, so the public path now returns pixels for both.
 #[test]
 fn vardct_d3_fixture_reaches_round_13_pipeline() {
-    let frame = decode_one_frame(VARDCT_D3_JXL, None)
-        .expect("d3 decodes on the public path since round 389");
+    let frame =
+        decode_planar(VARDCT_D3_JXL, None).expect("d3 decodes on the public path since round 389");
     assert_eq!(frame.planes.len(), 3);
     assert_eq!(frame.planes[0].data.len(), 256 * 256);
 }
 
 #[test]
 fn vardct_d1_fixture_reaches_round_13_pipeline() {
-    let frame = decode_one_frame(VARDCT_D1_JXL, None)
-        .expect("d1 decodes on the public path since round 389");
+    let frame =
+        decode_planar(VARDCT_D1_JXL, None).expect("d1 decodes on the public path since round 389");
     assert_eq!(frame.planes.len(), 3);
     assert_eq!(frame.planes[0].data.len(), 256 * 256);
 }

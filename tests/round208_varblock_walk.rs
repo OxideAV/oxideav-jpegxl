@@ -211,7 +211,7 @@ fn r208_decode_varblocks_propagates_ctx_closure_error() {
         0,
         13,
         |_vb| {
-            Err(oxideav_core::Error::InvalidData(
+            Err(oxideav_jpegxl::Error::InvalidData(
                 "ctx error from integration test".into(),
             ))
         },

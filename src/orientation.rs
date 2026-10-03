@@ -21,16 +21,17 @@
 //! | 7           | flip horizontally, then rotate 90° clockwise       |
 //! | 8           | rotate 90° counterclockwise                        |
 
-use oxideav_core::{Error, Result, VideoFrame, VideoPlane};
+use crate::error::{Error, Result};
+use crate::image::{Plane, RawFrame};
 
 /// Apply the Table A.17 orientation transform to a decoded frame whose
 /// planes use the crate byte layout (`bytes_per_sample` ∈ {1, 2}).
 /// Orientation 1 returns the frame unchanged.
 pub fn apply_orientation(
-    frame: VideoFrame,
+    frame: RawFrame,
     orientation: u8,
     bytes_per_sample: usize,
-) -> Result<VideoFrame> {
+) -> Result<RawFrame> {
     if orientation <= 1 {
         return Ok(frame);
     }
@@ -44,13 +45,13 @@ pub fn apply_orientation(
         .into_iter()
         .map(|p| orient_plane(p, orientation, bytes_per_sample))
         .collect::<Result<Vec<_>>>()?;
-    Ok(VideoFrame {
+    Ok(RawFrame {
         pts: frame.pts,
         planes,
     })
 }
 
-fn orient_plane(p: VideoPlane, orientation: u8, bytes: usize) -> Result<VideoPlane> {
+fn orient_plane(p: Plane, orientation: u8, bytes: usize) -> Result<Plane> {
     if p.stride == 0 || p.stride % bytes != 0 || p.data.len() % p.stride != 0 {
         return Err(Error::InvalidData(format!(
             "JXL orientation: plane geometry (stride {}, {} bytes) not sample-aligned",
@@ -87,7 +88,7 @@ fn orient_plane(p: VideoPlane, orientation: u8, bytes: usize) -> Result<VideoPla
             out[dst..dst + bytes].copy_from_slice(&p.data[src..src + bytes]);
         }
     }
-    Ok(VideoPlane {
+    Ok(Plane {
         stride: ow * bytes,
         data: out,
     })
@@ -103,15 +104,15 @@ mod tests {
     /// 3 4
     /// 5 6
     /// ```
-    fn plane_2x3() -> VideoPlane {
-        VideoPlane {
+    fn plane_2x3() -> Plane {
+        Plane {
             stride: 2,
             data: vec![1, 2, 3, 4, 5, 6],
         }
     }
 
     fn oriented(orientation: u8) -> (usize, Vec<u8>) {
-        let f = VideoFrame {
+        let f = RawFrame {
             pts: None,
             planes: vec![plane_2x3()],
         };
@@ -146,9 +147,9 @@ mod tests {
 
     #[test]
     fn two_byte_samples_move_as_units() {
-        let f = VideoFrame {
+        let f = RawFrame {
             pts: None,
-            planes: vec![VideoPlane {
+            planes: vec![Plane {
                 stride: 4,
                 data: vec![1, 10, 2, 20, 3, 30, 4, 40],
             }],
@@ -160,7 +161,7 @@ mod tests {
 
     #[test]
     fn out_of_range_orientation_rejected() {
-        let f = VideoFrame {
+        let f = RawFrame {
             pts: None,
             planes: vec![plane_2x3()],
         };

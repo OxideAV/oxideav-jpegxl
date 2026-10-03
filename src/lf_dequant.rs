@@ -262,7 +262,7 @@ pub fn dequant_lf(
 pub fn apply_lf_chroma_from_luma(
     out: &mut LfDequantOutput,
     cfl: &crate::lf_global::LfChannelCorrelation,
-) -> oxideav_core::Result<()> {
+) -> crate::error::Result<()> {
     if out.widths[0] != out.widths[1]
         || out.widths[2] != out.widths[1]
         || out.heights[0] != out.heights[1]

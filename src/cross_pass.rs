@@ -77,7 +77,7 @@
 //! module's output is exactly the HF-only accumulated quantised grid
 //! that single-pass decode would have produced for a one-pass frame.
 
-use oxideav_core::{Error, Result};
+use crate::error::{Error, Result};
 
 use crate::frame_header::Passes;
 use crate::pass_group_hf::DecodedHfBlock;

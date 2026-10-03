@@ -197,7 +197,7 @@
 //! (the `EntropyStream::decode_symbol` signature takes a `u32`
 //! `ctx` index into the cluster_map).
 
-use oxideav_core::{Error, Result};
+use crate::error::{Error, Result};
 
 use crate::bitreader::{unpack_signed, BitReader};
 use crate::block_context_resolver::{BlockContextResolver, ThreeChannelVarblock};

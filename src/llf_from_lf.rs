@@ -100,7 +100,7 @@
 //! * It does not apply Chroma-from-Luma — that runs after this step
 //!   on the per-channel dequantised samples (Annex G).
 
-use oxideav_core::{Error, Result};
+use crate::error::{Error, Result};
 
 use crate::dct_select::TransformType;
 

@@ -48,7 +48,7 @@
 //! `num_hf_presets = num_hf_presets_minus_1 + 1`. For single-group
 //! frames the field uses 0 bits.
 
-use oxideav_core::{Error, Result};
+use crate::error::{Error, Result};
 
 use crate::bitreader::{BitReader, U32Dist};
 use crate::global_modular::{apply_inverse_transforms, apply_transforms_to_channel_layout};

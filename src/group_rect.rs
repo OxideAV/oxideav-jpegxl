@@ -34,7 +34,7 @@
 //! entropy decode; the caller pastes the reconstructed group planes
 //! back at the group's pixel offset.
 
-use oxideav_core::{Error, Result};
+use crate::error::{Error, Result};
 
 use crate::dct_select::DctSelectGrid;
 use crate::lf_dequant::LfDequantOutput;

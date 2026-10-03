@@ -17,7 +17,7 @@
 //! decoder-facing helper that yields the concatenated codestream bytes
 //! regardless of wrapping.
 
-use oxideav_core::{Error, Result};
+use crate::error::{Error, Result};
 use std::borrow::Cow;
 
 /// Raw codestream magic: `FF 0A` (18181-2 Annex B.2 "magic numbers").

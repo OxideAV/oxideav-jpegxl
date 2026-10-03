@@ -103,7 +103,7 @@ fn synth_320_decodes_without_error_round_9() {
     // grid is deferred to round 10 (~21k of 102400 pixels match
     // today's gradient expectation; drift in the smaller edge groups
     // remains).
-    let vf = oxideav_jpegxl::decode_one_frame(SYNTH_320_JXL, None).unwrap();
+    let vf = oxideav_jpegxl::decode_planar(SYNTH_320_JXL, None).unwrap();
     assert_eq!(vf.planes.len(), 1);
     assert_eq!(vf.planes[0].data.len(), 320 * 320);
 }
@@ -118,7 +118,7 @@ fn synth_320_first_six_rows_first_two_columns_pixel_correct() {
     // decode cleanly, and the per-group decode at this offset is
     // unaffected by the still-open ANS-state-tail issue that surfaces
     // in the smaller edge groups (col 2 / row 2).
-    let vf = oxideav_jpegxl::decode_one_frame(SYNTH_320_JXL, None).unwrap();
+    let vf = oxideav_jpegxl::decode_planar(SYNTH_320_JXL, None).unwrap();
     let plane = &vf.planes[0];
     for y in 0..6usize {
         for x in 0..256usize {

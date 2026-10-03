@@ -13,12 +13,12 @@
 //! The bit-by-bit composition of the hand-built fixture lives in the
 //! crate-internal `lf_group::tests::round11_lfgroup_minimal_vardct_one_block_parses`
 //! test; this integration test exercises the public surface
-//! (`oxideav_jpegxl::probe`, `oxideav_jpegxl::decode_one_frame`) to
+//! (`oxideav_jpegxl::probe`, `oxideav_jpegxl::decode_planar`) to
 //! confirm the round-7..10 small-Modular pixel-correctness contract is
 //! still in force after the round-11 LfGlobal refactor.
 //!
 //! Five small lossless fixtures are checked. Each must decode into a
-//! `VideoFrame` matching its committed `expected.png`:
+//! `RawFrame` matching its committed `expected.png`:
 //!
 //! * pixel_1x1.jxl (1×1 RGB lossless)
 //! * gray_64x64_lossless.jxl (64×64 single-channel)
@@ -26,7 +26,7 @@
 //! * palette_32x32.jxl (palette transform)
 //! * grey_8x8_lossless.jxl (smallest cluster fixture)
 
-use oxideav_jpegxl::decode_one_frame;
+use oxideav_jpegxl::decode_planar;
 
 const PIXEL_1X1_JXL: &[u8] = include_bytes!("fixtures/pixel_1x1.jxl");
 const GRAY_64X64_JXL: &[u8] = include_bytes!("fixtures/gray_64x64_lossless.jxl");
@@ -47,7 +47,7 @@ fn five_small_lossless_fixtures_still_decode_round_11() {
         ("palette_32x32", PALETTE_JXL),
         ("grey_8x8", GREY_8X8_JXL),
     ] {
-        let vf = decode_one_frame(bytes, None);
+        let vf = decode_planar(bytes, None);
         assert!(
             vf.is_ok(),
             "round-11 regression: {name} should still decode (round-10 baseline); got {:?}",

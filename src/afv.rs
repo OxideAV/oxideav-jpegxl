@@ -54,7 +54,7 @@
 //! typo in any of the 256 floats would fail at least one orthonormality
 //! sum.
 
-use oxideav_core::{Error, Result};
+use crate::error::{Error, Result};
 
 /// Size of the AFV cell: 16 coefficients in, 16 samples out, mapped to
 /// a 4×4 grid using `index = 4 × y + x` (§I.2.2 convention).

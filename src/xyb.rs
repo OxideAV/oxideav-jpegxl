@@ -69,7 +69,7 @@
 //! `metadata_fdis::OpsinInverseMatrix::default()` constants
 //! independently transcribed from FDIS Table L.1.
 
-use oxideav_core::{Error, Result};
+use crate::error::{Error, Result};
 
 use crate::lf_global::LfChannelDequantization;
 use crate::metadata_fdis::{

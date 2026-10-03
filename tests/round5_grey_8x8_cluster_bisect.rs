@@ -377,7 +377,7 @@ fn decode_uint_in_walk(
     entropy: &mut EntropyStream,
     br: &mut BitReader<'_>,
     ctx: u32,
-) -> oxideav_core::Result<u32> {
+) -> oxideav_jpegxl::Result<u32> {
     let cluster_map_clone = entropy.cluster_map.clone();
     let configs_clone = entropy.configs.clone();
     let cfg_for = |c: u32| -> HybridUintConfig {

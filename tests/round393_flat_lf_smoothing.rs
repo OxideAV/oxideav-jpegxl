@@ -72,7 +72,7 @@ fn ref_rgb() -> (u32, u32, Vec<[u8; 3]>) {
 /// interleaved RGB pixels, with the §F.2 ramp selected by `literal`.
 fn decode_rgb(literal: bool) -> (u32, u32, Vec<[u8; 3]>) {
     set_lf_smoothing_literal_ramp(literal);
-    let r = oxideav_jpegxl::decode_vardct_frame_from_codestream(JXL, None);
+    let r = oxideav_jpegxl::decode_planar(JXL, None);
     set_lf_smoothing_literal_ramp(false);
     let frame = r.expect("integrated VarDCT decode of flat-content fixture");
     assert!(

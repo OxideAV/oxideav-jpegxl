@@ -7,6 +7,62 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- The image-crate API contract (`IMAGE_CRATE_API.md`) at the crate
+  root: `probe(&[u8]) -> bool`, `info -> ImageInfo`, `decode -> JxlImage`,
+  `decode_with(&DecodeOptions)`, `decode_rgb8 -> RgbImage`,
+  `decode_rgba8 -> RgbaImage`, `decode_all -> Vec<Frame>` (+
+  `decode_all_with`), `decode_from<R: Read>`, `encode` / `encode_rgb8` /
+  `encode_rgba8` / `encode_to` (decoder-only crate: all return
+  `Error::Unsupported`), with `JxlImage` (one packed plane: `Gray8` /
+  `Ya8` / `Rgb24` / `Rgba` / `Gray16Le` / `Ya16Le` / `Rgb48Le` /
+  `Rgba64Le`, `color`, `metadata`, `bits_per_sample`), `Plane`,
+  `ColorInfo` / `ColorRange`, `Metadata` (ICC from the Annex B stream,
+  Exif / XMP from the 18181-2 boxes, gamma), `RgbImage` / `RgbaImage`,
+  `PixelFormat` (= `JxlPixelFormat`), `ImageInfo` (header-only, with
+  presented-frame count for animations), `Frame` (with `delay` from the
+  frame header ticks), `AnimationInfo`, `DecodeOptions` (limits
+  enforced before allocation, `strict`, `coalesce`), `EncodeOptions`
+  (empty, `#[non_exhaustive]`) and `JxlError` (+ `Error` / `Result`
+  aliases: `InvalidData`, `Unsupported`, `LimitExceeded`,
+  `Io(std::io::Error)`, `Eof`, `NeedMore`, `Other`).
+- `registry` feature (default-on): `register`, `register_codecs`,
+  `make_decoder`, `make_encoder`, `From<JxlImage> for VideoFrame`,
+  `JxlImage::from_video_frame` + `TryFrom<(&VideoFrame,
+  &CodecParameters)>`, `From<JxlError> for oxideav_core::Error`,
+  pixel-format and colour-signal mappings.
+- Inline `ci-standalone` CI job (`--no-default-features` build, tests,
+  clippy); fuzz targets now drive `probe` / `info` / `decode`
+  (lenient + strict) / `decode_all` (coalesced + layers).
+
+### Changed
+
+- `oxideav-core` is optional behind the default-on `registry` feature;
+  the whole decode pipeline speaks the crate-local `JxlError` and the
+  per-channel planes ride a crate-local carrier, so the crate builds
+  and tests with `default-features = false`.
+- The framework `Decoder` now emits the contract's **packed** native
+  layout (one plane, colour-signal + significant-bits side-channels)
+  instead of one planar `VideoPlane` per channel, and returns frames
+  composed per §C.2 (the primary image of a multi-layer still is the
+  finished composition).
+- Codec capabilities are registered under `"jpegxl"` (was the
+  placeholder `"jpegxl_headers_only"`).
+- `probe -> Result<Headers>` (committee-draft preamble parse) is renamed
+  `headers`; the contract reuses `probe` for the `bool` signature sniff.
+  The root `detect` re-export is a deprecated wrapper (use `probe`, or
+  `container::detect` for the wrapping kind).
+- The decoded ICC profile is now surfaced (`JxlImage::metadata.icc`)
+  instead of being validated and dropped.
+
+### Deprecated
+
+- `decode_one_frame`, `decode_all_frames`,
+  `decode_vardct_frame_from_codestream` (planar `VideoFrame` wrappers,
+  `registry` only) — use `decode` / `decode_all`.
+- Root `detect` — use `probe`.
+
 ## [0.0.13](https://github.com/OxideAV/oxideav-jpegxl/compare/v0.0.12...v0.0.13) - 2026-09-01
 
 ### Other

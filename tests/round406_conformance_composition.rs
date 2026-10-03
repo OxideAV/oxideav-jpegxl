@@ -39,7 +39,7 @@
 //!   Listing I.21 tendency function divide with Idiv (round towards
 //!   zero, §5.2), not floor.
 
-use oxideav_jpegxl::decode_all_frames;
+use oxideav_jpegxl::decode_all_planar;
 use png::ColorType;
 use std::io::Cursor;
 
@@ -62,7 +62,7 @@ fn png_rgba16(bytes: &[u8]) -> (usize, usize, Vec<u16>) {
 }
 
 /// Our plane sample (little-endian 2-byte layout for bps > 8).
-fn plane_sample(plane: &oxideav_core::VideoPlane, idx: usize) -> u32 {
+fn plane_sample(plane: &oxideav_jpegxl::Plane, idx: usize) -> u32 {
     u16::from_le_bytes([plane.data[2 * idx], plane.data[2 * idx + 1]]) as u32
 }
 
@@ -79,7 +79,7 @@ fn native_from_16(v16: u32, bps: u32) -> u32 {
 /// Compare a decoded frame against a 16-bit RGBA oracle in the native
 /// `bps`-bit domain. Returns per-channel (max_abs_diff, diff_count).
 fn compare(
-    frame: &oxideav_core::VideoFrame,
+    frame: &oxideav_jpegxl::RawFrame,
     oracle: &(usize, usize, Vec<u16>),
     bps: u32,
 ) -> Vec<(u32, usize)> {
@@ -109,7 +109,7 @@ fn compare(
 fn alpha_nonpremultiplied_is_bit_exact() {
     let jxl = include_bytes!("fixtures/conformance_alpha_nonpremultiplied.jxl");
     let png = include_bytes!("fixtures/conformance_alpha_nonpremultiplied_expected.png");
-    let frames = decode_all_frames(jxl, None).expect("decode");
+    let frames = decode_all_planar(jxl, None).expect("decode");
     assert_eq!(frames.len(), 1);
     let oracle = png_rgba16(png);
     assert_eq!((oracle.0, oracle.1), (1024, 1024));
@@ -122,7 +122,7 @@ fn alpha_nonpremultiplied_is_bit_exact() {
 fn alpha_triangles_is_bit_exact() {
     let jxl = include_bytes!("fixtures/conformance_alpha_triangles.jxl");
     let png = include_bytes!("fixtures/conformance_alpha_triangles_expected.png");
-    let frames = decode_all_frames(jxl, None).expect("decode");
+    let frames = decode_all_planar(jxl, None).expect("decode");
     assert_eq!(frames.len(), 1);
     let oracle = png_rgba16(png);
     assert_eq!((oracle.0, oracle.1), (1024, 1024));
@@ -144,7 +144,7 @@ fn alpha_triangles_is_bit_exact() {
 fn blendmodes_chain_composes_within_one_code() {
     let jxl = include_bytes!("fixtures/conformance_blendmodes.jxl");
     let png = include_bytes!("fixtures/conformance_blendmodes_expected.png");
-    let frames = decode_all_frames(jxl, None).expect("decode");
+    let frames = decode_all_planar(jxl, None).expect("decode");
     assert_eq!(frames.len(), 1, "only the is_last frame is presented");
     let oracle = png_rgba16(png);
     assert_eq!((oracle.0, oracle.1), (1024, 1024));
@@ -174,7 +174,7 @@ fn blendmodes_chain_composes_within_one_code() {
 fn sunset_logo_two_layers_bit_exact() {
     let jxl = include_bytes!("fixtures/conformance_sunset_logo.jxl");
     let png = include_bytes!("fixtures/conformance_sunset_logo_expected.png");
-    let frames = decode_all_frames(jxl, None).expect("decode");
+    let frames = decode_all_planar(jxl, None).expect("decode");
     assert_eq!(frames.len(), 1);
     let oracle = png_rgba16(png);
     assert_eq!(

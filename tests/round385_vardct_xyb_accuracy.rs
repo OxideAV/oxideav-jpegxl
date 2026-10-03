@@ -37,7 +37,7 @@ const REF_PNG: &[u8] = include_bytes!("fixtures/vardct_256x256_d1_expected.png")
 fn decode_internal_xyb() -> [Vec<f32>; 3] {
     VARDCT_XYB_CAPTURE.with(|s| *s.borrow_mut() = None);
     set_vardct_xyb_capture_armed(true);
-    let r = oxideav_jpegxl::decode_vardct_frame_from_codestream(JXL, None);
+    let r = oxideav_jpegxl::decode_planar(JXL, None);
     set_vardct_xyb_capture_armed(false);
     r.expect("integrated VarDCT decode");
     VARDCT_XYB_CAPTURE

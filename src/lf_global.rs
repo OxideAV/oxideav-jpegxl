@@ -21,7 +21,7 @@
 //! `GlobalModular` (a Modular sub-bitstream — see that module for its
 //! own bounds).
 
-use oxideav_core::{Error, Result};
+use crate::error::{Error, Result};
 
 use crate::ans::cluster::{num_clusters, read_clustering};
 use crate::bitreader::{unpack_signed, BitReader, U32Dist};

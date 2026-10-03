@@ -20,7 +20,7 @@
 //! wrong for the single-entry case. Fix: chain the section reads on a
 //! shared `BitReader` when `toc.entries.len() == 1`.
 
-use oxideav_jpegxl::decode_one_frame;
+use oxideav_jpegxl::decode_planar;
 
 const PIXEL_1X1_JXL: &[u8] = include_bytes!("fixtures/pixel_1x1.jxl");
 const GRAY_64X64_JXL: &[u8] = include_bytes!("fixtures/gray_64x64_lossless.jxl");
@@ -42,7 +42,7 @@ fn five_small_lossless_fixtures_still_decode_round_15() {
         ("palette_32x32", PALETTE_JXL),
         ("grey_8x8", GREY_8X8_JXL),
     ] {
-        let vf = decode_one_frame(bytes, None);
+        let vf = decode_planar(bytes, None);
         assert!(
             vf.is_ok(),
             "round-15 regression: {name} should still decode (round-10 baseline); got {:?}",
@@ -62,7 +62,7 @@ fn vardct_d1_fixture_is_past_global_modular_round_15() {
     // Rounds 15–385 pinned a precise deferral here; round 389
     // reference-validated the integrated decode and lifted the public
     // pixel withhold, so being "past GlobalModular" now means pixels.
-    let frame = decode_one_frame(VARDCT_D1_JXL, None)
-        .expect("d1 decodes on the public path since round 389");
+    let frame =
+        decode_planar(VARDCT_D1_JXL, None).expect("d1 decodes on the public path since round 389");
     assert_eq!(frame.planes.len(), 3);
 }

@@ -47,8 +47,8 @@ fn cjxl_grey_8x8_dump_first_bytes() {
 /// `tests/round5_grey_8x8_pixel_correctness.rs`.
 #[test]
 fn cjxl_grey_8x8_decode_attempt() {
-    use oxideav_jpegxl::decode_one_frame;
-    let res = decode_one_frame(FIXTURE, None);
+    use oxideav_jpegxl::decode_planar;
+    let res = decode_planar(FIXTURE, None);
     match res {
         Ok(vf) => {
             eprintln!("cjxl_grey_8x8 decoded: {} planes", vf.planes.len());
@@ -76,8 +76,8 @@ fn cjxl_grey_8x8_decode_attempt() {
 /// which the symbol stream + per-pixel decode chain succeed.
 #[test]
 fn cjxl_grey_8x8_pixel_correct() {
-    use oxideav_jpegxl::decode_one_frame;
-    let vf = decode_one_frame(FIXTURE, None).expect("grey_8x8 should decode after round 5 fix");
+    use oxideav_jpegxl::decode_planar;
+    let vf = decode_planar(FIXTURE, None).expect("grey_8x8 should decode after round 5 fix");
     assert_eq!(vf.planes.len(), 1, "expected 1 plane (Gray8)");
     let plane = &vf.planes[0];
     assert_eq!(plane.stride, 8);

@@ -50,7 +50,7 @@ fn reconstruct_then_crop_to_logical_extent() {
 
     // A per-(channel, varblock) residual block whose every sample encodes
     // (channel, vb origin) so a mis-addressed crop would be visible.
-    let residual_at = |c: usize, vb: &Varblock| -> oxideav_core::Result<Vec<f32>> {
+    let residual_at = |c: usize, vb: &Varblock| -> oxideav_jpegxl::Result<Vec<f32>> {
         let base = (c as f32) * 1000.0 + (vb.y as f32) * 100.0 + (vb.x as f32) * 10.0;
         Ok((0..64).map(|i| base + i as f32).collect())
     };
@@ -96,7 +96,7 @@ fn crop_to_exact_multiple_of_eight_is_identity() {
     // truncation: crop_to the padded dims returns the planes unchanged.
     let g = grid_2x2();
     let residual_at =
-        |_c: usize, _vb: &Varblock| -> oxideav_core::Result<Vec<f32>> { Ok(vec![1.5f32; 64]) };
+        |_c: usize, _vb: &Varblock| -> oxideav_jpegxl::Result<Vec<f32>> { Ok(vec![1.5f32; 64]) };
     let x_from_y = vec![0i32; 1];
     let b_from_y = vec![0i32; 1];
     let cfl = LfChannelCorrelation::default();

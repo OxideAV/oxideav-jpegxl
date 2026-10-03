@@ -22,7 +22,7 @@
 //!   against a 2-preset histogram bundle routes through
 //!   `cluster_map[ctx + 495]` rather than `cluster_map[ctx]`.
 //! * The defensive rejections (`p >= num_passes`, `u32` overflow on
-//!   `ctx + offset`) bubble out as [`oxideav_core::Error`] without
+//!   `ctx + offset`) bubble out as [`oxideav_jpegxl::Error`] without
 //!   panicking.
 //! * No bit reads on a short-circuited block — the [`BitReader`]
 //!   cursor must not advance.

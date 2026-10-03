@@ -75,7 +75,7 @@
 //! before the cast. On 64-bit targets the cast is always lossless for
 //! the spec-permitted maxima.
 
-use oxideav_core::{Error, Result};
+use crate::error::{Error, Result};
 
 use crate::bitreader::BitReader;
 use crate::hf_coeff_histogram_size::HfCoefficientHistogramSize;

@@ -151,7 +151,7 @@ fn r228_three_pass_strict_pass_order() {
         |p, _vb| {
             visited.push(p);
             if p == 1 {
-                Err(oxideav_core::Error::InvalidData(
+                Err(oxideav_jpegxl::Error::InvalidData(
                     "pass-1 simulated failure".into(),
                 ))
             } else {
@@ -354,7 +354,7 @@ fn r228_inner_driver_error_propagates_through_outer_loop() {
         },
         |p, c, _coef| {
             if p == 1 && c == 0 {
-                Err(oxideav_core::Error::InvalidData(
+                Err(oxideav_jpegxl::Error::InvalidData(
                     "pass-1 X-channel decode_symbol failure".into(),
                 ))
             } else {

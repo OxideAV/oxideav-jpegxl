@@ -68,7 +68,7 @@
 //!   bounded pixel residual. The test pins BOTH the failure count and
 //!   the residual band so any change in either direction is loud.
 
-use oxideav_jpegxl::decode_all_frames;
+use oxideav_jpegxl::decode_all_planar;
 use oxideav_jpegxl::hf_coefficient_histograms::{
     reset_section_closure_failures, section_closure_failures,
 };
@@ -87,7 +87,7 @@ fn png_rgb(bytes: &[u8]) -> (usize, usize, Vec<u8>) {
 
 /// Per-channel (MAD, max) against a reference decode.
 fn compare_rgb(
-    frame: &oxideav_core::VideoFrame,
+    frame: &oxideav_jpegxl::RawFrame,
     w: usize,
     h: usize,
     want: &[u8],
@@ -118,7 +118,7 @@ fn assert_reference_band(jxl: &[u8], png: &[u8], max_allowed: u32, name: &str) {
     let (w, h, want) = png_rgb(png);
     reset_section_closure_failures();
     reset_walk_underruns();
-    let frames = decode_all_frames(jxl, None).expect("stream decodes");
+    let frames = decode_all_planar(jxl, None).expect("stream decodes");
     assert_eq!(
         section_closure_failures(),
         0,
@@ -213,7 +213,7 @@ fn round444_wave64_closure_deficiency_closed() {
     let (w, h, want) = png_rgb(include_bytes!("fixtures/r444_wave64_expected.png"));
     reset_section_closure_failures();
     reset_walk_underruns();
-    let frames = decode_all_frames(jxl, None).expect("stream decodes");
+    let frames = decode_all_planar(jxl, None).expect("stream decodes");
     assert_eq!(
         section_closure_failures(),
         0,

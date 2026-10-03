@@ -214,7 +214,7 @@ fn r221_three_channel_qdc_error_aborts_before_any_channel_read() {
         &mut nz,
         0,
         &resolver,
-        |_| Err(oxideav_core::Error::InvalidData("qdc fail".into())),
+        |_| Err(oxideav_jpegxl::Error::InvalidData("qdc fail".into())),
         |_, _| {
             nz_calls += 1;
             Ok(0)
@@ -245,7 +245,7 @@ fn r221_three_channel_y_error_aborts_before_x_and_b() {
         |channel, _pred| {
             per_channel[channel as usize] += 1;
             if channel == 1 {
-                Err(oxideav_core::Error::InvalidData("y fail".into()))
+                Err(oxideav_jpegxl::Error::InvalidData("y fail".into()))
             } else {
                 Ok(0)
             }

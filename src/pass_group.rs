@@ -12,7 +12,7 @@
 //! coordinates. Per G.4.2 last paragraph, inverse transforms run AFTER
 //! all PassGroups complete (driven by `decode_codestream`).
 
-use oxideav_core::{Error, Result};
+use crate::error::{Error, Result};
 
 use crate::bitreader::{BitReader, U32Dist};
 use crate::frame_header::FrameHeader;

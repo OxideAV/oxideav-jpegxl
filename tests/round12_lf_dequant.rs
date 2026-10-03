@@ -17,7 +17,7 @@
 //! IDCT / Chroma-from-Luma / restoration filters; this round only
 //! advances the per-LfGroup decode further down Table G.3.
 
-use oxideav_jpegxl::decode_one_frame;
+use oxideav_jpegxl::decode_planar;
 use oxideav_jpegxl::frame_header::flags;
 use oxideav_jpegxl::lf_dequant::{
     apply_adaptive_lf_smoothing, dequant_lf, should_apply_adaptive_lf_smoothing, LfDequantOutput,
@@ -45,7 +45,7 @@ fn five_small_lossless_fixtures_still_decode_round_12() {
         ("palette_32x32", PALETTE_JXL),
         ("grey_8x8", GREY_8X8_JXL),
     ] {
-        let vf = decode_one_frame(bytes, None);
+        let vf = decode_planar(bytes, None);
         assert!(
             vf.is_ok(),
             "round-12 regression: {name} should still decode (round-10 baseline); got {:?}",

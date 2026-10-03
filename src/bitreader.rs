@@ -4,7 +4,7 @@
 //! byte is read before bit 7, and multi-bit fields are assembled with the
 //! first bit read becoming the least-significant bit of the field.
 
-use oxideav_core::{Error, Result};
+use crate::error::{Error, Result};
 
 #[derive(Clone)]
 pub struct BitReader<'a> {

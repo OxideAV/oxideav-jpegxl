@@ -116,11 +116,11 @@
 use crate::coeff_order::{order_id_for_transform, varblock_size_for_order};
 use crate::dct_quant_weights::{slot_for_transform, DequantMatrixSet};
 use crate::dct_select::TransformType;
+use crate::error::{Error, Result};
 use crate::hf_dequant::{dequant_hf_coefficient, QmScaleFactors};
 use crate::idct::{dct_pixel_dims, idct_for_transform, non_dct_pixel_dims};
 use crate::metadata_fdis::OpsinInverseMatrix;
 use crate::pass_group_hf::DecodedHfBlock;
-use oxideav_core::{Error, Result};
 
 /// The coefficient-grid dimensions `(bwidth, bheight)` of a transform
 /// `t` covered by this per-block decode walk.

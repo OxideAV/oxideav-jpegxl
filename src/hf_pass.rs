@@ -69,7 +69,7 @@
 //!   (natural or permuted), and the histogram-size invariants the
 //!   §C.7.2 read consumes.
 
-use oxideav_core::{Error, Result};
+use crate::error::{Error, Result};
 
 use crate::ans::hybrid::HybridUintState;
 use crate::bitreader::{BitReader, U32Dist};

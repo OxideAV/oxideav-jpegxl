@@ -67,7 +67,7 @@
 //! * [`COEFFICIENTS_PER_ORDER`] — convenience: `bwidth * bheight`
 //!   for every `OrderId` (size argument for `DecodePermutation`).
 
-use oxideav_core::{Error, Result};
+use crate::error::{Error, Result};
 
 use crate::ans::hybrid::HybridUintState;
 use crate::bitreader::BitReader;

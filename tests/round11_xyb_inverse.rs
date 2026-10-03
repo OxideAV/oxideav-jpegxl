@@ -20,7 +20,7 @@
 //! one once the workspace's docs collaborator commissions a hand-
 //! built minimal modular-XYB trace.
 
-use oxideav_jpegxl::decode_one_frame;
+use oxideav_jpegxl::decode_planar;
 use oxideav_jpegxl::metadata_fdis::{OpsinInverseMatrix, ToneMapping};
 use oxideav_jpegxl::xyb::{
     inverse_xyb_to_rgb, inverse_ycbcr_to_rgb, linear_rgb_to_u8, modular_xyb_to_linear_rgb,
@@ -271,7 +271,7 @@ fn five_small_lossless_fixtures_pass_through_round_11() {
         ("palette_32x32", PALETTE_JXL),
         ("grey_8x8", GREY_8X8_JXL),
     ] {
-        let vf = decode_one_frame(bytes, None);
+        let vf = decode_planar(bytes, None);
         assert!(
             vf.is_ok(),
             "round-11 regression: {name} should still decode (round-1..5 baseline); got {:?}",

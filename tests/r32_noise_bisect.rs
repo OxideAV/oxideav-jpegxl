@@ -40,7 +40,7 @@
 //! byte-exact against `expected.png` on all three planes — which is
 //! what this test pins.
 
-use oxideav_jpegxl::decode_one_frame;
+use oxideav_jpegxl::decode_planar;
 use std::io::Cursor;
 
 const NOISE_JXL: &[u8] = include_bytes!("fixtures/noise_64x64_lossless.jxl");
@@ -48,7 +48,7 @@ const EXPECTED_PNG: &[u8] = include_bytes!("fixtures/noise_64x64_lossless_expect
 
 #[test]
 fn r32_noise_lossless_is_pixel_exact() {
-    let vf = decode_one_frame(NOISE_JXL, None).expect("noise fixture must decode");
+    let vf = decode_planar(NOISE_JXL, None).expect("noise fixture must decode");
     let decoder = png::Decoder::new(Cursor::new(EXPECTED_PNG));
     let mut reader = decoder.read_info().expect("png info");
     let mut buf = vec![0u8; reader.output_buffer_size().unwrap()];

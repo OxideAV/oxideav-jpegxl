@@ -53,7 +53,7 @@
 //! wp-trace-sample-194.md`. The surrounding-sample context (s=188..200)
 //! gives the spec-correct values at sample 193.
 
-use oxideav_jpegxl::decode_one_frame;
+use oxideav_jpegxl::decode_planar;
 use oxideav_jpegxl::modular_fdis::{
     encode_leaf_pick_target, WpHeader, LEAF_PICK_TRACE_TARGET, LEAF_PICK_TRACE_WP, WP_DEEP_TRACE,
     WP_DEEP_TRACE_ARMED,
@@ -98,13 +98,13 @@ fn r195_sample_193_te_n_equals_sample_194_te_nw() {
     // First capture sample 194's WP state
     LEAF_PICK_TRACE_TARGET.store(encode_leaf_pick_target(0, 2, 3), Ordering::Relaxed);
     LEAF_PICK_TRACE_WP.with(|s| s.borrow_mut().clear());
-    let _ = decode_one_frame(NOISE_JXL, None).expect("decode");
+    let _ = decode_planar(NOISE_JXL, None).expect("decode");
     let wp_194 = LEAF_PICK_TRACE_WP.with(|s| s.borrow().clone());
 
     // Now capture sample 193's WP state
     LEAF_PICK_TRACE_TARGET.store(encode_leaf_pick_target(0, 1, 3), Ordering::Relaxed);
     LEAF_PICK_TRACE_WP.with(|s| s.borrow_mut().clear());
-    let _ = decode_one_frame(NOISE_JXL, None).expect("decode");
+    let _ = decode_planar(NOISE_JXL, None).expect("decode");
     let wp_193 = LEAF_PICK_TRACE_WP.with(|s| s.borrow().clone());
 
     LEAF_PICK_TRACE_TARGET.store(u64::MAX, Ordering::Relaxed);
@@ -175,7 +175,7 @@ fn r195_sample_193_prediction_propagation() {
     LEAF_PICK_TRACE_WP.with(|s| s.borrow_mut().clear());
     WP_DEEP_TRACE.with(|s| s.borrow_mut().clear());
     WP_DEEP_TRACE_ARMED.with(|c| c.set(true));
-    let _ = decode_one_frame(NOISE_JXL, None).expect("decode");
+    let _ = decode_planar(NOISE_JXL, None).expect("decode");
     WP_DEEP_TRACE_ARMED.with(|c| c.set(false));
     LEAF_PICK_TRACE_TARGET.store(u64::MAX, Ordering::Relaxed);
 
@@ -248,7 +248,7 @@ fn r195_sample_193_corrected_te_n_gives_spec_prediction() {
         Ordering::Relaxed,
     );
     LEAF_PICK_TRACE_WP.with(|s| s.borrow_mut().clear());
-    let _ = decode_one_frame(NOISE_JXL, None).expect("decode");
+    let _ = decode_planar(NOISE_JXL, None).expect("decode");
     LEAF_PICK_TRACE_TARGET.store(u64::MAX, Ordering::Relaxed);
     let wp_cap = LEAF_PICK_TRACE_WP.with(|s| s.borrow().clone());
 
@@ -364,7 +364,7 @@ fn r195_true_err_divergence_scan_row_2() {
     // Capture sample 129's true_err (already known to be 716)
     LEAF_PICK_TRACE_TARGET.store(encode_leaf_pick_target(0, 1, 2), Ordering::Relaxed);
     LEAF_PICK_TRACE_WP.with(|s| s.borrow_mut().clear());
-    let _ = decode_one_frame(NOISE_JXL, None).expect("decode");
+    let _ = decode_planar(NOISE_JXL, None).expect("decode");
     let wp_129 = LEAF_PICK_TRACE_WP.with(|s| s.borrow().clone());
     LEAF_PICK_TRACE_TARGET.store(u64::MAX, Ordering::Relaxed);
 
@@ -385,7 +385,7 @@ fn r195_true_err_divergence_scan_row_2() {
     // Capture sample 130's te_* to compare
     LEAF_PICK_TRACE_TARGET.store(encode_leaf_pick_target(0, 2, 2), Ordering::Relaxed);
     LEAF_PICK_TRACE_WP.with(|s| s.borrow_mut().clear());
-    let _ = decode_one_frame(NOISE_JXL, None).expect("decode");
+    let _ = decode_planar(NOISE_JXL, None).expect("decode");
     let wp_130 = LEAF_PICK_TRACE_WP.with(|s| s.borrow().clone());
     LEAF_PICK_TRACE_TARGET.store(u64::MAX, Ordering::Relaxed);
 
@@ -420,7 +420,7 @@ fn r195_true_err_divergence_scan_row_2() {
     // The root cause must be before sample 129. Let's check sample 65 (x=1, y=1).
     LEAF_PICK_TRACE_TARGET.store(encode_leaf_pick_target(0, 1, 1), Ordering::Relaxed);
     LEAF_PICK_TRACE_WP.with(|s| s.borrow_mut().clear());
-    let _ = decode_one_frame(NOISE_JXL, None).expect("decode");
+    let _ = decode_planar(NOISE_JXL, None).expect("decode");
     let wp_65 = LEAF_PICK_TRACE_WP.with(|s| s.borrow().clone());
     LEAF_PICK_TRACE_TARGET.store(u64::MAX, Ordering::Relaxed);
 

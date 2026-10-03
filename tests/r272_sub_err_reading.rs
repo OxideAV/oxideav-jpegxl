@@ -164,7 +164,7 @@ fn readings_diverge_for_negative_predictions() {
 /// decodes synth_320 LESS far — revert to `sub_err_for`.
 #[test]
 fn synth_320_pixel_exact_with_production_reading() {
-    let vf = oxideav_jpegxl::decode_one_frame(SYNTH_320_JXL, None).unwrap();
+    let vf = oxideav_jpegxl::decode_planar(SYNTH_320_JXL, None).unwrap();
     let plane = &vf.planes[0];
 
     let mut first: Option<(usize, usize)> = None;

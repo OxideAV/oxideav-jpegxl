@@ -29,8 +29,8 @@
 //!
 //! ## What this test asserts
 //!
-//! After the §F.3 fix, `decode_one_frame` on the noise fixture returns
-//! a 3-plane 64×64 8-bit RGB `VideoFrame` with byte-packed planes
+//! After the §F.3 fix, `decode_planar` on the noise fixture returns
+//! a 3-plane 64×64 8-bit RGB `RawFrame` with byte-packed planes
 //! (stride == width, no error). This nails down the §F.3 single-section
 //! fast-path behaviour as a regression baseline.
 //!
@@ -72,7 +72,7 @@
 //! v0.11.1 input.jxl /tmp/out.png` produces the same PNG modulo
 //! per-byte equality with `expected.png`.
 
-use oxideav_jpegxl::decode_one_frame;
+use oxideav_jpegxl::decode_planar;
 
 const NOISE_JXL: &[u8] = include_bytes!("fixtures/noise_64x64_lossless.jxl");
 
@@ -80,8 +80,8 @@ const NOISE_JXL: &[u8] = include_bytes!("fixtures/noise_64x64_lossless.jxl");
 fn noise_64x64_lossless_decodes_without_eof_error() {
     // Pre-round-31: this call errored with InvalidData("unexpected end
     // of JXL bitstream") mid-pixel-decode. Post-fix: it returns a
-    // 3-plane 64×64 8-bit RGB VideoFrame.
-    let vf = decode_one_frame(NOISE_JXL, None)
+    // 3-plane 64×64 8-bit RGB RawFrame.
+    let vf = decode_planar(NOISE_JXL, None)
         .expect("noise-64x64-lossless must decode after §F.3 fast-path fix");
     assert_eq!(
         vf.planes.len(),
@@ -132,7 +132,7 @@ fn pre_round31_seven_lossless_fixtures_still_decode() {
             &include_bytes!("fixtures/bit_depth_16.jxl")[..],
         ),
     ] {
-        let _ = decode_one_frame(bytes, None)
+        let _ = decode_planar(bytes, None)
             .unwrap_or_else(|e| panic!("post-r31 regression: {label} failed to decode: {e}"));
     }
 }

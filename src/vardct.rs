@@ -37,7 +37,7 @@
 //! This unblocks downstream callers that probe the codestream
 //! signature and only error if pixel data is asked for.
 
-use oxideav_core::Error;
+use crate::error::Error;
 
 use crate::dct_select::TransformType;
 use crate::frame_header::FrameHeader;

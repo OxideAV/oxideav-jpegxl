@@ -22,7 +22,7 @@
 //!
 //! See [`Begabrac::decode`] for the integer-decode procedure proper.
 
-use oxideav_core::{Error, Result};
+use crate::error::{Error, Result};
 
 use crate::abrac::Abrac;
 

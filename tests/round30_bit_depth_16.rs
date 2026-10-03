@@ -5,7 +5,7 @@
 //!
 //! Round-29 surfaced `bit-depth-16` as a docs-gap probe failure: the
 //! decoder hard-rejected `metadata.bit_depth.bits_per_sample != 8` at
-//! the start of the post-Modular VideoFrame mapping. This round lifts
+//! the start of the post-Modular RawFrame mapping. This round lifts
 //! that restriction for the pass-through (non-XYB / non-YCbCr) path
 //! and adopts a documented LE-pack convention for samples wider than
 //! 8 bits:
@@ -15,7 +15,7 @@
 //!                  == width × 2.
 //!
 //! The convention is documented in the crate README. `oxideav-core`'s
-//! `VideoPlane` carries no bit-depth field, so a downstream consumer
+//! `Plane` carries no bit-depth field, so a downstream consumer
 //! must look up the source codestream's `bit_depth` (e.g. via the
 //! `CodecParameters.extra_data`) to know how to interpret a wide
 //! plane.
@@ -36,7 +36,7 @@
 //! `expected.png` (16-bit RGB PNG) is the ground-truth used at test
 //! time.
 
-use oxideav_jpegxl::decode_one_frame;
+use oxideav_jpegxl::decode_planar;
 use png::ColorType;
 use std::io::Cursor;
 
@@ -92,7 +92,7 @@ fn plane_to_u16_le(data: &[u8]) -> Vec<u16> {
 
 #[test]
 fn bit_depth_16_rgb_pixel_correct_vs_expected_png() {
-    let vf = decode_one_frame(BD16_JXL, None).expect("bit-depth-16 must decode");
+    let vf = decode_planar(BD16_JXL, None).expect("bit-depth-16 must decode");
     assert_eq!(
         vf.planes.len(),
         3,
@@ -135,7 +135,7 @@ fn bit_depth_16_rgb_pixel_correct_vs_expected_png() {
 /// reproduces the same samples as `to_le_bytes`.
 #[test]
 fn bit_depth_16_le_pack_convention_self_consistent() {
-    let vf = decode_one_frame(BD16_JXL, None).expect("bit-depth-16 must decode");
+    let vf = decode_planar(BD16_JXL, None).expect("bit-depth-16 must decode");
     for plane in &vf.planes {
         assert_eq!(plane.stride, 64 * 2);
         assert_eq!(plane.data.len(), 64 * 64 * 2);
@@ -152,21 +152,21 @@ fn bit_depth_16_le_pack_convention_self_consistent() {
 #[test]
 fn pre_round30_8bit_fixtures_still_byte_packed() {
     // pixel-1x1 (RGB 1×1)
-    let vf = decode_one_frame(include_bytes!("fixtures/pixel_1x1.jxl"), None).expect("pixel-1x1");
+    let vf = decode_planar(include_bytes!("fixtures/pixel_1x1.jxl"), None).expect("pixel-1x1");
     for p in &vf.planes {
         assert_eq!(p.stride, 1);
         assert_eq!(p.data.len(), 1);
     }
 
     // gray-64x64 (Grey 64×64)
-    let vf = decode_one_frame(include_bytes!("fixtures/gray_64x64_lossless.jxl"), None)
+    let vf = decode_planar(include_bytes!("fixtures/gray_64x64_lossless.jxl"), None)
         .expect("gray-64x64");
     assert_eq!(vf.planes.len(), 1);
     assert_eq!(vf.planes[0].stride, 64);
     assert_eq!(vf.planes[0].data.len(), 64 * 64);
 
     // gradient-64x64 (RGB 64×64)
-    let vf = decode_one_frame(include_bytes!("fixtures/gradient_64x64_lossless.jxl"), None)
+    let vf = decode_planar(include_bytes!("fixtures/gradient_64x64_lossless.jxl"), None)
         .expect("gradient-64x64");
     assert_eq!(vf.planes.len(), 3);
     for p in &vf.planes {
@@ -175,8 +175,7 @@ fn pre_round30_8bit_fixtures_still_byte_packed() {
     }
 
     // alpha-64x64 (RGBA 64×64) — round 29
-    let vf =
-        decode_one_frame(include_bytes!("fixtures/alpha_64x64.jxl"), None).expect("alpha-64x64");
+    let vf = decode_planar(include_bytes!("fixtures/alpha_64x64.jxl"), None).expect("alpha-64x64");
     assert_eq!(vf.planes.len(), 4);
     for p in &vf.planes {
         assert_eq!(p.stride, 64);

@@ -30,7 +30,7 @@
 //!   abort the walk before any downstream read; the BitReader cursor
 //!   is unchanged.
 //! * Defensive rejections (`p >= num_passes`, residual `Empty` cell
-//!   in the grid) bubble out as [`oxideav_core::Error`] without
+//!   in the grid) bubble out as [`oxideav_jpegxl::Error`] without
 //!   panicking.
 
 use oxideav_jpegxl::bitreader::BitReader;

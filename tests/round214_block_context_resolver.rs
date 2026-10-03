@@ -231,7 +231,7 @@ fn r214_driver_propagates_qdc_closure_error() {
         0,
         0,
         &resolver,
-        |_| Err(oxideav_core::Error::InvalidData("qdc-fail".into())),
+        |_| Err(oxideav_jpegxl::Error::InvalidData("qdc-fail".into())),
         |_| Ok(0),
         |_| Ok(0),
     );

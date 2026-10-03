@@ -78,12 +78,12 @@
 use crate::block_dequant::covered_grid_dims;
 use crate::chroma_from_luma::apply_hf_plane_inplace;
 use crate::dct_select::{DctSelectGrid, TransformType};
+use crate::error::{Error, Result};
 use crate::idct::{dct_pixel_dims, non_dct_pixel_dims};
 use crate::lf_dequant::LfDequantOutput;
 use crate::lf_global::LfChannelCorrelation;
 use crate::varblock_walk::{Varblock, VarblockWalk};
 use crate::vardct::compose_lf_to_llf_block;
-use oxideav_core::{Error, Result};
 
 /// A single-channel spatial residual plane sized to the padded block
 /// grid of a [`DctSelectGrid`].

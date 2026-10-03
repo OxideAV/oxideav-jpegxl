@@ -15,12 +15,25 @@ keywords = ["multimedia", "image", "jpegxl", "jxl", "codec"]
 categories = ["multimedia::encoding", "multimedia::images"]
 
 [dependencies]
-oxideav-core = "0.1"
+# `oxideav-core` is gated behind the default-on `registry` feature so
+# image-library consumers can depend on this crate with
+# `default-features = false` and skip the framework dependency tree.
+# Without `registry` the crate exposes the image-crate contract
+# (`probe` / `info` / `decode*` over `JxlImage`) and the depth modules.
+oxideav-core = { version = "0.1", optional = true }
 # `compcol` (Karpelès Lab's compression collection, the workspace-wide
 # compression dependency) supplies the RFC 7932 Brotli decoder that
 # ISO/IEC 18181-2 §9.7 (`brob` boxes) and §9.11 (the `jbrd` trailing
 # data stream) require.
 compcol = { version = "0.6", default-features = false, features = ["brotli", "std"] }
+
+[features]
+default = ["registry"]
+# Framework integration: `register(&mut RuntimeContext)`, the
+# `make_decoder` / `make_encoder` factories, the `JxlImage` <->
+# `VideoFrame` bridge and the deprecated planar `decode_one_frame` /
+# `decode_all_frames` wrappers. Turn off for image-library use.
+registry = ["dep:oxideav-core"]
 
 [dev-dependencies]
 # Used only by integration tests to decode the committed `expected.png`

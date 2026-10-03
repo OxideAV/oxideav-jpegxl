@@ -12,10 +12,10 @@
 //! interaction between [`predicted_non_zeros`] (round 159) →
 //! [`decode_block_at`] (round 177) → grid update → next prediction.
 
-use oxideav_core::Result;
 use oxideav_jpegxl::dct_select::TransformType;
 use oxideav_jpegxl::non_zeros_grid::{decode_block_at, NonZerosGrid};
 use oxideav_jpegxl::pass_group_hf::predicted_non_zeros;
+use oxideav_jpegxl::Result;
 
 #[test]
 fn round177_grid_origin_predicted_is_32_for_any_shape() {

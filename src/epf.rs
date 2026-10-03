@@ -210,9 +210,9 @@
 //!   from the §C.5.4 HF pipeline; the caller supplies the resulting
 //!   per-block sigma via [`SigmaGrid`].
 
+use crate::error::{Error, Result};
 use crate::frame_header::RestorationFilter;
 use crate::gaborish::mirror1d;
-use oxideav_core::{Error, Result};
 
 /// Which §J.3 pass an EPF call is implementing.  See module-level
 /// table for the mapping to `epf_iters`.

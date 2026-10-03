@@ -36,7 +36,7 @@ fn png_grey(bytes: &[u8]) -> (usize, usize, Vec<u8>) {
 }
 
 fn decode_and_compare(jxl: &[u8], expected_png: &[u8]) -> (f64, u8) {
-    let frame = oxideav_jpegxl::decode_one_frame(jxl, None).expect("decode");
+    let frame = oxideav_jpegxl::decode_planar(jxl, None).expect("decode");
     let (w, h, reference) = png_grey(expected_png);
     let plane = &frame.planes[0];
     let mut sum = 0u64;

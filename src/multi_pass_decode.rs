@@ -83,7 +83,7 @@
 //! unchanged — round 228 is purely the outer-loop control-flow
 //! layer.
 
-use oxideav_core::{Error, Result};
+use crate::error::{Error, Result};
 
 use crate::block_context_resolver::{
     decode_varblocks_three_channels_with_resolver, BlockContextResolver, ThreeChannelVarblock,

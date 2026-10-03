@@ -61,7 +61,7 @@
 //! display ICC profile, and that bytes 0-3 are the profile size as a
 //! big-endian u32. No ICC vendor's source / lcms source consulted.
 
-use oxideav_core::{Error, Result};
+use crate::error::{Error, Result};
 
 use crate::ans::hybrid::HybridUintState;
 use crate::bitreader::BitReader;

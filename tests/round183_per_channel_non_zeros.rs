@@ -7,9 +7,9 @@
 //! layers are pure-control-flow against FDIS §C.8.3 + Listing C.13 /
 //! Listing C.14.
 
-use oxideav_core::Result;
 use oxideav_jpegxl::dct_select::TransformType;
 use oxideav_jpegxl::per_channel_non_zeros::{PerChannelNonZerosGrids, DEFAULT_NUM_CHANNELS};
+use oxideav_jpegxl::Result;
 
 #[test]
 fn r183_default_num_channels_constant_is_three() {

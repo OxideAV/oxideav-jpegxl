@@ -109,7 +109,7 @@
 //!   caller passes one plane per channel at the channel's native
 //!   resolution.
 
-use oxideav_core::{Error, Result};
+use crate::error::{Error, Result};
 
 /// FDIS Listing 6.1 `Mirror1D(coord, size)`. Returns the in-bounds
 /// `usize` index that an out-of-bounds reference resolves to.

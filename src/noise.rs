@@ -35,7 +35,7 @@
 //! ISO 3200) pins the whole chain against a black-box reference
 //! decode (`round437_noise_feature`).
 
-use oxideav_core::Result;
+use crate::error::Result;
 
 use crate::bitreader::BitReader;
 use crate::gaborish::mirror1d;

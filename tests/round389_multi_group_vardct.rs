@@ -151,7 +151,7 @@ fn multi_group_decode_matches_reference_in_xyb() {
     // Decode with the XYB capture hook armed.
     oxideav_jpegxl::VARDCT_XYB_CAPTURE.with(|s| *s.borrow_mut() = None);
     oxideav_jpegxl::set_vardct_xyb_capture_armed(true);
-    let r = oxideav_jpegxl::decode_vardct_frame_from_codestream(JXL, None);
+    let r = oxideav_jpegxl::decode_planar(JXL, None);
     oxideav_jpegxl::set_vardct_xyb_capture_armed(false);
     let frame = r.expect("multi-group VarDCT decode runs end-to-end");
     assert_eq!(frame.planes.len(), 3);
@@ -237,8 +237,7 @@ fn multi_group_decode_matches_reference_in_xyb() {
 #[test]
 fn multi_group_decode_matches_reference_srgb_bytes() {
     use std::io::Cursor;
-    let frame = oxideav_jpegxl::decode_vardct_frame_from_codestream(JXL, None)
-        .expect("multi-group VarDCT decode");
+    let frame = oxideav_jpegxl::decode_planar(JXL, None).expect("multi-group VarDCT decode");
     let dec = png::Decoder::new(Cursor::new(REF_PNG));
     let mut reader = dec.read_info().expect("png read_info");
     let mut buf = vec![0u8; reader.output_buffer_size().unwrap_or(0)];
@@ -295,7 +294,7 @@ fn d3_header_parses_and_decodes_to_reference() {
         "single-entry TOC of 1476 bytes per the fixture trace"
     );
 
-    let frame = oxideav_jpegxl::decode_vardct_frame_from_codestream(D3_JXL, None)
+    let frame = oxideav_jpegxl::decode_planar(D3_JXL, None)
         .expect("d3 decodes end-to-end after the save_before_ct fix");
     let dec = png::Decoder::new(Cursor::new(D3_PNG));
     let mut reader = dec.read_info().expect("png read_info");

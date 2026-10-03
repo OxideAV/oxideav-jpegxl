@@ -30,7 +30,7 @@
 //!   an error mid-walk aborts before the remaining channels' reads
 //!   (so their ANS state is **not** advanced).
 //! * The defensive rejections (`p >= num_passes`, `u32` overflow on
-//!   `ctx + offset`) bubble out as [`oxideav_core::Error`] without
+//!   `ctx + offset`) bubble out as [`oxideav_jpegxl::Error`] without
 //!   panicking.
 //! * No bit reads on a short-circuited block — the [`BitReader`]
 //!   cursor must not advance across all three channels.

@@ -34,7 +34,7 @@ fn noise_feature_decodes_within_ratchet() {
     let jxl = include_bytes!("fixtures/noise_feature_256x256.jxl");
     let expected = include_bytes!("fixtures/noise_feature_256x256_expected.png");
     let (w, h, reference) = png_rgb(expected);
-    let frame = oxideav_jpegxl::decode_one_frame(jxl, None).expect("kNoise stream must decode");
+    let frame = oxideav_jpegxl::decode_planar(jxl, None).expect("kNoise stream must decode");
     assert_eq!(frame.planes.len(), 3);
     let bounds = [(0.95, 9u8), (0.85, 7u8), (0.95, 7u8)];
     for (c, (mad_max, abs_max)) in bounds.iter().enumerate() {

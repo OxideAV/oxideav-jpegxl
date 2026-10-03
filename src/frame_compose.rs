@@ -93,7 +93,8 @@
 //! to the canvas: samples outside the image area are discarded, never
 //! an error.
 
-use oxideav_core::{Error, Result, VideoFrame, VideoPlane};
+use crate::error::{Error, Result};
+use crate::image::{Plane, RawFrame};
 
 use crate::frame_header::BlendMode;
 
@@ -244,7 +245,7 @@ impl ComposeState {
     /// alpha-consuming modes (`kBlend` / `kAlphaWeightedAdd`) need
     /// `meta.alpha_plane` to point at the alpha plane and reject
     /// alpha-less frames precisely.
-    pub fn compose(&mut self, decoded: &VideoFrame, meta: &FrameComposeMeta) -> Result<VideoFrame> {
+    pub fn compose(&mut self, decoded: &RawFrame, meta: &FrameComposeMeta) -> Result<RawFrame> {
         let bytes = self.bytes_per_sample();
         let two = bytes == 2;
         let max = ((1u32 << self.bits_per_sample) - 1) as f32;
@@ -302,7 +303,7 @@ impl ComposeState {
         fw: usize,
         fh: usize,
         meta: &FrameComposeMeta,
-    ) -> Result<VideoFrame> {
+    ) -> Result<RawFrame> {
         let n_planes = newf.len();
         if n_planes < 3 {
             return Err(Error::Unsupported(format!(
@@ -546,7 +547,7 @@ impl ComposeState {
 
         // Materialise the presented frame: clamp to the nominal range
         // and quantise to the crate's integer plane layout.
-        Ok(VideoFrame {
+        Ok(RawFrame {
             pts: None,
             planes: planes
                 .into_iter()
@@ -556,7 +557,7 @@ impl ComposeState {
                         let q = (v.clamp(0.0, 1.0) * max).round() as u32;
                         put_sample(&mut out, i, two, q);
                     }
-                    VideoPlane {
+                    Plane {
                         stride: self.width * bytes,
                         data: out,
                     }
@@ -591,19 +592,19 @@ fn put_sample(data: &mut [u8], idx: usize, two_byte: bool, v: u32) {
 mod tests {
     use super::*;
 
-    fn rgb_frame(w: usize, h: usize, r: u8, g: u8, b: u8) -> VideoFrame {
-        VideoFrame {
+    fn rgb_frame(w: usize, h: usize, r: u8, g: u8, b: u8) -> RawFrame {
+        RawFrame {
             pts: None,
             planes: vec![
-                VideoPlane {
+                Plane {
                     stride: w,
                     data: vec![r; w * h],
                 },
-                VideoPlane {
+                Plane {
                     stride: w,
                     data: vec![g; w * h],
                 },
-                VideoPlane {
+                Plane {
                     stride: w,
                     data: vec![b; w * h],
                 },
@@ -611,9 +612,9 @@ mod tests {
         }
     }
 
-    fn rgba_frame(w: usize, h: usize, r: u8, g: u8, b: u8, a: u8) -> VideoFrame {
+    fn rgba_frame(w: usize, h: usize, r: u8, g: u8, b: u8, a: u8) -> RawFrame {
         let mut f = rgb_frame(w, h, r, g, b);
-        f.planes.push(VideoPlane {
+        f.planes.push(Plane {
             stride: w,
             data: vec![a; w * h],
         });
@@ -824,18 +825,18 @@ mod tests {
     /// normalisation (the alpha conformance streams' layout).
     #[test]
     fn twelve_bit_planes_blend_with_4095_denominator() {
-        fn plane16(w: usize, h: usize, v: u16) -> VideoPlane {
+        fn plane16(w: usize, h: usize, v: u16) -> Plane {
             let mut data = Vec::with_capacity(w * h * 2);
             for _ in 0..w * h {
                 data.extend_from_slice(&v.to_le_bytes());
             }
-            VideoPlane {
+            Plane {
                 stride: w * 2,
                 data,
             }
         }
         let mut st = ComposeState::new_with_depth(1, 1, 12).unwrap();
-        let f1 = VideoFrame {
+        let f1 = RawFrame {
             pts: None,
             planes: (0..3).map(|_| plane16(1, 1, 3000)).collect(),
         };
@@ -849,7 +850,7 @@ mod tests {
         );
 
         // kAdd saturates at 4095 on presentation, not 65535 or 255.
-        let f2 = VideoFrame {
+        let f2 = RawFrame {
             pts: None,
             planes: (0..3).map(|_| plane16(1, 1, 2000)).collect(),
         };
@@ -865,7 +866,7 @@ mod tests {
         );
 
         // kBlend straight alpha at 12 bits: opaque new frame wins.
-        let mut f3 = VideoFrame {
+        let mut f3 = RawFrame {
             pts: None,
             planes: (0..3).map(|_| plane16(1, 1, 1234)).collect(),
         };

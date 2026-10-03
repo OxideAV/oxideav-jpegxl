@@ -258,7 +258,7 @@ fn clamp_tainted(
 
 fn run_oracle(jxl: &[u8], expected_png: &[u8], group_dim: u32) -> usize {
     oxideav_jpegxl::set_modular_pre_inverse_capture_armed(true);
-    let frame = oxideav_jpegxl::decode_one_frame(jxl, None).expect("decode");
+    let frame = oxideav_jpegxl::decode_planar(jxl, None).expect("decode");
     oxideav_jpegxl::set_modular_pre_inverse_capture_armed(false);
     let captured = oxideav_jpegxl::MODULAR_PRE_INVERSE_CAPTURE
         .with(|s| s.borrow_mut().take())
@@ -397,7 +397,7 @@ fn external_output_geometry_probe() {
         headers.metadata.num_extra_channels,
     );
     oxideav_jpegxl::set_modular_pre_inverse_capture_armed(true);
-    let decoded = oxideav_jpegxl::decode_one_frame(&jxl, None);
+    let decoded = oxideav_jpegxl::decode_planar(&jxl, None);
     oxideav_jpegxl::set_modular_pre_inverse_capture_armed(false);
     if let Some((descs, chans, transforms)) =
         oxideav_jpegxl::MODULAR_PRE_INVERSE_CAPTURE.with(|s| s.borrow_mut().take())
@@ -522,9 +522,8 @@ fn sq_2880x320_wp_multilfgroup_coded_domain_oracle() {
 /// output quantisation on top).
 #[test]
 fn sq_2880x320_wp_multilfgroup_bit_exact() {
-    let frame =
-        oxideav_jpegxl::decode_one_frame(include_bytes!("fixtures/sq_2880x320_wp.jxl"), None)
-            .expect("decode");
+    let frame = oxideav_jpegxl::decode_planar(include_bytes!("fixtures/sq_2880x320_wp.jxl"), None)
+        .expect("decode");
     let (w, h, reference) = png_grey(include_bytes!("fixtures/sq_2880x320_wp_expected.png"));
     let plane = &frame.planes[0];
     let mut max = 0u8;

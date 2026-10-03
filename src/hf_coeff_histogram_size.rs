@@ -30,7 +30,7 @@
 //! step), and does NOT compute per-context offsets beyond the
 //! per-pass `offset_for_hfp` (which §C.8.3 spells out explicitly).
 
-use oxideav_core::{Error, Result};
+use crate::error::{Error, Result};
 
 /// The §C.7.2 spec constant — distributions per HF preset per block
 /// context. The factor of 495 = 11 × 45 partitions the 64-coefficient

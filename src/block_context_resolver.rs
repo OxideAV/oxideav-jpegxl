@@ -85,7 +85,7 @@
 //! DOCS-GAP) — the round-208 abstract `read_non_zeros` /
 //! `decode_symbol` closure boundary persists unchanged.
 
-use oxideav_core::Result;
+use crate::error::Result;
 
 use crate::coeff_order::order_id_for_transform;
 use crate::dct_select::DctSelectGrid;
@@ -632,7 +632,7 @@ mod tests {
             0,
             0,
             &resolver,
-            |_| Err(oxideav_core::Error::InvalidData("qdc failure".into())),
+            |_| Err(crate::error::Error::InvalidData("qdc failure".into())),
             |_| Ok(0),
             |_| Ok(0),
         );
@@ -818,7 +818,7 @@ mod tests {
             &mut nz,
             0,
             &resolver,
-            |_| Err(oxideav_core::Error::InvalidData("qdc failure".into())),
+            |_| Err(crate::error::Error::InvalidData("qdc failure".into())),
             |_, _| {
                 nz_call_count += 1;
                 Ok(0)
@@ -851,7 +851,7 @@ mod tests {
             |channel, _pred| {
                 per_channel_calls[channel as usize] += 1;
                 if channel == 0 {
-                    Err(oxideav_core::Error::InvalidData("x fail".into()))
+                    Err(crate::error::Error::InvalidData("x fail".into()))
                 } else {
                     Ok(0)
                 }
@@ -884,7 +884,7 @@ mod tests {
             |channel, _pred| {
                 per_channel_calls[channel as usize] += 1;
                 if channel == 1 {
-                    Err(oxideav_core::Error::InvalidData("y fail".into()))
+                    Err(crate::error::Error::InvalidData("y fail".into()))
                 } else {
                     Ok(0)
                 }

@@ -78,7 +78,7 @@
 //! [`crate::non_zeros_grid`], and round-183
 //! [`crate::per_channel_non_zeros`].
 
-use oxideav_core::{Error, Result};
+use crate::error::{Error, Result};
 
 use crate::dct_select::TransformType;
 use crate::pass_group_hf::DecodedHfBlock;

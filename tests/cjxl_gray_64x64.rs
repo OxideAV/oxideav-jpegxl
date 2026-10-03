@@ -29,8 +29,8 @@ fn pixel_1x1_probe() {
 /// round-1 acceptance fixture.
 #[test]
 fn pixel_1x1_decodes_to_red_rgb() {
-    use oxideav_jpegxl::decode_one_frame;
-    let vf = decode_one_frame(PIXEL1X1, None).expect("pixel-1x1 must decode");
+    use oxideav_jpegxl::decode_planar;
+    let vf = decode_planar(PIXEL1X1, None).expect("pixel-1x1 must decode");
     assert_eq!(vf.planes.len(), 3, "expected 3 RGB planes");
     assert_eq!(vf.planes[0].data, vec![255u8], "R plane");
     assert_eq!(vf.planes[1].data, vec![0u8], "G plane");
@@ -39,14 +39,14 @@ fn pixel_1x1_decodes_to_red_rgb() {
 
 #[test]
 fn pixel_1x1_decode_attempt() {
-    use oxideav_jpegxl::decode_one_frame;
+    use oxideav_jpegxl::decode_planar;
     eprintln!("pixel_1x1 size: {}", PIXEL1X1.len());
     let mut s = String::new();
     for b in PIXEL1X1.iter() {
         s.push_str(&format!("{b:02x} "));
     }
     eprintln!("pixel_1x1 bytes: {s}");
-    let res = decode_one_frame(PIXEL1X1, None);
+    let res = decode_planar(PIXEL1X1, None);
     match res {
         Ok(vf) => {
             eprintln!(
@@ -102,8 +102,8 @@ fn cjxl_gray_64x64_dump_first_bytes() {
 /// the fixture decodes correctly; the gap is on our side.
 #[test]
 fn cjxl_gray_64x64_decode_attempt() {
-    use oxideav_jpegxl::decode_one_frame;
-    let res = decode_one_frame(FIXTURE, None);
+    use oxideav_jpegxl::decode_planar;
+    let res = decode_planar(FIXTURE, None);
     match res {
         Ok(vf) => {
             assert_eq!(vf.planes.len(), 1, "expected 1 plane (Gray8)");
@@ -143,8 +143,8 @@ const GRAY_64X64_DOCS: &[u8] = include_bytes!("fixtures/gray_64x64_docs.jxl");
 /// first scanline so a human reviewer can eyeball the pattern.
 #[test]
 fn r3_gray_64x64_docs_decodes_to_gradient() {
-    use oxideav_jpegxl::decode_one_frame;
-    let vf = decode_one_frame(GRAY_64X64_DOCS, None).expect("gray-64x64 must decode");
+    use oxideav_jpegxl::decode_planar;
+    let vf = decode_planar(GRAY_64X64_DOCS, None).expect("gray-64x64 must decode");
     assert_eq!(vf.planes.len(), 1, "expected 1 grey plane");
     let plane = &vf.planes[0];
     assert_eq!(plane.stride, 64);
@@ -166,9 +166,9 @@ fn r3_gray_64x64_docs_decodes_to_gradient() {
 /// without asserting success so a future round can advance it.
 #[test]
 fn r2_gradient_decode_attempt() {
-    use oxideav_jpegxl::decode_one_frame;
+    use oxideav_jpegxl::decode_planar;
     eprintln!("gradient-64x64-lossless len={}", GRADIENT_64X64.len());
-    match decode_one_frame(GRADIENT_64X64, None) {
+    match decode_planar(GRADIENT_64X64, None) {
         Ok(vf) => eprintln!(
             "  OK: planes={} sample={:?}",
             vf.planes.len(),
@@ -179,9 +179,9 @@ fn r2_gradient_decode_attempt() {
 }
 #[test]
 fn r2_palette_decode_attempt() {
-    use oxideav_jpegxl::decode_one_frame;
+    use oxideav_jpegxl::decode_planar;
     eprintln!("palette-32x32 len={}", PALETTE_32X32.len());
-    match decode_one_frame(PALETTE_32X32, None) {
+    match decode_planar(PALETTE_32X32, None) {
         Ok(vf) => eprintln!(
             "  OK: planes={} sample={:?}",
             vf.planes.len(),
@@ -192,9 +192,9 @@ fn r2_palette_decode_attempt() {
 }
 #[test]
 fn r2_gray_docs_decode_attempt() {
-    use oxideav_jpegxl::decode_one_frame;
+    use oxideav_jpegxl::decode_planar;
     eprintln!("gray-64x64 (docs) len={}", GRAY_64X64_DOCS.len());
-    match decode_one_frame(GRAY_64X64_DOCS, None) {
+    match decode_planar(GRAY_64X64_DOCS, None) {
         Ok(vf) => eprintln!(
             "  OK: planes={} sample={:?}",
             vf.planes.len(),
@@ -205,7 +205,7 @@ fn r2_gray_docs_decode_attempt() {
 }
 
 /// Step-by-step diagnostic for round-2 work: walk through the same
-/// pipeline `decode_one_frame` does and print where it stops.
+/// pipeline `decode_planar` does and print where it stops.
 #[test]
 fn cjxl_gray_64x64_pipeline_walkthrough() {
     use oxideav_jpegxl::bitreader::BitReader;

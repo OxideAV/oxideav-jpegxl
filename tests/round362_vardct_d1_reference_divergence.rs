@@ -123,7 +123,7 @@ fn reference_is_a_normal_mid_tone_photo() {
 /// the ratchet below is tightened to 1.0/255 accordingly.
 #[test]
 fn vardct_output_tracks_reference_within_hf_filter_gap() {
-    let frame = oxideav_jpegxl::decode_vardct_frame_from_codestream(VARDCT_D1_JXL, None)
+    let frame = oxideav_jpegxl::decode_planar(VARDCT_D1_JXL, None)
         .expect("integrated VarDCT reconstruction runs end-to-end on vardct-d1");
     let (_w, _h, refpx) = ref_rgb();
     let n = refpx.len();

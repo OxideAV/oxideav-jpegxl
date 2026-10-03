@@ -1,6 +1,6 @@
 //! Round-17 Auditor diagnostic: bit-position trace of the d1 fixture.
 //!
-//! Replicates the relevant slice of `decode_one_frame` step-by-step
+//! Replicates the relevant slice of `decode_planar` step-by-step
 //! against `vardct_256x256_d1.jxl`, recording the bit cursor before/after
 //! each major sub-component (LfGlobal sub-bundles + LfGroup sub-bundles).
 //!

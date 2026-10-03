@@ -37,7 +37,7 @@
 #[test]
 fn vardct_d1_parses_through_hf_global_section() {
     const FIXTURE: &[u8] = include_bytes!("fixtures/vardct_256x256_d1.jxl");
-    let frame = oxideav_jpegxl::decode_one_frame(FIXTURE, None)
+    let frame = oxideav_jpegxl::decode_planar(FIXTURE, None)
         .expect("public VarDCT decode succeeds (round 389 lifted the pixel withhold)");
     assert_eq!(frame.planes.len(), 3);
     assert_eq!(frame.planes[0].data.len(), 256 * 256);
@@ -50,7 +50,7 @@ fn vardct_d1_parses_through_hf_global_section() {
 #[test]
 fn vardct_d1_hf_global_section_feeds_reconstruction() {
     const FIXTURE: &[u8] = include_bytes!("fixtures/vardct_256x256_d1.jxl");
-    let frame = oxideav_jpegxl::decode_vardct_frame_from_codestream(FIXTURE, None)
+    let frame = oxideav_jpegxl::decode_planar(FIXTURE, None)
         .expect("§C.7 section should feed a successful integrated reconstruction");
     assert_eq!(frame.planes.len(), 3);
     assert_eq!(frame.planes[0].data.len(), 256 * 256);

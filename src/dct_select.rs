@@ -23,8 +23,8 @@
 //! 27-entry table verbatim and walks BlockInfo column-by-column placing
 //! varblocks raster-order at the next-available 8×8 cell.
 
+use crate::error::{Error, Result};
 use crate::lf_group::HfMetadata;
-use oxideav_core::{Error, Result};
 
 /// Transform type per FDIS Table C.16. Numerical values 0..=26 are
 /// assigned to integral varblock transforms; later rounds will dispatch

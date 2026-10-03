@@ -60,7 +60,7 @@ fn idct_for_transform_non_dct_paths_match_helper_output() {
     coeffs[10] = 2.0;
     coeffs[20] = -0.5;
 
-    type Helper = fn(&[f32]) -> oxideav_core::Result<Vec<f32>>;
+    type Helper = fn(&[f32]) -> oxideav_jpegxl::Result<Vec<f32>>;
     let cases: &[(TransformType, Helper)] = &[
         (TransformType::Dct2x2, idct_dct2x2_wrap),
         (TransformType::Dct4x4, idct_dct4x4_wrap),
@@ -84,19 +84,19 @@ fn idct_for_transform_non_dct_paths_match_helper_output() {
     }
 }
 
-fn idct_dct2x2_wrap(c: &[f32]) -> oxideav_core::Result<Vec<f32>> {
+fn idct_dct2x2_wrap(c: &[f32]) -> oxideav_jpegxl::Result<Vec<f32>> {
     idct_dct2x2(c)
 }
-fn idct_dct4x4_wrap(c: &[f32]) -> oxideav_core::Result<Vec<f32>> {
+fn idct_dct4x4_wrap(c: &[f32]) -> oxideav_jpegxl::Result<Vec<f32>> {
     idct_dct4x4(c)
 }
-fn idct_hornuss_wrap(c: &[f32]) -> oxideav_core::Result<Vec<f32>> {
+fn idct_hornuss_wrap(c: &[f32]) -> oxideav_jpegxl::Result<Vec<f32>> {
     idct_hornuss(c)
 }
-fn idct_dct8x4_wrap(c: &[f32]) -> oxideav_core::Result<Vec<f32>> {
+fn idct_dct8x4_wrap(c: &[f32]) -> oxideav_jpegxl::Result<Vec<f32>> {
     idct_dct8x4(c)
 }
-fn idct_dct4x8_wrap(c: &[f32]) -> oxideav_core::Result<Vec<f32>> {
+fn idct_dct4x8_wrap(c: &[f32]) -> oxideav_jpegxl::Result<Vec<f32>> {
     idct_dct4x8(c)
 }
 

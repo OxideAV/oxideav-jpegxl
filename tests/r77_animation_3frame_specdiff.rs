@@ -31,7 +31,7 @@
 //! * Trace events at
 //!   `docs/image/jpegxl/fixtures/animation-3frame/trace.txt`.
 
-use oxideav_jpegxl::{decode_one_frame, probe_fdis};
+use oxideav_jpegxl::{decode_planar, probe_fdis};
 
 // Fixture is also copied under `docs/image/jpegxl/fixtures/animation-3frame/input.jxl`
 // in the workspace's `docs/` repository (provenance: cjxl v0.12.0 commit `950c327`,
@@ -67,7 +67,7 @@ fn animation_3frame_first_frame_decodes_to_solid_red() {
     // trial parse, the first frame decodes cleanly. `expected.png` is a
     // solid red (255, 0, 0) 32×32 image, so the R plane is all 255 and
     // the G / B planes are all 0.
-    let vf = decode_one_frame(ANIM_FIXTURE, None)
+    let vf = decode_planar(ANIM_FIXTURE, None)
         .expect("2024-edition RestorationFilter must let the first frame decode");
     assert_eq!(vf.planes.len(), 3, "RGB fixture must yield three planes");
     for (i, plane) in vf.planes.iter().enumerate() {

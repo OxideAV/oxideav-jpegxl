@@ -78,7 +78,7 @@
 //! shape grid; it does not materialise histograms or compute
 //! `block_context` itself.
 
-use oxideav_core::{Error, Result};
+use crate::error::{Error, Result};
 
 use crate::dct_select::{DctSelectCell, DctSelectGrid, TransformType};
 use crate::pass_group_hf::DecodedHfBlock;

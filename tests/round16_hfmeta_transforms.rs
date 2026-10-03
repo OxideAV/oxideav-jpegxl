@@ -25,7 +25,7 @@
 //! still errors, but **at a strictly later point** than round 15. The
 //! new error is the next round-17 candidate.
 
-use oxideav_jpegxl::decode_one_frame;
+use oxideav_jpegxl::decode_planar;
 
 const PIXEL_1X1_JXL: &[u8] = include_bytes!("fixtures/pixel_1x1.jxl");
 const GRAY_64X64_JXL: &[u8] = include_bytes!("fixtures/gray_64x64_lossless.jxl");
@@ -46,7 +46,7 @@ fn five_small_lossless_fixtures_still_decode_round_16() {
         ("palette_32x32", PALETTE_JXL),
         ("grey_8x8", GREY_8X8_JXL),
     ] {
-        let vf = decode_one_frame(bytes, None);
+        let vf = decode_planar(bytes, None);
         assert!(
             vf.is_ok(),
             "round-16 regression: {name} should still decode (round-10 baseline); got {:?}",
@@ -64,7 +64,7 @@ fn vardct_d1_fixture_is_past_hf_metadata_transform_parse_round_16() {
     // Rounds 16–385 pinned a precise deferral past the HfMetadata
     // transform parse; round 389 reference-validated the integrated
     // decode and lifted the public pixel withhold.
-    let frame = decode_one_frame(VARDCT_D1_JXL, None)
-        .expect("d1 decodes on the public path since round 389");
+    let frame =
+        decode_planar(VARDCT_D1_JXL, None).expect("d1 decodes on the public path since round 389");
     assert_eq!(frame.planes.len(), 3);
 }

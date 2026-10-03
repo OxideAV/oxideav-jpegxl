@@ -26,7 +26,7 @@
 //! tree can be cheaply walked during pixel decoding without recursion
 //! and without taking ownership of the underlying ABRAC stream.
 
-use oxideav_core::{Error, Result};
+use crate::error::{Error, Result};
 
 use crate::abrac::Abrac;
 use crate::begabrac::Begabrac;

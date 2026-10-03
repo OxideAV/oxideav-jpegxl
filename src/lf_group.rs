@@ -97,7 +97,7 @@
 //! 4. Inverse transforms run AFTER all PassGroups complete (G.4.2).
 //!    [round 7]
 
-use oxideav_core::{Error, Result};
+use crate::error::{Error, Result};
 
 use crate::bitreader::{BitReader, U32Dist};
 use crate::frame_header::{Encoding, FrameHeader};

@@ -28,7 +28,7 @@
 //! Arithmetic coding (SOF9/SOF10) and single-pass-frame violations
 //! refuse loudly.
 
-use oxideav_core::{Error, Result};
+use crate::error::{Error, Result};
 
 use crate::bitreader::BitReader;
 use crate::block_context_resolver::BlockContextResolver;

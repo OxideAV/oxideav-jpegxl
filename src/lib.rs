@@ -1,4 +1,16 @@
-//! JPEG XL (JXL) codec — decoder-side header parsing.
+//! JPEG XL (JXL) decoder.
+//!
+//! The stable surface is the image-crate contract at the crate root
+//! (`IMAGE_CRATE_API.md`): [`probe`], [`info`], [`decode`],
+//! [`decode_with`], [`decode_rgb8`] / [`decode_rgba8`], [`decode_all`],
+//! [`decode_from`], the always-`Unsupported` `encode*` family (the crate
+//! is decoder-only), the [`JxlImage`] record and [`DecodeOptions`] /
+//! [`EncodeOptions`] / [`JxlError`]. With the default-on `registry`
+//! feature the [`registry`] module adds the `oxideav-core` adapter
+//! (`register`, `make_decoder`, the `VideoFrame` bridge). Everything
+//! below the contract is decode plumbing, `#[doc(hidden)]` where it is
+//! `pub` for the fixture suite and fuzz targets. The remainder of this
+//! page is the round-by-round construction log.
 //!
 //! JPEG XL is ISO/IEC 18181 (final specification 2022). It supersedes
 //! classic JPEG with a modal design that separates a "VarDCT" path
@@ -35,7 +47,7 @@
 //! codestream framing (FrameHeader + TOC + frame-byte alignment) is not
 //! yet wired to the per-channel path. Programs that only need
 //! probe-level information (dimensions, bit depth) should call
-//! [`probe`] directly; programs that want to drive the per-channel
+//! [`info`] directly; programs that want to drive the per-channel
 //! Modular decode end-to-end should instantiate
 //! [`modular::decode_single_channel`] against a hand-built fixture
 //! (unit tests in `modular` show the expected wire format).
@@ -96,7 +108,7 @@
 //! `expected.png`.
 //!
 //! Anything outside this envelope returns
-//! [`Error::Unsupported`](oxideav_core::Error::Unsupported) at the
+//! [`Error::Unsupported`](crate::error::Error::Unsupported) at the
 //! relevant gate point. Wider coverage (VarDCT, Squeeze inverse,
 //! Palette inverse, ICC, full WP predictor 6) lands in round 2+.
 //!
@@ -110,8 +122,7 @@
 //!   true` the bit-position is now correctly advanced past the ICC
 //!   stream rather than failing with `Error::Unsupported` outright;
 //!   the decoded bytes are validated for the "acsp" magic at offset 36
-//!   but are not yet propagated to `oxideav_core::VideoFrame` (which
-//!   has no ICC slot in 0.1.x).
+//!   (since round 469 they are surfaced as `JxlImage::metadata.icc`).
 //! * **G.2 LfGroup / G.4 PassGroup type scaffolding** ([`lf_group`],
 //!   [`pass_group`]): typed bundles + per-group rectangle geometry +
 //!   `(minshift, maxshift)` computation per pass. Per-LfGroup and
@@ -490,13 +501,13 @@
 // NOT part of the crate's stable API surface — `#[doc(hidden)]` keeps
 // cargo-semver-checks (and rustdoc) from treating internals as public.
 //
-// The stable surface is: the crate-root decode entry points
-// (`decode_one_frame` / `decode_all_frames` /
-// `decode_vardct_frame_from_codestream`), the probes (`probe` /
-// `probe_fdis` + their header types), the registry surface (`register` /
-// `register_codecs` / `make_encoder` / `CODEC_ID_STR`), and the
-// `container` / `metadata` / `metadata_fdis` / `extensions` modules
-// whose types appear in those signatures.
+// The stable surface is: the crate-root contract (`probe` / `info` /
+// `decode*` / `encode*` + `JxlImage` and friends), the depth probes
+// (`headers` / `probe_fdis` + their header types), the `registry`
+// surface (`register` / `register_codecs` / `make_decoder` /
+// `make_encoder` / `CODEC_ID_STR`), and the `container` / `metadata` /
+// `metadata_fdis` / `extensions` / `jpeg_reconstruct` modules whose
+// types appear in those signatures.
 #[doc(hidden)] // internal: committee-draft bit-level range coder (D.7)
 pub mod abrac;
 #[doc(hidden)] // internal: AFV transform primitives
@@ -609,14 +620,38 @@ pub mod vardct_reconstruct;
 #[doc(hidden)] // internal: Annex L colour transforms (XYB / YCbCr)
 pub mod xyb;
 
-pub use container::{detect, extract_codestream, Signature};
-pub use metadata::{parse_headers, BitDepth, Headers, ImageMetadata, SizeHeader};
+mod api;
+pub mod error;
+pub mod image;
+pub mod options;
+#[cfg(feature = "registry")]
+pub mod registry;
 
-use oxideav_core::{CodecCapabilities, CodecId, CodecParameters, Error, Result};
-use oxideav_core::{
-    CodecInfo, CodecRegistry, Decoder, Encoder, Frame, Packet, RuntimeContext, VideoFrame,
-    VideoPlane,
+#[allow(deprecated)]
+pub use api::detect;
+pub use api::{
+    decode, decode_all, decode_all_with, decode_from, decode_rgb8, decode_rgba8, decode_with,
+    encode, encode_rgb8, encode_rgba8, encode_to, headers, info, probe, AnimationInfo, Frame,
+    ImageInfo,
 };
+pub use container::{extract_codestream, Signature};
+pub use error::{Error, JxlError, Result};
+#[doc(hidden)]
+pub use image::RawFrame;
+pub use image::{
+    ColorInfo, ColorRange, JxlImage, JxlPixelFormat, Metadata, PixelFormat, Plane, RgbImage,
+    RgbaImage,
+};
+pub use metadata::{parse_headers, BitDepth, Headers, ImageMetadata, SizeHeader};
+pub use options::{DecodeOptions, EncodeOptions};
+#[cfg(feature = "registry")]
+#[doc(hidden)]
+pub use registry::__oxideav_entry;
+#[cfg(feature = "registry")]
+#[allow(deprecated)]
+pub use registry::{decode_all_frames, decode_one_frame, decode_vardct_frame_from_codestream};
+#[cfg(feature = "registry")]
+pub use registry::{make_decoder, make_encoder, register, register_codecs};
 
 use crate::bitreader::BitReader;
 use crate::frame_header::{FrameDecodeParams, FrameHeader, RfEdition};
@@ -626,100 +661,6 @@ use crate::toc::Toc;
 
 /// Public codec id string. Matches the aggregator feature name `jpegxl`.
 pub const CODEC_ID_STR: &str = "jpegxl";
-
-/// Register the JPEG XL decoder stub into the supplied
-/// [`CodecRegistry`]. The encoder slot is intentionally left
-/// unregistered: the crate is decoder-side only and currently
-/// retired-pending-cleanroom (see crate-level docs).
-pub fn register_codecs(reg: &mut CodecRegistry) {
-    let caps = CodecCapabilities::video("jpegxl_headers_only")
-        .with_lossy(true)
-        .with_intra_only(true);
-    reg.register(
-        CodecInfo::new(CodecId::new(CODEC_ID_STR))
-            .capabilities(caps)
-            .decoder(make_decoder),
-    );
-}
-
-/// Unified entry point: install the JPEG XL codec into a
-/// [`RuntimeContext`].
-pub fn register(ctx: &mut RuntimeContext) {
-    register_codecs(&mut ctx.codecs);
-}
-
-oxideav_core::register!("jpegxl", register);
-
-fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
-    let codec_id = params.codec_id.clone();
-    Ok(Box::new(JxlDecoder {
-        codec_id,
-        pending: None,
-        ready: std::collections::VecDeque::new(),
-        eof: false,
-    }))
-}
-
-/// Registered JXL decoder. Drives `decode_one_frame` per packet.
-///
-/// The envelope has grown far past its round-1 origin (see the crate
-/// README "Status"): Modular and VarDCT frames, XYB / YCbCr inverse
-/// colour, multi-group / multi-LfGroup framing, restoration filters,
-/// and the Annex K image features (patches §K.2 + splines §K.3 since
-/// round 441, noise §K.4 since round 437 on VarDCT frames).
-///
-/// Anything outside the envelope returns `Error::Unsupported` from a
-/// well-defined point in the bitstream rather than panicking.
-struct JxlDecoder {
-    codec_id: CodecId,
-    pending: Option<Packet>,
-    /// Frames decoded from the most recent packet, drained one per
-    /// [`Decoder::receive_frame`] call. A JXL codestream can be
-    /// multi-frame (animation), so a single packet may yield several
-    /// [`VideoFrame`]s.
-    ready: std::collections::VecDeque<VideoFrame>,
-    eof: bool,
-}
-
-impl Decoder for JxlDecoder {
-    fn codec_id(&self) -> &CodecId {
-        &self.codec_id
-    }
-
-    fn send_packet(&mut self, packet: &Packet) -> Result<()> {
-        if self.pending.is_some() || !self.ready.is_empty() {
-            return Err(Error::other(
-                "jxl decoder: drain receive_frame before sending another packet",
-            ));
-        }
-        self.pending = Some(packet.clone());
-        Ok(())
-    }
-
-    fn receive_frame(&mut self) -> Result<Frame> {
-        // Decode the pending packet's full frame array on first pull,
-        // then drain the queue one frame at a time.
-        if let Some(pkt) = self.pending.take() {
-            let frames = decode_all_frames(&pkt.data, pkt.pts)?;
-            self.ready.extend(frames);
-        }
-        match self.ready.pop_front() {
-            Some(vf) => Ok(Frame::Video(vf)),
-            None => {
-                if self.eof {
-                    Err(Error::Eof)
-                } else {
-                    Err(Error::NeedMore)
-                }
-            }
-        }
-    }
-
-    fn flush(&mut self) -> Result<()> {
-        self.eof = true;
-        Ok(())
-    }
-}
 
 /// Decode the ICC stream (Annex E.4) at the current bit position and
 /// return the resulting ICC profile bytes.
@@ -743,14 +684,228 @@ fn decode_icc_stream_at(br: &mut BitReader<'_>) -> Result<Vec<u8>> {
     Ok(profile)
 }
 
-/// Decode the entire JXL packet (raw codestream OR ISOBMFF-wrapped) and
-/// return the first frame as a [`VideoFrame`]. Round-3 envelope.
-pub fn decode_one_frame(input: &[u8], pts: Option<i64>) -> Result<VideoFrame> {
-    decode_first_frame(input, pts)
+/// A JXL input with its container stripped: the codestream bytes
+/// **after** the two `FF 0A` signature bytes, plus the parsed 18181-2
+/// box model when the input was ISOBMFF-wrapped.
+pub(crate) struct Opened<'a> {
+    pub signature: container::Signature,
+    pub codestream: std::borrow::Cow<'a, [u8]>,
+    pub file: Option<container::JxlFile<'a>>,
 }
 
-/// Decode **every** frame in a JXL codestream (raw or ISOBMFF-wrapped),
-/// returning them in codestream order.
+/// Detect the wrapping and expose the codestream (§B.1 / 18181-2 §9.3).
+pub(crate) fn open(input: &[u8]) -> Result<Opened<'_>> {
+    use std::borrow::Cow;
+    let signature = container::detect(input)
+        .ok_or_else(|| Error::InvalidData("jxl decoder: no JXL signature".into()))?;
+    match signature {
+        container::Signature::RawCodestream => Ok(Opened {
+            signature,
+            codestream: Cow::Borrowed(&input[2..]),
+            file: None,
+        }),
+        container::Signature::Isobmff => {
+            // The jxlc/jxlp box payload concatenation is itself a JXL
+            // codestream and therefore begins with the 2-byte `FF 0A`
+            // codestream signature (FDIS Annex B.1). Strip it so the
+            // header parse starts on the SizeHeader bits exactly as for
+            // a raw codestream.
+            let mut file = container::JxlFile::parse(input)?;
+            let cs = std::mem::replace(&mut file.codestream, Cow::Borrowed(&[]));
+            if cs.len() < 2 || cs[0] != 0xFF || cs[1] != 0x0A {
+                return Err(Error::InvalidData(
+                    "JXL ISOBMFF: jxlc/jxlp payload missing FF 0A codestream signature".into(),
+                ));
+            }
+            let codestream = match cs {
+                Cow::Borrowed(b) => Cow::Borrowed(&b[2..]),
+                Cow::Owned(mut v) => {
+                    v.drain(..2);
+                    Cow::Owned(v)
+                }
+            };
+            Ok(Opened {
+                signature,
+                codestream,
+                file: Some(file),
+            })
+        }
+    }
+}
+
+/// The codestream prelude: §A.3 SizeHeader, §A.6 ImageMetadata, the
+/// optional Annex B ICC stream (decoded bytes kept) and the byte offset
+/// of the first FrameHeader.
+pub(crate) struct Prelude {
+    pub size: SizeHeaderFdis,
+    pub metadata: ImageMetadataFdis,
+    pub icc: Option<Vec<u8>>,
+    pub frames_offset: usize,
+}
+
+/// Read the prelude of a stripped codestream (see [`open`]).
+pub(crate) fn read_prelude(codestream: &[u8]) -> Result<Prelude> {
+    let (br, size, metadata, icc) = read_codestream_prelude(codestream)?;
+    Ok(Prelude {
+        size,
+        metadata,
+        icc,
+        frames_offset: br.bytes_consumed(),
+    })
+}
+
+/// How [`decode_sequence`] walks the frame array.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SequenceMode {
+    /// The first frame that is part of the image (Table C.3
+    /// kReferenceOnly frames are decoded into the `Reference[…]` slots
+    /// and skipped), as decoded — no §C.2 composition — with the Table
+    /// A.17 orientation applied. The historical `decode_one_frame`
+    /// semantics.
+    FirstFrame,
+    /// Every *presented* frame (`duration > 0 || is_last`), composed
+    /// onto the image canvas per §C.2 and oriented. The historical
+    /// `decode_all_frames` semantics.
+    Coalesced,
+    /// [`SequenceMode::Coalesced`] stopping after the first presented
+    /// frame — the contract `decode`.
+    FirstPresented,
+    /// Every frame of the array (presented or not, kReferenceOnly
+    /// excluded) as decoded: frame-rectangle geometry, no composition,
+    /// no orientation; `x0` / `y0` give the sample-grid offset.
+    Layers,
+}
+
+/// One frame out of [`decode_sequence`] with its framing.
+pub(crate) struct SequenceFrame {
+    pub frame: RawFrame,
+    /// Storage width of the samples in `frame` (1 or 2 bytes).
+    pub bytes_per_sample: usize,
+    /// FrameHeader `duration` in animation ticks (0 when not animated).
+    pub duration: u32,
+    /// Position in the frame array (kReferenceOnly frames count).
+    pub index: u32,
+    /// Crop offset in sample-grid space (`Layers` mode; 0 otherwise).
+    pub x0: i32,
+    pub y0: i32,
+    /// Whether the frame is presented (`duration > 0 || is_last`).
+    pub presented: bool,
+}
+
+/// The frame-array walk result.
+pub(crate) struct Sequence {
+    pub frames: Vec<SequenceFrame>,
+}
+
+/// Header-only frame-array walk: FrameHeader + TOC of every frame, no
+/// section decode.
+pub(crate) struct FrameWalk {
+    /// Frames that would be presented (`duration > 0 || is_last`,
+    /// kReferenceOnly excluded).
+    pub presented: u32,
+    /// Byte offset just past the `is_last` frame.
+    pub end_offset: usize,
+}
+
+/// The FrameHeader parse parameters (§C.2 conditions) a prelude implies.
+pub(crate) fn frame_params(prelude: &Prelude) -> FrameDecodeParams {
+    let size = &prelude.size;
+    let metadata = &prelude.metadata;
+    FrameDecodeParams {
+        xyb_encoded: metadata.xyb_encoded,
+        num_extra_channels: metadata.num_extra_channels,
+        have_animation: metadata.have_animation,
+        have_animation_timecodes: metadata
+            .animation
+            .map(|a| a.have_timecodes)
+            .unwrap_or(false),
+        image_width: size.width,
+        image_height: size.height,
+    }
+}
+
+/// Count the frames of the array by parsing each FrameHeader + TOC and
+/// skipping the TOC-declared section bytes (§C.3.1 / §6.3). Costs a few
+/// hundred bits per frame; no pixels are decoded.
+pub(crate) fn walk_frame_headers(codestream: &[u8], prelude: &Prelude) -> Result<FrameWalk> {
+    let fh_params = frame_params(prelude);
+    let mut offset = prelude.frames_offset;
+    let mut total = 0u32;
+    let mut presented = 0u32;
+    let max_frames = codestream.len().max(1);
+    loop {
+        if offset >= codestream.len() {
+            return Err(Error::InvalidData(
+                "jxl decoder: frame array ended before an is_last frame".into(),
+            ));
+        }
+        let frame_slice = &codestream[offset..];
+        let mut br = BitReader::new(frame_slice);
+        let (fh, toc) = read_frame_header_and_toc(&mut br, &fh_params, frame_slice)?;
+        let body: usize = toc.entries.iter().map(|&e| e as usize).sum();
+        let next_rel = br.bytes_consumed().saturating_add(body);
+        total = total.saturating_add(1);
+        if fh.frame_type != crate::frame_header::FrameType::ReferenceOnly
+            && (fh.duration > 0 || fh.is_last)
+        {
+            presented = presented.saturating_add(1);
+        }
+        if fh.is_last {
+            return Ok(FrameWalk {
+                presented,
+                end_offset: offset.saturating_add(next_rel).min(codestream.len()),
+            });
+        }
+        if next_rel == 0 {
+            return Err(Error::InvalidData(
+                "jxl decoder: frame array made no forward progress (zero-length frame)".into(),
+            ));
+        }
+        offset = offset.saturating_add(next_rel);
+        if total as usize > max_frames {
+            return Err(Error::InvalidData(
+                "jxl decoder: frame array exceeds codestream-length bound".into(),
+            ));
+        }
+    }
+}
+
+/// Decode the first frame of a JXL input (raw codestream or
+/// ISOBMFF-wrapped) as per-channel planes.
+///
+/// Internal driver shared by the contract [`decode`] and the deprecated
+/// registry wrapper `decode_one_frame`; integration tests pin pixels
+/// through it. Not stable API — use [`decode`].
+#[doc(hidden)]
+pub fn decode_planar(input: &[u8], pts: Option<i64>) -> Result<RawFrame> {
+    let opened = open(input)?;
+    let prelude = read_prelude(&opened.codestream)?;
+    let mut seq = decode_sequence(&opened.codestream, &prelude, pts, SequenceMode::FirstFrame)?;
+    match seq.frames.pop() {
+        Some(f) => Ok(f.frame),
+        None => Err(Error::InvalidData(
+            "jxl decoder: frame array ended before a presentable frame".into(),
+        )),
+    }
+}
+
+/// Decode every presented frame of a JXL input (raw codestream or
+/// ISOBMFF-wrapped), §C.2-composed, as per-channel planes.
+///
+/// Internal driver shared by the contract [`decode_all`] and the
+/// deprecated registry wrapper `decode_all_frames`. Not stable API —
+/// use [`decode_all`].
+#[doc(hidden)]
+pub fn decode_all_planar(input: &[u8], pts: Option<i64>) -> Result<Vec<RawFrame>> {
+    let opened = open(input)?;
+    let prelude = read_prelude(&opened.codestream)?;
+    let seq = decode_sequence(&opened.codestream, &prelude, pts, SequenceMode::Coalesced)?;
+    Ok(seq.frames.into_iter().map(|f| f.frame).collect())
+}
+
+/// Frame-array loop shared by every decode entry point. Reads frames
+/// from `prelude.frames_offset` until the one flagged `is_last` (or the
+/// first presentable frame in [`SequenceMode::FirstFrame`]).
 ///
 /// A JXL codestream may carry more than one frame (§C.1): the codestream
 /// prelude (SizeHeader / ImageMetadata / ICC) is read once, then frames
@@ -758,73 +913,58 @@ pub fn decode_one_frame(input: &[u8], pts: Option<i64>) -> Result<VideoFrame> {
 /// array. The array ends at the frame whose FrameHeader sets `is_last`
 /// (§C.2). This is the framing that drives animation: the 3-frame
 /// `animation-3frame` fixture, for example, carries three Regular frames
-/// with `is_last = 0, 0, 1`.
-///
-/// Only the colour (`kRegular`) frame types are surfaced as output
-/// frames; each decoded frame is subject to the same envelope as
-/// [`decode_one_frame`] (Modular path, Grey/RGB, 1–16-bit integer). A
-/// frame that falls outside that envelope surfaces its precise
-/// `Error::Unsupported` / `Error::InvalidData` rather than a silent
-/// misparse. `pts` is applied to the first frame only; subsequent frames
-/// carry `None` (per-frame animation timing lives in each FrameHeader's
-/// `duration` field and is not yet mapped onto `VideoFrame::pts`).
-///
-/// The returned vector always has at least one frame on success.
-pub fn decode_all_frames(input: &[u8], pts: Option<i64>) -> Result<Vec<VideoFrame>> {
-    let sig = container::detect(input)
-        .ok_or_else(|| Error::InvalidData("jxl decoder: no JXL signature".into()))?;
-    let codestream_owned;
-    let codestream: &[u8] = match sig {
-        container::Signature::RawCodestream => &input[2..],
-        container::Signature::Isobmff => {
-            codestream_owned = container::extract_codestream(input)?;
-            let cs: &[u8] = &codestream_owned;
-            if cs.len() < 2 || cs[0] != 0xFF || cs[1] != 0x0A {
-                return Err(Error::InvalidData(
-                    "JXL ISOBMFF: jxlc/jxlp payload missing FF 0A codestream signature".into(),
-                ));
-            }
-            &codestream_owned[2..]
-        }
-    };
-    decode_all_frames_from_codestream(codestream, pts)
-}
-
-/// Frame-array loop shared by [`decode_all_frames`]. Reads the codestream
-/// prelude once, then decodes frames until the one flagged `is_last`.
-fn decode_all_frames_from_codestream(
+/// with `is_last = 0, 0, 1`. `pts` is applied to the first frame only;
+/// subsequent frames carry `None`.
+pub(crate) fn decode_sequence(
     codestream: &[u8],
+    prelude: &Prelude,
     pts: Option<i64>,
-) -> Result<Vec<VideoFrame>> {
-    let (prelude_br, size, metadata) = read_codestream_prelude(codestream)?;
+    mode: SequenceMode,
+) -> Result<Sequence> {
+    let size = &prelude.size;
+    let metadata = &prelude.metadata;
     // Each frame gets a fresh reader positioned at its own byte offset
     // (frames are byte-aligned per §6.3, so a byte offset uniquely
-    // identifies a frame boundary). The prelude reader only supplies the
-    // first frame's start offset.
-    let mut offset = prelude_br.bytes_consumed();
+    // identifies a frame boundary). The prelude only supplies the first
+    // frame's start offset.
+    let mut offset = prelude.frames_offset;
 
-    let mut frames: Vec<VideoFrame> = Vec::new();
+    let mut frames: Vec<SequenceFrame> = Vec::new();
     // A conservative bound on the number of frames: no frame is smaller
     // than a FrameHeader, so the codestream byte length caps the count.
     // This guards against a malformed `is_last`-never-set stream.
     let max_frames = codestream.len().max(1);
     let mut frame_pts = pts;
+    let bytes = if metadata.bit_depth.bits_per_sample > 8 {
+        2
+    } else {
+        1
+    };
     // §C.2 composition state: the Reference[…] slots + image-sized
-    // canvas the per-frame BlendingInfo composes against.
-    let mut compose_state = frame_compose::ComposeState::new_with_depth(
-        size.width as usize,
-        size.height as usize,
-        metadata.bit_depth.bits_per_sample,
-    )?;
+    // canvas the per-frame BlendingInfo composes against (coalesced
+    // mode only).
+    let mut compose_state =
+        if matches!(mode, SequenceMode::Coalesced | SequenceMode::FirstPresented) {
+            Some(frame_compose::ComposeState::new_with_depth(
+                size.width as usize,
+                size.height as usize,
+                metadata.bit_depth.bits_per_sample,
+            )?)
+        } else {
+            None
+        };
     // §C.2 / §K.2 pre-CT `Reference[…]` slots — recorded by frames with
     // `save_as_reference != 0 && save_before_ct` (kReferenceOnly patch
     // sources foremost), consumed by the §K.2 patch renderer.
     let mut refs = crate::patches::ReferenceFrames::default();
+    let mut index = 0u32;
     loop {
         if offset >= codestream.len() {
-            return Err(Error::InvalidData(
-                "jxl decoder: frame array ended before an is_last frame".into(),
-            ));
+            return Err(Error::InvalidData(if mode == SequenceMode::FirstFrame {
+                "jxl decoder: frame array ended before a presentable frame".into()
+            } else {
+                "jxl decoder: frame array ended before an is_last frame".into()
+            }));
         }
         // Each frame reads from a sub-slice starting at its own byte
         // boundary; `decode_frame_body` reports the *next* frame offset
@@ -833,9 +973,11 @@ fn decode_all_frames_from_codestream(
         let frame_slice = &codestream[offset..];
         let mut br = BitReader::new(frame_slice);
         let mut decoded =
-            decode_frame_body(&mut br, frame_slice, &size, &metadata, frame_pts, &refs)?;
+            decode_frame_body(&mut br, frame_slice, size, metadata, frame_pts, &refs)?;
         let is_last = decoded.is_last;
         let next_rel = decoded.next_frame_offset;
+        let this_index = index;
+        index = index.saturating_add(1);
         // §C.2 pre-CT reference recording (the slot index is
         // `save_as_reference`; `decode_frame_body` only produces the
         // snapshot when the frame requested recording).
@@ -847,9 +989,11 @@ fn decode_all_frames_from_codestream(
         // composition, no presentation.
         if decoded.frame_type == crate::frame_header::FrameType::ReferenceOnly {
             if is_last {
-                return Err(Error::InvalidData(
-                    "jxl decoder: kReferenceOnly frame flagged is_last".into(),
-                ));
+                return Err(Error::InvalidData(if mode == SequenceMode::FirstFrame {
+                    "jxl decoder: kReferenceOnly frame ends the frame array".into()
+                } else {
+                    "jxl decoder: kReferenceOnly frame flagged is_last".into()
+                }));
             }
             if next_rel == 0 {
                 return Err(Error::InvalidData(
@@ -857,67 +1001,109 @@ fn decode_all_frames_from_codestream(
                 ));
             }
             offset = offset.saturating_add(next_rel);
+            if index as usize > max_frames {
+                return Err(Error::InvalidData(
+                    "jxl decoder: frame array exceeds codestream-length bound".into(),
+                ));
+            }
             continue;
         }
-        // §C.2 composition: blend the decoded frame over
-        // Reference[source] (crop rectangles update the source frame's
-        // rect; full-frame kReplace passes through; kBlend /
-        // kAlphaWeightedAdd consume the frame's alpha plane) and
-        // record Reference[save_as_reference] when requested. Frames
-        // with fewer than 3 planes (grey Modular images) bypass
-        // composition — the raw frame is what rounds ≤ 388 emitted.
-        let composed = if decoded.frame.planes.len() >= 3 {
-            let mut meta = decoded.compose;
-            // The header may declare an alpha extra channel the
-            // decoded frame doesn't carry as a plane (e.g. a plane
-            // count trimmed by the colour transform) — clear the
-            // dangling index so alpha-less modes still compose.
-            if let Some(a) = meta.alpha_plane {
-                if a >= decoded.frame.planes.len() {
-                    meta.alpha_plane = None;
+        let duration = decoded.compose.duration;
+        let presented = duration > 0 || is_last;
+        match mode {
+            SequenceMode::FirstFrame => {
+                let fb = decoded.bytes_per_sample;
+                frames.push(SequenceFrame {
+                    frame: orientation::apply_orientation(decoded.frame, metadata.orientation, fb)?,
+                    bytes_per_sample: fb,
+                    duration,
+                    index: this_index,
+                    x0: 0,
+                    y0: 0,
+                    presented,
+                });
+                return Ok(Sequence { frames });
+            }
+            SequenceMode::Layers => {
+                frames.push(SequenceFrame {
+                    bytes_per_sample: decoded.bytes_per_sample,
+                    frame: decoded.frame,
+                    duration,
+                    index: this_index,
+                    x0: decoded.compose.x0,
+                    y0: decoded.compose.y0,
+                    presented,
+                });
+            }
+            SequenceMode::Coalesced | SequenceMode::FirstPresented => {
+                let state = compose_state
+                    .as_mut()
+                    .expect("coalesced mode always carries a compose state");
+                // §C.2 composition: blend the decoded frame over
+                // Reference[source] (crop rectangles update the source
+                // frame's rect; full-frame kReplace passes through;
+                // kBlend / kAlphaWeightedAdd consume the frame's alpha
+                // plane) and record Reference[save_as_reference] when
+                // requested. Frames with fewer than 3 planes (grey
+                // Modular images) bypass composition — the raw frame is
+                // what rounds ≤ 388 emitted.
+                let composed = if decoded.frame.planes.len() >= 3 {
+                    let mut meta = decoded.compose;
+                    // The header may declare an alpha extra channel the
+                    // decoded frame doesn't carry as a plane (e.g. a
+                    // plane count trimmed by the colour transform) —
+                    // clear the dangling index so alpha-less modes
+                    // still compose.
+                    if let Some(a) = meta.alpha_plane {
+                        if a >= decoded.frame.planes.len() {
+                            meta.alpha_plane = None;
+                        }
+                    }
+                    // Prefer the unclamped float planes when the decode
+                    // path preserved them (Modular pass-through):
+                    // out-of-range samples are meaningful blend inputs.
+                    match &decoded.raw_f32 {
+                        Some(raw) if raw.len() == decoded.frame.planes.len() => {
+                            let fw = decoded.frame.planes[0].stride / bytes;
+                            let fh =
+                                decoded.frame.planes[0].data.len() / decoded.frame.planes[0].stride;
+                            let mut out = state.compose_planes(raw, fw, fh, &meta)?;
+                            out.pts = decoded.frame.pts;
+                            out
+                        }
+                        _ => state.compose(&decoded.frame, &meta)?,
+                    }
+                } else {
+                    decoded.frame
+                };
+                // Presentation rule (§C.2): a zero-duration non-last
+                // frame is composed but not presented. Presented frames
+                // get the §A.6 orientation transform (Table A.17) — the
+                // last step before hand-off; all decode/composition
+                // geometry above runs in sample-grid space.
+                if presented {
+                    frames.push(SequenceFrame {
+                        frame: orientation::apply_orientation(
+                            composed,
+                            metadata.orientation,
+                            bytes,
+                        )?,
+                        bytes_per_sample: bytes,
+                        duration,
+                        index: this_index,
+                        x0: 0,
+                        y0: 0,
+                        presented: true,
+                    });
+                    if mode == SequenceMode::FirstPresented {
+                        return Ok(Sequence { frames });
+                    }
                 }
             }
-            // Prefer the unclamped float planes when the decode path
-            // preserved them (Modular pass-through): out-of-range
-            // samples are meaningful blend inputs.
-            match &decoded.raw_f32 {
-                Some(raw) if raw.len() == decoded.frame.planes.len() => {
-                    let bytes = if metadata.bit_depth.bits_per_sample > 8 {
-                        2
-                    } else {
-                        1
-                    };
-                    let fw = decoded.frame.planes[0].stride / bytes;
-                    let fh = decoded.frame.planes[0].data.len() / decoded.frame.planes[0].stride;
-                    let mut out = compose_state.compose_planes(raw, fw, fh, &meta)?;
-                    out.pts = decoded.frame.pts;
-                    out
-                }
-                _ => compose_state.compose(&decoded.frame, &meta)?,
-            }
-        } else {
-            decoded.frame
-        };
-        // Presentation rule (§C.2): a zero-duration non-last frame is
-        // composed but not presented. Presented frames get the §A.6
-        // orientation transform (Table A.17) — the last step before
-        // hand-off; all decode/composition geometry above runs in
-        // sample-grid space.
-        if decoded.compose.duration > 0 || is_last {
-            let bytes = if metadata.bit_depth.bits_per_sample > 8 {
-                2
-            } else {
-                1
-            };
-            frames.push(orientation::apply_orientation(
-                composed,
-                metadata.orientation,
-                bytes,
-            )?);
         }
         frame_pts = None;
         if is_last {
-            break;
+            return Ok(Sequence { frames });
         }
         if next_rel == 0 {
             return Err(Error::InvalidData(
@@ -925,50 +1111,10 @@ fn decode_all_frames_from_codestream(
             ));
         }
         offset = offset.saturating_add(next_rel);
-        if frames.len() > max_frames {
+        if index as usize > max_frames {
             return Err(Error::InvalidData(
                 "jxl decoder: frame array exceeds codestream-length bound".into(),
             ));
-        }
-    }
-    Ok(frames)
-}
-
-/// Decode the first frame. Historical alias of [`decode_one_frame`]:
-/// through round 385 the public path withheld VarDCT pixels behind an
-/// `Error::Unsupported` sentinel and this entry bypassed the gate for
-/// tests/tooling; round 389 validated the reconstruction against the
-/// staged reference decodes and lifted the withhold, so the two entry
-/// points are now identical. Kept for source compatibility.
-pub fn decode_vardct_frame_from_codestream(input: &[u8], pts: Option<i64>) -> Result<VideoFrame> {
-    decode_first_frame(input, pts)
-}
-
-/// Shared container-strip + codestream dispatch for [`decode_one_frame`]
-/// and [`decode_vardct_frame_from_codestream`] (identical since round
-/// 389 lifted the VarDCT pixel withhold).
-fn decode_first_frame(input: &[u8], pts: Option<i64>) -> Result<VideoFrame> {
-    let sig = container::detect(input)
-        .ok_or_else(|| Error::InvalidData("jxl decoder: no JXL signature".into()))?;
-    match sig {
-        container::Signature::RawCodestream => decode_codestream(&input[2..], pts),
-        container::Signature::Isobmff => {
-            // The jxlc/jxlp box payload concatenation is itself a JXL
-            // codestream and therefore begins with the 2-byte `FF 0A`
-            // codestream signature (FDIS Annex B.1). Skip those 2 bytes
-            // before handing off to `decode_codestream` (which expects
-            // bits *after* the signature, matching the raw-codestream
-            // entry point above). Without this strip the SizeHeader
-            // parse below would misalign by 16 bits and cascade into
-            // corrupted FrameHeader/TOC reads.
-            let codestream_owned = container::extract_codestream(input)?;
-            let cs: &[u8] = &codestream_owned;
-            if cs.len() < 2 || cs[0] != 0xFF || cs[1] != 0x0A {
-                return Err(Error::InvalidData(
-                    "JXL ISOBMFF: jxlc/jxlp payload missing FF 0A codestream signature".into(),
-                ));
-            }
-            decode_codestream(&cs[2..], pts)
         }
     }
 }
@@ -1002,7 +1148,7 @@ fn toc_is_self_consistent(br_after_toc: &BitReader<'_>, toc: &Toc, codestream_le
 /// commit it. If the 2024 parse errors or yields an inconsistent TOC we
 /// retry the 2021 layout ([`RfEdition::V2021`]). The winning reader
 /// position is written back into `br`.
-fn read_frame_header_and_toc(
+pub(crate) fn read_frame_header_and_toc(
     br: &mut BitReader<'_>,
     fh_params: &FrameDecodeParams,
     codestream: &[u8],
@@ -1034,7 +1180,12 @@ fn read_frame_header_and_toc(
 /// offset (within the codestream) at which the next frame's FrameHeader
 /// begins (byte-aligned per FDIS §6.3).
 struct DecodedFrame {
-    frame: VideoFrame,
+    frame: RawFrame,
+    /// Storage width of the frame's samples: 1 byte for every 8-bit
+    /// path (VarDCT reconstructs to 8 bits whatever the declared depth,
+    /// and the XYB / YCbCr Modular paths are 8-bit only), 2 bytes
+    /// (little-endian) for the deeper Modular pass-through.
+    bytes_per_sample: usize,
     is_last: bool,
     next_frame_offset: usize,
     /// §C.2 composition fields the multi-frame walk feeds to
@@ -1064,10 +1215,16 @@ struct DecodedFrame {
 /// Read the codestream prelude that precedes the frame array: SizeHeader
 /// (§A.3), ImageMetadata (§A.6), the optional ICC stream (§E.4), and the
 /// byte-align (§6.3). Returns a [`BitReader`] positioned at the first
-/// FrameHeader plus the parsed `size` / `metadata`.
+/// FrameHeader plus the parsed `size` / `metadata` and the decoded ICC
+/// profile bytes when the colour encoding carries one.
 fn read_codestream_prelude(
     codestream: &[u8],
-) -> Result<(BitReader<'_>, SizeHeaderFdis, ImageMetadataFdis)> {
+) -> Result<(
+    BitReader<'_>,
+    SizeHeaderFdis,
+    ImageMetadataFdis,
+    Option<Vec<u8>>,
+)> {
     let mut br = BitReader::new(codestream);
 
     // 1. SizeHeader (FDIS A.3).
@@ -1076,15 +1233,13 @@ fn read_codestream_prelude(
     // 2. ImageMetadata (FDIS A.6).
     let metadata = ImageMetadataFdis::read(&mut br)?;
 
-    // 3. ICC profile (Annex B / E.4-2024 numbering) — round-6 lands the
-    //    decoder. The decoded ICC bytes are validated (must contain
-    //    "acsp" magic at offset 36 if length >= 40) but not currently
-    //    propagated to `VideoFrame` because `oxideav_core::VideoFrame`
-    //    has no ICC slot. The decode is still run because (a) it
-    //    advances the bit reader past the ICC stream so subsequent
-    //    FrameHeader / TOC parsing finds the right bit offset, and (b)
-    //    it gives a direct `Error::InvalidData` if the codestream's ICC
-    //    stream is malformed.
+    // 3. ICC profile (Annex B / E.4-2024 numbering). The decoded ICC
+    //    bytes are validated (must contain "acsp" magic at offset 36 if
+    //    length >= 40) and surfaced as `JxlImage::metadata.icc`. The
+    //    decode also (a) advances the bit reader past the ICC stream so
+    //    subsequent FrameHeader / TOC parsing finds the right bit
+    //    offset, and (b) gives a direct `Error::InvalidData` if the
+    //    codestream's ICC stream is malformed.
     //
     //    Round 408: `enc_size` is coded at the very next bit after the
     //    end of ImageMetadata — there is NO ZeroPadToByte() before the
@@ -1095,58 +1250,16 @@ fn read_codestream_prelude(
     //    (Table A.16 `default_transform` gating — see
     //    `ImageMetadataFdis::read`), which shifted `enc_size` by one
     //    bit and mis-framed everything after it.
-    if metadata.colour_encoding.want_icc {
-        let _icc_bytes = decode_icc_stream_at(&mut br)?;
-    }
+    let icc = if metadata.colour_encoding.want_icc {
+        Some(decode_icc_stream_at(&mut br)?)
+    } else {
+        None
+    };
 
     // 4. Byte-align before frame data per FDIS 6.3.
     br.pu0()?;
 
-    Ok((br, size, metadata))
-}
-
-fn decode_codestream(codestream: &[u8], pts: Option<i64>) -> Result<VideoFrame> {
-    let (prelude_br, size, metadata) = read_codestream_prelude(codestream)?;
-    // The "first frame" is the first frame that is part of the image:
-    // Table C.3 kReferenceOnly frames (patch sources) are decoded into
-    // the pre-CT `Reference[…]` slots and skipped.
-    let mut refs = crate::patches::ReferenceFrames::default();
-    let mut offset = prelude_br.bytes_consumed();
-    let max_frames = codestream.len().max(1);
-    let mut skipped = 0usize;
-    loop {
-        if offset >= codestream.len() {
-            return Err(Error::InvalidData(
-                "jxl decoder: frame array ended before a presentable frame".into(),
-            ));
-        }
-        let frame_slice = &codestream[offset..];
-        let mut br = BitReader::new(frame_slice);
-        let mut decoded = decode_frame_body(&mut br, frame_slice, &size, &metadata, pts, &refs)?;
-        if let Some(pre) = decoded.pre_ct.take() {
-            refs.slots[decoded.compose.save_as_reference as usize] = Some(pre);
-        }
-        if decoded.frame_type != crate::frame_header::FrameType::ReferenceOnly {
-            let bytes = if metadata.bit_depth.bits_per_sample > 8 {
-                2
-            } else {
-                1
-            };
-            return orientation::apply_orientation(decoded.frame, metadata.orientation, bytes);
-        }
-        if decoded.is_last || decoded.next_frame_offset == 0 {
-            return Err(Error::InvalidData(
-                "jxl decoder: kReferenceOnly frame ends the frame array".into(),
-            ));
-        }
-        offset = offset.saturating_add(decoded.next_frame_offset);
-        skipped += 1;
-        if skipped > max_frames {
-            return Err(Error::InvalidData(
-                "jxl decoder: frame array exceeds codestream-length bound".into(),
-            ));
-        }
-    }
+    Ok((br, size, metadata, icc))
 }
 
 /// Decode one frame whose FrameHeader begins at `br`'s current
@@ -1284,6 +1397,7 @@ fn decode_frame_body(
             want_pre_ct,
         )?;
         return Ok(DecodedFrame {
+            bytes_per_sample: 1,
             frame,
             is_last,
             next_frame_offset,
@@ -1485,7 +1599,7 @@ fn decode_frame_body(
     }
     let _ = hf_global_slot; // round-10+ VarDCT consumer; for kModular the slot is 0-byte
 
-    // 9. Map the decoded modular image to a VideoFrame.
+    // 9. Map the decoded modular image to a RawFrame.
     //
     // Round-1 (2024-spec) supports:
     //   - Grey colour_space (single channel, 1 plane)
@@ -1593,7 +1707,8 @@ fn decode_frame_body(
             planes.swap_remove(0);
         }
         return Ok(DecodedFrame {
-            frame: VideoFrame { pts, planes },
+            bytes_per_sample: 1,
+            frame: RawFrame { pts, planes },
             is_last,
             next_frame_offset,
             compose: compose_meta,
@@ -1620,7 +1735,8 @@ fn decode_frame_body(
         }
         let planes = build_rgb_planes_from_ycbcr(&img)?;
         return Ok(DecodedFrame {
-            frame: VideoFrame { pts, planes },
+            bytes_per_sample: 1,
+            frame: RawFrame { pts, planes },
             is_last,
             next_frame_offset,
             compose: compose_meta,
@@ -1734,7 +1850,7 @@ fn decode_frame_body(
     } else {
         None
     };
-    let mut planes: Vec<VideoPlane> = Vec::with_capacity(n_chans);
+    let mut planes: Vec<Plane> = Vec::with_capacity(n_chans);
     for (i, ch_data) in img.channels.iter().enumerate() {
         let desc = img.descs[i];
         let w = desc.width as usize;
@@ -1744,7 +1860,7 @@ fn decode_frame_body(
             for &v in ch_data.iter() {
                 bytes.push(v.clamp(0, max_sample) as u8);
             }
-            VideoPlane {
+            Plane {
                 stride: w,
                 data: bytes,
             }
@@ -1754,7 +1870,7 @@ fn decode_frame_body(
                 let s = v.clamp(0, max_sample) as u16;
                 bytes.extend_from_slice(&s.to_le_bytes());
             }
-            VideoPlane {
+            Plane {
                 stride: w * 2,
                 data: bytes,
             }
@@ -1765,7 +1881,8 @@ fn decode_frame_body(
         debug_assert_eq!(planes[i].data.len(), expected_len);
     }
     Ok(DecodedFrame {
-        frame: VideoFrame { pts, planes },
+        bytes_per_sample: if bps <= 8 { 1 } else { 2 },
+        frame: RawFrame { pts, planes },
         is_last,
         next_frame_offset,
         compose: compose_meta,
@@ -1843,7 +1960,7 @@ fn build_rgb_planes_from_xyb(
     metadata: &ImageMetadataFdis,
     rf: &crate::frame_header::RestorationFilter,
     features: ModularXybFeatures<'_>,
-) -> Result<(Vec<VideoPlane>, Option<crate::patches::PreCtFrame>)> {
+) -> Result<(Vec<Plane>, Option<crate::patches::PreCtFrame>)> {
     if img.channels.len() != 3 {
         return Err(Error::InvalidData(format!(
             "JXL XYB inverse: expected 3 channels (Y', X', B'), got {}",
@@ -1974,15 +2091,15 @@ fn build_rgb_planes_from_xyb(
     }
     Ok((
         vec![
-            VideoPlane {
+            Plane {
                 stride: w,
                 data: r_bytes,
             },
-            VideoPlane {
+            Plane {
                 stride: w,
                 data: g_bytes,
             },
-            VideoPlane {
+            Plane {
                 stride: w,
                 data: b_bytes,
             },
@@ -1997,7 +2114,7 @@ fn build_rgb_planes_from_xyb(
 /// formula treats inputs as floats in the [0, 1] interval, so we
 /// rescale `[0..=255]` integer samples by `1/255` first then re-
 /// quantise the RGB outputs by 255.
-fn build_rgb_planes_from_ycbcr(img: &crate::modular_fdis::ModularImage) -> Result<Vec<VideoPlane>> {
+fn build_rgb_planes_from_ycbcr(img: &crate::modular_fdis::ModularImage) -> Result<Vec<Plane>> {
     if img.channels.len() != 3 {
         return Err(Error::InvalidData(format!(
             "JXL YCbCr inverse: expected 3 channels (Cb, Y, Cr), got {}",
@@ -2031,15 +2148,15 @@ fn build_rgb_planes_from_ycbcr(img: &crate::modular_fdis::ModularImage) -> Resul
         b_bytes.push(crate::xyb::linear_rgb_to_u8(b_lin));
     }
     Ok(vec![
-        VideoPlane {
+        Plane {
             stride: w,
             data: r_bytes,
         },
-        VideoPlane {
+        Plane {
             stride: w,
             data: g_bytes,
         },
-        VideoPlane {
+        Plane {
             stride: w,
             data: b_bytes,
         },
@@ -2426,7 +2543,7 @@ fn finish_vardct_decode(
     hf_section: &mut crate::hf_global_section::HfGlobalSection,
     group_readers: Vec<(crate::group_rect::GroupRect, Vec<BitReader<'_>>)>,
     pts: Option<i64>,
-) -> Result<(VideoFrame, Option<crate::patches::PreCtFrame>)> {
+) -> Result<(RawFrame, Option<crate::patches::PreCtFrame>)> {
     use crate::block_context_resolver::BlockContextResolver;
     use crate::hf_dequant::QmScaleFactors;
     use crate::multi_pass_hf_header::PerPassHfHeaders;
@@ -2797,18 +2914,18 @@ fn finish_vardct_decode(
         b_bytes.push(enc.encode_u8(bb));
     }
     Ok((
-        VideoFrame {
+        RawFrame {
             pts,
             planes: vec![
-                VideoPlane {
+                Plane {
                     stride: w,
                     data: r_bytes,
                 },
-                VideoPlane {
+                Plane {
                     stride: w,
                     data: g_bytes,
                 },
-                VideoPlane {
+                Plane {
                     stride: w,
                     data: b_bytes,
                 },
@@ -2833,13 +2950,13 @@ fn finish_vardct_decode(
 /// **Pixel-validation status.** The whole chain executes on a real
 /// codestream, but the per-block HF coefficient scaling is not yet
 /// validated bit-exact against a reference decode. The public
-/// [`decode_one_frame`] path therefore withholds the reconstructed
-/// pixels (see `decode_codestream`); this function is exposed so the
+/// `decode` path therefore withheld the reconstructed pixels (lifted in
+/// round 389); this function is exposed so the
 /// crate's integration tests can drive the pipeline end-to-end and pin
 /// its structural invariants (plane count, dimensions, that every stage
 /// runs without aborting). Restoration filters (Gaborish §J.2, EPF
 /// §J.3) are likewise not applied here yet.
-#[doc(hidden)] // internal: mid-pipeline driver exposed for integration tests; use decode_one_frame
+#[doc(hidden)] // internal: mid-pipeline driver exposed for integration tests; use decode
 pub fn decode_vardct_frame(
     fh: &FrameHeader,
     metadata: &ImageMetadataFdis,
@@ -2847,7 +2964,7 @@ pub fn decode_vardct_frame(
     br: &mut BitReader<'_>,
     scaffold: crate::vardct::VarDctScaffold,
     pts: Option<i64>,
-) -> Result<VideoFrame> {
+) -> Result<RawFrame> {
     decode_vardct_frame_with_refs(
         fh,
         metadata,
@@ -2864,7 +2981,7 @@ pub fn decode_vardct_frame(
 /// [`decode_vardct_frame`] with the §C.2 reference-frame state the §K.2
 /// patch renderer consumes, plus the `save_before_ct` pre-CT snapshot
 /// request. The multi-frame walk drives this form.
-#[doc(hidden)] // internal: mid-pipeline driver exposed for integration tests; use decode_one_frame
+#[doc(hidden)] // internal: mid-pipeline driver exposed for integration tests; use decode
 #[allow(clippy::too_many_arguments)]
 pub fn decode_vardct_frame_with_refs(
     fh: &FrameHeader,
@@ -2875,7 +2992,7 @@ pub fn decode_vardct_frame_with_refs(
     pts: Option<i64>,
     refs: &crate::patches::ReferenceFrames,
     want_pre_ct: bool,
-) -> Result<(VideoFrame, Option<crate::patches::PreCtFrame>)> {
+) -> Result<(RawFrame, Option<crate::patches::PreCtFrame>)> {
     let num_groups = fh.num_groups();
     let num_lf_groups = fh.num_lf_groups();
 
@@ -3318,63 +3435,27 @@ fn probe_fdis_codestream(
     })
 }
 
-/// Inspect a JXL file (raw codestream or ISOBMFF-wrapped) and return the
-/// signature type + parsed `SizeHeader` + `ImageMetadata` preamble.
-///
-/// This is the main API users can reach today: it covers identification,
-/// dimensions and sample format without needing an actual decoder.
-pub fn probe(input: &[u8]) -> Result<Headers> {
-    parse_headers(input)
-}
-
-/// Encoder slot, always rejected. Exposed for completeness so callers
-/// that wire an `Encoder` factory by codec id get a clean `Unsupported`
-/// error instead of `CodecNotFound`.
-pub fn make_encoder(_params: &CodecParameters) -> Result<Box<dyn Encoder>> {
-    Err(Error::Unsupported(
-        "jxl encode is out of scope for this crate".into(),
-    ))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn decoder_factory_returns_live_decoder() {
-        let mut ctx = RuntimeContext::new();
-        register(&mut ctx);
-        let params = CodecParameters::video(CodecId::new(CODEC_ID_STR));
-        let dec = ctx
-            .codecs
-            .first_decoder(&params)
-            .expect("expected live decoder");
-        assert_eq!(dec.codec_id().as_str(), CODEC_ID_STR);
-    }
-
-    #[test]
-    fn probe_rejects_non_jxl() {
-        let err = probe(&[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]).unwrap_err();
+    fn headers_rejects_non_jxl() {
+        let err = headers(&[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]).unwrap_err();
         assert!(matches!(err, Error::InvalidData(_)));
     }
 
     #[test]
-    fn probe_accepts_minimal_raw_codestream() {
+    fn headers_accepts_minimal_raw_codestream() {
         // small=1, 8x8 square (ratio=1), all_default=1 → 10 bits total.
         // LSB-first packing: byte0 holds bits 0..=7, byte1 holds bits 8..=9.
         // bit0=1, bits1..=5=0, bits6..=8=001 (ratio=1), bit9=1 (all_default)
         // → byte0 = 0b01000001 = 0x41, byte1 = 0b00000010 = 0x02.
         let input = [0xFF, 0x0A, 0x41, 0x02];
-        let h = probe(&input).unwrap();
+        let h = headers(&input).unwrap();
         assert_eq!(h.size.width, 8);
         assert_eq!(h.size.height, 8);
         assert!(h.metadata.all_default);
-    }
-
-    #[test]
-    fn encoder_factory_rejects_cleanly() {
-        let params = CodecParameters::video(CodecId::new(CODEC_ID_STR));
-        assert!(matches!(make_encoder(&params), Err(Error::Unsupported(_))));
     }
 
     // ---- §J restoration-filter wiring into the modular XYB path ----

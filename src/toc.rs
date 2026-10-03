@@ -20,7 +20,7 @@
 //! billions of groups would already have been rejected by the
 //! `width × height` check in [`crate::frame_header::FrameHeader`].
 
-use oxideav_core::{Error, Result};
+use crate::error::{Error, Result};
 
 use crate::ans::hybrid::HybridUintState;
 use crate::bitreader::{BitReader, U32Dist};

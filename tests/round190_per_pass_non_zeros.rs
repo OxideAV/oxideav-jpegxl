@@ -9,9 +9,9 @@
 //! control-flow primitive — no bit reads, no spec re-derivation, no
 //! histogram materialisation.
 
-use oxideav_core::Result;
 use oxideav_jpegxl::dct_select::TransformType;
 use oxideav_jpegxl::per_pass_non_zeros::PerPassNonZerosGrids;
+use oxideav_jpegxl::Result;
 
 #[test]
 fn r190_new_uniform_two_passes_three_channels() {

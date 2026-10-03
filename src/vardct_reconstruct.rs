@@ -40,7 +40,7 @@
 //! spatial samples in one call. This module is that wiring; it owns no
 //! bit reads, no entropy state, and no spec re-derivation.
 
-use oxideav_core::{Error, Result};
+use crate::error::{Error, Result};
 
 use crate::bitreader::BitReader;
 use crate::block_context_resolver::BlockContextResolver;

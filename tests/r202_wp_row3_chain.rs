@@ -94,7 +94,7 @@
 //! upstream-bisect-blocked because the trace doc does not give
 //! spec-correct `true_err` values for samples before 188.)
 
-use oxideav_jpegxl::decode_one_frame;
+use oxideav_jpegxl::decode_planar;
 use oxideav_jpegxl::modular_fdis::{
     encode_leaf_pick_target, LEAF_PICK_TRACE_TARGET, LEAF_PICK_TRACE_WP,
 };
@@ -151,7 +151,7 @@ const WP_PRED8: usize = 8;
 fn capture_wp_at(channel: u32, x: u32, y: u32) -> Vec<i32> {
     LEAF_PICK_TRACE_TARGET.store(encode_leaf_pick_target(channel, x, y), Ordering::Relaxed);
     LEAF_PICK_TRACE_WP.with(|s| s.borrow_mut().clear());
-    let _ = decode_one_frame(NOISE_JXL, None).expect("decode");
+    let _ = decode_planar(NOISE_JXL, None).expect("decode");
     let snap = LEAF_PICK_TRACE_WP.with(|s| s.borrow().clone());
     LEAF_PICK_TRACE_TARGET.store(u64::MAX, Ordering::Relaxed);
     snap

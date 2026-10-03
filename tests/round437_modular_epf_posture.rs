@@ -48,7 +48,7 @@ fn mad_under(posture: Option<ModularEpfPosture>) -> f64 {
     let expected = include_bytes!("fixtures/conformance_grayscale_public_university_expected.png");
     let (w, h, reference) = png_grey(expected);
     set_modular_epf_posture_override(posture);
-    let frame = oxideav_jpegxl::decode_one_frame(jxl, None).expect("decode");
+    let frame = oxideav_jpegxl::decode_planar(jxl, None).expect("decode");
     set_modular_epf_posture_override(None);
     let plane = &frame.planes[0];
     let mut sum = 0u64;

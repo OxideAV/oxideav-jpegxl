@@ -90,8 +90,8 @@
 //! * It does not handle subsampled chroma (the spec excludes that
 //!   case from CfL entirely).
 
+use crate::error::{Error, Result};
 use crate::lf_global::LfChannelCorrelation;
-use oxideav_core::{Error, Result};
 
 /// Compute the per-sample colour-correlation multipliers `(kX, kB)`
 /// from a raw `(x_factor, b_factor)` pair and the bundle's

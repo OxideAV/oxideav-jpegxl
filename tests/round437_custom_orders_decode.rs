@@ -62,7 +62,7 @@ fn custom_orders_stream_decodes_end_to_end() {
     let (w, h, reference) = png_rgb(expected);
     oxideav_jpegxl::hf_coefficient_histograms::reset_section_closure_failures();
     oxideav_jpegxl::pass_group_hf::reset_walk_underruns();
-    let frame = oxideav_jpegxl::decode_one_frame(jxl, None)
+    let frame = oxideav_jpegxl::decode_planar(jxl, None)
         .expect("used_orders != 0 stream must decode (round 437 per-channel layout)");
     assert_eq!(frame.planes.len(), 3);
     // Round-451 closure: the §C.8.3 desync class this stream sat in

@@ -60,7 +60,7 @@
 //! the rest of the round-89 / 95 / 121 / 138 / 141 / 144 / 147 / 159
 //! / 164 / 177 cascade follows.
 
-use oxideav_core::{Error, Result};
+use crate::error::{Error, Result};
 
 use crate::dct_select::TransformType;
 use crate::non_zeros_grid::{decode_block_at, NonZerosGrid};

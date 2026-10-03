@@ -25,7 +25,7 @@
 //! source is consulted (see the crate README "History" note).
 
 use crate::bitreader::unpack_signed;
-use oxideav_core::{Error, Result};
+use crate::error::{Error, Result};
 
 /// A 2-D point with element-wise arithmetic, as used by the §K.1
 /// rendering listing (`Mirror`, control-point upsampling, arc-length

@@ -17,7 +17,7 @@
 //! [`crate::jpeg_reconstruct`].
 
 use crate::bitreader::{BitReader, U32Dist};
-use oxideav_core::{Error, Result};
+use crate::error::{Error, Result};
 
 /// Decompress a Brotli stream (IETF RFC 7932, the format 18181-2 §9.7 and
 /// §9.11 mandate) capping the output at `max_output` bytes as a

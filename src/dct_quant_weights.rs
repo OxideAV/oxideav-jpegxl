@@ -73,8 +73,8 @@
 #![allow(clippy::excessive_precision)]
 
 use crate::dct_select::TransformType;
+use crate::error::{Error, Result};
 use crate::hf_global::{DequantMatrixParams, EncodingMode};
-use oxideav_core::{Error, Result};
 
 /// `Mult(v)` per ISO/IEC 18181-1:2024 §I.2.4 listing (page 58):
 ///

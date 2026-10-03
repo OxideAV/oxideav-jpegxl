@@ -12,14 +12,14 @@
 //!     type `Alpha` (per FDIS A.6 + A.9 + Table A.22).
 //!   * Four per-channel Palette transforms (one per R, G, B, A) per
 //!     FDIS H.6 + Table H.4.
-//!   * A 4-plane VideoFrame output where plane[3] is the decoded alpha
+//!   * A 4-plane RawFrame output where plane[3] is the decoded alpha
 //!     channel — exercised here by byte-for-byte comparison against
 //!     the committed `alpha-64x64/expected.png` (PNG ColorType=Rgba,
 //!     8-bit).
 //!
 //! The two fixes that unblock this fixture:
 //!
-//!   1. `decode_one_frame` now strips the 2-byte `FF 0A` codestream
+//!   1. `decode_planar` now strips the 2-byte `FF 0A` codestream
 //!      signature from the jxlc/jxlp payload before calling
 //!      `decode_codestream` (FDIS Annex B.1). The previous code only
 //!      stripped FF 0A on the RawCodestream branch, so any
@@ -29,10 +29,10 @@
 //!   2. The post-Modular channel-count check that previously rejected
 //!      `n_chans != expected_chans` now also accepts
 //!      `n_chans == expected_chans + metadata.num_extra_channels`,
-//!      mapping the extra channels into trailing VideoFrame planes
+//!      mapping the extra channels into trailing RawFrame planes
 //!      (FDIS Annex G.1.3 colour-then-extras channel-order rule).
 
-use oxideav_jpegxl::decode_one_frame;
+use oxideav_jpegxl::decode_planar;
 use png::ColorType;
 use std::io::Cursor;
 
@@ -104,7 +104,7 @@ fn assert_rgba_planes_equal(ours: &[Vec<u8>], theirs: &[Vec<u8>], w: u32, h: u32
 
 #[test]
 fn alpha_64x64_rgba_pixel_correct_vs_expected_png() {
-    let vf = decode_one_frame(ALPHA_JXL, None).expect("alpha-64x64 must decode");
+    let vf = decode_planar(ALPHA_JXL, None).expect("alpha-64x64 must decode");
     assert_eq!(
         vf.planes.len(),
         4,
@@ -123,42 +123,42 @@ fn alpha_64x64_rgba_pixel_correct_vs_expected_png() {
 fn five_pre_round29_fixtures_still_pass() {
     // Smallest fixture: pixel-1x1 (raw codestream, RGB single pixel).
     let bytes = include_bytes!("fixtures/pixel_1x1.jxl");
-    let vf = decode_one_frame(bytes, None).expect("pixel-1x1");
+    let vf = decode_planar(bytes, None).expect("pixel-1x1");
     assert_eq!(vf.planes.len(), 3);
     assert_eq!(vf.planes[0].data, vec![255u8]);
 
     // gray-64x64 (raw codestream, single-channel grey).
     let bytes = include_bytes!("fixtures/gray_64x64_lossless.jxl");
-    let vf = decode_one_frame(bytes, None).expect("gray-64x64");
+    let vf = decode_planar(bytes, None).expect("gray-64x64");
     assert_eq!(vf.planes.len(), 1);
     assert_eq!(vf.planes[0].data.len(), 64 * 64);
 
     // gradient-64x64 (raw codestream, 3-channel RGB).
     let bytes = include_bytes!("fixtures/gradient_64x64_lossless.jxl");
-    let vf = decode_one_frame(bytes, None).expect("gradient-64x64");
+    let vf = decode_planar(bytes, None).expect("gradient-64x64");
     assert_eq!(vf.planes.len(), 3);
     assert_eq!(vf.planes[0].data.len(), 64 * 64);
 
     // palette-32x32 (raw codestream, 3-channel RGB via Palette).
     let bytes = include_bytes!("fixtures/palette_32x32.jxl");
-    let vf = decode_one_frame(bytes, None).expect("palette-32x32");
+    let vf = decode_planar(bytes, None).expect("palette-32x32");
     assert_eq!(vf.planes.len(), 3);
     assert_eq!(vf.planes[0].data.len(), 32 * 32);
 
     // grey_8x8_lossless (raw codestream, 8x8 grey).
     let bytes = include_bytes!("fixtures/grey_8x8_lossless.jxl");
-    let vf = decode_one_frame(bytes, None).expect("grey-8x8");
+    let vf = decode_planar(bytes, None).expect("grey-8x8");
     assert_eq!(vf.planes.len(), 1);
     assert_eq!(vf.planes[0].data.len(), 8 * 8);
 }
 
-/// Regression for the `decode_one_frame` ISOBMFF path: wrap an
+/// Regression for the `decode_planar` ISOBMFF path: wrap an
 /// existing pixel-correct raw codestream in a minimal ISOBMFF (JXL
 /// signature box + jxlc box carrying `FF 0A || codestream_tail`) and
 /// verify the decoded pixels are byte-identical to the raw-path
 /// decode.
 ///
-/// Before this round, `decode_one_frame` on the ISOBMFF branch did
+/// Before this round, `decode_planar` on the ISOBMFF branch did
 /// NOT strip the `FF 0A` codestream signature from the jxlc/jxlp
 /// payload, so `SizeHeader::read` started 16 bits into the
 /// codestream and produced silent miscompares (or downstream parse
@@ -185,8 +185,8 @@ fn isobmff_wraps_raw_codestream_decodes_identically() {
     isobmff.extend_from_slice(b"jxlc");
     isobmff.extend_from_slice(raw);
 
-    let vf_raw = decode_one_frame(raw, None).expect("raw decode");
-    let vf_iso = decode_one_frame(&isobmff, None).expect("isobmff decode");
+    let vf_raw = decode_planar(raw, None).expect("raw decode");
+    let vf_iso = decode_planar(&isobmff, None).expect("isobmff decode");
     assert_eq!(vf_raw.planes.len(), vf_iso.planes.len());
     for (i, (a, b)) in vf_raw.planes.iter().zip(vf_iso.planes.iter()).enumerate() {
         assert_eq!(

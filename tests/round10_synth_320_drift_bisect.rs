@@ -40,7 +40,7 @@ fn synth_320_pg00_first_24_rows_pixel_correct() {
     // Historical round-10 bisect anchor (rows y=0..24 inside PG[0][0]
     // were the maximal correct prefix until round 278). Kept as a
     // fast-failing subset with a precise failure message.
-    let vf = oxideav_jpegxl::decode_one_frame(SYNTH_320_JXL, None).unwrap();
+    let vf = oxideav_jpegxl::decode_planar(SYNTH_320_JXL, None).unwrap();
     assert_eq!(vf.planes.len(), 1);
     let plane = &vf.planes[0];
     for y in 0..24usize {
@@ -63,7 +63,7 @@ fn synth_320_whole_image_pixel_correct() {
     // removed the round-10 (y=24, x=14) drift anchor and every
     // downstream mismatch. The whole 320x320 frame must decode to
     // the synthetic gradient exactly.
-    let vf = oxideav_jpegxl::decode_one_frame(SYNTH_320_JXL, None).unwrap();
+    let vf = oxideav_jpegxl::decode_planar(SYNTH_320_JXL, None).unwrap();
     let plane = &vf.planes[0];
     let mut mismatches = 0usize;
     let mut first: Option<(usize, usize)> = None;

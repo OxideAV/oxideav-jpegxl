@@ -8,7 +8,7 @@
 //! per-slot encoding modes are recognised, parameters captured, and
 //! Table I.5 valid-index constraints enforced.
 
-use oxideav_jpegxl::decode_one_frame;
+use oxideav_jpegxl::decode_planar;
 
 const PIXEL_1X1_JXL: &[u8] = include_bytes!("fixtures/pixel_1x1.jxl");
 const GRAY_64X64_JXL: &[u8] = include_bytes!("fixtures/gray_64x64_lossless.jxl");
@@ -32,7 +32,7 @@ fn five_small_lossless_fixtures_still_decode_round_14() {
         ("palette_32x32", PALETTE_JXL),
         ("grey_8x8", GREY_8X8_JXL),
     ] {
-        let vf = decode_one_frame(bytes, None);
+        let vf = decode_planar(bytes, None);
         assert!(
             vf.is_ok(),
             "round-14 regression: {name} should still decode (round-10 baseline); got {:?}",
@@ -47,8 +47,8 @@ fn five_small_lossless_fixtures_still_decode_round_14() {
 /// pixels on the public path.
 #[test]
 fn vardct_d1_fixture_is_past_hf_block_context_round_14() {
-    let frame = decode_one_frame(VARDCT_D1_JXL, None)
-        .expect("d1 decodes on the public path since round 389");
+    let frame =
+        decode_planar(VARDCT_D1_JXL, None).expect("d1 decodes on the public path since round 389");
     assert_eq!(frame.planes.len(), 3);
 }
 
@@ -57,7 +57,7 @@ fn vardct_d1_fixture_is_past_hf_block_context_round_14() {
 /// "name is not valid UTF-8") was root-caused and fixed; it decodes.
 #[test]
 fn vardct_d3_fixture_still_errors_in_round_14() {
-    let frame = decode_one_frame(VARDCT_D3_JXL, None)
-        .expect("d3 decodes on the public path since round 389");
+    let frame =
+        decode_planar(VARDCT_D3_JXL, None).expect("d3 decodes on the public path since round 389");
     assert_eq!(frame.planes.len(), 3);
 }

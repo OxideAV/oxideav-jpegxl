@@ -127,7 +127,7 @@
 //!   `sub_erri = abs(((predictioni + 3) >> 3) - true_value)`.
 //!
 
-use oxideav_jpegxl::decode_one_frame;
+use oxideav_jpegxl::decode_planar;
 use oxideav_jpegxl::modular_fdis::{
     encode_leaf_pick_target, LEAF_PICK_TRACE_TARGET, LEAF_PICK_TRACE_WP, WP_DEEP_TRACE,
 };
@@ -148,7 +148,7 @@ fn r126_wp_intermediates_at_sample_194_pinned() {
     // Reset the WP capture so a previous test run can't leak in.
     LEAF_PICK_TRACE_WP.with(|s| s.borrow_mut().clear());
 
-    let _ = decode_one_frame(NOISE_JXL, None).expect("noise fixture must decode");
+    let _ = decode_planar(NOISE_JXL, None).expect("noise fixture must decode");
 
     let wp = LEAF_PICK_TRACE_WP.with(|s| s.borrow().clone());
     // Reset the trace target so it doesn't fire in unrelated tests.
@@ -300,7 +300,7 @@ fn r126_first_divergence_scan() {
 
     const EXPECTED: &[u8] = include_bytes!("fixtures/noise_64x64_lossless_expected.png");
 
-    let vf = decode_one_frame(NOISE_JXL, None).expect("decode");
+    let vf = decode_planar(NOISE_JXL, None).expect("decode");
     let decoder = png::Decoder::new(Cursor::new(EXPECTED));
     let mut reader = decoder.read_info().unwrap();
     let mut buf = vec![0u8; reader.output_buffer_size().unwrap()];

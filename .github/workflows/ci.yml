@@ -33,6 +33,24 @@ jobs:
       - name: Test
         run: cargo test --verbose
 
+  ci-standalone:
+    name: Build + test (no registry)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: standalone
+      - name: cargo build --lib --no-default-features
+        run: cargo build --lib --no-default-features --verbose
+      - name: cargo test --no-default-features
+        run: cargo test --no-default-features --verbose
+      - name: cargo clippy --no-default-features -- -D warnings
+        run: cargo clippy --all-targets --no-default-features -- -D warnings
+
   lint:
     name: rustfmt + clippy
     runs-on: ubuntu-latest

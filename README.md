@@ -2,16 +2,197 @@
 
 [![CI](https://github.com/OxideAV/oxideav-jpegxl/actions/workflows/ci.yml/badge.svg)](https://github.com/OxideAV/oxideav-jpegxl/actions/workflows/ci.yml) [![crates.io](https://img.shields.io/crates/v/oxideav-jpegxl.svg)](https://crates.io/crates/oxideav-jpegxl) [![docs.rs](https://docs.rs/oxideav-jpegxl/badge.svg)](https://docs.rs/oxideav-jpegxl) [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-Pure-Rust **JPEG XL** (JXL, ISO/IEC 18181-1) decoder for the
+Pure-Rust **JPEG XL** (JXL, ISO/IEC 18181-1 codestream + 18181-2 box
+file format) decoder, usable standalone or through the
 [oxideav](https://github.com/OxideAV/oxideav-workspace) framework. Built
-clean-room from the published core specification and the conformance /
+clean-room from the published specification and the conformance /
 behavioural-trace fixtures committed under `docs/image/jpegxl/` only —
 no external codec source is consulted. Zero C dependencies, zero FFI,
 zero `*-sys`.
 
-## Status
+The crate follows the workspace's image-crate API contract
+(`IMAGE_CRATE_API.md`): `probe` / `info` / `decode` / `decode_rgba8` /
+`decode_all` over a packed `JxlImage`, with `oxideav-core` optional
+behind the default-on `registry` feature. **Decoder only** — every
+`encode*` function returns `Error::Unsupported`.
 
-This crate is a **decoder under active construction**. The Modular path
+## Standalone use
+
+```toml
+[dependencies]
+oxideav-jpegxl = { version = "0.0", default-features = false }
+```
+
+```rust
+let bytes = std::fs::read("in.jxl")?;
+if oxideav_jpegxl::probe(&bytes) {
+    let info = oxideav_jpegxl::info(&bytes)?;      // headers only
+    println!("{}x{} {:?} frames={} alpha={} icc={}",
+        info.width, info.height, info.format, info.frames, info.has_alpha, info.has_icc);
+
+    let img = oxideav_jpegxl::decode(&bytes)?;     // JxlImage, native packed layout
+    let rgba: Vec<u8> = img.to_rgba8();            // 4 * width bytes per row
+    let (w, h) = (img.width(), img.height());
+
+    // Animations: every presented frame with its display delay.
+    for frame in oxideav_jpegxl::decode_all(&bytes)? {
+        let _ = (frame.image.width(), frame.delay);
+    }
+}
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+Root items: `probe(&[u8]) -> bool`, `info -> ImageInfo`,
+`decode -> JxlImage`, `decode_with(&DecodeOptions)`,
+`decode_rgb8 -> RgbImage`, `decode_rgba8 -> RgbaImage`,
+`decode_all -> Vec<Frame>` (+ `decode_all_with`), `decode_from<R: Read>`,
+`encode` / `encode_rgb8` / `encode_rgba8` / `encode_to` (all
+`Error::Unsupported`), types `JxlImage`, `Plane`, `ColorInfo`,
+`ColorRange`, `Metadata`, `RgbImage`, `RgbaImage`, `PixelFormat`
+(= `JxlPixelFormat`), `ImageInfo`, `Frame`, `AnimationInfo`,
+`DecodeOptions`, `EncodeOptions`, `Error` (= `JxlError`).
+
+`JxlImage` is `{ width, height, format, planes: Vec<Plane>, color,
+metadata, bits_per_sample }` — exactly one packed plane (stride
+`width × bytes_per_pixel`); no `palette` (the Modular palette transform
+is undone inside the decoder). `JxlImage::new` / `from_rgb8` /
+`from_rgba8` validate geometry and return `Result`.
+
+Depth APIs keep their names: `headers` (committee-draft preamble),
+`probe_fdis -> HeadersFdis` (2024 bundle layout), `container::JxlFile`
+(18181-2 boxes), `jpeg_reconstruct::reconstruct_jpeg` (byte-exact JPEG
+reconstruction from a `jbrd`-carrying transcode), `extract_codestream`.
+
+## Framework use
+
+With the default `registry` feature:
+
+```rust
+let mut ctx = oxideav_core::RuntimeContext::new();
+oxideav_jpegxl::register(&mut ctx);               // codec "jpegxl", decoder only
+let params = oxideav_core::CodecParameters::video(
+    oxideav_core::CodecId::new(oxideav_jpegxl::CODEC_ID_STR));
+let decoder = oxideav_jpegxl::make_decoder(&params)?;  // one .jxl file per packet
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+* `register(&mut RuntimeContext)` / `register_codecs(&mut CodecRegistry)`;
+  `make_decoder` (live) and `make_encoder` (always `Unsupported`). No
+  demuxer is registered: a JXL file is one packet.
+* The framework `Decoder` calls `decode_all` and hands out one
+  `VideoFrame` per presented frame in the **native packed layout**
+  (`Gray8` / `Ya8` / `Rgb24` / `Rgba` / `Gray16Le` / `Ya16Le` /
+  `Rgb48Le` / `Rgba64Le`, 1:1 with `oxideav_core::PixelFormat`), with the
+  colour-signal side-channel stamped (JPEG XL always signals a
+  `ColourEncoding`) and the significant-bits side-channel when the
+  declared depth is not the storage width (e.g. 12-bit in `Rgba64Le`).
+* `From<JxlImage> for VideoFrame`, `JxlImage::from_video_frame(&VideoFrame,
+  &CodecParameters) -> Result` and `TryFrom<(&VideoFrame, &CodecParameters)>`
+  bridge the two layers; `From<JxlError> for oxideav_core::Error`
+  (`LimitExceeded` → `ResourceExhausted`).
+* Deprecated for one release: `decode_one_frame`, `decode_all_frames`,
+  `decode_vardct_frame_from_codestream` (planar `VideoFrame`s, see
+  *Plane byte layout* below) and root `detect`. The old
+  `probe -> Headers` is now `headers` (the contract reuses the name
+  `probe` for the `bool` sniff).
+
+## Supported layouts
+
+Decode (native layout of `decode` / `info.format`; the framework frame
+uses the same label):
+
+| Codestream | `PixelFormat` | Notes |
+|---|---|---|
+| grey, `bits_per_sample ≤ 8` | `Gray8` | samples in `0 ..= 2^bits − 1` |
+| grey + alpha, ≤ 8 | `Ya8` | |
+| RGB, ≤ 8 | `Rgb24` | |
+| RGB + alpha, ≤ 8 | `Rgba` | |
+| grey, 9 ..= 16 | `Gray16Le` | little-endian `u16`, `bits_per_sample` significant |
+| grey + alpha, 9 ..= 16 | `Ya16Le` | |
+| RGB, 9 ..= 16 | `Rgb48Le` | |
+| RGB + alpha, 9 ..= 16 | `Rgba64Le` | |
+
+* **VarDCT frames reconstruct to 8 bits per sample** whatever the
+  declared depth (`info` reads the first frame header and reports the
+  8-bit label in that case); Modular frames keep the declared depth.
+* A kGrey image decoded through XYB or VarDCT arrives as three planes
+  (R, G, B); the grey output is the **G** plane (the opsin luminance
+  carrier; R = G = B for genuinely grey content up to quantisation).
+* Extra channels other than the first alpha channel (depth, spot
+  colours, selection masks, CFA, thermal) are decoded but **not
+  carried** in `JxlImage`; a sub-sampled (`dim_shift > 0`) alpha channel
+  is `Error::Unsupported`.
+* Floating-point samples (`float_sample`) and `bits_per_sample > 16`
+  are `Error::Unsupported` — no `*F32Le` layout is produced yet.
+* `to_rgb8` / `to_rgba8`: grey replicated to R = G = B, alpha dropped /
+  set to 255, deeper samples scaled by `255 / (2^bits_per_sample − 1)`
+  with round-to-nearest.
+
+Encode: none. `encode`, `encode_rgb8`, `encode_rgba8`, `encode_to`
+return `Error::Unsupported("JPEG XL encoding is not implemented")`;
+`EncodeOptions` is an empty `#[non_exhaustive]` struct so callers can
+be written against it today. A lossless Modular encoder is a later
+seat.
+
+## Options
+
+`DecodeOptions` (`Default`: 1 GiB `max_bytes`, `2^30 − 1` max
+dimension, `2^30` max pixels, `strict = false`, `coalesce = true`):
+
+| Field | Meaning |
+|---|---|
+| `max_width`, `max_height`, `max_pixels`, `max_bytes` | checked against the headers **before** any pixel buffer is allocated; `None` = unlimited; a hit is `Error::LimitExceeded`. `max_bytes` bounds the native output size (`width × height × channels × bytes_per_sample`) — the decoder's working set is about four bytes per sample per channel on top |
+| `strict` | reject trailing bytes after the `is_last` frame of a raw codestream (a box file's structure is always validated) |
+| `coalesce` | `decode_all` composes frames onto the canvas per §C.2 and returns only presented frames (`true`), or returns every frame of the array as decoded — frame-rectangle geometry, un-blended, un-oriented, `Frame::x` / `y` offsets, zero-duration layers included (`false`) |
+
+`decode` is always the first **presented** frame, §C.2-composed over
+any preceding layers and oriented (Table A.17) — for a multi-layer
+still image that is the finished picture, not the bare first layer.
+
+## Metadata and colour
+
+* `JxlImage::color` (`ColorInfo { range, primaries, transfer, matrix }`,
+  H.273 code points) comes from the codestream's `ColourEncoding`: range
+  is always `Full`; primaries sRGB → 1, BT.2100 → 9, P3 → 11, custom
+  → 2; transfer BT.709 → 1, linear → 8, sRGB → 13, PQ → 16, DCI → 17,
+  HLG → 18, unknown → 2; `have_gamma` → transfer 2 with the exponent
+  (`gamma / 10^7`, PNG `gAMA` semantics) in `metadata.gamma`; matrix
+  is always 0 (RGB output). With an embedded ICC profile the enumerated
+  fields are unspecified (2) and the profile is in `metadata.icc`.
+  The default `all_default` encoding is sRGB (`ColorInfo::srgb()`).
+* `Metadata { icc, exif, xmp, gamma }`: `icc` is the Annex B encoded ICC
+  stream reconstructed to profile bytes; `exif` is the container's
+  `Exif` box payload from its TIFF header (18181-2 Table 6 offset
+  applied); `xmp` the `xml ` box; `brob`-compressed boxes are
+  decompressed up to 64 MiB. Metadata rides on the first frame of
+  `decode_all`.
+* `ImageInfo` extras: `bits_per_sample`, `float_sample`, `xyb_encoded`,
+  `orientation`, `num_extra_channels`, `animation`
+  (`AnimationInfo { ticks_per_second, loops }`), `signature`,
+  `has_jpeg_reconstruction` (a `jbrd` box is present).
+* `Frame { image, delay, index, ticks, x, y, presented }`: `delay` is
+  `duration × tps_denominator / tps_numerator`, `None` for
+  non-animated files.
+
+## Limits
+
+* `probe` is total and allocation-free; `info` parses the SizeHeader,
+  ImageMetadata and (when present) the ICC stream, peeks the first
+  frame header for the layout and, for animations, walks every frame
+  header + TOC to count presented frames — no pixels are decoded.
+* Every decode path returns `Error` on hostile input (never panics);
+  the fuzz battery covers `probe` / `info` / `headers` / `probe_fdis`,
+  `decode` (lenient + strict), `decode_all` (coalesced + layers) and
+  the container / ICC / JPEG-reconstruction depth APIs.
+* `info` may succeed on geometry that cannot be allocated; `decode`
+  then fails with `LimitExceeded` (default limits) or `Unsupported`
+  (unlimited, `usize` overflow).
+
+## Format specifics
+
+### Decoder coverage
+
+The decoder is **under active construction**. The Modular path
 decodes end to end (grey / RGB / RGBA, 1–16-bit integer, XYB / YCbCr
 inverse colour) for the small lossless fixtures; the **VarDCT** path
 decodes **on the public path** (round 389): the full chain — §C.8.3
@@ -43,8 +224,9 @@ offset), so the staged 3-pass × 2-preset progressive stream and the
 (MAD 1.97/1.36/0.68 and 0.60/0.41/0.47 vs black-box reference). Multi-frame
 codestreams compose per §C.2 (Reference slots + Table C.8 blending,
 incl. round-393 kBlend / kAlphaWeightedAdd alpha modes) in
-`decode_all_frames`. Programs that only need probe-level information
-should call `probe(...)` directly.
+`decode_all` (and `decode`, which is the first presented composed
+frame). Programs that only need header-level information should call
+`info(...)` directly.
 
 What is implemented and tested today:
 
@@ -159,7 +341,7 @@ What is implemented and tested today:
   hand-assembled 43-byte codestream the reference decoder accepts —
   our render lands within ±1/255 of the black-box reference decode.
 
-### Round 389 — multi-group / multi-pass framing, sRGB output, public exposure
+#### Round 389 — multi-group / multi-pass framing, sRGB output, public exposure
 
 - **Multi-group VarDCT framing** (§C.3.1 / §C.8.1): one PassGroup
   section per `(pass, group)` off the pass-major TOC slot map; per
@@ -194,7 +376,7 @@ What is implemented and tested today:
   reads the actual quantised-LF samples; the non-empty-`lf_thresholds`
   reject gate is gone.
 
-### Round 393 — flat-content fixture arbitration, alpha blending, multi-LfGroup
+#### Round 393 — flat-content fixture arbitration, alpha blending, multi-LfGroup
 
 - **§F.3 HfMul erratum (the "d1 HF accuracy tail" closed).** The FDIS
   prose says the bias-adjusted quant "is then multiplied by … the
@@ -235,7 +417,7 @@ What is implemented and tested today:
   `large-3072x2048-multigroup` (2×1 LF groups, 96 groups, permuted
   100-entry TOC) up to the §C.7.1 boundary below.
 
-### Round 406 — ISO/IEC 18181-3 conformance corpus (Modular blending / layering)
+#### Round 406 — ISO/IEC 18181-3 conformance corpus (Modular blending / layering)
 
 Four of the six committed Part 3 conformance streams now decode
 end-to-end, validated against black-box reference decodes
@@ -262,7 +444,7 @@ the blend mode alone (not `multi_extra`), §A.6 Table A.17 orientation
 semantics (round toward zero) in the Listing C.16 averaging predictors
 and the Listing I.21 Squeeze tendency function.
 
-### Round 408 — ImageMetadata tail, ICC decode, §C.7.1 half-resolution, Squeeze + multi-LfGroup
+#### Round 408 — ImageMetadata tail, ICC decode, §C.7.1 half-resolution, Squeeze + multi-LfGroup
 
 - **Squeeze decodes end-to-end** (second block): the Listing I.19
   default-parameter sequence (derived at transform-application time;
@@ -274,7 +456,7 @@ and the Listing I.21 Squeeze tendency function.
   `grayscale_public_university` conformance stream (2880×1620, 2 LF
   groups, Squeeze) went from hard-`Unsupported` to a full decode.
 
-### Round 420 — the multi-group Squeeze tail CLOSED, restoration filters on Modular
+#### Round 420 — the multi-group Squeeze tail CLOSED, restoration filters on Modular
 
 - **Coded-domain forward-Squeeze oracle**
   (`round420_squeeze_residual_oracle`): the inverse Squeeze is a
@@ -350,7 +532,7 @@ and the Listing I.21 Squeeze tendency function.
   generated `used_orders` streams), so the grayscale frame itself
   remains refused, one boundary later than round 393.
 
-### Round 437 — used_orders custom coefficient orders, kNoise, kModular EPF posture, multi-pass gate
+#### Round 437 — used_orders custom coefficient orders, kNoise, kModular EPF posture, multi-pass gate
 
 - **§C.7.1 `used_orders != 0` streams DECODE — the Listing C.12
   per-channel permutation layout erratum.** The printed listing reads
@@ -393,7 +575,7 @@ and the Listing I.21 Squeeze tendency function.
   domain normalisation. CI-gated arbitration
   (`round437_modular_epf_posture`).
 
-### Round 441 — Patches + Splines wired; two new FDIS errata (§L.2 /128, Listing C.3 order)
+#### Round 441 — Patches + Splines wired; two new FDIS errata (§L.2 /128, Listing C.3 order)
 
 - **§C.4.5 + §K.2 kPatches decodes and renders end to end** (`patches`
   module): the Listing C.2 dictionary parse (10-distribution §D.3
@@ -452,7 +634,7 @@ and the Listing I.21 Squeeze tendency function.
   reject). The dedicated fixture generated this round reproduces it
   standalone; follow-up round material.
 
-### Round 444 — the §C.8.3 entropy layer root-caused: impulse deficiency FIXED, two new FDIS errata (§F.3 2^16/global_scale, Listing I.4 orientation)
+#### Round 444 — the §C.8.3 entropy layer root-caused: impulse deficiency FIXED, two new FDIS errata (§F.3 2^16/global_scale, Listing I.4 orientation)
 
 Round 444 took the round-441 impulse reproducer (Hornuss / DCT2×2
 varblocks decoding fewer nonzeros than declared, `remaining_non_zeros
@@ -519,7 +701,7 @@ and |q| ≈ 500), `flat-content-lf-smoothing` tightens to **max 1**,
 `large-1024x768-d2` 0.39/0.33/0.30, `noise-feature` 0.69/0.67/0.70
 max 4 (was max 7), `patches_vardct` MAD 1.91/0.85/0.91.
 
-### Round 448 — ISO/IEC 18181-2 file format + byte-exact JPEG reconstruction; the round-444 desync class CLOSED
+#### Round 448 — ISO/IEC 18181-2 file format + byte-exact JPEG reconstruction; the round-444 desync class CLOSED
 
 - **The full 18181-2:2024 box layer** (`container`): the Clause 8 box
   walk (LBox/XLBox/last-box), byte-exact Signature and File Type
@@ -581,7 +763,7 @@ max 4 (was max 7), `patches_vardct` MAD 1.91/0.85/0.91.
   parsed as SizeHeader bits and coincidentally yielded a plausible
   header for 256-px-tall images).
 
-### Round 451 — the noisy-content §C.8.3 desync class CLOSED (two errata) + Annex A reconstruction complete across greyscale / ICC / MCU-padded / progressive JPEGs
+#### Round 451 — the noisy-content §C.8.3 desync class CLOSED (two errata) + Annex A reconstruction complete across greyscale / ICC / MCU-padded / progressive JPEGs
 
 Round 451 root-caused the desync class that had stalked every noisy
 4:4:4 stream since round 444 to **two independent errata**, each
@@ -641,7 +823,7 @@ generated `cjxl` transcode pairs:
   `jpegtran -restart` specimens). Arithmetic-coded JPEGs (SOF9/10)
   refuse precisely.
 
-### Not yet implemented
+#### Not yet implemented
 
 - **A rare self-consistent §C.8.3 chroma mis-parse** (round 451):
   ~0.03 % of chroma coefficients on some noisy 4:4:4 content decode
@@ -668,9 +850,7 @@ generated `cjxl` transcode pairs:
 - The AFV non-DCT IDCT variants (parsed and dispatched; accuracy
   unvalidated — no staged fixture reaches them with a pixel oracle).
 - Floating-point samples and `bps > 16`; high-bit-depth XYB / YCbCr.
-- Surfacing the decoded ICC profile to callers (the Annex B decode
-  runs and validates, but `oxideav_core::VideoFrame` has no ICC slot)
-  and applying an embedded profile's transfer curve to the decoded
+- Applying an embedded ICC profile's transfer curve to the decoded
   samples (the `grayscale` stream's image output currently uses the
   signalled/default transfer, sRGB, rather than the profile's
   gamma-2.2-class `kTRC` curve).
@@ -687,12 +867,13 @@ generated `cjxl` transcode pairs:
   decoder still refuses them; reconstruction is coefficient-level).
 - The LfFrame (`lf_level > 0`) dimension scaling `progressive-dc`
   needs.
-- The encoder (not registered).
+- The encoder (`encode*` return `Error::Unsupported`; a lossless
+  Modular encoder is a later seat).
 
 Unsupported inputs surface as `Error::Unsupported` rather than a silent
 misparse.
 
-## Fuzzing
+### Fuzzing
 
 The crate carries a `cargo-fuzz` battery under `fuzz/` (nightly-only
 sub-package, excluded from the umbrella build), run daily by the Fuzz
@@ -701,11 +882,11 @@ across runs, crashing inputs uploaded as artifacts):
 
 | target | surface |
 |---|---|
-| `parse_headers` | signature detect + SizeHeader / ImageMetadata probes (committee-draft AND full FDIS Table A.16 layouts) |
+| `parse_headers` | `probe` + `info` + the SizeHeader / ImageMetadata depth probes (committee-draft AND full FDIS Table A.16 layouts) |
 | `parse_icc` | Annex B / E.4 encoded-ICC entropy decode + E.4.2..E.4.5 profile reconstruction |
 | `container_walk` | 18181-2 box walk: `BoxIter`, `JxlFile::parse`, `jxli`, capped `brob` unwrap, codestream extraction |
-| `decode_full` | geometry-capped `decode_all_frames` (whole multi-frame decode surface) |
-| `decode_vardct` | geometry-capped first-frame decode, seeded with VarDCT streams |
+| `decode_full` | geometry-capped `decode_all` (coalesced + layers; whole multi-frame decode surface) |
+| `decode_vardct` | geometry-capped `decode` (lenient + strict), seeded with VarDCT streams |
 | `decode_modular` | structure-aware single-channel Modular decode (header + MA tree + pixel loop) under fuzz-chosen geometry |
 | `jpeg_recon` | Annex A JPEG bitstream reconstruction over container + `jbrd` |
 | `decode_partial` | truncation driver: the capped decode over fuzz-chosen prefixes of valid streams |
@@ -738,66 +919,21 @@ fixtures committed under `docs/image/jpegxl/fixtures/`. Workspace policy
 forbids consulting any third-party implementation source as a
 substitute.
 
-## Installation
+### Plane byte layout (deprecated planar API)
 
-```toml
-[dependencies]
-oxideav-core   = "0.1"
-oxideav-codec  = "0.1"
-oxideav-jpegxl = "0.0"
-```
-
-## Usage
-
-```rust
-use oxideav_jpegxl::{probe, Signature};
-
-let bytes = std::fs::read("input.jxl")?;
-let headers = probe(&bytes)?;
-
-match headers.signature {
-    Signature::RawCodestream => println!("raw .jxl codestream"),
-    Signature::Isobmff       => println!("ISOBMFF-wrapped .jxl"),
-}
-println!("{}x{}", headers.size.width, headers.size.height);
-println!("{} bits/sample, float={}",
-    headers.metadata.bit_depth.bits_per_sample,
-    headers.metadata.bit_depth.floating_point);
-# Ok::<(), Box<dyn std::error::Error>>(())
-```
-
-### Codec / container IDs
-
-- Codec `"jpegxl"` — decoder slot registered; no encoder slot. The
-  registered decoder handles the Modular path (grey / RGB / RGBA, 1–16-bit
-  integer) and the VarDCT path (single-LfGroup frames of any group
-  count, reference-validated; see Status).
-- No demuxer is registered: a JXL file is treated as a single
-  codestream buffer fed directly to `probe(...)`.
-
-## Plane byte layout
-
-`oxideav_core::VideoPlane` carries `(stride, data)` only — there is no
-per-plane bit-depth field in core 0.1.x. The decoder packs samples into
-`data: Vec<u8>` according to the codestream's `bits_per_sample`
-(Annex A.6 + Table A.22):
+The deprecated `decode_one_frame` / `decode_all_frames` wrappers (and
+the `#[doc(hidden)]` planar drivers the fixture suite pins) return one
+plane per channel — colour channels first, extra channels after, in
+Annex G.1.3 order — packed according to the codestream's
+`bits_per_sample` (Annex A.6 + Table A.22):
 
 | `bits_per_sample` (`bps`) | Bytes / sample | Plane stride | Layout                              |
 |---------------------------|----------------|--------------|-------------------------------------|
 | `1 ..= 8`                 | 1              | `width`      | sample clamped to `[0, 2^bps - 1]`  |
 | `9 ..= 16`                | 2              | `width × 2`  | **little-endian** `u16` per sample  |
 
-Floating-point samples and `bps > 16` are not yet supported and surface
-as `Error::Unsupported`. The little-endian 16-bit convention lets a
-little-endian host take a zero-cost `u16` view of the plane:
-
-```rust
-let samples: Vec<u16> = plane
-    .data
-    .chunks_exact(2)
-    .map(|c| u16::from_le_bytes([c[0], c[1]]))
-    .collect();
-```
+The contract `JxlImage` interleaves the same bytes into one packed
+plane; the 16-bit samples keep their little-endian order.
 
 ## License
 

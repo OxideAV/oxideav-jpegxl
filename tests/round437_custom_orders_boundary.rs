@@ -55,7 +55,7 @@ fn multipass_fixture_decodes_within_ratchet() {
     oxideav_jpegxl::pass_group_hf::reset_walk_underruns();
 
     let (w, h, reference) = png_rgb(EXPECTED);
-    let frame = oxideav_jpegxl::decode_one_frame(FIXTURE, None)
+    let frame = oxideav_jpegxl::decode_planar(FIXTURE, None)
         .expect("round 454: the multi-preset multi-pass fixture decodes (2024 I.3.1 layout)");
     assert_eq!(frame.planes.len(), 3);
 

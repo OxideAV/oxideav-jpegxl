@@ -2,7 +2,7 @@
 //! reference images for the small lossless docs fixtures.
 //!
 //! Each test:
-//! 1. Decodes the committed `<fixture>.jxl` via `decode_one_frame`.
+//! 1. Decodes the committed `<fixture>.jxl` via `decode_planar`.
 //! 2. Decodes the committed `<fixture>_expected.png` via the `png` crate.
 //! 3. Asserts pixel-for-pixel equality on every plane.
 //!
@@ -10,7 +10,7 @@
 //! no codec-semantics overlap with JPEG XL. Round 3 used first-16-pixels
 //! plus histogram statistics; round 4 graduates to byte-exact match.
 
-use oxideav_jpegxl::decode_one_frame;
+use oxideav_jpegxl::decode_planar;
 use png::ColorType;
 use std::io::Cursor;
 
@@ -115,7 +115,7 @@ fn assert_planes_equal(label: &str, ours: &[Vec<u8>], theirs: &[Vec<u8>], w: u32
 
 #[test]
 fn pixel_1x1_decodes_to_red_rgb() {
-    let vf = decode_one_frame(PIXEL_1X1_JXL, None).expect("pixel-1x1 must decode");
+    let vf = decode_planar(PIXEL_1X1_JXL, None).expect("pixel-1x1 must decode");
     assert_eq!(vf.planes.len(), 3, "pixel-1x1: expected 3 RGB planes");
     assert_eq!(vf.planes[0].data, vec![255u8], "R plane");
     assert_eq!(vf.planes[1].data, vec![0u8], "G plane");
@@ -124,7 +124,7 @@ fn pixel_1x1_decodes_to_red_rgb() {
 
 #[test]
 fn gray_64x64_pixel_correct_vs_expected_png() {
-    let vf = decode_one_frame(GRAY_64X64_JXL, None).expect("gray-64x64 must decode");
+    let vf = decode_planar(GRAY_64X64_JXL, None).expect("gray-64x64 must decode");
     let (w, h, ref_planes) = png_to_planes(GRAY_64X64_PNG);
     assert_eq!((w, h), (64, 64));
     let ours: Vec<Vec<u8>> = vf.planes.iter().map(|p| p.data.clone()).collect();
@@ -133,7 +133,7 @@ fn gray_64x64_pixel_correct_vs_expected_png() {
 
 #[test]
 fn gradient_64x64_lossless_pixel_correct_vs_expected_png() {
-    let vf = decode_one_frame(GRADIENT_JXL, None).expect("gradient-64x64 must decode");
+    let vf = decode_planar(GRADIENT_JXL, None).expect("gradient-64x64 must decode");
     let (w, h, ref_planes) = png_to_planes(GRADIENT_PNG);
     assert_eq!((w, h), (64, 64));
     let ours: Vec<Vec<u8>> = vf.planes.iter().map(|p| p.data.clone()).collect();
@@ -142,7 +142,7 @@ fn gradient_64x64_lossless_pixel_correct_vs_expected_png() {
 
 #[test]
 fn palette_32x32_pixel_correct_vs_expected_png() {
-    let vf = decode_one_frame(PALETTE_JXL, None).expect("palette-32x32 must decode");
+    let vf = decode_planar(PALETTE_JXL, None).expect("palette-32x32 must decode");
     let (w, h, ref_planes) = png_to_planes(PALETTE_PNG);
     assert_eq!((w, h), (32, 32));
     let ours: Vec<Vec<u8>> = vf.planes.iter().map(|p| p.data.clone()).collect();

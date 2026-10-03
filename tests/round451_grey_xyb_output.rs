@@ -23,7 +23,7 @@ fn grey_xyb_output_reference_band() {
     let info = reader.next_frame(&mut buf).unwrap();
     assert_eq!(info.color_type, png::ColorType::Grayscale);
     let (w, h) = (info.width as usize, info.height as usize);
-    let frame = oxideav_jpegxl::decode_one_frame(jxl, None).expect("grey xyb stream decodes");
+    let frame = oxideav_jpegxl::decode_planar(jxl, None).expect("grey xyb stream decodes");
     assert_eq!(frame.planes.len(), 1, "grey output must be a single plane");
     let p = &frame.planes[0];
     let mut sum = 0u64;

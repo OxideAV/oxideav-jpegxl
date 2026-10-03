@@ -34,7 +34,7 @@
 //! Every `_expected.png` is the black-box reference decode of the
 //! committed stream.
 
-use oxideav_jpegxl::decode_all_frames;
+use oxideav_jpegxl::decode_all_planar;
 use std::io::Cursor;
 
 fn png_rgb(bytes: &[u8]) -> (usize, usize, Vec<u8>) {
@@ -49,7 +49,7 @@ fn png_rgb(bytes: &[u8]) -> (usize, usize, Vec<u8>) {
 
 /// Per-channel (MAD, max) against a reference decode.
 fn compare_rgb(
-    frame: &oxideav_core::VideoFrame,
+    frame: &oxideav_jpegxl::RawFrame,
     w: usize,
     h: usize,
     want: &[u8],
@@ -83,7 +83,7 @@ fn compare_rgb(
 fn round441_patches_dots_lossless_bit_exact() {
     let jxl = include_bytes!("fixtures/patches_dots_256x256.jxl");
     let (w, h, want) = png_rgb(include_bytes!("fixtures/patches_dots_256x256_expected.png"));
-    let frames = decode_all_frames(jxl, None).expect("patches stream decodes");
+    let frames = decode_all_planar(jxl, None).expect("patches stream decodes");
     assert_eq!(frames.len(), 1, "one presented frame (dict frame skipped)");
     let stats = compare_rgb(&frames[0], w, h, &want);
     for (c, &(mad, max)) in stats.iter().enumerate() {
@@ -97,7 +97,7 @@ fn round441_patches_glyphs_multiposition_bit_exact() {
     let (w, h, want) = png_rgb(include_bytes!(
         "fixtures/patches_glyphs_256x256_expected.png"
     ));
-    let frames = decode_all_frames(jxl, None).expect("glyph patches stream decodes");
+    let frames = decode_all_planar(jxl, None).expect("glyph patches stream decodes");
     assert_eq!(frames.len(), 1);
     let stats = compare_rgb(&frames[0], w, h, &want);
     for (c, &(mad, max)) in stats.iter().enumerate() {
@@ -114,9 +114,9 @@ fn round441_patches_glyphs_multiposition_bit_exact() {
 fn round441_patches_mode_ctx_5_vs_6_equivalent_on_wire() {
     let jxl = include_bytes!("fixtures/patches_dots_256x256.jxl");
     oxideav_jpegxl::patches::set_patch_mode_ctx_override(Some(5));
-    let a = decode_all_frames(jxl, None).expect("ctx 5 decode");
+    let a = decode_all_planar(jxl, None).expect("ctx 5 decode");
     oxideav_jpegxl::patches::set_patch_mode_ctx_override(Some(6));
-    let b = decode_all_frames(jxl, None).expect("ctx 6 decode");
+    let b = decode_all_planar(jxl, None).expect("ctx 6 decode");
     oxideav_jpegxl::patches::set_patch_mode_ctx_override(None);
     assert_eq!(a.len(), b.len());
     for (fa, fb) in a.iter().zip(b.iter()) {
@@ -142,7 +142,7 @@ fn round441_patches_vardct_xyb_ratchet() {
     let (w, h, want) = png_rgb(include_bytes!(
         "fixtures/patches_vardct_256x256_expected.png"
     ));
-    let frames = decode_all_frames(jxl, None).expect("vardct patches stream decodes");
+    let frames = decode_all_planar(jxl, None).expect("vardct patches stream decodes");
     assert_eq!(frames.len(), 1);
     let stats = compare_rgb(&frames[0], w, h, &want);
     // Round-441 measured: MAD 1.73 / 0.79 / 0.73, max 15 / 13 / 8.
@@ -168,7 +168,7 @@ fn round441_patches_vardct_xyb_ratchet() {
 fn round441_modular_xyb_rescale_erratum() {
     let jxl = include_bytes!("fixtures/modular_xyb_256x256.jxl");
     let (w, h, want) = png_rgb(include_bytes!("fixtures/modular_xyb_256x256_expected.png"));
-    let frames = decode_all_frames(jxl, None).expect("modular-xyb stream decodes");
+    let frames = decode_all_planar(jxl, None).expect("modular-xyb stream decodes");
     assert_eq!(frames.len(), 1);
     let stats = compare_rgb(&frames[0], w, h, &want);
     for (c, &(mad, max)) in stats.iter().enumerate() {
@@ -467,7 +467,7 @@ fn round441_spline_synth_builder_matches_committed_fixture() {
 fn round441_spline_synth_renders_reference_exact_band() {
     let jxl = include_bytes!("fixtures/spline_synth_64x64.jxl");
     let (w, h, want) = png_rgb(include_bytes!("fixtures/spline_synth_64x64_expected.png"));
-    let frames = decode_all_frames(jxl, None).expect("spline stream decodes");
+    let frames = decode_all_planar(jxl, None).expect("spline stream decodes");
     assert_eq!(frames.len(), 1);
     let stats = compare_rgb(&frames[0], w, h, &want);
     // The spline brush is continuous math (erf + arc-length resampling

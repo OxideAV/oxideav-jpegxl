@@ -79,7 +79,7 @@
 //! per-LfGroup driver that calls into this grid from the
 //! `decode_codestream` plumbing remains the follow-up.
 
-use oxideav_core::{Error, Result};
+use crate::error::{Error, Result};
 
 use crate::dct_select::TransformType;
 use crate::pass_group_hf::{

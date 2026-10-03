@@ -155,7 +155,7 @@ fn synthesised_profile_round_trips_byte_exact() {
 /// application lands.
 #[test]
 fn grayscale_frame_decodes_past_the_former_c71_boundary() {
-    let frame = oxideav_jpegxl::decode_one_frame(GRAYSCALE, None)
+    let frame = oxideav_jpegxl::decode_planar(GRAYSCALE, None)
         .expect("grayscale frame must decode (round 437 §C.7.1 per-channel layout)");
     assert_eq!(frame.planes.len(), 3);
     assert_eq!(frame.planes[0].stride, 200);

@@ -50,7 +50,7 @@
 //! (§C.2 `save_before_ct`; see [`ReferenceFrames`]).
 
 use crate::bitreader::{unpack_signed, BitReader};
-use oxideav_core::{Error, Result};
+use crate::error::{Error, Result};
 use std::cell::Cell;
 
 /// §C.4.5: "The decoder reads a set of 10 clustered distributions".

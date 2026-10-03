@@ -18,7 +18,7 @@
 //!    (regression sentinel against the new IDCT module landing).
 
 use oxideav_jpegxl::dct_select::TransformType;
-use oxideav_jpegxl::decode_one_frame;
+use oxideav_jpegxl::decode_planar;
 use oxideav_jpegxl::idct::{dct_pixel_dims, idct_1d, idct_2d, idct_for_transform};
 
 const PIXEL_1X1_JXL: &[u8] = include_bytes!("fixtures/pixel_1x1.jxl");
@@ -212,7 +212,7 @@ fn five_small_lossless_fixtures_still_decode_round_12() {
         ("palette_32x32", PALETTE_JXL),
         ("grey_8x8", GREY_8X8_JXL),
     ] {
-        let r = decode_one_frame(bytes, None);
+        let r = decode_planar(bytes, None);
         assert!(
             r.is_ok(),
             "round-12 regression: {name} should still decode; got {:?}",

@@ -63,7 +63,7 @@
 //! NOT from anything inside the HfGlobal section. The caller threads it
 //! in from `lf_global.hf_block_context`.
 
-use oxideav_core::{Error, Result};
+use crate::error::{Error, Result};
 
 use crate::bitreader::BitReader;
 use crate::hf_coefficient_histograms::HfCoefficientHistograms;

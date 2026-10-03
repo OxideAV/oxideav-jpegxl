@@ -77,7 +77,7 @@
 //! AFV0..AFV3 branch of [`idct_for_transform`] out of its previous
 //! `Err(Unsupported)` state.
 
-use oxideav_core::{Error, Result};
+use crate::error::{Error, Result};
 
 use crate::dct_select::TransformType;
 

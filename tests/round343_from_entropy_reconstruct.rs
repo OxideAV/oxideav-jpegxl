@@ -271,7 +271,7 @@ fn from_entropy_propagates_entropy_error() {
         |_p, _vb| Ok([0i32; 3]),
         |_p, _c, _pred| Ok(1u32),
         |_p, _c, _coef| {
-            Err(oxideav_core::Error::InvalidData(
+            Err(oxideav_jpegxl::Error::InvalidData(
                 "synthetic entropy failure".into(),
             ))
         },

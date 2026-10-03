@@ -166,7 +166,7 @@ fn full_decode_within_pixel_ratchet() {
     assert_eq!(info.color_type, png::ColorType::Rgb);
     let (w, h) = (info.width as usize, info.height as usize);
 
-    let frame = oxideav_jpegxl::decode_vardct_frame_from_codestream(JXL, None)
+    let frame = oxideav_jpegxl::decode_planar(JXL, None)
         .expect("round 454: the permuted-TOC 2-preset stream decodes end to end");
     assert_eq!(frame.planes.len(), 3);
     for c in 0..3usize {

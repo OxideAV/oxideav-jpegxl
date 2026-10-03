@@ -35,7 +35,7 @@
 //! sizing. See the `read_distribution` doc comment for the rationale
 //! and the rejected interpretations A/B.
 
-use oxideav_core::{Error, Result};
+use crate::error::{Error, Result};
 
 use crate::bitreader::BitReader;
 

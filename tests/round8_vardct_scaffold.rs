@@ -13,7 +13,7 @@
 //!    full pixel-decode path still defers, but the module's
 //!    envelope check can be exercised directly).
 
-use oxideav_jpegxl::decode_one_frame;
+use oxideav_jpegxl::decode_planar;
 use oxideav_jpegxl::vardct::{idct1d_8, idct2d_8x8};
 
 const PIXEL_1X1_JXL: &[u8] = include_bytes!("fixtures/pixel_1x1.jxl");
@@ -38,7 +38,7 @@ fn five_small_lossless_fixtures_still_decode_round_8() {
         ("palette_32x32", PALETTE_JXL),
         ("grey_8x8", GREY_8X8_JXL),
     ] {
-        let vf = decode_one_frame(bytes, None);
+        let vf = decode_planar(bytes, None);
         assert!(
             vf.is_ok(),
             "round-8 regression: {name} should still decode (round-7 baseline); got {:?}",
@@ -79,7 +79,7 @@ fn vardct_codestream_returns_specific_unsupported_message() {
     // (cjxl-generated VarDCT fixtures are out-of-tree per workspace
     // policy on encoder dependence — round 9 may add a hand-crafted
     // minimal VarDCT bitstream). Until then, this test documents
-    // that the live `decode_one_frame` rejects VarDCT codestreams
+    // that the live `decode_planar` rejects VarDCT codestreams
     // with a VarDCT-specific message rather than a generic one.
     //
     // The shortest valid VarDCT codestream we can build by hand is
