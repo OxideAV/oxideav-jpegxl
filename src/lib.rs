@@ -631,8 +631,8 @@ pub mod registry;
 pub use api::detect;
 pub use api::{
     decode, decode_all, decode_all_with, decode_from, decode_rgb8, decode_rgba8, decode_with,
-    encode, encode_rgb8, encode_rgba8, encode_to, headers, info, probe, AnimationInfo, Frame,
-    ImageInfo,
+    encode, encode_all, encode_rgb8, encode_rgba8, encode_to, headers, info, probe, AnimationInfo,
+    Frame, ImageInfo,
 };
 pub use container::{extract_codestream, Signature};
 pub use error::{Error, JxlError, Result};

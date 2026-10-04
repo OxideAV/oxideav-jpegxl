@@ -317,6 +317,7 @@ impl Metadata {
 
 /// Tightly packed RGB8, 3 bytes per pixel, row-major.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct RgbImage {
     /// Width in pixels.
     pub width: u32,
@@ -327,6 +328,16 @@ pub struct RgbImage {
 }
 
 impl RgbImage {
+    /// Wrap a tightly packed RGB8 buffer (not validated; the decode
+    /// paths always hand over `3 × width × height` bytes).
+    pub fn new(width: u32, height: u32, data: Vec<u8>) -> Self {
+        Self {
+            width,
+            height,
+            data,
+        }
+    }
+
     /// The pixel bytes.
     pub fn as_bytes(&self) -> &[u8] {
         &self.data
@@ -340,6 +351,7 @@ impl RgbImage {
 
 /// Tightly packed RGBA8, 4 bytes per pixel, row-major.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct RgbaImage {
     /// Width in pixels.
     pub width: u32,
@@ -350,6 +362,16 @@ pub struct RgbaImage {
 }
 
 impl RgbaImage {
+    /// Wrap a tightly packed RGBA8 buffer (not validated; the decode
+    /// paths always hand over `4 × width × height` bytes).
+    pub fn new(width: u32, height: u32, data: Vec<u8>) -> Self {
+        Self {
+            width,
+            height,
+            data,
+        }
+    }
+
     /// The pixel bytes.
     pub fn as_bytes(&self) -> &[u8] {
         &self.data
@@ -391,11 +413,17 @@ pub struct JxlImage {
 }
 
 impl JxlImage {
-    /// Build an image from its planes, validating the geometry: exactly
-    /// one plane, `stride ≥ width × bytes_per_pixel`, `data.len() ≥
-    /// stride × height`. `bits_per_sample` is set to the layout's
+    /// Build an image from its planes, validating the geometry: both
+    /// dimensions `> 0`, exactly one plane, `stride ≥ width ×
+    /// bytes_per_pixel`, `data.len() ≥ stride × height`
+    /// ([`Error::InvalidData`] otherwise). `bits_per_sample` is set to the layout's
     /// storage width (8 or 16).
     pub fn new(width: u32, height: u32, format: PixelFormat, planes: Vec<Plane>) -> Result<Self> {
+        if width == 0 || height == 0 {
+            return Err(Error::invalid(format!(
+                "JxlImage::new: {width}×{height} image (both dimensions must be > 0)"
+            )));
+        }
         if planes.len() != 1 {
             return Err(Error::invalid(format!(
                 "JxlImage::new: packed layouts need exactly one plane, got {}",

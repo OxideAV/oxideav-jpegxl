@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `encode_all(&[Frame], &EncodeOptions)` — the multi-frame mirror of
+  `decode_all` required by the contract on animated formats; like every
+  `encode*` function of this decoder-only crate it returns
+  `Error::Unsupported` (round 470 fleet sweep).
+- `RgbImage::new` / `RgbaImage::new`; both records are now
+  `#[non_exhaustive]` like every other contract record.
+
 - The image-crate API contract (`IMAGE_CRATE_API.md`) at the crate
   root: `probe(&[u8]) -> bool`, `info -> ImageInfo`, `decode -> JxlImage`,
   `decode_with(&DecodeOptions)`, `decode_rgb8 -> RgbImage`,
@@ -37,6 +44,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (lenient + strict) / `decode_all` (coalesced + layers).
 
 ### Changed
+
+- `JxlImage::new` / `packed` / `from_rgb8` / `from_rgba8` reject a zero
+  width or height with `Error::InvalidData` (fleet sweep: a geometry
+  defect, not an empty image).
+- `Cargo.toml` `exclude` is the contract's exact `["/tests", "/fuzz"]`;
+  the `round*-d1-*.md` working notes (~100 KB) now ship in the package.
 
 - `oxideav-core` is optional behind the default-on `registry` feature;
   the whole decode pipeline speaks the crate-local `JxlError` and the

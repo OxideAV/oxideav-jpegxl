@@ -11,9 +11,9 @@ use std::io::Cursor;
 
 use oxideav_jpegxl::{
     decode, decode_all, decode_all_planar, decode_all_with, decode_from, decode_planar,
-    decode_rgb8, decode_rgba8, decode_with, encode, encode_rgb8, encode_rgba8, encode_to, info,
-    probe, ColorInfo, ColorRange, DecodeOptions, EncodeOptions, Error, JxlImage, PixelFormat,
-    RawFrame, Signature,
+    decode_rgb8, decode_rgba8, decode_with, encode, encode_all, encode_rgb8, encode_rgba8,
+    encode_to, info, probe, ColorInfo, ColorRange, DecodeOptions, EncodeOptions, Error, JxlImage,
+    PixelFormat, RawFrame, RgbImage, RgbaImage, Signature,
 };
 
 const PIXEL_1X1: &[u8] = include_bytes!("fixtures/pixel_1x1.jxl");
@@ -319,6 +319,11 @@ fn encoding_is_unsupported() {
         Err(Error::Unsupported(_))
     ));
     assert!(sink.is_empty());
+    let frames = decode_all(ANIMATION).unwrap();
+    assert!(matches!(
+        encode_all(&frames, &opts),
+        Err(Error::Unsupported(_))
+    ));
 }
 
 #[test]
@@ -332,9 +337,30 @@ fn image_constructors_validate_geometry() {
         JxlImage::from_rgba8(2, 2, vec![0; 15]),
         Err(Error::InvalidData(_))
     ));
+    // Zero dimensions are a geometry defect, not an empty image.
+    assert!(matches!(
+        JxlImage::from_rgb8(0, 2, Vec::new()),
+        Err(Error::InvalidData(_))
+    ));
+    assert!(matches!(
+        JxlImage::new(
+            2,
+            0,
+            PixelFormat::Gray8,
+            vec![oxideav_jpegxl::Plane::new(2, Vec::new())]
+        ),
+        Err(Error::InvalidData(_))
+    ));
     let img = JxlImage::from_rgba8(1, 2, vec![1, 2, 3, 4, 5, 6, 7, 8]).unwrap();
     assert_eq!(img.to_rgb8(), vec![1, 2, 3, 5, 6, 7]);
     assert_eq!(img.into_raw(), vec![1, 2, 3, 4, 5, 6, 7, 8]);
+    let rgb = RgbImage::new(1, 1, vec![9, 8, 7]);
+    assert_eq!(
+        (rgb.width, rgb.height, rgb.as_bytes()),
+        (1, 1, &[9u8, 8, 7][..])
+    );
+    let rgba = RgbaImage::new(1, 1, vec![9, 8, 7, 6]);
+    assert_eq!(rgba.into_raw(), vec![9, 8, 7, 6]);
 }
 
 #[cfg(feature = "registry")]

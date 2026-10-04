@@ -225,21 +225,21 @@ pub fn decode_with(bytes: &[u8], opts: &DecodeOptions) -> Result<JxlImage> {
 /// Decode to tightly packed RGB8 (alpha dropped, grey replicated).
 pub fn decode_rgb8(bytes: &[u8]) -> Result<crate::RgbImage> {
     let img = decode(bytes)?;
-    Ok(crate::RgbImage {
-        width: img.width,
-        height: img.height,
-        data: img.try_to_rgb8()?,
-    })
+    Ok(crate::RgbImage::new(
+        img.width,
+        img.height,
+        img.try_to_rgb8()?,
+    ))
 }
 
 /// Decode to tightly packed RGBA8 (alpha 255 when the image has none).
 pub fn decode_rgba8(bytes: &[u8]) -> Result<crate::RgbaImage> {
     let img = decode(bytes)?;
-    Ok(crate::RgbaImage {
-        width: img.width,
-        height: img.height,
-        data: img.try_to_rgba8()?,
-    })
+    Ok(crate::RgbaImage::new(
+        img.width,
+        img.height,
+        img.try_to_rgba8()?,
+    ))
 }
 
 /// Decode every presented frame (animations: in display order,
@@ -335,6 +335,12 @@ pub fn encode_rgba8(
 
 /// See [`encode`].
 pub fn encode_to<W: Write>(_image: &JxlImage, _opts: &EncodeOptions, _w: W) -> Result<()> {
+    Err(Error::unsupported(ENCODE_UNSUPPORTED))
+}
+
+/// Multi-frame mirror of [`decode_all`] (animations); see [`encode`] —
+/// always [`Error::Unsupported`] in this decoder-only crate.
+pub fn encode_all(_frames: &[Frame], _opts: &EncodeOptions) -> Result<Vec<u8>> {
     Err(Error::unsupported(ENCODE_UNSUPPORTED))
 }
 
