@@ -41,7 +41,7 @@ registry = ["dep:oxideav-core"]
 # decoder's output. The workspace's own pure-Rust PNG crate, built
 # without its framework `registry` feature; no codec semantics overlap
 # with JPEG XL.
-oxideav-png = { version = "0.1", default-features = false }
+oxideav-png = { version = "0.1.11", default-features = false }
 # r195+ WP trace tests require sequential execution due to shared
 # thread-local trace state.
 serial_test = "3"
