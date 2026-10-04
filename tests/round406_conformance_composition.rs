@@ -39,20 +39,17 @@
 //!   Listing I.21 tendency function divide with Idiv (round towards
 //!   zero, §5.2), not floor.
 
+mod common;
+use common::png::{decode_png, BitDepth, ColorType};
 use oxideav_jpegxl::decode_all_planar;
-use png::ColorType;
-use std::io::Cursor;
 
 /// Decode a 16-bit RGBA expected.png into interleaved u16 samples.
 fn png_rgba16(bytes: &[u8]) -> (usize, usize, Vec<u16>) {
-    let dec = png::Decoder::new(Cursor::new(bytes));
-    let mut reader = dec.read_info().expect("png read_info");
-    let mut buf = vec![0u8; reader.output_buffer_size().unwrap_or(0)];
-    let info = reader.next_frame(&mut buf).expect("png next_frame");
-    assert_eq!(info.bit_depth, png::BitDepth::Sixteen, "16-bit oracle");
+    let info = decode_png(bytes);
+    assert_eq!(info.bit_depth, BitDepth::Sixteen, "16-bit oracle");
     assert_eq!(info.color_type, ColorType::Rgba, "RGBA oracle");
     let (w, h) = (info.width as usize, info.height as usize);
-    let raw = &buf[..info.buffer_size()];
+    let raw = &info.data[..];
     let samples: Vec<u16> = raw
         .chunks_exact(2)
         .map(|c| u16::from_be_bytes([c[0], c[1]]))

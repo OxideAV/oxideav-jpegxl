@@ -43,15 +43,12 @@
 //! byte-exact) and is an open follow-up (see the round report); the
 //! ratchet below bounds it against regression.
 
-use std::io::Cursor;
-
+mod common;
+use common::png::{decode_png, ColorType};
 fn png_rgb(bytes: &[u8]) -> (usize, usize, Vec<u8>) {
-    let decoder = png::Decoder::new(Cursor::new(bytes));
-    let mut reader = decoder.read_info().unwrap();
-    let mut buf = vec![0u8; reader.output_buffer_size().unwrap()];
-    let info = reader.next_frame(&mut buf).unwrap();
-    buf.truncate(info.buffer_size());
-    assert_eq!(info.color_type, png::ColorType::Rgb);
+    let info = decode_png(bytes);
+    let buf = info.data;
+    assert_eq!(info.color_type, ColorType::Rgb);
     (info.width as usize, info.height as usize, buf)
 }
 

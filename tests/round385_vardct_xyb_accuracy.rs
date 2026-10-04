@@ -24,8 +24,8 @@
 //! (Annex L.2 + the default OpsinInverseMatrix). No external
 //! implementation source is consulted.
 
-use std::io::Cursor;
-
+mod common;
+use common::png::{decode_png, ColorType};
 use oxideav_jpegxl::metadata_fdis::{OpsinInverseMatrix, ToneMapping};
 use oxideav_jpegxl::{set_vardct_xyb_capture_armed, VARDCT_XYB_CAPTURE};
 
@@ -79,13 +79,11 @@ fn reference_xyb() -> [Vec<f64>; 3] {
             ((c + 0.055) / 1.055).powf(2.4)
         }
     };
-    let dec = png::Decoder::new(Cursor::new(REF_PNG));
-    let mut reader = dec.read_info().expect("png read_info");
-    let mut buf = vec![0u8; reader.output_buffer_size().unwrap_or(0)];
-    let info = reader.next_frame(&mut buf).expect("png next_frame");
+    let info = decode_png(REF_PNG);
+    let buf = info.data;
     let ch = match info.color_type {
-        png::ColorType::Rgb => 3,
-        png::ColorType::Rgba => 4,
+        ColorType::Rgb => 3,
+        ColorType::Rgba => 4,
         other => panic!("unexpected reference colour type {other:?}"),
     };
     assert_eq!((info.width, info.height), (256, 256));

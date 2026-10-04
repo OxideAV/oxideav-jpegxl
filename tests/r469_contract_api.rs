@@ -5,6 +5,8 @@
 //! always exercised (byte-identical samples, interleaved) and against
 //! the committed `expected.png` references.
 
+mod common;
+use common::png::{decode_png, ColorType};
 use std::io::Cursor;
 
 use oxideav_jpegxl::{
@@ -136,12 +138,9 @@ fn decode_is_the_composed_primary_image() {
 
 #[test]
 fn decode_rgb8_and_rgba8_match_expected_png() {
-    let dec = png::Decoder::new(Cursor::new(ALPHA_64_PNG));
-    let mut reader = dec.read_info().unwrap();
-    let mut buf = vec![0u8; reader.output_buffer_size().unwrap()];
-    let pinfo = reader.next_frame(&mut buf).unwrap();
-    assert_eq!(pinfo.color_type, png::ColorType::Rgba);
-    let expected = &buf[..pinfo.buffer_size()];
+    let pinfo = decode_png(ALPHA_64_PNG);
+    assert_eq!(pinfo.color_type, ColorType::Rgba);
+    let expected = &pinfo.data[..];
 
     let rgba = decode_rgba8(ALPHA_64).unwrap();
     assert_eq!((rgba.width, rgba.height), (64, 64));

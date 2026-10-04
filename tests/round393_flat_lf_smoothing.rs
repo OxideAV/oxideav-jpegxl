@@ -38,8 +38,8 @@
 //! crate's own instrumentation (the #168 notes explicitly leave them to
 //! the clean-room crate).
 
-use std::io::Cursor;
-
+mod common;
+use common::png::{decode_png, BitDepth, ColorType};
 use oxideav_jpegxl::lf_dequant::{
     set_lf_smooth_trace_armed, set_lf_smoothing_literal_ramp, LF_SMOOTH_TRACE,
 };
@@ -50,15 +50,12 @@ const REF_PNG: &[u8] = include_bytes!("fixtures/flat_content_lf_smoothing_expect
 
 /// Decode the committed reference PNG into interleaved RGB pixels.
 fn ref_rgb() -> (u32, u32, Vec<[u8; 3]>) {
-    let dec = png::Decoder::new(Cursor::new(REF_PNG));
-    let mut reader = dec.read_info().expect("png read_info");
-    let mut buf = vec![0u8; reader.output_buffer_size().unwrap_or(0)];
-    let info = reader.next_frame(&mut buf).expect("png next_frame");
-    assert_eq!(info.bit_depth, png::BitDepth::Eight, "8-bit reference");
-    let data = &buf[..info.buffer_size()];
+    let info = decode_png(REF_PNG);
+    assert_eq!(info.bit_depth, BitDepth::Eight, "8-bit reference");
+    let data = &info.data[..];
     let ch = match info.color_type {
-        png::ColorType::Rgb => 3,
-        png::ColorType::Rgba => 4,
+        ColorType::Rgb => 3,
+        ColorType::Rgba => 4,
         other => panic!("unexpected reference colour type {other:?}"),
     };
     let mut px = Vec::with_capacity((info.width * info.height) as usize);

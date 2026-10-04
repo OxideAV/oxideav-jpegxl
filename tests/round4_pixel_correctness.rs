@@ -10,9 +10,9 @@
 //! no codec-semantics overlap with JPEG XL. Round 3 used first-16-pixels
 //! plus histogram statistics; round 4 graduates to byte-exact match.
 
+mod common;
+use common::png::{decode_png, BitDepth, ColorType};
 use oxideav_jpegxl::decode_planar;
-use png::ColorType;
-use std::io::Cursor;
 
 const PIXEL_1X1_JXL: &[u8] = include_bytes!("fixtures/pixel_1x1.jxl");
 
@@ -29,13 +29,10 @@ const PALETTE_PNG: &[u8] = include_bytes!("fixtures/palette_32x32_expected.png")
 /// Strips alpha if present and panics on unsupported bit depths (only 8-bit
 /// here, matching our Modular decoder's round-3 envelope).
 fn png_to_planes(bytes: &[u8]) -> (u32, u32, Vec<Vec<u8>>) {
-    let dec = png::Decoder::new(Cursor::new(bytes));
-    let mut reader = dec.read_info().expect("read png info");
-    let mut buf = vec![0u8; reader.output_buffer_size().unwrap_or(0)];
-    let info = reader.next_frame(&mut buf).expect("png next_frame");
+    let info = decode_png(bytes);
     let (w, h) = (info.width, info.height);
-    let bytes = &buf[..info.buffer_size()];
-    assert_eq!(info.bit_depth, png::BitDepth::Eight, "expect 8-bit PNG");
+    let bytes = &info.data[..];
+    assert_eq!(info.bit_depth, BitDepth::Eight, "expect 8-bit PNG");
     let planes: Vec<Vec<u8>> = match info.color_type {
         ColorType::Grayscale => vec![bytes.to_vec()],
         ColorType::Rgb => {
@@ -74,7 +71,6 @@ fn png_to_planes(bytes: &[u8]) -> (u32, u32, Vec<Vec<u8>>) {
             }
             vec![r, g, b]
         }
-        other => panic!("unsupported PNG color type {:?}", other),
     };
     (w, h, planes)
 }

@@ -32,8 +32,8 @@
 //! the ISO/IEC 18181-1 forward XYB math (Annex L.2 + the default
 //! OpsinInverseMatrix). No external implementation source is consulted.
 
-use std::io::Cursor;
-
+mod common;
+use common::png::{decode_png, ColorType};
 use oxideav_jpegxl::bitreader::BitReader;
 use oxideav_jpegxl::frame_header::{FrameDecodeParams, FrameHeader};
 use oxideav_jpegxl::lf_dequant::{dequant_lf, LfMultipliers};
@@ -161,13 +161,11 @@ fn reference_lf_xyb() -> [Vec<f64>; 3] {
         }
     };
 
-    let dec = png::Decoder::new(Cursor::new(REF_PNG));
-    let mut reader = dec.read_info().expect("png read_info");
-    let mut buf = vec![0u8; reader.output_buffer_size().unwrap_or(0)];
-    let info = reader.next_frame(&mut buf).expect("png next_frame");
+    let info = decode_png(REF_PNG);
+    let buf = info.data;
     let ch = match info.color_type {
-        png::ColorType::Rgb => 3,
-        png::ColorType::Rgba => 4,
+        ColorType::Rgb => 3,
+        ColorType::Rgba => 4,
         other => panic!("unexpected reference colour type {other:?}"),
     };
     let w = info.width as usize;

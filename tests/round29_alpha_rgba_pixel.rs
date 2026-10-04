@@ -32,22 +32,19 @@
 //!      mapping the extra channels into trailing RawFrame planes
 //!      (FDIS Annex G.1.3 colour-then-extras channel-order rule).
 
+mod common;
+use common::png::{decode_png, BitDepth, ColorType};
 use oxideav_jpegxl::decode_planar;
-use png::ColorType;
-use std::io::Cursor;
 
 const ALPHA_JXL: &[u8] = include_bytes!("fixtures/alpha_64x64.jxl");
 const ALPHA_PNG: &[u8] = include_bytes!("fixtures/alpha_64x64_expected.png");
 
 /// Decode an 8-bit PNG into `(width, height, planes_in_R-G-B-A_order)`.
 fn png_to_planes_rgba(bytes: &[u8]) -> (u32, u32, Vec<Vec<u8>>) {
-    let dec = png::Decoder::new(Cursor::new(bytes));
-    let mut reader = dec.read_info().expect("png read_info");
-    let mut buf = vec![0u8; reader.output_buffer_size().unwrap_or(0)];
-    let info = reader.next_frame(&mut buf).expect("png next_frame");
+    let info = decode_png(bytes);
     let (w, h) = (info.width, info.height);
-    let bytes = &buf[..info.buffer_size()];
-    assert_eq!(info.bit_depth, png::BitDepth::Eight, "expect 8-bit PNG");
+    let bytes = &info.data[..];
+    assert_eq!(info.bit_depth, BitDepth::Eight, "expect 8-bit PNG");
     assert!(
         matches!(info.color_type, ColorType::Rgba),
         "alpha-64x64/expected.png must be RGBA"

@@ -24,20 +24,18 @@
 //!    (no silently-accepted section desync or walk underrun).
 //! 3. The round-437 Part 8.3 survivor `PermStreamConfig` remains the
 //!    shipped default.
-use std::io::Cursor;
 
+mod common;
+use common::png::{decode_png, ColorType};
 use oxideav_jpegxl::coeff_order::{PermPrevContext, PermStreamConfig};
 
 const FIXTURE: &[u8] = include_bytes!("fixtures/progressive_ac_multipass.jxl");
 const EXPECTED: &[u8] = include_bytes!("fixtures/progressive_ac_multipass_expected.png");
 
 fn png_rgb(bytes: &[u8]) -> (usize, usize, Vec<u8>) {
-    let decoder = png::Decoder::new(Cursor::new(bytes));
-    let mut reader = decoder.read_info().unwrap();
-    let mut buf = vec![0u8; reader.output_buffer_size().unwrap()];
-    let info = reader.next_frame(&mut buf).unwrap();
-    buf.truncate(info.buffer_size());
-    assert_eq!(info.color_type, png::ColorType::Rgb);
+    let info = decode_png(bytes);
+    let buf = info.data;
+    assert_eq!(info.color_type, ColorType::Rgb);
     (info.width as usize, info.height as usize, buf)
 }
 

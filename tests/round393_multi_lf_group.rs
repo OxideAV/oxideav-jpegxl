@@ -33,6 +33,8 @@
 //! derived from the ISO/IEC 18181-1 FDIS. No external implementation
 //! source is consulted.
 
+mod common;
+use common::png::{decode_png, ColorType};
 use oxideav_jpegxl::bitreader::BitReader;
 use oxideav_jpegxl::container;
 use oxideav_jpegxl::frame_header::{Encoding, FrameDecodeParams, FrameHeader, RfEdition};
@@ -156,14 +158,10 @@ fn both_lf_groups_parse_at_permuted_offsets() {
 /// the same sub-1/255 band as the other photo VarDCT fixtures.
 #[test]
 fn full_decode_within_pixel_ratchet() {
-    use std::io::Cursor;
     let expected = include_bytes!("fixtures/large_3072x2048_multigroup_expected.png");
-    let decoder = png::Decoder::new(Cursor::new(&expected[..]));
-    let mut reader = decoder.read_info().unwrap();
-    let mut buf = vec![0u8; reader.output_buffer_size().unwrap()];
-    let info = reader.next_frame(&mut buf).unwrap();
-    buf.truncate(info.buffer_size());
-    assert_eq!(info.color_type, png::ColorType::Rgb);
+    let info = decode_png(&expected[..]);
+    let buf = info.data;
+    assert_eq!(info.color_type, ColorType::Rgb);
     let (w, h) = (info.width as usize, info.height as usize);
 
     let frame = oxideav_jpegxl::decode_planar(JXL, None)

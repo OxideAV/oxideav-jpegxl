@@ -50,22 +50,19 @@
 //! reference PNG is the opaque output of the `djxl` validator binary; no
 //! external implementation *source* is consulted.
 
-use std::io::Cursor;
-
+mod common;
+use common::png::{decode_png, BitDepth, ColorType};
 const VARDCT_D1_JXL: &[u8] = include_bytes!("fixtures/vardct_256x256_d1.jxl");
 const REF_PNG: &[u8] = include_bytes!("fixtures/vardct_256x256_d1_expected.png");
 
 /// Decode the committed reference PNG into interleaved RGB pixels.
 fn ref_rgb() -> (u32, u32, Vec<[u8; 3]>) {
-    let dec = png::Decoder::new(Cursor::new(REF_PNG));
-    let mut reader = dec.read_info().expect("png read_info");
-    let mut buf = vec![0u8; reader.output_buffer_size().unwrap_or(0)];
-    let info = reader.next_frame(&mut buf).expect("png next_frame");
-    assert_eq!(info.bit_depth, png::BitDepth::Eight, "8-bit reference");
-    let data = &buf[..info.buffer_size()];
+    let info = decode_png(REF_PNG);
+    assert_eq!(info.bit_depth, BitDepth::Eight, "8-bit reference");
+    let data = &info.data[..];
     let ch = match info.color_type {
-        png::ColorType::Rgb => 3,
-        png::ColorType::Rgba => 4,
+        ColorType::Rgb => 3,
+        ColorType::Rgba => 4,
         other => panic!("unexpected reference colour type {other:?}"),
     };
     let mut px = Vec::with_capacity((info.width * info.height) as usize);

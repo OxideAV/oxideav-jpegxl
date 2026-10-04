@@ -37,10 +37,11 @@ registry = ["dep:oxideav-core"]
 
 [dev-dependencies]
 # Used only by integration tests to decode the committed `expected.png`
-# fixtures and compare them byte-for-byte against our decoder's output.
-# `png` is a single-purpose pure-Rust PNG decoder; no codec semantics
-# overlap with JPEG XL.
-png = "0.18"
+# fixtures (via `tests/common/png.rs`) and compare them against our
+# decoder's output. The workspace's own pure-Rust PNG crate, built
+# without its framework `registry` feature; no codec semantics overlap
+# with JPEG XL.
+oxideav-png = { version = "0.1", default-features = false }
 # r195+ WP trace tests require sequential execution due to shared
 # thread-local trace state.
 serial_test = "3"

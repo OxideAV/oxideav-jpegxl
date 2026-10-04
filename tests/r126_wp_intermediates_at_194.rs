@@ -127,6 +127,8 @@
 //!   `sub_erri = abs(((predictioni + 3) >> 3) - true_value)`.
 //!
 
+mod common;
+use common::png::decode_png;
 use oxideav_jpegxl::decode_planar;
 use oxideav_jpegxl::modular_fdis::{
     encode_leaf_pick_target, LEAF_PICK_TRACE_TARGET, LEAF_PICK_TRACE_WP, WP_DEEP_TRACE,
@@ -296,16 +298,11 @@ fn r126_wp_intermediates_at_sample_194_pinned() {
 /// be byte-exact.
 #[test]
 fn r126_first_divergence_scan() {
-    use std::io::Cursor;
-
     const EXPECTED: &[u8] = include_bytes!("fixtures/noise_64x64_lossless_expected.png");
 
     let vf = decode_planar(NOISE_JXL, None).expect("decode");
-    let decoder = png::Decoder::new(Cursor::new(EXPECTED));
-    let mut reader = decoder.read_info().unwrap();
-    let mut buf = vec![0u8; reader.output_buffer_size().unwrap()];
-    let info = reader.next_frame(&mut buf).unwrap();
-    let raw = &buf[..info.buffer_size()];
+    let info = decode_png(EXPECTED);
+    let raw = &info.data[..];
 
     let mut first_div = [(usize::MAX, 0u8, 0u8); 3];
     for (c, slot) in first_div.iter_mut().enumerate() {

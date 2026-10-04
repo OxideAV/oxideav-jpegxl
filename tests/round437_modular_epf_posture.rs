@@ -28,18 +28,16 @@
 //! every other grid point on the conformance stream (same pattern as
 //! the round-393 §F.2 ramp arbitration).
 
+mod common;
+use common::png::{decode_png, ColorType};
 use oxideav_jpegxl::{
     set_modular_epf_posture_override, ModularEpfDomain, ModularEpfPosture, ModularGreyMapping,
 };
-use std::io::Cursor;
 
 fn png_grey(bytes: &[u8]) -> (usize, usize, Vec<u8>) {
-    let decoder = png::Decoder::new(Cursor::new(bytes));
-    let mut reader = decoder.read_info().unwrap();
-    let mut buf = vec![0u8; reader.output_buffer_size().unwrap()];
-    let info = reader.next_frame(&mut buf).unwrap();
-    buf.truncate(info.buffer_size());
-    assert_eq!(info.color_type, png::ColorType::Grayscale);
+    let info = decode_png(bytes);
+    let buf = info.data;
+    assert_eq!(info.color_type, ColorType::Grayscale);
     (info.width as usize, info.height as usize, buf)
 }
 

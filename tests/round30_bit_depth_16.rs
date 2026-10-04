@@ -36,9 +36,9 @@
 //! `expected.png` (16-bit RGB PNG) is the ground-truth used at test
 //! time.
 
+mod common;
+use common::png::{decode_png, BitDepth, ColorType};
 use oxideav_jpegxl::decode_planar;
-use png::ColorType;
-use std::io::Cursor;
 
 const BD16_JXL: &[u8] = include_bytes!("fixtures/bit_depth_16.jxl");
 const BD16_PNG: &[u8] = include_bytes!("fixtures/bit_depth_16_expected.png");
@@ -47,15 +47,12 @@ const BD16_PNG: &[u8] = include_bytes!("fixtures/bit_depth_16_expected.png");
 /// channels (R, G, B) at native u16. Asserts the PNG is exactly 64×64
 /// 16-bit RGB.
 fn png_to_planes_rgb16(bytes: &[u8]) -> (u32, u32, [Vec<u16>; 3]) {
-    let dec = png::Decoder::new(Cursor::new(bytes));
-    let mut reader = dec.read_info().expect("png read_info");
-    let mut buf = vec![0u8; reader.output_buffer_size().unwrap_or(0)];
-    let info = reader.next_frame(&mut buf).expect("png next_frame");
+    let info = decode_png(bytes);
     let (w, h) = (info.width, info.height);
-    let bytes = &buf[..info.buffer_size()];
+    let bytes = &info.data[..];
     assert_eq!(
         info.bit_depth,
-        png::BitDepth::Sixteen,
+        BitDepth::Sixteen,
         "bit-depth-16/expected.png must be 16-bit",
     );
     assert!(

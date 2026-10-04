@@ -7,6 +7,8 @@
 //! the on-wire section sizes; `expected.png` is the reference decode.
 //! No external implementation source is consulted.
 
+mod common;
+use common::png::{decode_png, ColorType};
 use oxideav_jpegxl::bitreader::BitReader;
 use oxideav_jpegxl::frame_header::{Encoding, FrameDecodeParams, FrameHeader};
 use oxideav_jpegxl::metadata_fdis::{ImageMetadataFdis, SizeHeaderFdis};
@@ -146,7 +148,6 @@ fn hf_global_section_parses_within_33_bytes() {
 #[test]
 fn multi_group_decode_matches_reference_in_xyb() {
     use oxideav_jpegxl::metadata_fdis::{OpsinInverseMatrix, ToneMapping};
-    use std::io::Cursor;
 
     // Decode with the XYB capture hook armed.
     oxideav_jpegxl::VARDCT_XYB_CAPTURE.with(|s| *s.borrow_mut() = None);
@@ -193,13 +194,11 @@ fn multi_group_decode_matches_reference_in_xyb() {
             ((c + 0.055) / 1.055).powf(2.4)
         }
     };
-    let dec = png::Decoder::new(Cursor::new(REF_PNG));
-    let mut reader = dec.read_info().expect("png read_info");
-    let mut buf = vec![0u8; reader.output_buffer_size().unwrap_or(0)];
-    let info = reader.next_frame(&mut buf).expect("png next_frame");
+    let info = decode_png(REF_PNG);
+    let buf = info.data;
     let ch = match info.color_type {
-        png::ColorType::Rgb => 3,
-        png::ColorType::Rgba => 4,
+        ColorType::Rgb => 3,
+        ColorType::Rgba => 4,
         other => panic!("unexpected reference colour type {other:?}"),
     };
     assert_eq!((info.width, info.height), (1024, 768));
@@ -236,15 +235,12 @@ fn multi_group_decode_matches_reference_in_xyb() {
 /// absolute difference 6 / 4 / 3. Ratchet at 1.5 MAD per channel.
 #[test]
 fn multi_group_decode_matches_reference_srgb_bytes() {
-    use std::io::Cursor;
     let frame = oxideav_jpegxl::decode_planar(JXL, None).expect("multi-group VarDCT decode");
-    let dec = png::Decoder::new(Cursor::new(REF_PNG));
-    let mut reader = dec.read_info().expect("png read_info");
-    let mut buf = vec![0u8; reader.output_buffer_size().unwrap_or(0)];
-    let info = reader.next_frame(&mut buf).expect("png next_frame");
+    let info = decode_png(REF_PNG);
+    let buf = info.data;
     let ch = match info.color_type {
-        png::ColorType::Rgb => 3,
-        png::ColorType::Rgba => 4,
+        ColorType::Rgb => 3,
+        ColorType::Rgba => 4,
         other => panic!("unexpected reference colour type {other:?}"),
     };
     let n = 1024usize * 768;
@@ -280,7 +276,6 @@ fn multi_group_decode_matches_reference_srgb_bytes() {
 fn d3_header_parses_and_decodes_to_reference() {
     const D3_JXL: &[u8] = include_bytes!("fixtures/vardct_256x256_d3.jxl");
     const D3_PNG: &[u8] = include_bytes!("fixtures/vardct_256x256_d3_expected.png");
-    use std::io::Cursor;
 
     let (fh, toc, _) = parse_to_sections(&D3_JXL[2..]);
     assert_eq!(fh.encoding, Encoding::VarDct);
@@ -296,13 +291,11 @@ fn d3_header_parses_and_decodes_to_reference() {
 
     let frame = oxideav_jpegxl::decode_planar(D3_JXL, None)
         .expect("d3 decodes end-to-end after the save_before_ct fix");
-    let dec = png::Decoder::new(Cursor::new(D3_PNG));
-    let mut reader = dec.read_info().expect("png read_info");
-    let mut buf = vec![0u8; reader.output_buffer_size().unwrap_or(0)];
-    let info = reader.next_frame(&mut buf).expect("png next_frame");
+    let info = decode_png(D3_PNG);
+    let buf = info.data;
     let ch = match info.color_type {
-        png::ColorType::Rgb => 3,
-        png::ColorType::Rgba => 4,
+        ColorType::Rgb => 3,
+        ColorType::Rgba => 4,
         other => panic!("unexpected reference colour type {other:?}"),
     };
     assert_eq!((info.width, info.height), (256, 256));
