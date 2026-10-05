@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.14](https://github.com/OxideAV/oxideav-jpegxl/compare/v0.0.13...v0.0.14) - 2026-10-05
+
+### Other
+
+- `jpegxl` framework container (demuxer only) — one packet per frame in the animation tick, `pacing = packet` decoder option, register_containers
+- fleet sweep — exact `exclude`, encode_all (Unsupported), zero-dimension rejection in JxlImage::new, non_exhaustive RgbImage/RgbaImage with constructors
+- floor the oxideav-png dev-dependency at 0.1.11
+- decode reference PNGs with oxideav-png instead of the png crate
+- Annex M spline bounds + MA tree budget (two round-469 fuzz findings); fuzz targets drive the contract API
+- image-crate contract + oxideav-core optional behind the registry feature
+
 ### Added
 
 - The `jpegxl` framework container (`oxideav_jpegxl::demux`,
