@@ -131,26 +131,7 @@ pub fn info(bytes: &[u8]) -> Result<ImageInfo> {
     let prelude = read_prelude_at_level(&opened.codestream, opened.level())?;
     let md = &prelude.metadata;
     let (width, height) = oriented_size(&prelude);
-    // The sample layout depends on the first frame's encoding: VarDCT
-    // frames reconstruct to 8 bits per sample whatever the declared
-    // depth; Modular frames keep the declared depth (1 or 2 bytes).
-    let first_is_vardct = {
-        let params = frame_params(&prelude);
-        let slice = opened
-            .codestream
-            .get(prelude.frames_offset..)
-            .unwrap_or(&[]);
-        let mut br = crate::bitreader::BitReader::new(slice);
-        match crate::read_frame_header_and_toc(&mut br, &params, slice) {
-            Ok((fh, _)) => fh.encoding == crate::frame_header::Encoding::VarDct,
-            Err(_) => false,
-        }
-    };
-    let bytes_per_sample = if md.bit_depth.bits_per_sample > 8 && !first_is_vardct {
-        2
-    } else {
-        1
-    };
+    let bytes_per_sample = first_frame_bytes_per_sample(&opened, &prelude);
     let has_alpha = alpha_channel_index(md).is_some();
     let format = PixelFormat::for_layout(colour_channels(md), has_alpha, bytes_per_sample)?;
     let frames = if md.have_animation {
@@ -186,6 +167,94 @@ pub fn info(bytes: &[u8]) -> Result<ImageInfo> {
         animation: animation_info(md),
         signature: opened.signature,
         has_jpeg_reconstruction: has_jbrd,
+    })
+}
+
+/// Storage width of the samples the first frame decodes to: VarDCT
+/// frames reconstruct to 8 bits per sample whatever the declared depth;
+/// Modular frames keep the declared depth (1 or 2 bytes).
+fn first_frame_bytes_per_sample(opened: &crate::Opened<'_>, prelude: &Prelude) -> usize {
+    let params = frame_params(prelude);
+    let slice = opened
+        .codestream
+        .get(prelude.frames_offset..)
+        .unwrap_or(&[]);
+    let mut br = crate::bitreader::BitReader::new(slice);
+    let first_is_vardct = match crate::read_frame_header_and_toc(&mut br, &params, slice) {
+        Ok((fh, _)) => fh.encoding == crate::frame_header::Encoding::VarDct,
+        Err(_) => false,
+    };
+    if prelude.metadata.bit_depth.bits_per_sample > 8 && !first_is_vardct {
+        2
+    } else {
+        1
+    }
+}
+
+/// What the framework demuxer publishes before any sample is decoded —
+/// [`info`] with the layout made optional and the per-frame timing.
+#[cfg(feature = "registry")]
+pub(crate) struct Described {
+    pub width: u32,
+    pub height: u32,
+    /// The contract layout, `None` when the channel set has none: the
+    /// stream still opens, the decoder reports `Unsupported`.
+    pub format: Option<PixelFormat>,
+    pub color: ColorInfo,
+    pub animation: Option<AnimationInfo>,
+    /// FrameHeader `duration` in ticks of every presented frame, in
+    /// order — one per frame `decode_all` returns. A single entry (`0`)
+    /// for a still.
+    pub durations: Vec<u32>,
+    pub has_icc: bool,
+    pub has_exif: bool,
+    pub has_xmp: bool,
+}
+
+/// Header-only walk for the framework demuxer (FrameHeader + TOC of
+/// every frame, no section decode). Only an `Unsupported` layout
+/// verdict is absorbed — malformed input is an error here as in
+/// [`info`].
+#[cfg(feature = "registry")]
+pub(crate) fn describe(bytes: &[u8]) -> Result<Described> {
+    let opened = open(bytes)?;
+    let prelude = read_prelude_at_level(&opened.codestream, opened.level())?;
+    let md = &prelude.metadata;
+    let (width, height) = oriented_size(&prelude);
+    let bytes_per_sample = first_frame_bytes_per_sample(&opened, &prelude);
+    let has_alpha = alpha_channel_index(md).is_some();
+    let format = match PixelFormat::for_layout(colour_channels(md), has_alpha, bytes_per_sample) {
+        Ok(f) => Some(f),
+        Err(Error::Unsupported(_)) => None,
+        Err(e) => return Err(e),
+    };
+    let durations = if md.have_animation {
+        let walk = walk_frame_headers(&opened.codestream, &prelude)?;
+        if walk.durations.is_empty() {
+            vec![0]
+        } else {
+            walk.durations
+        }
+    } else {
+        vec![0]
+    };
+    let (has_exif, has_xmp) = match &opened.file {
+        Some(f) => (
+            f.metadata.iter().any(|m| m.kind == MetadataKind::Exif),
+            f.metadata.iter().any(|m| m.kind == MetadataKind::Xml),
+        ),
+        None => (false, false),
+    };
+    Ok(Described {
+        width,
+        height,
+        format,
+        color: color_info(md),
+        animation: animation_info(md),
+        durations,
+        has_icc: md.colour_encoding.want_icc,
+        has_exif,
+        has_xmp,
     })
 }
 

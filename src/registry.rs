@@ -218,22 +218,54 @@ pub fn register_codecs(reg: &mut CodecRegistry) {
     );
 }
 
-/// Install the JPEG XL codec into a [`RuntimeContext`] (fleet
-/// signature).
+/// Register the `jpegxl` container of [`crate::demux`] (demuxer, probe
+/// and the `.jxl` extension). No muxer: the crate is decoder-only.
+pub fn register_containers(reg: &mut oxideav_core::ContainerRegistry) {
+    crate::demux::register(reg);
+}
+
+/// Install the JPEG XL codec and container into a [`RuntimeContext`]
+/// (fleet signature).
 pub fn register(ctx: &mut RuntimeContext) {
     register_codecs(&mut ctx.codecs);
+    register_containers(&mut ctx.containers);
 }
 
 oxideav_core::register!("jpegxl", register);
 
+/// Decoder option key selecting how frames are released
+/// ([`PACING_PACKET`]).
+pub const OPTION_PACING: &str = "pacing";
+/// `pacing = packet`: one frame per packet received. The first packet
+/// carries the whole file and releases its first presented frame;
+/// every further packet (normally zero-length, as the `jpegxl` demuxer
+/// emits them) releases the next frame and lends it its `pts`;
+/// `flush` releases whatever is left. Without the option every frame
+/// of the file comes out of the packet that carried it.
+pub const PACING_PACKET: &str = "packet";
+
 /// Decoder factory: one whole JPEG XL file per packet, every presented
-/// frame returned in order (animations yield several frames per
-/// packet).
+/// frame returned in order — all of them from the one packet by
+/// default, one per packet with `pacing = packet` ([`PACING_PACKET`],
+/// what the `jpegxl` demuxer asks for so animation frames carry the
+/// container's timing).
 pub fn make_decoder(params: &CodecParameters) -> oxideav_core::Result<Box<dyn Decoder>> {
+    let paced = match params.options.get(OPTION_PACING) {
+        None => false,
+        Some(v) if v == PACING_PACKET => true,
+        Some("all") => false,
+        Some(other) => {
+            return Err(oxideav_core::Error::invalid(format!(
+            "jxl decoder: option {OPTION_PACING}={other:?} is not \"{PACING_PACKET}\" or \"all\""
+        )))
+        }
+    };
     Ok(Box::new(JxlDecoder {
         codec_id: params.codec_id.clone(),
         pending: None,
         ready: VecDeque::new(),
+        paced,
+        credits: VecDeque::new(),
         eof: false,
     }))
 }
@@ -255,6 +287,11 @@ struct JxlDecoder {
     codec_id: CodecId,
     pending: Option<Packet>,
     ready: VecDeque<VideoFrame>,
+    /// `pacing = packet`: frames are released one per packet.
+    paced: bool,
+    /// Packets received but not yet matched with a frame (paced mode):
+    /// each releases one frame and lends it its `pts`.
+    credits: VecDeque<Option<i64>>,
     eof: bool,
 }
 
@@ -264,10 +301,22 @@ impl Decoder for JxlDecoder {
     }
 
     fn send_packet(&mut self, packet: &Packet) -> oxideav_core::Result<()> {
+        if self.paced && packet.data.is_empty() {
+            // A pacing packet releases the next decoded frame; with
+            // nothing decoded or pending it has nothing to release and
+            // is a no-op.
+            if self.pending.is_some() || !self.ready.is_empty() {
+                self.credits.push_back(packet.pts);
+            }
+            return Ok(());
+        }
         if self.pending.is_some() || !self.ready.is_empty() {
             return Err(oxideav_core::Error::other(
                 "jxl decoder: drain receive_frame before sending another packet",
             ));
+        }
+        if self.paced {
+            self.credits.push_back(packet.pts);
         }
         self.pending = Some(packet.clone());
         Ok(())
@@ -278,15 +327,43 @@ impl Decoder for JxlDecoder {
             let frames = crate::decode_all(&pkt.data)?;
             // `pts` is applied to the first frame only; later frames of
             // an animation carry `None` (their spacing is the frame
-            // header's tick duration, not a stream timebase).
+            // header's tick duration, not a stream timebase) unless a
+            // pacing packet lends them its own.
             let mut pts = pkt.pts;
             for f in frames {
                 self.ready
                     .push_back(image_into_video_frame(f.image, pts.take()));
             }
         }
+        if self.paced && !self.eof {
+            // One frame per packet: hold the rest until the next packet
+            // (or the flush) releases it.
+            let Some(credit) = self.credits.pop_front() else {
+                return Err(oxideav_core::Error::NeedMore);
+            };
+            return match self.ready.pop_front() {
+                Some(mut vf) => {
+                    if credit.is_some() {
+                        vf.pts = credit;
+                    }
+                    Ok(Frame::Video(vf))
+                }
+                None => {
+                    // The file decoded to no frame; nothing to release.
+                    self.credits.clear();
+                    Err(oxideav_core::Error::NeedMore)
+                }
+            };
+        }
         match self.ready.pop_front() {
-            Some(vf) => Ok(Frame::Video(vf)),
+            Some(mut vf) => {
+                if let Some(credit) = self.credits.pop_front() {
+                    if credit.is_some() {
+                        vf.pts = credit;
+                    }
+                }
+                Ok(Frame::Video(vf))
+            }
             None if self.eof => Err(oxideav_core::Error::Eof),
             None => Err(oxideav_core::Error::NeedMore),
         }
@@ -349,6 +426,12 @@ mod tests {
     fn decoder_factory_returns_live_decoder() {
         let mut ctx = RuntimeContext::new();
         register(&mut ctx);
+        assert!(ctx.containers.demuxer_names().any(|n| n == "jpegxl"));
+        assert!(ctx.containers.muxer_names().all(|n| n != "jpegxl"));
+        assert_eq!(
+            ctx.containers.container_for_extension("jxl"),
+            Some("jpegxl")
+        );
         let params = CodecParameters::video(CodecId::new(CODEC_ID_STR));
         let dec = ctx
             .codecs

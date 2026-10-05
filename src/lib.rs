@@ -533,6 +533,8 @@ pub mod cross_pass;
 pub mod dct_quant_weights;
 #[doc(hidden)] // internal: Table C.16 transform-type / varblock placement
 pub mod dct_select;
+#[cfg(feature = "registry")]
+pub mod demux;
 #[doc(hidden)] // internal: edge-preserving filter (J.3)
 pub mod epf;
 pub mod extensions;
@@ -651,7 +653,7 @@ pub use registry::__oxideav_entry;
 #[allow(deprecated)]
 pub use registry::{decode_all_frames, decode_one_frame, decode_vardct_frame_from_codestream};
 #[cfg(feature = "registry")]
-pub use registry::{make_decoder, make_encoder, register, register_codecs};
+pub use registry::{make_decoder, make_encoder, register, register_codecs, register_containers};
 
 use crate::bitreader::BitReader;
 use crate::frame_header::{FrameDecodeParams, FrameHeader, RfEdition};
@@ -816,6 +818,11 @@ pub(crate) struct FrameWalk {
     /// Frames that would be presented (`duration > 0 || is_last`,
     /// kReferenceOnly excluded).
     pub presented: u32,
+    /// FrameHeader `duration` (animation ticks) of each presented
+    /// frame, in frame-array order — one entry per frame `decode_all`
+    /// returns. Consumed by the framework demuxer.
+    #[cfg_attr(not(feature = "registry"), allow(dead_code))]
+    pub durations: Vec<u32>,
     /// Byte offset just past the `is_last` frame.
     pub end_offset: usize,
 }
@@ -845,6 +852,7 @@ pub(crate) fn walk_frame_headers(codestream: &[u8], prelude: &Prelude) -> Result
     let mut offset = prelude.frames_offset;
     let mut total = 0u32;
     let mut presented = 0u32;
+    let mut durations = Vec::new();
     let max_frames = codestream.len().max(1);
     loop {
         if offset >= codestream.len() {
@@ -862,10 +870,12 @@ pub(crate) fn walk_frame_headers(codestream: &[u8], prelude: &Prelude) -> Result
             && (fh.duration > 0 || fh.is_last)
         {
             presented = presented.saturating_add(1);
+            durations.push(fh.duration);
         }
         if fh.is_last {
             return Ok(FrameWalk {
                 presented,
+                durations,
                 end_offset: offset.saturating_add(next_rel).min(codestream.len()),
             });
         }

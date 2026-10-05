@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- The `jpegxl` framework container (`oxideav_jpegxl::demux`,
+  `registry` feature): probe (both signatures) + demuxer + `.jxl`
+  extension, installed by `register` / the new `register_containers`,
+  so `ctx.containers.probe_input` → `open_demuxer` → `first_decoder`
+  opens JPEG XL files through the registry (`oxideav-image`). Stills
+  are one packet; animations one packet per presented frame in the
+  animation tick (`pts` cumulative, `duration` from the FrameHeader),
+  with `("loop_count", n)` and ICC / Exif / XMP presence flags in
+  `metadata()`. No muxer — the crate is decoder-only.
+- Decoder option `pacing` (`all` default / `packet`): with `packet` the
+  framework decoder releases one frame per packet received (zero-length
+  pacing packets accepted, their `pts` lent to the frame) and the rest
+  at `flush`; the default keeps the historical every-frame-per-packet
+  behaviour.
+- `demux` fuzz target.
+
 - `encode_all(&[Frame], &EncodeOptions)` — the multi-frame mirror of
   `decode_all` required by the contract on animated formats; like every
   `encode*` function of this decoder-only crate it returns

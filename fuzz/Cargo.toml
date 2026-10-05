@@ -62,6 +62,18 @@ libfuzzer-sys = "0.4"
 [dependencies.oxideav-jpegxl]
 path = ".."
 
+# The `demux` target drives the framework container (`registry`
+# feature, on by default).
+[dependencies.oxideav-core]
+version = "0.1"
+
+[[bin]]
+name = "demux"
+path = "fuzz_targets/demux.rs"
+test = false
+doc = false
+bench = false
+
 [profile.release]
 debug = 1
 

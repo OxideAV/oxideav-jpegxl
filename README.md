@@ -76,9 +76,28 @@ let decoder = oxideav_jpegxl::make_decoder(&params)?;  // one .jxl file per pack
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
-* `register(&mut RuntimeContext)` / `register_codecs(&mut CodecRegistry)`;
-  `make_decoder` (live) and `make_encoder` (always `Unsupported`). No
-  demuxer is registered: a JXL file is one packet.
+* `register(&mut RuntimeContext)` / `register_codecs(&mut CodecRegistry)`
+  / `register_containers(&mut ContainerRegistry)`; `make_decoder` (live)
+  and `make_encoder` (always `Unsupported`).
+* The `jpegxl` container (`oxideav_jpegxl::demux`, extension `.jxl`,
+  both signatures probed) is a **demuxer only** — the crate is
+  decoder-only by ruling, so there is nothing a muxer could receive. It
+  declares one video stream the way `info` describes the file (native
+  `pixel_format`, the enumerated `ColourEncoding` as `color_signal`,
+  `pixel_format = None` when the channel set has no contract layout)
+  and sets the decoder option `pacing = packet`. A still is one keyframe
+  packet with the whole file (time base 1/1). An animation is one packet
+  per presented frame: the stream time base is the animation tick
+  (`tps_denominator / tps_numerator` s), `duration` the frame's tick
+  count and `pts` the running sum; because JPEG XL frames are not
+  independently decodable, only the first packet carries bytes and the
+  rest are zero-length pacing packets. `metadata()` carries
+  `("loop_count", n)` and `("icc" | "exif" | "xmp", "present")` flags
+  (the blobs have no framework carriage yet).
+* Decoder option `pacing`: `all` (default — every frame of the file
+  comes out of the packet that carried it) or `packet` (one frame per
+  packet received, the remainder at `flush`; a packet lends its `pts` to
+  the frame it releases). The demuxer asks for `packet`.
 * The framework `Decoder` calls `decode_all` and hands out one
   `VideoFrame` per presented frame in the **native packed layout**
   (`Gray8` / `Ya8` / `Rgb24` / `Rgba` / `Gray16Le` / `Ya16Le` /
