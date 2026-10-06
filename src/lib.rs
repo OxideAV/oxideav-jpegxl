@@ -566,6 +566,7 @@ pub mod icc;
 pub mod idct;
 /// ISO/IEC 18181-2 §9.11 JPEG Bitstream Reconstruction Data (`jbrd`).
 pub mod jpeg_bitstream;
+pub(crate) mod jpeg_pixels;
 /// ISO/IEC 18181-2 Annex A JPEG bitstream reconstruction.
 pub mod jpeg_reconstruct;
 #[doc(hidden)] // internal: F.1 LF dequantisation + F.2 smoothing
@@ -1397,6 +1398,59 @@ fn decode_frame_body(
     // the LfGlobal/LfGroup/HfGlobal sections + computing the
     // dequantised LF samples per Listing F.1 + applying F.2 smoothing
     // when `kSkipAdaptiveLFSmoothing == 0`.
+    if fh.encoding == crate::frame_header::Encoding::VarDct && fh.do_ycbcr {
+        // A JPEG-recompressed frame (`do_YCbCr`; the JPEG's quantized
+        // coefficients on the JPEG's sampling lattices, RAW quant
+        // tables): the exact integer coefficient decode that Annex A
+        // reconstruction pins byte-exact, then the JPEG sample
+        // pipeline (dequant + 10918-1 IDCT per channel on its own
+        // lattice, J.2 chroma upsampling, §L.3 inverse YCbCr) — see
+        // `jpeg_pixels`. The §J restoration filters are off on every
+        // transcode frame (there is nothing to reproduce).
+        if fh.save_as_reference != 0 && fh.save_before_ct {
+            return Err(Error::Unsupported(
+                "jxl decoder: pre-colour-transform reference recording of a YCbCr VarDCT \
+                 frame is not wired"
+                    .into(),
+            ));
+        }
+        if fh.restoration_filter.gab || fh.restoration_filter.epf_iters > 0 {
+            return Err(Error::Unsupported(
+                "jxl decoder: restoration filters on a YCbCr VarDCT (JPEG transcode) frame".into(),
+            ));
+        }
+        reject_undrawn_image_features(fh.flags)?;
+        let frame_data_start = br.bytes_consumed();
+        let frame_bytes = codestream.get(frame_data_start..).ok_or_else(|| {
+            Error::InvalidData("JXL decoder: frame data start past codestream end".into())
+        })?;
+        let tc = crate::jpeg_reconstruct::decode_transcoded_frame(
+            &fh,
+            &toc,
+            metadata,
+            frame_bytes,
+            fh.width,
+            fh.height,
+            None,
+        )?;
+        let planes = crate::jpeg_pixels::planes_from_coefficients(&tc, fh.width, fh.height)?;
+        let grey = metadata.colour_encoding.colour_space == crate::metadata_fdis::ColourSpace::Grey;
+        let frame = if grey {
+            planes.into_luma_frame(pts)
+        } else {
+            planes.to_rgb_frame(pts)?
+        };
+        return Ok(DecodedFrame {
+            bytes_per_sample: 1,
+            frame,
+            is_last,
+            next_frame_offset,
+            compose: compose_meta,
+            raw_f32: None,
+            frame_type: fh.frame_type,
+            pre_ct: None,
+        });
+    }
     if fh.encoding == crate::frame_header::Encoding::VarDct {
         let scaffold = crate::vardct::recognise_vardct_codestream(&fh, metadata)?;
         // The integrated VarDCT decode (`decode_vardct_frame`) runs the

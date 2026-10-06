@@ -293,15 +293,21 @@ fn demuxer_flags_embedded_metadata() {
 }
 
 #[test]
-fn layer1_decode_errors_surface_through_the_registry_unchanged() {
-    // A file Layer 1 cannot decode yet (VarDCT with sub-sampled LF
-    // channels) opens — the header walk is fine — and the registry
-    // decoder reports the same `Unsupported` as `decode_all`.
+fn jpeg_transcode_decodes_planar_on_both_paths() {
+    // A losslessly recompressed 4:2:0 JPEG decodes to the JPEG's own
+    // planar YCbCr on Layer 1; the registry publishes the same label on
+    // the stream and the decoder frame carries the same three planes
+    // byte for byte.
     let ctx = ctx();
-    let err = decode_all(JPEG_TRANSCODE).unwrap_err();
-    assert!(
-        matches!(err, oxideav_jpegxl::JxlError::Unsupported(_)),
-        "{err}"
+    let frames = decode_all(JPEG_TRANSCODE).unwrap();
+    assert_eq!(frames.len(), 1);
+    let img = &frames[0].image;
+    assert_eq!(img.format, oxideav_jpegxl::PixelFormat::YuvJ420P);
+    assert_eq!(img.planes.len(), 3);
+    assert_eq!(img, &oxideav_jpegxl::decode(JPEG_TRANSCODE).unwrap());
+    assert_eq!(
+        oxideav_jpegxl::info(JPEG_TRANSCODE).unwrap().format,
+        oxideav_jpegxl::PixelFormat::YuvJ420P
     );
     let name = probe(&ctx, JPEG_TRANSCODE, None).unwrap();
     let mut demux = ctx
@@ -309,11 +315,25 @@ fn layer1_decode_errors_surface_through_the_registry_unchanged() {
         .open_demuxer(&name, reader(JPEG_TRANSCODE), &ctx.codecs)
         .unwrap();
     let stream = demux.streams()[0].clone();
-    assert_eq!(stream.params.pixel_format, Some(PixelFormat::Rgb24));
+    assert_eq!(stream.params.pixel_format, Some(PixelFormat::YuvJ420P));
     let pkt = demux.next_packet().unwrap();
     let mut dec = ctx.codecs.first_decoder(&stream.params).unwrap();
     dec.send_packet(&pkt).unwrap();
-    assert!(matches!(dec.receive_frame(), Err(Error::Unsupported(_))));
+    let Frame::Video(vf) = dec.receive_frame().unwrap() else {
+        panic!("video frame expected");
+    };
+    let planes = vf.image_planes();
+    assert_eq!(planes.len(), 3);
+    for (c, p) in planes.iter().enumerate() {
+        assert_eq!(p.stride, img.planes[c].stride, "plane {c} stride");
+        assert_eq!(p.data, img.planes[c].data, "plane {c} bytes");
+    }
+    let sig = vf.color_signal().expect("JPEG = sYCC colour signal");
+    assert_eq!(sig.range, oxideav_core::ColorRange::Full);
+    assert_eq!(sig.matrix.0, 5);
+    // Through the generic bridge the planar frame rebuilds the image.
+    let back = oxideav_jpegxl::JxlImage::from_video_frame(&vf, &stream.params).unwrap();
+    assert_eq!(back.planes, img.planes);
 }
 
 #[test]

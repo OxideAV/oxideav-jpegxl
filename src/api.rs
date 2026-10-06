@@ -133,7 +133,10 @@ pub fn info(bytes: &[u8]) -> Result<ImageInfo> {
     let (width, height) = oriented_size(&prelude);
     let bytes_per_sample = first_frame_bytes_per_sample(&opened, &prelude);
     let has_alpha = alpha_channel_index(md).is_some();
-    let format = PixelFormat::for_layout(colour_channels(md), has_alpha, bytes_per_sample)?;
+    let format = match transcode_layout(&opened, &prelude) {
+        Some(t) => t.format,
+        None => PixelFormat::for_layout(colour_channels(md), has_alpha, bytes_per_sample)?,
+    };
     let frames = if md.have_animation {
         walk_frame_headers(&opened.codestream, &prelude)?
             .presented
@@ -174,21 +177,121 @@ pub fn info(bytes: &[u8]) -> Result<ImageInfo> {
 /// frames reconstruct to 8 bits per sample whatever the declared depth;
 /// Modular frames keep the declared depth (1 or 2 bytes).
 fn first_frame_bytes_per_sample(opened: &crate::Opened<'_>, prelude: &Prelude) -> usize {
-    let params = frame_params(prelude);
-    let slice = opened
-        .codestream
-        .get(prelude.frames_offset..)
-        .unwrap_or(&[]);
-    let mut br = crate::bitreader::BitReader::new(slice);
-    let first_is_vardct = match crate::read_frame_header_and_toc(&mut br, &params, slice) {
-        Ok((fh, _)) => fh.encoding == crate::frame_header::Encoding::VarDct,
-        Err(_) => false,
-    };
+    let first_is_vardct = first_frame_header(opened, prelude)
+        .map(|(fh, _, _)| fh.encoding == crate::frame_header::Encoding::VarDct)
+        .unwrap_or(false);
     if prelude.metadata.bit_depth.bits_per_sample > 8 && !first_is_vardct {
         2
     } else {
         1
     }
+}
+
+/// FrameHeader + TOC of the first frame and the byte offset (into the
+/// codestream) of its first TOC section; `None` when the header does
+/// not parse (the decode paths report the error).
+fn first_frame_header(
+    opened: &crate::Opened<'_>,
+    prelude: &Prelude,
+) -> Option<(crate::frame_header::FrameHeader, crate::toc::Toc, usize)> {
+    let params = frame_params(prelude);
+    let slice = opened.codestream.get(prelude.frames_offset..)?;
+    let mut br = crate::bitreader::BitReader::new(slice);
+    let (fh, toc) = crate::read_frame_header_and_toc(&mut br, &params, slice).ok()?;
+    Some((fh, toc, prelude.frames_offset + br.bytes_consumed()))
+}
+
+/// The native planar layout of a losslessly recompressed JPEG, decided
+/// from headers alone: a still (no animation), identity orientation, no
+/// extra channels, RGB colour space, whose single frame is `kVarDCT +
+/// do_YCbCr` (a JPEG transcode) with luma at full resolution and both
+/// chroma channels on one lattice. Such a file decodes to the JPEG's
+/// own YCbCr planes (`YuvJ444P` / `YuvJ422P` / `YuvJ420P` / `Yuv440P`,
+/// README "Supported layouts"); everything else goes through the
+/// generic frame pipeline (RGB output).
+struct TranscodeLayout {
+    format: PixelFormat,
+    fh: crate::frame_header::FrameHeader,
+    toc: crate::toc::Toc,
+    /// Codestream offset of the frame's first TOC section.
+    frame_bytes_offset: usize,
+}
+
+fn transcode_layout(opened: &crate::Opened<'_>, prelude: &Prelude) -> Option<TranscodeLayout> {
+    let md = &prelude.metadata;
+    if md.have_animation
+        || md.orientation > 1
+        || md.num_extra_channels != 0
+        || md.xyb_encoded
+        || md.colour_encoding.colour_space != ColourSpace::Rgb
+    {
+        return None;
+    }
+    let (fh, toc, frame_bytes_offset) = first_frame_header(opened, prelude)?;
+    if fh.encoding != crate::frame_header::Encoding::VarDct
+        || !fh.do_ycbcr
+        || !fh.is_last
+        || fh.have_crop
+        || fh.frame_type != crate::frame_header::FrameType::Regular
+        || fh.width != prelude.size.width
+        || fh.height != prelude.size.height
+    {
+        return None;
+    }
+    let shifts = fh.jpeg_upsampling_shifts();
+    if shifts[1] != (0, 0) || shifts[0] != shifts[2] {
+        return None;
+    }
+    let format = match shifts[0] {
+        (0, 0) => PixelFormat::YuvJ444P,
+        (1, 0) => PixelFormat::YuvJ422P,
+        (1, 1) => PixelFormat::YuvJ420P,
+        (0, 1) => PixelFormat::Yuv440P,
+        _ => return None,
+    };
+    Some(TranscodeLayout {
+        format,
+        fh,
+        toc,
+        frame_bytes_offset,
+    })
+}
+
+/// Decode a [`transcode_layout`] file to its planar YCbCr image.
+fn decode_transcode_image(
+    opened: &crate::Opened<'_>,
+    prelude: &Prelude,
+    layout: &TranscodeLayout,
+    pts: Option<i64>,
+    with_metadata: bool,
+) -> Result<JxlImage> {
+    let md = &prelude.metadata;
+    let frame_bytes = opened
+        .codestream
+        .get(layout.frame_bytes_offset..)
+        .ok_or_else(|| Error::invalid("jxl decoder: frame data start past codestream end"))?;
+    let tc = crate::jpeg_reconstruct::decode_transcoded_frame(
+        &layout.fh,
+        &layout.toc,
+        md,
+        frame_bytes,
+        layout.fh.width,
+        layout.fh.height,
+        None,
+    )?;
+    let planes =
+        crate::jpeg_pixels::planes_from_coefficients(&tc, layout.fh.width, layout.fh.height)?;
+    let raw = planes.into_planar_frame(pts);
+    let mut img = JxlImage::new(layout.fh.width, layout.fh.height, layout.format, raw.planes)?
+        .with_color(color_info(md).with_matrix(ColorInfo::MATRIX_BT601))
+        .with_bits_per_sample(8);
+    if with_metadata {
+        let mut meta = Metadata::new().with_gamma(gamma(md));
+        meta.icc = prelude.icc.clone();
+        container_metadata(opened.file.as_ref(), &mut meta);
+        img.metadata = meta;
+    }
+    Ok(img)
 }
 
 /// What the framework demuxer publishes before any sample is decoded —
@@ -223,10 +326,13 @@ pub(crate) fn describe(bytes: &[u8]) -> Result<Described> {
     let (width, height) = oriented_size(&prelude);
     let bytes_per_sample = first_frame_bytes_per_sample(&opened, &prelude);
     let has_alpha = alpha_channel_index(md).is_some();
-    let format = match PixelFormat::for_layout(colour_channels(md), has_alpha, bytes_per_sample) {
-        Ok(f) => Some(f),
-        Err(Error::Unsupported(_)) => None,
-        Err(e) => return Err(e),
+    let format = match transcode_layout(&opened, &prelude) {
+        Some(t) => Some(t.format),
+        None => match PixelFormat::for_layout(colour_channels(md), has_alpha, bytes_per_sample) {
+            Ok(f) => Some(f),
+            Err(Error::Unsupported(_)) => None,
+            Err(e) => return Err(e),
+        },
     };
     let durations = if md.have_animation {
         let walk = walk_frame_headers(&opened.codestream, &prelude)?;
@@ -268,9 +374,13 @@ pub fn decode(bytes: &[u8]) -> Result<JxlImage> {
 pub fn decode_with(bytes: &[u8], opts: &DecodeOptions) -> Result<JxlImage> {
     let opened = open(bytes)?;
     let prelude = read_prelude_at_level(&opened.codestream, opened.level())?;
-    check_limits(&prelude, opts)?;
+    let transcode = transcode_layout(&opened, &prelude);
+    check_limits(&prelude, opts, transcode.as_ref().map(|t| t.format))?;
     if opts.strict {
         check_trailing(&opened, &prelude)?;
+    }
+    if let Some(t) = &transcode {
+        return decode_transcode_image(&opened, &prelude, t, None, true);
     }
     let mut seq = decode_sequence(
         &opened.codestream,
@@ -323,9 +433,24 @@ pub fn decode_all(bytes: &[u8]) -> Result<Vec<Frame>> {
 pub fn decode_all_with(bytes: &[u8], opts: &DecodeOptions) -> Result<Vec<Frame>> {
     let opened = open(bytes)?;
     let prelude = read_prelude_at_level(&opened.codestream, opened.level())?;
-    check_limits(&prelude, opts)?;
+    let transcode = transcode_layout(&opened, &prelude);
+    check_limits(&prelude, opts, transcode.as_ref().map(|t| t.format))?;
     if opts.strict {
         check_trailing(&opened, &prelude)?;
+    }
+    if let Some(t) = &transcode {
+        // A transcode is one presented full frame: the same planar image
+        // `decode` returns, in either coalescing mode.
+        let image = decode_transcode_image(&opened, &prelude, t, None, true)?;
+        return Ok(vec![Frame {
+            image,
+            delay: None,
+            index: 0,
+            ticks: 0,
+            x: 0,
+            y: 0,
+            presented: true,
+        }]);
     }
     let mode = if opts.coalesce {
         SequenceMode::Coalesced
@@ -542,7 +667,11 @@ fn container_metadata(file: Option<&container::JxlFile<'_>>, meta: &mut Metadata
 /// pixel buffer exists. `max_bytes` is checked against the native
 /// output size (`width × height × channels × bytes_per_sample`, alpha
 /// included).
-fn check_limits(prelude: &Prelude, opts: &DecodeOptions) -> Result<()> {
+fn check_limits(
+    prelude: &Prelude,
+    opts: &DecodeOptions,
+    planar: Option<PixelFormat>,
+) -> Result<()> {
     let (w, h) = oriented_size(prelude);
     if let Some(mw) = opts.max_width {
         if w > mw {
@@ -563,13 +692,25 @@ fn check_limits(prelude: &Prelude, opts: &DecodeOptions) -> Result<()> {
         }
     }
     let md = &prelude.metadata;
-    let channels = colour_channels(md) as u64 + u64::from(alpha_channel_index(md).is_some());
-    let bps: u64 = if md.bit_depth.bits_per_sample > 8 {
-        2
-    } else {
-        1
+    let bytes = match planar {
+        // Planar YCbCr: luma plus two chroma planes on their lattice.
+        Some(f) => {
+            let (hs, vs) = f.chroma_shift();
+            let cw = u64::from(w).div_ceil(1 << hs);
+            let ch = u64::from(h).div_ceil(1 << vs);
+            pixels.saturating_add(cw.saturating_mul(ch).saturating_mul(2))
+        }
+        None => {
+            let channels =
+                colour_channels(md) as u64 + u64::from(alpha_channel_index(md).is_some());
+            let bps: u64 = if md.bit_depth.bits_per_sample > 8 {
+                2
+            } else {
+                1
+            };
+            pixels.saturating_mul(channels).saturating_mul(bps)
+        }
     };
-    let bytes = pixels.saturating_mul(channels).saturating_mul(bps);
     if let Some(mb) = opts.max_bytes {
         if bytes > mb {
             return Err(Error::limit(format!(

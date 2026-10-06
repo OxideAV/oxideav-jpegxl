@@ -13,11 +13,18 @@ use crate::error::{Error, Result};
 /// Native pixel layouts this crate produces. Variant names mirror
 /// `oxideav_core::PixelFormat`.
 ///
-/// Every layout is one packed, row-major plane. The `*16Le` / `48Le` /
+/// The packed layouts are one row-major plane. The `*16Le` / `48Le` /
 /// `64Le` variants hold little-endian `u16` samples in the range
 /// `0 ..= 2^bits_per_sample − 1` (see [`JxlImage::bits_per_sample`]);
 /// the 8-bit variants hold `0 ..= 2^bits_per_sample − 1` for
 /// `bits_per_sample ≤ 8`.
+///
+/// The planar `YuvJ444P` / `YuvJ422P` / `YuvJ420P` / `Yuv440P` layouts
+/// are three 8-bit planes (`Y`, `Cb`, `Cr`) and are produced for a
+/// losslessly recompressed JPEG (`do_YCbCr` VarDCT frame): the JPEG's
+/// own full-range YCbCr samples on the JPEG's sampling lattice, chroma
+/// planes `ceil(width / h) × ceil(height / v)`. They are what the
+/// original JPEG decodes to (see the README's layout table).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum JxlPixelFormat {
@@ -37,13 +44,27 @@ pub enum JxlPixelFormat {
     Rgb48Le,
     /// R, G, B, A as little-endian `u16` (8 bytes per pixel).
     Rgba64Le,
+    /// Planar 8-bit full-range YCbCr 4:4:4 (JPEG transcode; three
+    /// planes of `width × height`).
+    YuvJ444P,
+    /// Planar 8-bit full-range YCbCr 4:2:2 (chroma `ceil(width / 2) ×
+    /// height`).
+    YuvJ422P,
+    /// Planar 8-bit full-range YCbCr 4:2:0 (chroma `ceil(width / 2) ×
+    /// ceil(height / 2)`).
+    YuvJ420P,
+    /// Planar 8-bit YCbCr 4:4:0 (chroma `width × ceil(height / 2)`).
+    /// Full range like every JPEG transcode — `oxideav_core` has no
+    /// `YuvJ440P` label, so the range rides on [`ColorInfo::range`].
+    Yuv440P,
 }
 
 /// Contract alias of [`JxlPixelFormat`].
 pub type PixelFormat = JxlPixelFormat;
 
 impl JxlPixelFormat {
-    /// Bytes per packed pixel.
+    /// Bytes per packed pixel; for the planar YCbCr layouts, bytes per
+    /// luma sample (1).
     pub const fn bytes_per_pixel(self) -> usize {
         match self {
             Self::Gray8 => 1,
@@ -54,16 +75,19 @@ impl JxlPixelFormat {
             Self::Ya16Le => 4,
             Self::Rgb48Le => 6,
             Self::Rgba64Le => 8,
+            Self::YuvJ444P | Self::YuvJ422P | Self::YuvJ420P | Self::Yuv440P => 1,
         }
     }
 
-    /// Number of interleaved channels (1, 2, 3 or 4).
+    /// Number of channels (1, 2, 3 or 4): interleaved for the packed
+    /// layouts, one plane each for the planar ones.
     pub const fn channels(self) -> usize {
         match self {
             Self::Gray8 | Self::Gray16Le => 1,
             Self::Ya8 | Self::Ya16Le => 2,
             Self::Rgb24 | Self::Rgb48Le => 3,
             Self::Rgba | Self::Rgba64Le => 4,
+            Self::YuvJ444P | Self::YuvJ422P | Self::YuvJ420P | Self::Yuv440P => 3,
         }
     }
 
@@ -72,7 +96,54 @@ impl JxlPixelFormat {
         match self {
             Self::Gray8 | Self::Ya8 | Self::Rgb24 | Self::Rgba => 1,
             Self::Gray16Le | Self::Ya16Le | Self::Rgb48Le | Self::Rgba64Le => 2,
+            Self::YuvJ444P | Self::YuvJ422P | Self::YuvJ420P | Self::Yuv440P => 1,
         }
+    }
+
+    /// Whether the layout is planar YCbCr (three planes) rather than one
+    /// packed plane.
+    pub const fn is_planar(self) -> bool {
+        matches!(
+            self,
+            Self::YuvJ444P | Self::YuvJ422P | Self::YuvJ420P | Self::Yuv440P
+        )
+    }
+
+    /// Number of planes a [`JxlImage`] in this layout carries (1 or 3).
+    pub const fn plane_count(self) -> usize {
+        if self.is_planar() {
+            3
+        } else {
+            1
+        }
+    }
+
+    /// Chroma subsampling of the planar layouts as `(log2 horizontal,
+    /// log2 vertical)` divisors; `(0, 0)` for 4:4:4 and every packed
+    /// layout.
+    pub const fn chroma_shift(self) -> (u32, u32) {
+        match self {
+            Self::YuvJ420P => (1, 1),
+            Self::YuvJ422P => (1, 0),
+            Self::Yuv440P => (0, 1),
+            _ => (0, 0),
+        }
+    }
+
+    /// Sample geometry `(samples per row, rows)` of plane `index` for a
+    /// `width × height` image: the packed layouts have one plane of
+    /// `width` pixels; planar chroma planes are `ceil(width / h) ×
+    /// ceil(height / v)`. `None` when `index ≥ plane_count()`.
+    pub fn plane_dims(self, width: u32, height: u32, index: usize) -> Option<(usize, usize)> {
+        if index >= self.plane_count() {
+            return None;
+        }
+        let (w, h) = (width as usize, height as usize);
+        if index == 0 || !self.is_planar() {
+            return Some((w, h));
+        }
+        let (hs, vs) = self.chroma_shift();
+        Some((w.div_ceil(1 << hs), h.div_ceil(1 << vs)))
     }
 
     /// Whether the layout carries an alpha channel.
@@ -181,6 +252,9 @@ impl ColorInfo {
     pub const UNSPECIFIED: u8 = 2;
     /// H.273 identity matrix (RGB).
     pub const MATRIX_IDENTITY: u8 = 0;
+    /// H.273 matrix 5 (BT.601 / T.871 sYCC) — the YCbCr relationship of
+    /// the planar JPEG-transcode layouts.
+    pub const MATRIX_BT601: u8 = 5;
     /// H.273 BT.709 / sRGB primaries.
     pub const PRIMARIES_BT709: u8 = 1;
     /// H.273 BT.2100 primaries.
@@ -399,7 +473,8 @@ pub struct JxlImage {
     pub height: u32,
     /// Native layout.
     pub format: PixelFormat,
-    /// Exactly one packed plane.
+    /// Exactly one packed plane, or the three `Y`, `Cb`, `Cr` planes of a
+    /// planar layout ([`JxlPixelFormat::plane_count`]).
     pub planes: Vec<Plane>,
     /// Colour signalling from the codestream's `ColourEncoding`.
     pub color: ColorInfo,
@@ -414,41 +489,48 @@ pub struct JxlImage {
 
 impl JxlImage {
     /// Build an image from its planes, validating the geometry: both
-    /// dimensions `> 0`, exactly one plane, `stride ≥ width ×
-    /// bytes_per_pixel`, `data.len() ≥ stride × height`
-    /// ([`Error::InvalidData`] otherwise). `bits_per_sample` is set to the layout's
-    /// storage width (8 or 16).
+    /// dimensions `> 0`, [`JxlPixelFormat::plane_count`] planes, and for
+    /// every plane `stride ≥ samples per row × bytes_per_sample` and
+    /// `data.len() ≥ stride × rows` with the per-plane geometry of
+    /// [`JxlPixelFormat::plane_dims`] ([`Error::InvalidData`]
+    /// otherwise). `bits_per_sample` is set to the layout's storage
+    /// width (8 or 16).
     pub fn new(width: u32, height: u32, format: PixelFormat, planes: Vec<Plane>) -> Result<Self> {
         if width == 0 || height == 0 {
             return Err(Error::invalid(format!(
                 "JxlImage::new: {width}×{height} image (both dimensions must be > 0)"
             )));
         }
-        if planes.len() != 1 {
+        let want = format.plane_count();
+        if planes.len() != want {
             return Err(Error::invalid(format!(
-                "JxlImage::new: packed layouts need exactly one plane, got {}",
+                "JxlImage::new: {format:?} needs exactly {want} plane(s), got {}",
                 planes.len()
             )));
         }
-        let row = (width as usize)
-            .checked_mul(format.bytes_per_pixel())
-            .ok_or_else(|| Error::invalid("JxlImage::new: row size overflows usize"))?;
-        let p = &planes[0];
-        if p.stride < row {
-            return Err(Error::invalid(format!(
-                "JxlImage::new: stride {} shorter than the {row}-byte row",
-                p.stride
-            )));
-        }
-        let need = p
-            .stride
-            .checked_mul(height as usize)
-            .ok_or_else(|| Error::invalid("JxlImage::new: plane size overflows usize"))?;
-        if p.data.len() < need {
-            return Err(Error::invalid(format!(
-                "JxlImage::new: plane holds {} bytes, {need} needed for {width}×{height}",
-                p.data.len()
-            )));
+        for (i, p) in planes.iter().enumerate() {
+            let (pw, ph) = format
+                .plane_dims(width, height, i)
+                .expect("index below plane_count");
+            let row = pw
+                .checked_mul(format.bytes_per_pixel())
+                .ok_or_else(|| Error::invalid("JxlImage::new: row size overflows usize"))?;
+            if p.stride < row {
+                return Err(Error::invalid(format!(
+                    "JxlImage::new: plane {i} stride {} shorter than the {row}-byte row",
+                    p.stride
+                )));
+            }
+            let need = p
+                .stride
+                .checked_mul(ph)
+                .ok_or_else(|| Error::invalid("JxlImage::new: plane size overflows usize"))?;
+            if p.data.len() < need {
+                return Err(Error::invalid(format!(
+                    "JxlImage::new: plane {i} holds {} bytes, {need} needed for {pw}×{ph}",
+                    p.data.len()
+                )));
+            }
         }
         Ok(Self {
             width,
@@ -515,14 +597,19 @@ impl JxlImage {
         self.format
     }
 
-    /// Bytes per row of the packed plane.
+    /// Bytes per row of the packed plane (the luma plane of a planar
+    /// layout).
     pub fn stride(&self) -> usize {
         self.planes.first().map(|p| p.stride).unwrap_or(0)
     }
 
-    /// The packed sample bytes (always `Some` for an image this crate
-    /// produced — every layout is packed).
+    /// The packed sample bytes: `Some` for the packed layouts, `None`
+    /// for the planar YCbCr ones (use [`into_raw`](Self::into_raw) or
+    /// read `planes` directly).
     pub fn as_bytes(&self) -> Option<&[u8]> {
+        if self.format.is_planar() {
+            return None;
+        }
         self.planes.first().map(|p| p.data.as_slice())
     }
 
@@ -565,7 +652,9 @@ impl JxlImage {
 
     /// Convert to tightly packed RGB8 (grey replicated to R = G = B,
     /// alpha dropped). Deeper samples are scaled by
-    /// `255 / (2^bits_per_sample − 1)` with round-to-nearest.
+    /// `255 / (2^bits_per_sample − 1)` with round-to-nearest. The planar
+    /// YCbCr layouts are upsampled with the ISO/IEC 18181-1 J.2 triangle
+    /// filter and converted with the §L.3 (T.871) full-range matrix.
     pub fn to_rgb8(&self) -> Vec<u8> {
         self.try_to_rgb8().unwrap_or_default()
     }
@@ -589,11 +678,32 @@ impl JxlImage {
     }
 
     fn convert(&self, out_channels: usize) -> Result<Vec<u8>> {
+        let (w, h) = (self.width as usize, self.height as usize);
+        if self.format.is_planar() {
+            let [y, cb, cr] = match self.planes.as_slice() {
+                [y, cb, cr] => [y, cb, cr],
+                _ => {
+                    return Err(Error::invalid(format!(
+                        "JxlImage: {:?} needs three planes, found {}",
+                        self.format,
+                        self.planes.len()
+                    )))
+                }
+            };
+            return crate::jpeg_pixels::planar_ycbcr_to_rgb(
+                w,
+                h,
+                (&y.data, y.stride),
+                (&cb.data, cb.stride),
+                (&cr.data, cr.stride),
+                self.format.chroma_shift(),
+                out_channels,
+            );
+        }
         let p = self
             .planes
             .first()
             .ok_or_else(|| Error::invalid("JxlImage: no plane"))?;
-        let (w, h) = (self.width as usize, self.height as usize);
         let row = w * self.format.bytes_per_pixel();
         if p.stride < row || p.data.len() < p.stride.saturating_mul(h) {
             return Err(Error::invalid(
@@ -681,6 +791,47 @@ mod tests {
         let ya = JxlImage::packed(1, 1, PixelFormat::Ya8, vec![10, 20]).unwrap();
         assert_eq!(ya.to_rgb8(), vec![10, 10, 10]);
         assert_eq!(ya.to_rgba8(), vec![10, 10, 10, 20]);
+    }
+
+    #[test]
+    fn planar_layouts_validate_per_plane_geometry() {
+        let f = PixelFormat::YuvJ420P;
+        assert_eq!(f.plane_count(), 3);
+        assert_eq!(f.plane_dims(5, 3, 0), Some((5, 3)));
+        assert_eq!(f.plane_dims(5, 3, 1), Some((3, 2)));
+        assert_eq!(f.plane_dims(5, 3, 3), None);
+        assert_eq!(PixelFormat::YuvJ422P.plane_dims(5, 3, 2), Some((3, 3)));
+        assert_eq!(PixelFormat::Yuv440P.plane_dims(5, 3, 2), Some((5, 2)));
+        assert_eq!(PixelFormat::YuvJ444P.plane_dims(5, 3, 1), Some((5, 3)));
+        let ok = JxlImage::new(
+            5,
+            3,
+            f,
+            vec![
+                Plane::new(5, vec![0; 15]),
+                Plane::new(3, vec![128; 6]),
+                Plane::new(3, vec![128; 6]),
+            ],
+        )
+        .unwrap();
+        assert_eq!(ok.as_bytes(), None);
+        assert_eq!(ok.to_rgb8(), vec![0; 45]);
+        assert_eq!(ok.to_rgba8().len(), 60);
+        assert_eq!(ok.into_raw().len(), 27);
+        // Short chroma plane.
+        assert!(JxlImage::new(
+            5,
+            3,
+            f,
+            vec![
+                Plane::new(5, vec![0; 15]),
+                Plane::new(3, vec![128; 5]),
+                Plane::new(3, vec![128; 6]),
+            ],
+        )
+        .is_err());
+        // Plane count.
+        assert!(JxlImage::new(5, 3, f, vec![Plane::new(5, vec![0; 15])]).is_err());
     }
 
     #[test]

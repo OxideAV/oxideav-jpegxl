@@ -54,6 +54,10 @@ pub fn to_core_pixel_format(pf: JxlPixelFormat) -> PixelFormat {
         JxlPixelFormat::Ya16Le => PixelFormat::Ya16Le,
         JxlPixelFormat::Rgb48Le => PixelFormat::Rgb48Le,
         JxlPixelFormat::Rgba64Le => PixelFormat::Rgba64Le,
+        JxlPixelFormat::YuvJ444P => PixelFormat::YuvJ444P,
+        JxlPixelFormat::YuvJ422P => PixelFormat::YuvJ422P,
+        JxlPixelFormat::YuvJ420P => PixelFormat::YuvJ420P,
+        JxlPixelFormat::Yuv440P => PixelFormat::Yuv440P,
     }
 }
 
@@ -69,6 +73,10 @@ pub fn from_core_pixel_format(pf: PixelFormat) -> Result<JxlPixelFormat> {
         PixelFormat::Ya16Le => JxlPixelFormat::Ya16Le,
         PixelFormat::Rgb48Le => JxlPixelFormat::Rgb48Le,
         PixelFormat::Rgba64Le => JxlPixelFormat::Rgba64Le,
+        PixelFormat::YuvJ444P => JxlPixelFormat::YuvJ444P,
+        PixelFormat::YuvJ422P => JxlPixelFormat::YuvJ422P,
+        PixelFormat::YuvJ420P => JxlPixelFormat::YuvJ420P,
+        PixelFormat::Yuv440P => JxlPixelFormat::Yuv440P,
         other => {
             return Err(JxlError::unsupported(format!(
                 "JPEG XL: pixel format {other:?} is not a JPEG XL output layout"
@@ -120,22 +128,23 @@ pub fn from_color_signal(s: &ColorSignal) -> ColorInfo {
 // ---- frame bridge --------------------------------------------------------
 
 fn image_into_video_frame(mut image: JxlImage, pts: Option<i64>) -> VideoFrame {
-    let plane = if image.planes.is_empty() {
-        VideoPlane {
+    // One plane for the packed layouts, `Y` / `Cb` / `Cr` for the planar
+    // JPEG-transcode layouts — the framework label's own plane order.
+    let planes: Vec<VideoPlane> = if image.planes.is_empty() {
+        vec![VideoPlane {
             stride: 0,
             data: Vec::new(),
-        }
+        }]
     } else {
-        let p = image.planes.swap_remove(0);
-        VideoPlane {
-            stride: p.stride,
-            data: p.data,
-        }
+        std::mem::take(&mut image.planes)
+            .into_iter()
+            .map(|p| VideoPlane {
+                stride: p.stride,
+                data: p.data,
+            })
+            .collect()
     };
-    let mut frame = VideoFrame {
-        pts,
-        planes: vec![plane],
-    };
+    let mut frame = VideoFrame { pts, planes };
     stamp_frame_side_channels(&mut frame, &image);
     frame
 }
@@ -176,16 +185,19 @@ impl JxlImage {
             .height
             .ok_or_else(|| JxlError::invalid("JPEG XL: CodecParameters.height missing"))?;
         let pix = from_core_pixel_format(params.pixel_format.unwrap_or(PixelFormat::Rgba))?;
-        let plane = frame
-            .image_planes()
-            .first()
-            .ok_or_else(|| JxlError::invalid("JPEG XL: frame has no image plane"))?;
-        let mut img = JxlImage::new(
-            width,
-            height,
-            pix,
-            vec![Plane::new(plane.stride, plane.data.clone())],
-        )?;
+        let image_planes = frame.image_planes();
+        let want = pix.plane_count();
+        if image_planes.len() < want {
+            return Err(JxlError::invalid(format!(
+                "JPEG XL: frame carries {} image plane(s), {pix:?} needs {want}",
+                image_planes.len()
+            )));
+        }
+        let planes = image_planes[..want]
+            .iter()
+            .map(|p| Plane::new(p.stride, p.data.clone()))
+            .collect();
+        let mut img = JxlImage::new(width, height, pix, planes)?;
         if let Some(sig) = frame.color_signal() {
             img.color = from_color_signal(&sig);
         }
@@ -472,6 +484,28 @@ mod tests {
         assert_eq!(back, img);
         let via_try: JxlImage = (&vf, &params).try_into().unwrap();
         assert_eq!(via_try, img);
+
+        // Planar: three planes cross the bridge in Y / Cb / Cr order.
+        let yuv = JxlImage::new(
+            3,
+            1,
+            JxlPixelFormat::YuvJ420P,
+            vec![
+                Plane::new(3, vec![1, 2, 3]),
+                Plane::new(2, vec![4, 5]),
+                Plane::new(2, vec![6, 7]),
+            ],
+        )
+        .unwrap()
+        .with_color(ColorInfo::srgb().with_matrix(ColorInfo::MATRIX_BT601));
+        let vf: VideoFrame = (&yuv).into();
+        assert_eq!(vf.image_planes().len(), 3);
+        assert_eq!(vf.image_planes()[1].data, vec![4, 5]);
+        let mut params = CodecParameters::video(CodecId::new(CODEC_ID_STR));
+        params.width = Some(3);
+        params.height = Some(1);
+        params.pixel_format = Some(PixelFormat::YuvJ420P);
+        assert_eq!(JxlImage::from_video_frame(&vf, &params).unwrap(), yuv);
     }
 
     #[test]
@@ -485,11 +519,16 @@ mod tests {
             JxlPixelFormat::Ya16Le,
             JxlPixelFormat::Rgb48Le,
             JxlPixelFormat::Rgba64Le,
+            JxlPixelFormat::YuvJ444P,
+            JxlPixelFormat::YuvJ422P,
+            JxlPixelFormat::YuvJ420P,
+            JxlPixelFormat::Yuv440P,
         ] {
             let core: PixelFormat = pf.into();
             assert_eq!(format!("{core:?}"), format!("{pf:?}"));
             assert_eq!(JxlPixelFormat::try_from(core).unwrap(), pf);
         }
         assert!(JxlPixelFormat::try_from(PixelFormat::Yuv420P).is_err());
+        assert!(JxlPixelFormat::try_from(PixelFormat::Yuv411P).is_err());
     }
 }

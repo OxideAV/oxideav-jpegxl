@@ -138,13 +138,57 @@ pub fn decode_transcoded_coefficients(codestream: &[u8]) -> Result<TranscodedCoe
         image_height: size.height,
     };
     let (fh, toc) = crate::read_frame_header_and_toc(&mut br, &fh_params, codestream)?;
+    if !fh.is_last {
+        return Err(Error::Unsupported(
+            "JXL jpeg_reconstruct: transcode must be a single full regular frame".into(),
+        ));
+    }
+    let frame_data_start = br.bytes_consumed();
+    let frame_bytes = codestream.get(frame_data_start..).ok_or_else(|| {
+        Error::InvalidData("JXL jpeg_reconstruct: frame data start past codestream end".into())
+    })?;
+    decode_transcoded_frame(
+        &fh,
+        &toc,
+        &metadata,
+        frame_bytes,
+        size.width,
+        size.height,
+        icc_profile,
+    )
+}
 
+/// Frame-level half of [`decode_transcoded_coefficients`]: the quantized
+/// DCT coefficients of ONE VarDCT + YCbCr frame whose FrameHeader and
+/// TOC are already parsed. `frame_bytes` starts at the first TOC
+/// section (the byte after the TOC's ZeroPadToByte); `width` / `height`
+/// are the frame's logical pixel dimensions before any MCU padding
+/// (`fh.width` / `fh.height` — the §F.2 subsampled block-grid rule pads
+/// a private copy of the header). The pixel decoder
+/// ([`crate::jpeg_pixels`]) drives this for every JPEG-recompressed
+/// frame it meets in the frame array; Annex A reconstruction reaches it
+/// through the single-frame entry above.
+#[doc(hidden)] // internal: mid-pipeline driver shared with the pixel decoder
+pub fn decode_transcoded_frame(
+    fh: &crate::frame_header::FrameHeader,
+    toc: &crate::toc::Toc,
+    metadata: &ImageMetadataFdis,
+    frame_bytes: &[u8],
+    width: u32,
+    height: u32,
+    icc_profile: Option<Vec<u8>>,
+) -> Result<TranscodedCoefficients> {
+    if metadata.xyb_encoded {
+        return Err(Error::Unsupported(
+            "JXL jpeg_reconstruct: frame is xyb_encoded (not a JPEG transcode)".into(),
+        ));
+    }
     if fh.encoding != Encoding::VarDct || !fh.do_ycbcr {
         return Err(Error::Unsupported(
             "JXL jpeg_reconstruct: transcode frame must be VarDCT + YCbCr".into(),
         ));
     }
-    if !fh.is_last || fh.have_crop || fh.frame_type != crate::frame_header::FrameType::Regular {
+    if fh.have_crop || fh.frame_type != crate::frame_header::FrameType::Regular {
         return Err(Error::Unsupported(
             "JXL jpeg_reconstruct: transcode must be a single full regular frame".into(),
         ));
@@ -153,6 +197,12 @@ pub fn decode_transcoded_coefficients(codestream: &[u8]) -> Result<TranscodedCoe
         return Err(Error::Unsupported(format!(
             "JXL jpeg_reconstruct: {} passes (only single-pass transcodes handled)",
             fh.passes.num_passes
+        )));
+    }
+    if metadata.num_extra_channels != 0 {
+        return Err(Error::Unsupported(format!(
+            "JXL jpeg_reconstruct: {} extra channels on a JPEG transcode frame",
+            metadata.num_extra_channels
         )));
     }
     let shifts = fh.jpeg_upsampling_shifts();
@@ -171,7 +221,7 @@ pub fn decode_transcoded_coefficients(codestream: &[u8]) -> Result<TranscodedCoe
     // nb_blocks, NonZeros lattices, group rects) follow the same
     // rule. Group / LfGroup / CfL-tile counts cannot change: the pad
     // is < MCU ≤ 16 px and every such boundary is a multiple of 16.
-    let mut fh = fh;
+    let mut fh = fh.clone();
     if subsampled {
         let max_hs = shifts.iter().map(|&(h, _)| h).max().unwrap_or(0);
         let max_vs = shifts.iter().map(|&(_, v)| v).max().unwrap_or(0);
@@ -189,8 +239,6 @@ pub fn decode_transcoded_coefficients(codestream: &[u8]) -> Result<TranscodedCoe
 
     let num_groups = fh.num_groups();
     let num_lf_groups = fh.num_lf_groups();
-    let frame_data_start = br.bytes_consumed();
-    let frame_bytes = &codestream[frame_data_start..];
     let total_frame_len: u64 = toc.entries.iter().map(|&e| e as u64).sum();
     if total_frame_len > frame_bytes.len() as u64 {
         return Err(Error::InvalidData(
@@ -247,8 +295,8 @@ pub fn decode_transcoded_coefficients(codestream: &[u8]) -> Result<TranscodedCoe
     // Section walk (mirrors the pixel decoder's layout logic).
     let (lf_global, lf_groups, mut hf_section, pass_group_readers) = if single_toc {
         let mut shared = BitReader::new_section(section_bytes(0)?);
-        let lf_global = LfGlobal::read(&mut shared, &fh, &metadata)?;
-        let lf_group = crate::lf_group::LfGroup::read(&mut shared, &fh, &lf_global, &metadata, 0)?;
+        let lf_global = LfGlobal::read(&mut shared, &fh, metadata)?;
+        let lf_group = crate::lf_group::LfGroup::read(&mut shared, &fh, &lf_global, metadata, 0)?;
         let nb_block_ctx = require_hbc(&lf_global)?.nb_block_ctx;
         let raw_ctx = crate::hf_global::RawDequantContext {
             num_lf_groups,
@@ -264,12 +312,12 @@ pub fn decode_transcoded_coefficients(codestream: &[u8]) -> Result<TranscodedCoe
         (lf_global, vec![lf_group], hf_section, vec![vec![shared]])
     } else {
         let mut lf_br = BitReader::new_section(section_bytes(0)?);
-        let lf_global = LfGlobal::read(&mut lf_br, &fh, &metadata)?;
+        let lf_global = LfGlobal::read(&mut lf_br, &fh, metadata)?;
         let mut lf_groups = Vec::with_capacity(num_lf_groups as usize);
         for lg in 0..num_lf_groups {
             let mut lg_br = BitReader::new_section(section_bytes(1 + lg as usize)?);
             lf_groups.push(crate::lf_group::LfGroup::read(
-                &mut lg_br, &fh, &lf_global, &metadata, lg as u32,
+                &mut lg_br, &fh, &lf_global, metadata, lg as u32,
             )?);
         }
         let nb_block_ctx = require_hbc(&lf_global)?.nb_block_ctx;
@@ -609,8 +657,8 @@ pub fn decode_transcoded_coefficients(codestream: &[u8]) -> Result<TranscodedCoe
     }
 
     Ok(TranscodedCoefficients {
-        width: size.width,
-        height: size.height,
+        width,
+        height,
         jpeg_upsampling: fh.jpeg_upsampling,
         bw: fbw,
         bh: fbh,
