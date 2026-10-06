@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.15](https://github.com/OxideAV/oxideav-jpegxl/compare/v0.0.14...v0.0.15) - 2026-10-06
+
+### Other
+
+- README / CHANGELOG — planar transcode layouts, the reconstruction matrix (sampling × progressive × DRI) and what remains
+- fuzz — jpeg_recon also drives the pixel path (decode + to_rgb8) of transcode inputs; corpus seeded with every subsampled fixture
+- Annex A reconstruction matrix — 4:4:4 / 4:2:0 / 4:2:2 / 4:4:0 × baseline / progressive × DRI, byte-exact; 4:4:0 joins the pin set
+- pixel decode of recompressed JPEGs on every sampling lattice — planar YuvJ444P/422P/420P + Yuv440P native layouts, exact coefficient decode shared with Annex A reconstruction
+
 ### Added
 
 - **Pixel decode of losslessly recompressed JPEGs on every sampling
