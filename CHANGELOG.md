@@ -7,6 +7,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Pixel decode of losslessly recompressed JPEGs on every sampling
+  lattice** (round 473). A `do_YCbCr` VarDCT frame — what
+  `cjxl --lossless_jpeg=1` writes — previously decoded as garbage RGB
+  (4:4:4) or `Unsupported` ("subsampled LF channels", 4:2:0 / 4:2:2 /
+  4:4:0) on both the standalone and the registry path; it now runs the
+  exact coefficient decoder behind Annex A reconstruction and the JPEG
+  sample pipeline (dequant + 10918-1 IDCT per channel on its own
+  lattice, 8-bit clamp). Stills decode to the JPEG's own planar
+  samples in the new `PixelFormat::{YuvJ444P, YuvJ422P, YuvJ420P,
+  Yuv440P}` layouts (full range, matrix 5 on `ColorInfo`; chroma
+  planes `ceil(w / h) × ceil(h / v)`); greyscale transcodes to
+  `Gray8`; transcode frames in animations or under a non-identity
+  orientation come out as `Rgb24`. `to_rgb8` / `to_rgba8` apply the
+  ISO/IEC 18181-1 J.2 triangle upsampling and the §L.3 (T.871) matrix.
+  Every committed fixture is within ≤ 3 per sample of `djpeg` on the
+  original JPEG (4:4:4 / grey ≥ 96 % exact, subsampled ≥ 60 % exact,
+  mean ≤ 0.36).
+- `JxlPixelFormat::{is_planar, plane_count, chroma_shift, plane_dims}`,
+  `ColorInfo::MATRIX_BT601`; `JxlImage::new` accepts and validates the
+  three planes of a planar layout; `as_bytes()` is `None` for planar
+  images. The framework frame bridge carries all planes both ways and
+  maps the four new labels 1:1.
+- `jpeg_reconstruct::decode_transcoded_frame` (`#[doc(hidden)]`): the
+  frame-level half of `decode_transcoded_coefficients`, callable with
+  an already-parsed FrameHeader / TOC.
+- Reconstruction matrix fixtures (`r473_*`): 4:4:4 / 4:2:0 / 4:2:2 /
+  4:4:0 × baseline / progressive × with / without DRI, byte-exact
+  against the original JPEG (4:4:0 is new to the pin set; `cjxl`
+  refuses the 4:2:0 and 4:2:2 progressive + DRI sources).
+
+### Changed
+
+- `info().format` and the `jpegxl` demuxer's `pixel_format` report the
+  planar label for a recompressed JPEG still; `DecodeOptions::max_bytes`
+  counts luma plus the two chroma planes for them.
+- The `jpeg_recon` fuzz target also drives `decode` + `to_rgb8` on its
+  inputs.
+
 ## [0.0.14](https://github.com/OxideAV/oxideav-jpegxl/compare/v0.0.13...v0.0.14) - 2026-10-05
 
 ### Other

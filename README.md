@@ -53,9 +53,11 @@ Root items: `probe(&[u8]) -> bool`, `info -> ImageInfo`,
 `DecodeOptions`, `EncodeOptions`, `Error` (= `JxlError`).
 
 `JxlImage` is `{ width, height, format, planes: Vec<Plane>, color,
-metadata, bits_per_sample }` — exactly one packed plane (stride
-`width × bytes_per_pixel`); no `palette` (the Modular palette transform
-is undone inside the decoder). `JxlImage::new` / `from_rgb8` /
+metadata, bits_per_sample }` — one packed plane (stride `width ×
+bytes_per_pixel`), or the three `Y` / `Cb` / `Cr` planes of a
+recompressed JPEG (`PixelFormat::plane_count`, `plane_dims`); no
+`palette` (the Modular palette transform is undone inside the
+decoder). `JxlImage::new` / `from_rgb8` /
 `from_rgba8` validate geometry and return `Result`.
 
 Depth APIs keep their names: `headers` (committee-draft preamble),
@@ -130,7 +132,31 @@ uses the same label):
 | grey + alpha, 9 ..= 16 | `Ya16Le` | |
 | RGB, 9 ..= 16 | `Rgb48Le` | |
 | RGB + alpha, 9 ..= 16 | `Rgba64Le` | |
+| recompressed JPEG, 4:4:4 | `YuvJ444P` | three planes `Y`, `Cb`, `Cr`; full range, matrix 5 (sYCC) |
+| recompressed JPEG, 4:2:0 | `YuvJ420P` | chroma `ceil(w / 2) × ceil(h / 2)` |
+| recompressed JPEG, 4:2:2 | `YuvJ422P` | chroma `ceil(w / 2) × h` |
+| recompressed JPEG, 4:4:0 | `Yuv440P` | chroma `w × ceil(h / 2)`; full range on `ColorInfo` (core has no `YuvJ440P`) |
+| recompressed greyscale JPEG | `Gray8` | the luma plane |
 
+* **A losslessly recompressed JPEG decodes to the JPEG's own samples**
+  (round 473): a still whose single frame is `kVarDCT + do_YCbCr`
+  (what `cjxl --lossless_jpeg=1` writes, with or without the `jbrd`
+  box) runs the exact coefficient decoder of Annex A reconstruction,
+  then dequantisation + the 10918-1 A.3.3 IDCT per channel on its own
+  sampling lattice, clamped to 8 bits like any JPEG decoder — the
+  planar native layout carries exactly those samples. `to_rgb8` /
+  `to_rgba8` upsample the chroma planes with the ISO/IEC 18181-1 J.2
+  triangle filter (`0.25·A + 0.75·B`, edge-replicated) and apply the
+  §L.3 (T.871) matrix. Against `djpeg` on the original JPEG every
+  committed fixture is within **≤ 3 per sample** (4:4:4 / grey:
+  ≥ 96 % of samples exact, IDCT rounding only; subsampled: ≥ 60 %
+  exact, mean ≤ 0.36 — the upsampled chroma stays float here where
+  `djpeg` rounds it first). Transcode frames inside an animation, with
+  a non-identity orientation or alongside extra channels take the
+  generic pipeline and come out as `Rgb24` (J.2 + §L.3 applied in the
+  decoder); `info` / the registry stream publish the same label
+  `decode` returns. 4:1:1 / 4:1:0 JPEGs cannot be recompressed at all
+  (`jpeg_upsampling` describes {1,1}, {2,2}, {2,1}, {1,2} only).
 * **VarDCT frames reconstruct to 8 bits per sample** whatever the
   declared depth (`info` reads the first frame header and reports the
   8-bit label in that case); Modular frames keep the declared depth.
@@ -145,7 +171,9 @@ uses the same label):
   are `Error::Unsupported` — no `*F32Le` layout is produced yet.
 * `to_rgb8` / `to_rgba8`: grey replicated to R = G = B, alpha dropped /
   set to 255, deeper samples scaled by `255 / (2^bits_per_sample − 1)`
-  with round-to-nearest.
+  with round-to-nearest; the planar layouts as described above.
+  `as_bytes()` is `None` for the planar layouts (`into_raw` concatenates
+  the three planes).
 
 Encode: none. `encode`, `encode_rgb8`, `encode_rgba8`, `encode_to`
 return `Error::Unsupported("JPEG XL encoding is not implemented")`;
@@ -850,6 +878,57 @@ generated `cjxl` transcode pairs:
   `jpegtran -restart` specimens). Arithmetic-coded JPEGs (SOF9/10)
   refuse precisely.
 
+#### Round 473 — pixel decode of recompressed JPEGs on every sampling lattice; the reconstruction matrix
+
+- **Transcode frames decode to pixels** (`jpeg_pixels`): the contract
+  `decode` of a `do_YCbCr` VarDCT frame used to run the XYB pipeline —
+  garbage RGB for 4:4:4, `Unsupported` ("subsampled LF channels") for
+  every chroma-subsampled file, on the standalone and the registry
+  path alike (the `oxideav-image` gateway finding). Every such frame
+  now goes through `jpeg_reconstruct::decode_transcoded_frame` (the
+  exact integer coefficient decode, split out of the Annex A entry so
+  the frame loop can call it with an already-parsed header) and the
+  JPEG sample pipeline per channel on its own lattice: dequant +
+  10918-1 A.3.3 IDCT, +128, clamp, §6.2 crop of the MCU-padded canvas
+  to `ceil(w / h) × ceil(h / v)`. Stills with identity orientation and
+  no extra channels come out as planar `YuvJ444P` / `YuvJ420P` /
+  `YuvJ422P` / `Yuv440P` (new `#[non_exhaustive]` variants; `JxlImage`
+  validates three planes; `to_rgb8` = J.2 triangle upsampling + §L.3);
+  greyscale transcodes as `Gray8`; anything else (animation frames,
+  oriented files) as `Rgb24` through the generic composer. The
+  framework decoder carries the three planes with the matching core
+  label and `color_signal` (full range, matrix 5).
+- **Tolerance vs `djpeg`** (original JPEG, accurate integer IDCT,
+  fancy upsampling), 28 committed fixtures: ≤ 3 per sample everywhere;
+  4:4:4 / grey ≥ 96 % exact (hard-edge content byte-exact), subsampled
+  ≥ 60 % exact with mean ≤ 0.36. The reference JPEG XL decoder itself
+  sits ≤ 3 from `djpeg` on smooth content and up to ±15 on noisy
+  4:4:4 (it does not clamp YCbCr before the colour transform); this
+  path tracks `djxl` to ≤ 3 on 4:2:0.
+- **Reconstruction matrix**, byte-exact against the original JPEG
+  (`tests/r473_reconstruct_matrix.rs`, fixtures + command lines in
+  `tests/fixtures/r473_matrix_NOTES.md`; 100×60 so every subsampled
+  class is MCU-padded on both axes):
+
+  | sampling | baseline | baseline + DRI | progressive | progressive + DRI |
+  |---|---|---|---|---|
+  | 4:4:4 | ✅ | ✅ | ✅ | ✅ |
+  | 4:2:0 | ✅ | ✅ | ✅ | `cjxl` refuses the source |
+  | 4:2:2 | ✅ | ✅ | ✅ | `cjxl` refuses the source |
+  | 4:4:0 | ✅ | ✅ | ✅ | ✅ |
+  | 4:1:1 / 4:1:0 | not representable (`jpeg_upsampling` F.2) | | | |
+  | greyscale | ✅ (r451) | ✅ (r451) | ✅ (r451) | — |
+
+  4:4:0 (`jpeg_upsampling` = {0, 3, 0}) is new to the pin set; the
+  earlier rounds covered 4:4:4 / 4:2:0 / 4:2:2 with custom orders,
+  COM / APPn / ICC / Exif / XMP segments and odd dimensions. The
+  pixel path is pinned on the same matrix, and the variants of one
+  sampling class decode to byte-identical planes.
+- `DecodeOptions::max_bytes` counts the planar output (luma + two
+  chroma planes); the `jpeg_recon` fuzz target now also drives
+  `decode` + `to_rgb8` on its inputs, seeded with every subsampled
+  fixture.
+
 #### Not yet implemented
 
 - **A rare self-consistent §C.8.3 chroma mis-parse** (round 451):
@@ -890,8 +969,11 @@ generated `cjxl` transcode pairs:
   domain undetermined) and kNoise on Modular frames stay refused.
 - Arithmetic-coded JPEG (SOF9/SOF10) reconstruction (refuses
   precisely; no staged specimen — `cjxl` declines arithmetic input).
-  Pixel-domain decode of YCbCr transcode frames (the registered
-  decoder still refuses them; reconstruction is coefficient-level).
+  `do_YCbCr` VarDCT frames outside the transcode class — default
+  (non-RAW) dequant matrices, multi-pass, restoration filters on, a
+  `save_before_ct` reference recording — refuse precisely instead of
+  decoding (no encoder is known to write them; the XYB-domain
+  pipeline would be wrong for them).
 - The LfFrame (`lf_level > 0`) dimension scaling `progressive-dc`
   needs.
 - The encoder (`encode*` return `Error::Unsupported`; a lossless
