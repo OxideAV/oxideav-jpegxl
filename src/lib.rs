@@ -1558,8 +1558,18 @@ fn decode_frame_body(
         acc = acc.saturating_add(e as u64);
     }
     let section_byte_range = |idx: usize| -> Result<&[u8]> {
-        let start = section_starts[idx];
-        let len = toc.entries[idx] as usize;
+        // A hostile header can make the slot layout (groups, LF groups,
+        // passes) disagree with the entry count the TOC was read with
+        // (round 477 fuzz: a one-entry TOC on a frame whose channels
+        // were not fully decoded in GlobalModular): a typed error, not
+        // an index panic.
+        let (Some(&start), Some(&len)) = (section_starts.get(idx), toc.entries.get(idx)) else {
+            return Err(Error::InvalidData(format!(
+                "JXL decoder: section slot {idx} beyond the {}-entry TOC",
+                toc.entries.len()
+            )));
+        };
+        let len = len as usize;
         let end = start + len;
         if end > frame_bytes.len() {
             return Err(Error::InvalidData(format!(

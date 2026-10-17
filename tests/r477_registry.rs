@@ -489,3 +489,54 @@ fn muxer_refuses_what_it_cannot_retime() {
     ));
     let _ = open_demuxer(reader(ANIMATION), &NullCodecResolver).unwrap();
 }
+
+/// Round-477 `mux_splice` fuzz find: a byte flip in a spliced still made
+/// the decoder index past a one-entry TOC (LfGroup slot on a frame whose
+/// GlobalModular did not finish) — a typed error now, never a panic.
+#[test]
+fn flipped_spliced_still_fails_cleanly() {
+    let tb = TimeBase::new(1, 100);
+    let (w, h) = (10u32, 18u32);
+    let body = [0xf9u8, 0x11, 0x11];
+    let n = (w * h * 3) as usize;
+    let mut packets = Vec::new();
+    for k in 0..2u8 {
+        let px: Vec<u8> = (0..n)
+            .map(|i| body[(i + usize::from(k)) % body.len()])
+            .collect();
+        let img = JxlImage::from_rgb8(w, h, px).unwrap();
+        let mut bytes =
+            oxideav_jpegxl::encode(&img, &oxideav_jpegxl::EncodeOptions::default()).unwrap();
+        if k == 1 {
+            let at = 0x11 % bytes.len();
+            bytes[at] ^= body[2] | 1;
+        }
+        let mut p = Packet::new(0, tb, bytes);
+        p.pts = Some(i64::from(k) * 7);
+        p.duration = Some(7);
+        packets.push(p);
+    }
+    if let Ok(out) = mux(tb, &packets) {
+        let _ = decode_all(&out);
+        let _ = decode(&out);
+    }
+    // Every byte flip over the whole spliced file, too.
+    let clean: Vec<Packet> = packets
+        .iter()
+        .enumerate()
+        .map(|(k, p)| {
+            let img =
+                JxlImage::from_rgb8(w, h, (0..n).map(|i| body[(i + k) % 3]).collect()).unwrap();
+            let mut q = p.clone();
+            q.data =
+                oxideav_jpegxl::encode(&img, &oxideav_jpegxl::EncodeOptions::default()).unwrap();
+            q
+        })
+        .collect();
+    let out = mux(tb, &clean).unwrap();
+    for at in 0..out.len() {
+        let mut flipped = out.clone();
+        flipped[at] ^= 0x11;
+        let _ = decode_all(&flipped);
+    }
+}

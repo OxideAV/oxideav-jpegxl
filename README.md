@@ -1102,8 +1102,9 @@ generated `cjxl` transcode pairs:
   needs.
 - On the encoder: VarDCT (lossy XYB) output, the self-correcting
   predictor, Palette / Squeeze, LZ77 / ANS coding, context modelling
-  beyond one leaf per channel (the lossless ratio is PNG-class, not a
-  reference encoder's), extra channels beyond one alpha, float samples.
+  beyond one leaf per channel (the lossless ratio is PNG-class; richer
+  context modelling is follow-up material), extra channels beyond one
+  alpha, float samples.
 
 Unsupported inputs surface as `Error::Unsupported` rather than a silent
 misparse.
