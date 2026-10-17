@@ -1,18 +1,38 @@
-//! Entropy *encoder* — the inverse of Annex C for the prefix-code path
-//! (`use_prefix_code = 1`, LZ77 off): the C.2.1 prelude (LZ77 flag,
-//! C.2.2 simple clustering, hybrid-integer configurations, per-cluster
-//! symbol counts, RFC 7932 §3.4 / §3.5 prefix codes) and the C.3.3
-//! hybrid-integer symbol stream.
+//! Entropy *encoder* — the inverse of Annex C with LZ77 off: the C.2.1
+//! prelude (LZ77 flag, C.2.2 simple clustering, hybrid-integer
+//! configurations, then either per-cluster symbol counts + RFC 7932
+//! §3.4 / §3.5 prefix codes, or `5 + u(2)` alphabet bits + C.2.5 ANS
+//! distributions) and the C.3.3 hybrid-integer symbol stream (C.3.2
+//! rANS: one 32-bit state per stream, 12-bit probabilities, 16-bit
+//! renormalisation, final state `0x130000`).
 //!
 //! Two passes: [`SymbolStats`] collects every `(context, value)` the
-//! caller will emit, [`EntropyCodes::build`] turns the statistics into
-//! prefix codes, and the caller then writes the prelude followed —
-//! possibly after intervening bundle fields, as the GlobalModular
-//! layout requires — by the symbols in the same order.
+//! caller will emit, [`EntropyCodes::build`] /
+//! [`EntropyCodes::build_with`] turn the statistics into codes, and the
+//! caller then writes the prelude followed — possibly after intervening
+//! bundle fields, as the GlobalModular layout requires — by the symbols
+//! in the same order through [`EntropyCodes::write_symbols`]. An ANS
+//! stream is built backwards (the state the decoder ends on is the
+//! encoder's starting point), so the symbols must be presented twice.
 
+use crate::ans::alias::AliasTable;
+use crate::ans::distribution::K_LOG_COUNT_LUT;
 use crate::ans::prefix::{K_CODE_LENGTH_CODE_ORDER, MAX_CODE_LENGTH};
 use crate::bitwriter::BitWriter;
 use crate::error::{Error, Result};
+
+/// The C.3.2 state every ANS stream ends on.
+pub const ANS_FINAL_STATE: u32 = 0x130000;
+
+/// Which symbol coding a stream uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Coding {
+    /// RFC 7932 prefix codes — whole bits per symbol, no state.
+    Prefix,
+    /// C.2.5 / C.3.2 ANS — fractional bits per symbol, one 32-bit
+    /// state (and its initialiser) per stream.
+    Ans,
+}
 
 /// `log_alphabet_size` of every prefix-coded stream (C.2.1).
 pub const PREFIX_LOG_ALPHABET_SIZE: u32 = 15;
@@ -400,6 +420,181 @@ impl PrefixCodeWriter {
     }
 }
 
+/// One ANS cluster: the 12-bit distribution and, per symbol, the slot
+/// each offset lives in under the decoder's alias mapping (C.2.6).
+#[derive(Debug, Clone)]
+struct AnsCluster {
+    /// `1 << log_alphabet_size` entries summing to 4096.
+    dist: Vec<u16>,
+    /// `slot_of[sym][offset]` for `offset < dist[sym]`.
+    slot_of: Vec<Vec<u16>>,
+}
+
+/// Scale `counts` to a 4096-sum distribution with every used symbol
+/// at least 1 (the largest symbol absorbs the rounding).
+fn normalize_counts(counts: &[u64]) -> Vec<u16> {
+    let total: u64 = counts.iter().sum();
+    let mut d = vec![0u16; counts.len()];
+    if total == 0 {
+        return d;
+    }
+    let mut sum = 0u32;
+    let mut largest = 0usize;
+    for (i, &c) in counts.iter().enumerate() {
+        if c == 0 {
+            continue;
+        }
+        let v = ((c as u128 * 4096 + (total as u128) / 2) / total as u128) as u32;
+        let v = v.clamp(1, 4095);
+        d[i] = v as u16;
+        sum += v;
+        if counts[i] > counts[largest] || d[largest] == 0 {
+            largest = i;
+        }
+    }
+    // Settle on exactly 4096: move the difference onto the largest
+    // symbol, then if that would drive it below 1 take from the others.
+    let target = 4096i64;
+    let mut diff = target - i64::from(sum);
+    let l = i64::from(d[largest]);
+    if l + diff >= 1 {
+        d[largest] = (l + diff) as u16;
+        diff = 0;
+    }
+    let mut i = 0usize;
+    while diff != 0 {
+        if d[i] > 1 && diff < 0 {
+            d[i] -= 1;
+            diff += 1;
+        } else if diff > 0 && d[i] > 0 {
+            d[i] += 1;
+            diff -= 1;
+        }
+        i = (i + 1) % d.len();
+    }
+    d
+}
+
+/// `u8()` of C.2.5: `0` as one bit, else `1`, `u(3)` exponent, `u(n)`.
+fn write_u8_value(w: &mut BitWriter, v: u32) {
+    if v == 0 {
+        w.write_bool(false);
+        return;
+    }
+    w.write_bool(true);
+    let n = 31 - v.leading_zeros();
+    w.write_bits(3, n);
+    w.write_bits(n, v - (1 << n));
+}
+
+/// The log-count prefix code of C.2.5 (`K_LOG_COUNT_LUT` inverted):
+/// `(bits, length)` for each value 0..=13.
+fn logcount_codes() -> [(u32, u32); 14] {
+    let mut out = [(0u32, 0u32); 14];
+    let mut seen = [false; 14];
+    for (h, &[len, value]) in K_LOG_COUNT_LUT.iter().enumerate() {
+        let v = value as usize;
+        if v < 14 && !seen[v] {
+            seen[v] = true;
+            out[v] = ((h as u32) & ((1 << len) - 1), u32::from(len));
+        }
+    }
+    out
+}
+
+/// Write one C.2.5 distribution for `dist` (4096-sum, length
+/// `1 << log_alphabet_size`): the one- and two-symbol short forms, else
+/// the log-count form at full precision (`shift = 13`).
+fn write_distribution(w: &mut BitWriter, dist: &[u16]) {
+    let used: Vec<usize> = (0..dist.len()).filter(|&i| dist[i] > 0).collect();
+    match used.len() {
+        0 | 1 => {
+            w.write_bool(true);
+            w.write_bool(false);
+            write_u8_value(w, used.first().copied().unwrap_or(0) as u32);
+            return;
+        }
+        2 => {
+            w.write_bool(true);
+            w.write_bool(true);
+            write_u8_value(w, used[0] as u32);
+            write_u8_value(w, used[1] as u32);
+            w.write_bits(12, u32::from(dist[used[0]]));
+            return;
+        }
+        _ => {}
+    }
+    w.write_bool(false);
+    w.write_bool(false); // not flat
+                         // shift = 13: three 1-bits then u(3) = 13 - 7.
+    w.write_bits(3, 0b111);
+    w.write_bits(3, 6);
+    let alphabet_size = (used[used.len() - 1] + 1).max(3);
+    write_u8_value(w, (alphabet_size - 3) as u32);
+    let codes = logcount_codes();
+    let logcount = |v: u16| -> u32 {
+        if v == 0 {
+            0
+        } else {
+            32 - u32::from(v).leading_zeros()
+        }
+    };
+    // The omitted symbol: first occurrence of the largest log count.
+    let mut omit = 0usize;
+    for i in 0..alphabet_size {
+        if logcount(dist[i]) > logcount(dist[omit]) {
+            omit = i;
+        }
+    }
+    for &d in &dist[..alphabet_size] {
+        let (bits, len) = codes[logcount(d) as usize];
+        w.write_bits(len, bits);
+    }
+    for (i, &d) in dist[..alphabet_size].iter().enumerate() {
+        let v = u32::from(d);
+        let c = logcount(d);
+        if i == omit || c <= 1 {
+            continue;
+        }
+        let inner = (13 - c) >> 1;
+        let bitcount = (13u32.saturating_sub(inner)).min(c - 1);
+        debug_assert_eq!(bitcount, c - 1, "shift 13 keeps full precision");
+        w.write_bits(bitcount, (v - (1 << (c - 1))) >> (c - 1 - bitcount));
+    }
+}
+
+impl AnsCluster {
+    fn build(counts: &[u64], log_alphabet_size: u32) -> Result<Self> {
+        let table = 1usize << log_alphabet_size;
+        let mut dist = normalize_counts(counts);
+        dist.resize(table, 0);
+        if dist.iter().all(|&d| d == 0) {
+            dist[0] = 4096;
+        }
+        let alias = AliasTable::build(&dist, log_alphabet_size)?;
+        let mut slot_of: Vec<Vec<u16>> = dist
+            .iter()
+            .map(|&d| vec![u16::MAX; usize::from(d)])
+            .collect();
+        for x in 0..4096u32 {
+            let (sym, off) = alias.lookup(x);
+            let slots = slot_of.get_mut(usize::from(sym)).ok_or_else(|| {
+                Error::invalid("JXL writer: alias symbol beyond the distribution")
+            })?;
+            let cell = slots.get_mut(off as usize).ok_or_else(|| {
+                Error::invalid("JXL writer: alias offset beyond the symbol's probability")
+            })?;
+            *cell = x as u16;
+        }
+        if slot_of.iter().flatten().any(|&s| s == u16::MAX) {
+            return Err(Error::invalid(
+                "JXL writer: alias mapping does not cover every offset",
+            ));
+        }
+        Ok(Self { dist, slot_of })
+    }
+}
+
 /// Symbol statistics of one entropy-coded stream: `num_dist` contexts
 /// mapped onto clusters, one hybrid configuration per cluster.
 #[derive(Debug, Clone)]
@@ -465,10 +660,12 @@ pub struct EntropyCodes {
     cluster_map: Vec<u32>,
     configs: Vec<HybridConfig>,
     codes: Vec<PrefixCodeWriter>,
+    /// `Some((log_alphabet_size, clusters))` for an ANS stream.
+    ans: Option<(u32, Vec<AnsCluster>)>,
 }
 
 impl EntropyCodes {
-    /// Build the per-cluster prefix codes from the statistics.
+    /// Build per-cluster prefix codes from the statistics.
     pub fn build(stats: &SymbolStats) -> Self {
         let codes = stats
             .counts
@@ -485,11 +682,52 @@ impl EntropyCodes {
             cluster_map: stats.cluster_map.clone(),
             configs: stats.configs.clone(),
             codes,
+            ans: None,
         }
     }
 
-    /// Write the C.2.1 prelude: LZ77 off, the clustering, the prefix
-    /// flag, the configurations, the counts and the codes.
+    /// Build with the given coding. ANS needs every token below 256
+    /// (`log_alphabet_size <= 8`); larger tokens fall back to prefix
+    /// codes.
+    pub fn build_with(stats: &SymbolStats, coding: Coding) -> Result<Self> {
+        let mut codes = Self::build(stats);
+        if coding == Coding::Prefix {
+            return Ok(codes);
+        }
+        let max_tokens = stats
+            .counts
+            .iter()
+            .map(|c| c.len())
+            .max()
+            .unwrap_or(0)
+            .max(1);
+        if max_tokens > 256 {
+            return Ok(codes);
+        }
+        let log_alphabet_size = (5..=8u32)
+            .find(|&l| (1usize << l) >= max_tokens)
+            .expect("max_tokens <= 256");
+        let clusters = stats
+            .counts
+            .iter()
+            .map(|c| AnsCluster::build(c, log_alphabet_size))
+            .collect::<Result<Vec<_>>>()?;
+        codes.ans = Some((log_alphabet_size, clusters));
+        Ok(codes)
+    }
+
+    /// The coding this stream uses.
+    pub fn coding(&self) -> Coding {
+        if self.ans.is_some() {
+            Coding::Ans
+        } else {
+            Coding::Prefix
+        }
+    }
+
+    /// Write the C.2.1 prelude: LZ77 off, the clustering, the coding
+    /// flag, the configurations, then the prefix counts + codes or the
+    /// ANS alphabet size + distributions.
     pub fn write_prelude(&self, w: &mut BitWriter) {
         w.write_bool(false); // lz77.enabled
         let num_dist = self.cluster_map.len();
@@ -502,24 +740,88 @@ impl EntropyCodes {
                 w.write_bits(nbits, c);
             }
         }
-        w.write_bool(true); // use_prefix_code
-        for cfg in &self.configs {
-            cfg.write(w, PREFIX_LOG_ALPHABET_SIZE);
-        }
-        for code in &self.codes {
-            code.write_count(w);
-        }
-        for code in &self.codes {
-            code.write(w);
+        match &self.ans {
+            None => {
+                w.write_bool(true); // use_prefix_code
+                for cfg in &self.configs {
+                    cfg.write(w, PREFIX_LOG_ALPHABET_SIZE);
+                }
+                for code in &self.codes {
+                    code.write_count(w);
+                }
+                for code in &self.codes {
+                    code.write(w);
+                }
+            }
+            Some((log_alphabet_size, clusters)) => {
+                w.write_bool(false); // use_prefix_code
+                w.write_bits(2, log_alphabet_size - 5);
+                for cfg in &self.configs {
+                    cfg.write(w, *log_alphabet_size);
+                }
+                for c in clusters {
+                    write_distribution(w, &c.dist);
+                }
+            }
         }
     }
 
-    /// Write one hybrid integer in context `ctx`.
+    /// Write one hybrid integer in context `ctx` (prefix streams only;
+    /// an ANS stream goes through [`write_symbols`](Self::write_symbols)).
     pub fn write(&self, w: &mut BitWriter, ctx: u32, value: u32) {
+        debug_assert!(self.ans.is_none(), "ANS streams are written as a whole");
         let cluster = self.cluster_map[ctx as usize] as usize;
         let (token, nbits, extra) = self.configs[cluster].tokenize(value);
         self.codes[cluster].write_symbol(w, token);
         w.write_bits(nbits, extra);
+    }
+
+    /// Write a whole symbol stream `(context, value)` in order. For an
+    /// ANS stream this emits the `u(32)` state initialiser first (the
+    /// reader takes it right before the first symbol), then per symbol
+    /// the optional 16-bit renormalisation word followed by the hybrid
+    /// integer's extra bits; the stream ends on [`ANS_FINAL_STATE`].
+    pub fn write_symbols<I>(&self, w: &mut BitWriter, symbols: I)
+    where
+        I: Iterator<Item = (u32, u32)> + DoubleEndedIterator + Clone,
+    {
+        let Some((_, clusters)) = &self.ans else {
+            for (ctx, v) in symbols {
+                self.write(w, ctx, v);
+            }
+            return;
+        };
+        // Backward pass: from the final state to the initial one,
+        // recording which symbols carry a renormalisation word.
+        let mut state: u32 = ANS_FINAL_STATE;
+        let mut words: Vec<Option<u16>> = Vec::new();
+        for (ctx, v) in symbols.clone().rev() {
+            let cluster = self.cluster_map[ctx as usize] as usize;
+            let (token, _, _) = self.configs[cluster].tokenize(v);
+            let c = &clusters[cluster];
+            let f = u32::from(c.dist[token as usize]);
+            debug_assert!(f > 0, "token {token} has probability 0");
+            let mut word = None;
+            // `f << 20` reaches 2^32 for a one-symbol cluster: compare
+            // in 64 bits (such a symbol never renormalises).
+            if u64::from(state) >= (u64::from(f) << 20) {
+                word = Some((state & 0xFFFF) as u16);
+                state >>= 16;
+            }
+            let slot = u32::from(c.slot_of[token as usize][(state % f) as usize]);
+            state = ((state / f) << 12) | slot;
+            words.push(word);
+        }
+        words.reverse();
+        w.write_bits(32, state);
+        for ((ctx, v), word) in symbols.zip(words) {
+            let cluster = self.cluster_map[ctx as usize] as usize;
+            let (_, nbits, extra) = self.configs[cluster].tokenize(v);
+            if let Some(word) = word {
+                w.write_bits(16, u32::from(word));
+            }
+            w.write_bits(nbits, extra);
+        }
     }
 }
 
@@ -531,25 +833,42 @@ mod tests {
     use crate::modular_fdis::{decode_uint_in_with_dist_pub, EntropyStream};
 
     fn round_trip(stats_fn: impl Fn() -> SymbolStats, symbols: &[(u32, u32)]) {
-        let mut stats = stats_fn();
-        for &(c, v) in symbols {
-            stats.add(c, v);
-        }
-        let codes = EntropyCodes::build(&stats);
-        let mut w = BitWriter::new();
-        codes.write_prelude(&mut w);
-        for &(c, v) in symbols {
-            codes.write(&mut w, c, v);
-        }
-        let bytes = w.into_bytes();
-        let num_dist = stats.cluster_map.len();
-        let mut br = BitReader::new(&bytes);
-        let mut es = EntropyStream::read(&mut br, num_dist).expect("prelude");
-        assert!(es.use_prefix_code);
-        let mut hy = HybridUintState::new(es.lz77, es.lz_len_conf);
-        for &(c, v) in symbols {
-            let got = decode_uint_in_with_dist_pub(&mut hy, &mut es, &mut br, c, 0).unwrap();
-            assert_eq!(got, v, "ctx {c}");
+        for coding in [Coding::Prefix, Coding::Ans] {
+            let mut stats = stats_fn();
+            for &(c, v) in symbols {
+                stats.add(c, v);
+            }
+            let codes = EntropyCodes::build_with(&stats, coding).unwrap();
+            let mut w = BitWriter::new();
+            codes.write_prelude(&mut w);
+            // Something between the prelude and the symbols, as the
+            // Modular layout has.
+            w.write_bits(5, 0b10110);
+            codes.write_symbols(&mut w, symbols.iter().copied());
+            w.write_bits(3, 0b101);
+            let bytes = w.into_bytes();
+            let num_dist = stats.cluster_map.len();
+            let mut br = BitReader::new(&bytes);
+            let mut es = EntropyStream::read(&mut br, num_dist).expect("prelude");
+            assert_eq!(
+                es.use_prefix_code,
+                coding == Coding::Prefix || codes.coding() == Coding::Prefix
+            );
+            assert_eq!(br.read_bits(5).unwrap(), 0b10110);
+            es.read_ans_state_init(&mut br).unwrap();
+            let mut hy = HybridUintState::new(es.lz77, es.lz_len_conf);
+            for &(c, v) in symbols {
+                let got = decode_uint_in_with_dist_pub(&mut hy, &mut es, &mut br, c, 0).unwrap();
+                assert_eq!(got, v, "{coding:?} ctx {c}");
+            }
+            if let Some(ans) = &es.ans_state {
+                assert!(ans.final_state(), "{coding:?}: stream ends on 0x130000");
+            }
+            assert_eq!(
+                br.read_bits(3).unwrap(),
+                0b101,
+                "{coding:?}: bit position after the stream"
+            );
         }
     }
 
@@ -660,6 +979,58 @@ mod tests {
         round_trip(
             || SymbolStats::single(1, HybridConfig::BYTES).unwrap(),
             &syms,
+        );
+    }
+
+    #[test]
+    fn ans_distributions_are_normalised_and_skewed_streams_cost_under_a_bit() {
+        let d = normalize_counts(&[1, 0, 1_000_000, 3, 0, 7]);
+        assert_eq!(d.iter().map(|&x| u32::from(x)).sum::<u32>(), 4096);
+        assert!(d[0] >= 1 && d[3] >= 1 && d[5] >= 1 && d[1] == 0 && d[4] == 0);
+        assert_eq!(normalize_counts(&[0, 5]), vec![0, 4096]);
+        // 4000 symbols, one rare: ANS spends well under one bit each.
+        let mut syms = vec![(0u32, 0u32); 4000];
+        syms[1234] = (0, 3);
+        let mut stats = SymbolStats::single(1, HybridConfig::RESIDUALS).unwrap();
+        for &(c, v) in &syms {
+            stats.add(c, v);
+        }
+        let codes = EntropyCodes::build_with(&stats, Coding::Ans).unwrap();
+        let mut w = BitWriter::new();
+        codes.write_prelude(&mut w);
+        codes.write_symbols(&mut w, syms.iter().copied());
+        assert!(
+            w.byte_len() < 60,
+            "{} bytes for 4000 near-constant symbols",
+            w.byte_len()
+        );
+        round_trip(
+            || SymbolStats::single(1, HybridConfig::RESIDUALS).unwrap(),
+            &syms,
+        );
+        // Three symbols, then a full 256-token alphabet (log 8).
+        round_trip(
+            || SymbolStats::single(1, HybridConfig::BYTES).unwrap(),
+            &[(0, 9), (0, 9), (0, 200), (0, 9), (0, 42)],
+        );
+    }
+
+    #[test]
+    fn a_constant_cluster_shares_the_state_with_a_varied_one() {
+        // Context 0 always 0 (a 4096-probability symbol), context 1 varied:
+        // the one-symbol cluster must never renormalise.
+        let mut syms = Vec::new();
+        for i in 0..3000u32 {
+            syms.push((0, 0));
+            syms.push((1, (i * 7919) % 97));
+        }
+        round_trip(
+            || SymbolStats::identity(2, HybridConfig::RESIDUALS).unwrap(),
+            &syms,
+        );
+        round_trip(
+            || SymbolStats::identity(3, HybridConfig::RESIDUALS).unwrap(),
+            &[(2, 5); 300],
         );
     }
 

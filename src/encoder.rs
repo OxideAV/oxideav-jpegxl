@@ -28,7 +28,7 @@
 
 use crate::bitreader::U32Dist;
 use crate::bitwriter::{pack_signed, BitWriter};
-use crate::entropy_write::{EntropyCodes, HybridConfig, SymbolStats};
+use crate::entropy_write::{Coding, EntropyCodes, HybridConfig, SymbolStats};
 use crate::error::{Error, Result};
 use crate::icc::icc_context;
 use crate::image::ColorInfo;
@@ -59,6 +59,19 @@ const NB_TRANSFORMS_DIST: [U32Dist; 4] = [
 
 /// Largest section the TOC can describe.
 const MAX_SECTION_BYTES: usize = 4211712 + (1 << 30) - 1;
+
+/// Streams with at least this many symbols are ANS coded (fractional
+/// bits per symbol); shorter ones keep prefix codes, whose histograms
+/// are cheaper than the 32-bit ANS state initialiser.
+const ANS_MIN_SYMBOLS: usize = 64;
+
+fn coding_for(num_symbols: usize) -> Coding {
+    if num_symbols >= ANS_MIN_SYMBOLS {
+        Coding::Ans
+    } else {
+        Coding::Prefix
+    }
+}
 
 /// Colour signalling of the codestream.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -427,16 +440,22 @@ pub fn write_icc_stream(w: &mut BitWriter, profile: &[u8]) -> Result<()> {
         prev_prev = prev;
         prev = b;
     }
-    let codes = EntropyCodes::build(&stats);
+    let codes = EntropyCodes::build_with(&stats, coding_for(encoded.len()))?;
     w.write_u64(encoded.len() as u64);
     codes.write_prelude(w);
     let mut prev = 0u8;
     let mut prev_prev = 0u8;
-    for (i, &b) in encoded.iter().enumerate() {
-        codes.write(w, icc_context(i, prev, prev_prev), u32::from(b));
-        prev_prev = prev;
-        prev = b;
-    }
+    let symbols: Vec<(u32, u32)> = encoded
+        .iter()
+        .enumerate()
+        .map(|(i, &b)| {
+            let ctx = icc_context(i, prev, prev_prev);
+            prev_prev = prev;
+            prev = b;
+            (ctx, u32::from(b))
+        })
+        .collect();
+    codes.write_symbols(w, symbols.iter().copied());
     Ok(())
 }
 
@@ -791,7 +810,7 @@ fn code_frame(spec: &EncodeSpec, frame: &FrameInput) -> Result<CodedFrame> {
         }
         sections.push(CodedSection { symbols });
     }
-    let leaf_codes = EntropyCodes::build(&leaf_stats);
+    let leaf_codes = EntropyCodes::build_with(&leaf_stats, coding_for(width * height))?;
     Ok(CodedFrame {
         tree_codes,
         tree_syms,
@@ -881,9 +900,9 @@ fn write_global_modular_header(w: &mut BitWriter, coded: &CodedFrame) -> Result<
     // GlobalModular: the global tree.
     w.write_bool(true); // use_global_tree
     coded.tree_codes.write_prelude(w);
-    for &(c, v) in &coded.tree_syms {
-        coded.tree_codes.write(w, c, v);
-    }
+    coded
+        .tree_codes
+        .write_symbols(w, coded.tree_syms.iter().copied());
     coded.leaf_codes.write_prelude(w);
     // Inner ModularHeader.
     w.write_bool(true); // use_global_tree
@@ -915,12 +934,14 @@ fn write_global_modular_header(w: &mut BitWriter, coded: &CodedFrame) -> Result<
     Ok(())
 }
 
+/// One section's symbols as one stream (an ANS section carries its own
+/// state initialiser, so every section is a stream of its own).
 fn write_section_symbols(w: &mut BitWriter, codes: &EntropyCodes, section: &CodedSection) {
-    for (ctx, vals) in &section.symbols {
-        for &v in vals {
-            codes.write(w, *ctx, v);
-        }
-    }
+    let symbols = section
+        .symbols
+        .iter()
+        .flat_map(|(ctx, vals)| vals.iter().map(move |&v| (*ctx, v)));
+    codes.write_symbols(w, symbols);
 }
 
 /// Append one frame (header, TOC, sections) to a byte-aligned writer.

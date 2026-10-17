@@ -253,8 +253,12 @@ layouts — the same table in both directions, the output label is what
   balanced split on the channel index); each leaf's predictor is
   picked per channel among West / North / Select / Gradient by
   residual energy (predictors without integer division, so no
-  rounding convention is involved); prefix-coded entropy streams
-  (`use_prefix_code = 1`, no LZ77, simple clustering); pictures up to
+  rounding convention is involved); **ANS** entropy streams (C.2.5
+  distributions at full 12-bit precision, C.3.2 rANS with a 16-bit
+  renormalisation word, one state per stream ending on `0x130000`)
+  for every stream of 64 symbols or more — the MA tree and other tiny
+  streams keep prefix codes, whose histograms are cheaper than the
+  32-bit state initialiser — no LZ77, simple clustering; pictures up to
   `group_dim` (default 256, `group_size_shift`) are coded in
   `GlobalModular`, larger ones as one `PassGroup` section per group
   sharing the global tree (empty `ModularLfGroup` / `HfGlobal`
@@ -274,10 +278,17 @@ layouts — the same table in both directions, the output label is what
   frames' `delay` in milliseconds (`100` ms without one). Frames share
   one geometry / layout / depth — a mismatch is `Error::Unsupported`
   naming both shapes. Metadata is the first frame's.
+* **Size, lossless** (bytes, this crate vs a black-box encoder at its
+  efforts 1 / 3 / 7 on the committed content): a 924×1386 RGBA logo
+  864 464 vs 1 115 085 / 846 578 / 480 409; a 1024×768 photo 520 370
+  vs 628 091 / 504 402 / 358 738; 64×64 noise 13 635 vs 14 564 /
+  13 730 / 13 507; a 64×64 gradient 828 vs 2 335 / 702 / 107; a flat
+  64×64 grey 29 vs 1 279 / 247 / 37 — between that encoder's efforts
+  1 and 3 throughout.
 * Not written: VarDCT (lossy XYB), the self-correcting predictor,
-  Palette / Squeeze transforms, LZ77 / ANS streams, patches, splines,
-  noise, upsampling, crops, previews, extra channels beyond one alpha,
-  float samples, `bits_per_sample > 16`.
+  Palette / Squeeze transforms, LZ77, patches, splines, noise,
+  upsampling, crops, previews, extra channels beyond one alpha, float
+  samples, `bits_per_sample > 16`.
 
 ## Options
 
@@ -1101,10 +1112,9 @@ generated `cjxl` transcode pairs:
 - The LfFrame (`lf_level > 0`) dimension scaling `progressive-dc`
   needs.
 - On the encoder: VarDCT (lossy XYB) output, the self-correcting
-  predictor, Palette / Squeeze, LZ77 / ANS coding, context modelling
-  beyond one leaf per channel (the lossless ratio is PNG-class; richer
-  context modelling is follow-up material), extra channels beyond one
-  alpha, float samples.
+  predictor, Palette / Squeeze, LZ77, context modelling beyond one
+  leaf per channel (richer context modelling is follow-up material),
+  extra channels beyond one alpha, float samples.
 
 Unsupported inputs surface as `Error::Unsupported` rather than a silent
 misparse.

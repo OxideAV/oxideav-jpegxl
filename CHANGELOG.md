@@ -20,9 +20,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `bits_per_sample`); the planar transcode layouts are a typed
   `Unsupported`. One global MA tree with one leaf per channel
   (predictor picked per channel among West / North / Select /
-  Gradient), the YCoCg RCT ahead of RGB, prefix-coded entropy streams,
+  Gradient), the YCoCg RCT ahead of RGB, ANS entropy streams (C.2.5
+  distributions at full precision, C.3.2 rANS ending on `0x130000`)
+  for streams of 64 symbols or more and prefix codes below that,
   `GlobalModular` for pictures within one group and one `PassGroup`
-  section per group otherwise. ICC profiles are embedded in the
+  section per group otherwise. Lossless output lands between a
+  black-box encoder's efforts 1 and 3 on the committed content (a
+  924×1386 RGBA logo: 864 464 bytes vs 1 115 085 / 846 578). ICC profiles are embedded in the
   codestream (E.4, byte-exact round trip), Exif / XMP become `Exif` /
   `xml ` boxes (the box file is written whenever a box is needed or
   `EncodeOptions::container` is set), the enumerated `ColourEncoding`
