@@ -375,7 +375,7 @@ pub fn reconstruct_icc_profile(encoded: &[u8]) -> Result<Vec<u8>> {
 /// header, per the E.4.3 listing. `header` is the partially-built ICC
 /// output so far (positions `0..i` already populated), `output_size` is
 /// the final ICC profile size.
-fn predict_header_byte(i: usize, header: &[u8], output_size: u64) -> u8 {
+pub(crate) fn predict_header_byte(i: usize, header: &[u8], output_size: u64) -> u8 {
     // Positions 0..3: predicted as bytes of `output_size` interpreted
     // as big-endian u32. The spec says "output_size[i]" meaning byte i
     // of output_size encoded as an unsigned 32-bit integer in big
@@ -447,8 +447,10 @@ fn decode_tag_list(
     }
     let v = varint_read(encoded, cmd_pos)?;
     if v == 0 {
-        // Spec: num_tags = v - 1 = -1 → output nothing, finalise.
-        return Ok(true);
+        // E.4.4: `num_tags == -1` — "output nothing, stop reading the
+        // tag list, and proceed to E.4.5". The main content follows;
+        // the stream is not finished here.
+        return Ok(false);
     }
     let num_tags = v - 1;
     if num_tags > MAX_OUTPUT_SIZE {

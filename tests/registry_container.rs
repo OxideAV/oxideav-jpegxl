@@ -1,7 +1,8 @@
-//! The `jpegxl` framework container (demuxer only): probe → demuxer →
-//! decoder yields the Layer 1 frames byte for byte on every committed
-//! layout, animations come out one packet per frame with the animation
-//! header's timing, and there is deliberately no muxer.
+//! The `jpegxl` framework container: probe → demuxer → decoder yields
+//! the Layer 1 frames byte for byte on every committed layout,
+//! animations come out one packet per frame with the animation
+//! header's timing (the muxer and encoder are covered in
+//! `r477_registry.rs`).
 
 #![cfg(feature = "registry")]
 
@@ -390,20 +391,27 @@ fn decoder_pacing_option_is_additive() {
 }
 
 #[test]
-fn register_installs_codec_and_demuxer_but_no_muxer() {
+fn register_installs_codec_demuxer_and_muxer() {
     let ctx = ctx();
     let id = CodecId::new(CODEC_ID_STR);
     assert!(ctx.codecs.has_decoder(&id));
+    assert!(
+        ctx.codecs.has_encoder(&id),
+        "round 477: the Modular encoder"
+    );
     assert!(ctx.containers.demuxer_names().any(|n| n == CONTAINER_NAME));
     assert!(
-        ctx.containers.muxer_names().all(|n| n != CONTAINER_NAME),
-        "decoder-only crate registers no muxer"
+        ctx.containers.muxer_names().any(|n| n == CONTAINER_NAME),
+        "round 477: the splicing muxer"
     );
     let out: Box<dyn WriteSeek> = Box::new(Cursor::new(Vec::new()));
-    assert!(matches!(
-        ctx.containers.open_muxer(CONTAINER_NAME, out, &[]),
-        Err(Error::FormatNotFound(_))
-    ));
+    assert!(
+        matches!(
+            ctx.containers.open_muxer(CONTAINER_NAME, out, &[]),
+            Err(Error::Unsupported(_))
+        ),
+        "the muxer wants exactly one jpegxl video stream"
+    );
     assert_eq!(
         ctx.containers.container_for_extension("JXL"),
         Some(CONTAINER_NAME)

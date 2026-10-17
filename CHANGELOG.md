@@ -9,6 +9,70 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **A JPEG XL encoder** (round 477): `encode` / `encode_rgb8` /
+  `encode_rgba8` / `encode_to` / `encode_all` write `kModular`
+  codestreams — lossless at the default `quality = 100`, with the
+  Modular residuals quantised (MA-tree leaf `multiplier =
+  round(2^((100 − q) / 12))` at 8 bits, scaled with the depth,
+  closed-loop prediction) below it, so the size ladder is monotone on
+  textured content. Every packed layout is an input (`Gray8` / `Ya8` /
+  `Rgb24` / `Rgba` and the 16-bit forms, depths 1..=16 from
+  `bits_per_sample`); the planar transcode layouts are a typed
+  `Unsupported`. One global MA tree with one leaf per channel
+  (predictor picked per channel among West / North / Select /
+  Gradient), the YCoCg RCT ahead of RGB, prefix-coded entropy streams,
+  `GlobalModular` for pictures within one group and one `PassGroup`
+  section per group otherwise. ICC profiles are embedded in the
+  codestream (E.4, byte-exact round trip), Exif / XMP become `Exif` /
+  `xml ` boxes (the box file is written whenever a box is needed or
+  `EncodeOptions::container` is set), the enumerated `ColourEncoding`
+  follows `JxlImage::color`. `encode_all` writes animations
+  (`EncodeOptions::animation` or a 1000 Hz tick from the frames'
+  delays); mixed geometries are refused by type. Validated bit-exact
+  through `decode` on every layout and geometry class, and against a
+  black-box decoder where one is installed.
+- `EncodeOptions { quality, container, group_size_shift, animation }`
+  with builders; `Frame::new` / `with_delay` / `with_ticks` /
+  `with_index`; `AnimationInfo::new`.
+- Registry (`registry` feature): `make_encoder` is live under
+  `jpegxl` with `CodecCapabilities::accepted_pixel_formats` declaring
+  the eight packed layouts (`registry::ACCEPTED_PIXEL_FORMATS`) and
+  the `JxlEncoderOptions` schema (`quality` / `container` /
+  `group_size_shift`); one complete still file per frame. The `jpegxl`
+  container gains a **muxer** that writes one packet verbatim and
+  splices several stills into an animated codestream (headers rewritten
+  with the stream time base as the tick, frame headers re-timed from
+  the packets' durations, TOCs and section bytes copied verbatim, the
+  first packet's metadata boxes kept).
+- **Metadata blobs through the registry** (core 0.1.40
+  `oxideav_core::blob`): the demuxer puts the codestream ICC profile
+  and the `Exif` / `xml ` box payloads on the stream's
+  `CodecParameters::blobs` (`BlobKind::ICC` / `EXIF` / `XMP`), the
+  decoder repeats them on the first frame, the encoder reads frame
+  blobs first and stream blobs second (frame overrides stream per
+  kind) and writes them back. `registry::blobs_of_metadata` /
+  `metadata_of_blobs`; `JxlImage::from_video_frame` fills `metadata`
+  from the blobs. A recompressed JPEG's blobs equal the `APP1` / `APP2`
+  payloads its byte-exact reconstruction re-emits (pinned on a new
+  Exif + XMP transcode fixture).
+- Fuzz targets `encode_roundtrip` and `mux_splice`.
+
+### Fixed
+
+- `FrameHeader.save_before_ct` is read only for a `kReferenceOnly`
+  frame or a frame that can be referenced (`!is_last && (duration == 0
+  || save_as_reference != 0)`), per Table F.2 — the earlier `!is_last`
+  reading consumed a bit that a presented animation frame with
+  `save_as_reference = 0` does not carry, mis-aligning every header
+  after it (pinned on the committed streams: zero-duration layers
+  carry the bit whatever their blend mode, presented frames only when
+  saved as a reference).
+- E.4.4: a tag list with `num_tags == -1` outputs nothing and proceeds
+  to the main content (E.4.5) instead of ending the profile — the
+  layout the encoder writes for any profile longer than 128 bytes.
+
+### Added
+
 - **Pixel decode of losslessly recompressed JPEGs on every sampling
   lattice** (round 473). A `do_YCbCr` VarDCT frame — what
   `cjxl --lossless_jpeg=1` writes — previously decoded as garbage RGB

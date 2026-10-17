@@ -55,7 +55,13 @@ cargo-fuzz = true
 #                       (`reconstruct_jpeg` over container + jbrd);
 # * `decode_partial`  — progressive/partial-input behaviour: the same
 #                       capped decode over a fuzz-chosen prefix
-#                       truncation, asserting truncation never panics.
+#                       truncation, asserting truncation never panics;
+# * `encode_roundtrip` — the Modular encoder over fuzz-chosen geometry /
+#                       layout / depth / quality / metadata: the output
+#                       must parse and decode, bit-exactly at quality 100;
+# * `mux_splice`      — the `jpegxl` muxer's animation splice over hostile
+#                       packets and over genuine (possibly corrupted)
+#                       stills.
 [dependencies]
 libfuzzer-sys = "0.4"
 
@@ -129,6 +135,20 @@ bench = false
 [[bin]]
 name = "decode_partial"
 path = "fuzz_targets/decode_partial.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "encode_roundtrip"
+path = "fuzz_targets/encode_roundtrip.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "mux_splice"
+path = "fuzz_targets/mux_splice.rs"
 test = false
 doc = false
 bench = false

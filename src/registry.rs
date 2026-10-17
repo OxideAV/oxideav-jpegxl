@@ -3,14 +3,22 @@
 //! Everything here is a thin layer over the standalone API in
 //! [`crate::api`]:
 //!
-//! * [`register`] / [`register_codecs`] install the decoder into a
-//!   `RuntimeContext` / `CodecRegistry`; [`make_decoder`] /
-//!   [`make_encoder`] are the factories (the encoder one always reports
-//!   `Unsupported` — the crate is decoder-only).
+//! * [`register`] / [`register_codecs`] install the decoder and the
+//!   Modular encoder into a `RuntimeContext` / `CodecRegistry`;
+//!   [`make_decoder`] / [`make_encoder`] are the factories. The encoder
+//!   declares the layouts it codes ([`ACCEPTED_PIXEL_FORMATS`]) and the
+//!   [`JxlEncoderOptions`] schema (`quality`, `container`,
+//!   `group_size_shift`); anything else is a typed `Unsupported`.
+//! * Metadata blobs (`oxideav_core::blob`): the decoder attaches the
+//!   codestream ICC profile and the `Exif` / `xml ` box payloads to the
+//!   first frame as `BlobKind::ICC` / `EXIF` / `XMP`; the encoder reads
+//!   them back from the frame (a frame blob overrides the stream blob
+//!   of the same kind on `CodecParameters::blobs`) and writes the ICC
+//!   into the codestream, Exif / XMP as boxes.
 //! * `From<JxlImage> for VideoFrame`, [`JxlImage::from_video_frame`] and
 //!   `TryFrom<(&VideoFrame, &CodecParameters)>` bridge the contract
-//!   image and the framework frame (one packed plane; colour signal and
-//!   significant-bits side-channels stamped).
+//!   image and the framework frame (one packed plane; colour signal,
+//!   significant-bits and blob side-channels stamped).
 //! * `From<JxlError> for oxideav_core::Error`.
 //! * The deprecated planar wrappers ([`decode_one_frame`],
 //!   [`decode_all_frames`], [`decode_vardct_frame_from_codestream`]).
@@ -18,13 +26,15 @@
 use std::collections::VecDeque;
 
 use oxideav_core::{
-    CodecCapabilities, CodecId, CodecInfo, CodecParameters, CodecRegistry, ColorPrimaries,
-    ColorSignal, Decoder, Encoder, Frame, MatrixCoefficients, Packet, PixelFormat, RuntimeContext,
-    TransferCharacteristics, VideoFrame, VideoPlane,
+    BlobKind, CodecCapabilities, CodecId, CodecInfo, CodecOptionsStruct, CodecParameters,
+    CodecRegistry, ColorPrimaries, ColorSignal, Decoder, Encoder, Frame, MatrixCoefficients,
+    MetadataBlob, OptionField, OptionKind, OptionValue, Packet, PixelFormat, RuntimeContext,
+    TimeBase, TransferCharacteristics, VideoFrame, VideoPlane,
 };
 
 use crate::error::{JxlError, Result};
-use crate::image::{ColorInfo, ColorRange, JxlImage, JxlPixelFormat, Plane, RawFrame};
+use crate::image::{ColorInfo, ColorRange, JxlImage, JxlPixelFormat, Metadata, Plane, RawFrame};
+use crate::options::EncodeOptions;
 use crate::CODEC_ID_STR;
 
 impl From<JxlError> for oxideav_core::Error {
@@ -159,6 +169,45 @@ fn stamp_frame_side_channels(frame: &mut VideoFrame, image: &JxlImage) {
     if image.bits_per_sample != storage {
         frame.set_significant_bits(vec![image.bits_per_sample]);
     }
+    let blobs = blobs_of_metadata(&image.metadata);
+    if !blobs.is_empty() {
+        frame.set_blobs(blobs);
+    }
+}
+
+/// The ICC / Exif / XMP of a [`Metadata`] as framework blobs, in that
+/// order (the `oxideav_core::blob` payload conventions: a complete
+/// profile, a TIFF-structured Exif block, the XMP packet).
+pub fn blobs_of_metadata(meta: &Metadata) -> Vec<MetadataBlob> {
+    let mut out = Vec::new();
+    if let Some(icc) = &meta.icc {
+        out.push(MetadataBlob::new(BlobKind::ICC, icc.clone()));
+    }
+    if let Some(exif) = &meta.exif {
+        out.push(MetadataBlob::new(BlobKind::EXIF, exif.clone()));
+    }
+    if let Some(xmp) = &meta.xmp {
+        out.push(MetadataBlob::new(BlobKind::XMP, xmp.clone()).with_mime("application/rdf+xml"));
+    }
+    out
+}
+
+/// [`Metadata`] from framework blobs: the first `icc` / `exif` / `xmp`
+/// blob of `frame` (per-frame), else of `stream` (stream-level) —
+/// a frame blob overrides the stream blob of the same kind. Other
+/// kinds are not carried by JPEG XL and are ignored.
+pub fn metadata_of_blobs(frame: &[MetadataBlob], stream: &[MetadataBlob]) -> Metadata {
+    let pick = |kind: &BlobKind| -> Option<Vec<u8>> {
+        frame
+            .iter()
+            .chain(stream.iter())
+            .find(|b| b.is(kind))
+            .map(|b| b.data.clone())
+    };
+    Metadata::new()
+        .with_icc(pick(&BlobKind::ICC))
+        .with_exif(pick(&BlobKind::EXIF))
+        .with_xmp(pick(&BlobKind::XMP))
 }
 
 impl From<JxlImage> for VideoFrame {
@@ -204,6 +253,7 @@ impl JxlImage {
         if let Some(bits) = frame.significant_bits().and_then(|b| b.first().copied()) {
             img = img.with_bits_per_sample(bits);
         }
+        img.metadata = metadata_of_blobs(&frame.blobs(), &params.blobs);
         Ok(img)
     }
 }
@@ -217,21 +267,38 @@ impl TryFrom<(&VideoFrame, &CodecParameters)> for JxlImage {
 
 // ---- registry ------------------------------------------------------------
 
-/// Register the JPEG XL decoder into a [`CodecRegistry`]. No encoder is
-/// registered: the crate is decoder-only.
+/// The layouts the registry encoder codes, in ladder order (colour
+/// first, 8-bit before 16-bit, grey last): every one is written as it
+/// is and decodes to the same label.
+pub const ACCEPTED_PIXEL_FORMATS: &[PixelFormat] = &[
+    PixelFormat::Rgb24,
+    PixelFormat::Rgba,
+    PixelFormat::Rgb48Le,
+    PixelFormat::Rgba64Le,
+    PixelFormat::Gray8,
+    PixelFormat::Ya8,
+    PixelFormat::Gray16Le,
+    PixelFormat::Ya16Le,
+];
+
+/// Register the JPEG XL decoder and encoder into a [`CodecRegistry`].
 pub fn register_codecs(reg: &mut CodecRegistry) {
     let caps = CodecCapabilities::video(CODEC_ID_STR)
         .with_lossy(true)
-        .with_intra_only(true);
+        .with_lossless(true)
+        .with_intra_only(true)
+        .with_pixel_formats(ACCEPTED_PIXEL_FORMATS.to_vec());
     reg.register(
         CodecInfo::new(CodecId::new(CODEC_ID_STR))
             .capabilities(caps)
-            .decoder(make_decoder),
+            .decoder(make_decoder)
+            .encoder(make_encoder)
+            .encoder_options::<JxlEncoderOptions>(),
     );
 }
 
-/// Register the `jpegxl` container of [`crate::demux`] (demuxer, probe
-/// and the `.jxl` extension). No muxer: the crate is decoder-only.
+/// Register the `jpegxl` container of [`crate::demux`] (demuxer, muxer,
+/// probe and the `.jxl` extension).
 pub fn register_containers(reg: &mut oxideav_core::ContainerRegistry) {
     crate::demux::register(reg);
 }
@@ -282,13 +349,194 @@ pub fn make_decoder(params: &CodecParameters) -> oxideav_core::Result<Box<dyn De
     }))
 }
 
-/// Encoder factory: always `Unsupported` (no JPEG XL encoder in this
-/// crate). Exposed so callers wiring an `Encoder` by codec id get a
-/// clean `Unsupported` instead of `CodecNotFound`.
-pub fn make_encoder(_params: &CodecParameters) -> oxideav_core::Result<Box<dyn Encoder>> {
-    Err(oxideav_core::Error::Unsupported(
-        "JPEG XL encoding is not implemented".into(),
-    ))
+/// Encoder options (the `quality` / `container` / `group_size_shift`
+/// keys of `CodecParameters::options`).
+///
+/// | key | kind | default | meaning |
+/// |---|---|---|---|
+/// | `quality` | u32 `0..=100` | `100` | `100` = lossless Modular; below it the residual quantiser of [`crate::encoder::quantizer_for_quality`] |
+/// | `container` | bool | `false` | always write the 18181-2 box file (a bare codestream otherwise, unless Exif / XMP blobs need boxes) |
+/// | `group_size_shift` | u32 `0..=3` | `1` | `group_dim = 128 << shift` |
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct JxlEncoderOptions {
+    pub quality: u32,
+    pub container: bool,
+    pub group_size_shift: u32,
+}
+
+impl Default for JxlEncoderOptions {
+    fn default() -> Self {
+        Self {
+            quality: 100,
+            container: false,
+            group_size_shift: 1,
+        }
+    }
+}
+
+impl JxlEncoderOptions {
+    /// Same as [`Default::default`].
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Builder: set `quality`.
+    pub fn with_quality(mut self, quality: u32) -> Self {
+        self.quality = quality;
+        self
+    }
+
+    /// Builder: set `container`.
+    pub fn with_container(mut self, container: bool) -> Self {
+        self.container = container;
+        self
+    }
+
+    /// Builder: set `group_size_shift`.
+    pub fn with_group_size_shift(mut self, shift: u32) -> Self {
+        self.group_size_shift = shift;
+        self
+    }
+
+    fn to_encode_options(&self) -> oxideav_core::Result<EncodeOptions> {
+        if self.quality > 100 {
+            return Err(oxideav_core::Error::invalid(
+                "jxl encoder: quality must be in 0..=100",
+            ));
+        }
+        if self.group_size_shift > 3 {
+            return Err(oxideav_core::Error::invalid(
+                "jxl encoder: group_size_shift must be in 0..=3",
+            ));
+        }
+        Ok(EncodeOptions::new()
+            .with_quality(self.quality as u8)
+            .with_container(self.container)
+            .with_group_size_shift(self.group_size_shift as u8))
+    }
+}
+
+impl CodecOptionsStruct for JxlEncoderOptions {
+    const SCHEMA: &'static [OptionField] = &[
+        OptionField {
+            name: "quality",
+            kind: OptionKind::U32,
+            default: OptionValue::U32(100),
+            help: "0..=100; 100 = lossless Modular, lower quantises the Modular residuals",
+        },
+        OptionField {
+            name: "container",
+            kind: OptionKind::Bool,
+            default: OptionValue::Bool(false),
+            help: "always write the ISO/IEC 18181-2 box file instead of a bare codestream",
+        },
+        OptionField {
+            name: "group_size_shift",
+            kind: OptionKind::U32,
+            default: OptionValue::U32(1),
+            help: "0..=3; group_dim = 128 << shift",
+        },
+    ];
+
+    fn apply(&mut self, key: &str, value: &OptionValue) -> oxideav_core::Result<()> {
+        match key {
+            "quality" => self.quality = value.as_u32()?,
+            "container" => self.container = value.as_bool()?,
+            "group_size_shift" => self.group_size_shift = value.as_u32()?,
+            _ => unreachable!("guarded by SCHEMA"),
+        }
+        Ok(())
+    }
+}
+
+/// Encoder factory: one still JPEG XL file per frame received (a bare
+/// codestream, or the box file when the frame's / stream's Exif / XMP
+/// blobs need boxes or `container` is set). `params.pixel_format` must
+/// be one of [`ACCEPTED_PIXEL_FORMATS`] (default `Rgba`) — anything
+/// else is `Unsupported`, never converted. The frame's `pts` is kept on
+/// the packet; an animation is assembled by the `jpegxl` muxer from one
+/// packet per picture.
+pub fn make_encoder(params: &CodecParameters) -> oxideav_core::Result<Box<dyn Encoder>> {
+    let opts: JxlEncoderOptions = oxideav_core::parse_options(&params.options)
+        .map_err(|e| oxideav_core::Error::invalid(format!("jxl encoder: {e}")))?;
+    let encode_opts = opts.to_encode_options()?;
+    let fmt = params.pixel_format.unwrap_or(PixelFormat::Rgba);
+    if !ACCEPTED_PIXEL_FORMATS.contains(&fmt) {
+        return Err(oxideav_core::Error::Unsupported(format!(
+            "jxl encoder: pixel format {fmt:?} is not an accepted input layout ({ACCEPTED_PIXEL_FORMATS:?})"
+        )));
+    }
+    let (Some(w), Some(h)) = (params.width, params.height) else {
+        return Err(oxideav_core::Error::invalid(
+            "jxl encoder: width and height are required",
+        ));
+    };
+    if w == 0 || h == 0 {
+        return Err(oxideav_core::Error::invalid("jxl encoder: zero dimension"));
+    }
+    let mut output = params.clone();
+    output.codec_id = CodecId::new(CODEC_ID_STR);
+    output.pixel_format = Some(fmt);
+    output.extradata.clear();
+    output.tag = None;
+    Ok(Box::new(JxlEncoder {
+        params: output,
+        opts: encode_opts,
+        ready: VecDeque::new(),
+        eof: false,
+    }))
+}
+
+struct JxlEncoder {
+    params: CodecParameters,
+    opts: EncodeOptions,
+    ready: VecDeque<Packet>,
+    eof: bool,
+}
+
+impl Encoder for JxlEncoder {
+    fn codec_id(&self) -> &CodecId {
+        &self.params.codec_id
+    }
+
+    fn output_params(&self) -> &CodecParameters {
+        &self.params
+    }
+
+    fn send_frame(&mut self, frame: &Frame) -> oxideav_core::Result<()> {
+        let Frame::Video(vf) = frame else {
+            return Err(oxideav_core::Error::invalid(
+                "jxl encoder: a video frame is required",
+            ));
+        };
+        if self.eof {
+            return Err(oxideav_core::Error::invalid(
+                "jxl encoder: send_frame after flush",
+            ));
+        }
+        let image = JxlImage::from_video_frame(vf, &self.params)?;
+        let bytes = crate::encode(&image, &self.opts)?;
+        let mut pkt = Packet::new(0, TimeBase::new(1, 1), bytes);
+        pkt.pts = vf.pts;
+        pkt.dts = vf.pts;
+        pkt.flags.keyframe = true;
+        self.ready.push_back(pkt);
+        Ok(())
+    }
+
+    fn receive_packet(&mut self) -> oxideav_core::Result<Packet> {
+        match self.ready.pop_front() {
+            Some(p) => Ok(p),
+            None if self.eof => Err(oxideav_core::Error::Eof),
+            None => Err(oxideav_core::Error::NeedMore),
+        }
+    }
+
+    fn flush(&mut self) -> oxideav_core::Result<()> {
+        self.eof = true;
+        Ok(())
+    }
 }
 
 /// Registered decoder: [`crate::decode_all`] per packet, frames handed
@@ -439,7 +687,7 @@ mod tests {
         let mut ctx = RuntimeContext::new();
         register(&mut ctx);
         assert!(ctx.containers.demuxer_names().any(|n| n == "jpegxl"));
-        assert!(ctx.containers.muxer_names().all(|n| n != "jpegxl"));
+        assert!(ctx.containers.muxer_names().any(|n| n == "jpegxl"));
         assert_eq!(
             ctx.containers.container_for_extension("jxl"),
             Some("jpegxl")
@@ -453,12 +701,81 @@ mod tests {
     }
 
     #[test]
-    fn encoder_factory_rejects_cleanly() {
-        let params = CodecParameters::video(CodecId::new(CODEC_ID_STR));
+    fn encoder_factory_declares_its_layouts_and_options() {
+        let mut params = CodecParameters::video(CodecId::new(CODEC_ID_STR));
+        assert!(matches!(
+            make_encoder(&params),
+            Err(oxideav_core::Error::InvalidData(_))
+        ));
+        params.width = Some(2);
+        params.height = Some(2);
+        params.pixel_format = Some(PixelFormat::Yuv420P);
         assert!(matches!(
             make_encoder(&params),
             Err(oxideav_core::Error::Unsupported(_))
         ));
+        params.pixel_format = Some(PixelFormat::Rgb24);
+        params.options.insert("quality", "101");
+        assert!(matches!(
+            make_encoder(&params),
+            Err(oxideav_core::Error::InvalidData(_))
+        ));
+        params.options = oxideav_core::CodecOptions::new().set("bogus", "1");
+        assert!(matches!(
+            make_encoder(&params),
+            Err(oxideav_core::Error::InvalidData(_))
+        ));
+        params.options = oxideav_core::CodecOptions::new().set("quality", "90");
+        let enc = make_encoder(&params).unwrap();
+        assert_eq!(enc.output_params().pixel_format, Some(PixelFormat::Rgb24));
+        let mut ctx = RuntimeContext::new();
+        register(&mut ctx);
+        let schema = ctx
+            .codecs
+            .encoder_options_schema(&CodecId::new(CODEC_ID_STR))
+            .expect("schema");
+        assert!(schema.iter().any(|f| f.name == "quality"));
+        let caps = &ctx.codecs.implementations(&CodecId::new(CODEC_ID_STR))[0].caps;
+        assert!(caps.encode && caps.decode && caps.lossy && caps.lossless);
+        assert_eq!(caps.accepted_pixel_formats, ACCEPTED_PIXEL_FORMATS);
+        assert!(ctx.containers.muxer_names().any(|n| n == "jpegxl"));
+    }
+
+    #[test]
+    fn frame_blobs_bridge_both_ways() {
+        let img = JxlImage::from_rgb8(1, 1, vec![1, 2, 3])
+            .unwrap()
+            .with_metadata(
+                Metadata::new()
+                    .with_icc(vec![1u8; 130])
+                    .with_exif(b"II*\0".to_vec())
+                    .with_xmp(b"<x/>".to_vec()),
+            );
+        let vf: VideoFrame = (&img).into();
+        let blobs = vf.blobs();
+        assert_eq!(blobs.len(), 3);
+        assert_eq!(blobs[0].kind, BlobKind::ICC);
+        assert_eq!(blobs[1].kind, BlobKind::EXIF);
+        assert_eq!(blobs[2].kind, BlobKind::XMP);
+        assert_eq!(blobs[2].mime.as_deref(), Some("application/rdf+xml"));
+        let mut params = CodecParameters::video(CodecId::new(CODEC_ID_STR));
+        params.width = Some(1);
+        params.height = Some(1);
+        params.pixel_format = Some(PixelFormat::Rgb24);
+        // Stream-level Exif is overridden by the frame's; a stream XMP
+        // fills in when the frame has none.
+        params.blobs = vec![
+            MetadataBlob::new(BlobKind::EXIF, b"MM\0*".to_vec()),
+            MetadataBlob::new(BlobKind::XMP, b"<stream/>".to_vec()),
+        ];
+        let back = JxlImage::from_video_frame(&vf, &params).unwrap();
+        assert_eq!(back.metadata, img.metadata);
+        let mut bare: VideoFrame = (&img).into();
+        bare.set_blobs(Vec::new());
+        let back = JxlImage::from_video_frame(&bare, &params).unwrap();
+        assert_eq!(back.metadata.exif.as_deref(), Some(&b"MM\0*"[..]));
+        assert_eq!(back.metadata.xmp.as_deref(), Some(&b"<stream/>"[..]));
+        assert!(back.metadata.icc.is_none());
     }
 
     #[test]

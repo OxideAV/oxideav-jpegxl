@@ -8,6 +8,7 @@ use std::io::{Read, Write};
 use std::time::Duration;
 
 use crate::container::{self, MetadataKind, Signature};
+use crate::encoder::{AnimationSpec, ColourSpec, EncodeSpec, FrameInput};
 use crate::error::{Error, Result};
 use crate::image::{ColorInfo, ColorRange, JxlImage, Metadata, PixelFormat, Plane, RawFrame};
 use crate::metadata_fdis::{
@@ -36,6 +37,15 @@ pub struct AnimationInfo {
 }
 
 impl AnimationInfo {
+    /// `ticks_per_second = numerator / denominator`, repeated `loops`
+    /// times (`0` = forever).
+    pub fn new(numerator: u32, denominator: u32, loops: u32) -> Self {
+        Self {
+            ticks_per_second: (numerator, denominator),
+            loops,
+        }
+    }
+
     /// Duration of `ticks` animation ticks.
     pub fn tick_duration(&self, ticks: u32) -> Duration {
         let (num, den) = self.ticks_per_second;
@@ -116,6 +126,40 @@ pub struct Frame {
     /// Whether the frame is presented (`duration > 0 || is_last`);
     /// always `true` when coalescing.
     pub presented: bool,
+}
+
+impl Frame {
+    /// A presented frame holding `image` with no timing (`delay`
+    /// `None`, zero ticks, index 0, no offset).
+    pub fn new(image: JxlImage) -> Self {
+        Self {
+            image,
+            delay: None,
+            index: 0,
+            ticks: 0,
+            x: 0,
+            y: 0,
+            presented: true,
+        }
+    }
+
+    /// Builder: set `delay`.
+    pub fn with_delay(mut self, delay: impl Into<Option<Duration>>) -> Self {
+        self.delay = delay.into();
+        self
+    }
+
+    /// Builder: set `ticks`.
+    pub fn with_ticks(mut self, ticks: u32) -> Self {
+        self.ticks = ticks;
+        self
+    }
+
+    /// Builder: set `index`.
+    pub fn with_index(mut self, index: u32) -> Self {
+        self.index = index;
+        self
+    }
 }
 
 /// Signature sniff: the `FF 0A` codestream signature or the 12-byte
@@ -312,6 +356,9 @@ pub(crate) struct Described {
     pub has_icc: bool,
     pub has_exif: bool,
     pub has_xmp: bool,
+    /// The codestream ICC profile and the first `Exif` / `xml ` box
+    /// payloads (the stream-level metadata blobs).
+    pub metadata: Metadata,
 }
 
 /// Header-only walk for the framework demuxer (FrameHeader + TOC of
@@ -351,6 +398,9 @@ pub(crate) fn describe(bytes: &[u8]) -> Result<Described> {
         ),
         None => (false, false),
     };
+    let mut metadata = Metadata::new().with_gamma(gamma(md));
+    metadata.icc = prelude.icc.clone();
+    container_metadata(opened.file.as_ref(), &mut metadata);
     Ok(Described {
         width,
         height,
@@ -361,6 +411,7 @@ pub(crate) fn describe(bytes: &[u8]) -> Result<Described> {
         has_icc: md.colour_encoding.want_icc,
         has_exif,
         has_xmp,
+        metadata,
     })
 }
 
@@ -499,43 +550,227 @@ pub fn decode_from<R: Read>(mut r: R) -> Result<JxlImage> {
     decode(&buf)
 }
 
-const ENCODE_UNSUPPORTED: &str = "JPEG XL encoding is not implemented";
-
-/// JPEG XL encoding is not implemented in this crate; always returns
-/// [`Error::Unsupported`].
-pub fn encode(_image: &JxlImage, _opts: &EncodeOptions) -> Result<Vec<u8>> {
-    Err(Error::unsupported(ENCODE_UNSUPPORTED))
+/// One picture as the encoder wants it: the channel planes (grey or
+/// R, G, B, then alpha), the sample depth and the codestream colour
+/// description.
+struct EncodeInput {
+    channels: Vec<Vec<i32>>,
+    grey: bool,
+    alpha: bool,
+    bits: u32,
+    colour: ColourSpec,
 }
 
-/// See [`encode`].
-pub fn encode_rgb8(
-    _width: u32,
-    _height: u32,
-    _rgb: &[u8],
-    _opts: &EncodeOptions,
-) -> Result<Vec<u8>> {
-    Err(Error::unsupported(ENCODE_UNSUPPORTED))
+/// Unpack a [`JxlImage`] into Modular channels. Only the packed
+/// grey / RGB layouts (8- and 16-bit) are encoder inputs; the planar
+/// YCbCr transcode layouts are refused by type rather than converted.
+fn encode_input(image: &JxlImage) -> Result<EncodeInput> {
+    let fmt = image.format;
+    let (grey, alpha) = match fmt {
+        PixelFormat::Gray8 | PixelFormat::Gray16Le => (true, false),
+        PixelFormat::Ya8 | PixelFormat::Ya16Le => (true, true),
+        PixelFormat::Rgb24 | PixelFormat::Rgb48Le => (false, false),
+        PixelFormat::Rgba | PixelFormat::Rgba64Le => (false, true),
+        other => {
+            return Err(Error::unsupported(format!(
+                "JPEG XL encoder: {other:?} is not an encoder input layout (packed Gray8 / Ya8 / \
+                 Rgb24 / Rgba and their 16-bit forms are)"
+            )))
+        }
+    };
+    let bytes = fmt.bytes_per_sample();
+    let channels_n = fmt.channels();
+    let bits = u32::from(image.bits_per_sample);
+    if bits == 0 || bits > 16 || bits > (bytes as u32) * 8 {
+        return Err(Error::invalid(format!(
+            "JPEG XL encoder: bits_per_sample {bits} does not fit {fmt:?}"
+        )));
+    }
+    let width = image.width as usize;
+    let height = image.height as usize;
+    let plane = image
+        .planes
+        .first()
+        .ok_or_else(|| Error::invalid("JPEG XL encoder: image has no plane"))?;
+    let row = width * channels_n * bytes;
+    if plane.stride < row || plane.data.len() < plane.stride * (height - 1) + row {
+        return Err(Error::invalid(
+            "JPEG XL encoder: plane too short for the geometry",
+        ));
+    }
+    let mut channels: Vec<Vec<i32>> = (0..channels_n)
+        .map(|_| Vec::with_capacity(width * height))
+        .collect();
+    for y in 0..height {
+        let src = &plane.data[y * plane.stride..y * plane.stride + row];
+        for x in 0..width {
+            for (c, ch) in channels.iter_mut().enumerate() {
+                let o = (x * channels_n + c) * bytes;
+                let v = if bytes == 1 {
+                    i32::from(src[o])
+                } else {
+                    i32::from(u16::from_le_bytes([src[o], src[o + 1]]))
+                };
+                ch.push(v);
+            }
+        }
+    }
+    let colour = match &image.metadata.icc {
+        Some(icc) => ColourSpec::Icc(icc.clone()),
+        None => ColourSpec::from_color_info(&image.color),
+    };
+    Ok(EncodeInput {
+        channels,
+        grey,
+        alpha,
+        bits,
+        colour,
+    })
 }
 
-/// See [`encode`].
-pub fn encode_rgba8(
-    _width: u32,
-    _height: u32,
-    _rgba: &[u8],
-    _opts: &EncodeOptions,
-) -> Result<Vec<u8>> {
-    Err(Error::unsupported(ENCODE_UNSUPPORTED))
+fn encode_spec(
+    input: &EncodeInput,
+    image: &JxlImage,
+    opts: &EncodeOptions,
+    animation: Option<AnimationSpec>,
+) -> EncodeSpec {
+    EncodeSpec {
+        width: image.width,
+        height: image.height,
+        bits: input.bits,
+        grey: input.grey,
+        alpha: input.alpha,
+        colour: input.colour.clone(),
+        animation,
+        quality: opts.quality.min(100),
+        group_size_shift: u32::from(opts.group_size_shift.min(3)),
+    }
 }
 
-/// See [`encode`].
-pub fn encode_to<W: Write>(_image: &JxlImage, _opts: &EncodeOptions, _w: W) -> Result<()> {
-    Err(Error::unsupported(ENCODE_UNSUPPORTED))
+/// Box the codestream when the metadata needs a box (or the options
+/// ask for the container).
+fn finish_file(codestream: Vec<u8>, meta: &Metadata, opts: &EncodeOptions) -> Result<Vec<u8>> {
+    if opts.container || meta.exif.is_some() || meta.xmp.is_some() {
+        crate::encoder::wrap_container(&codestream, meta.exif.as_deref(), meta.xmp.as_deref())
+    } else {
+        Ok(codestream)
+    }
 }
 
-/// Multi-frame mirror of [`decode_all`] (animations); see [`encode`] —
-/// always [`Error::Unsupported`] in this decoder-only crate.
-pub fn encode_all(_frames: &[Frame], _opts: &EncodeOptions) -> Result<Vec<u8>> {
-    Err(Error::unsupported(ENCODE_UNSUPPORTED))
+/// Encode one picture (Modular, lossless at the default quality 100).
+///
+/// The output is a bare codestream, or the 18181-2 box file when the
+/// image's [`Metadata`] carries Exif / XMP (written as `Exif` / `xml `
+/// boxes) or [`EncodeOptions::container`] is set; an ICC profile is
+/// embedded in the codestream (E.4) and the enumerated colour
+/// description otherwise comes from [`JxlImage::color`]. Only the
+/// packed grey / RGB layouts are accepted — a planar YCbCr transcode
+/// layout is `Error::Unsupported`.
+pub fn encode(image: &JxlImage, opts: &EncodeOptions) -> Result<Vec<u8>> {
+    let input = encode_input(image)?;
+    let spec = encode_spec(&input, image, opts, None);
+    let frame = FrameInput {
+        channels: input.channels,
+        duration: 0,
+    };
+    let cs = crate::encoder::encode_codestream(&spec, std::slice::from_ref(&frame))?;
+    finish_file(cs, &image.metadata, opts)
+}
+
+/// [`encode`] of a tightly packed RGB8 picture.
+pub fn encode_rgb8(width: u32, height: u32, rgb: &[u8], opts: &EncodeOptions) -> Result<Vec<u8>> {
+    encode(&JxlImage::from_rgb8(width, height, rgb.to_vec())?, opts)
+}
+
+/// [`encode`] of a tightly packed RGBA8 picture.
+pub fn encode_rgba8(width: u32, height: u32, rgba: &[u8], opts: &EncodeOptions) -> Result<Vec<u8>> {
+    encode(&JxlImage::from_rgba8(width, height, rgba.to_vec())?, opts)
+}
+
+/// [`encode`] into a writer.
+pub fn encode_to<W: Write>(image: &JxlImage, opts: &EncodeOptions, mut w: W) -> Result<()> {
+    let bytes = encode(image, opts)?;
+    w.write_all(&bytes)?;
+    Ok(())
+}
+
+/// Encode an animation: one `kModular` frame per input picture with
+/// the `AnimationHeader` of [`EncodeOptions::animation`] (or a 1000 Hz
+/// tick and millisecond delays). Every frame must share the first
+/// frame's geometry, layout and depth (`Error::Unsupported` names the
+/// mismatch); metadata (ICC / Exif / XMP) is taken from the first
+/// frame. A single frame is a still, as with [`encode`].
+pub fn encode_all(frames: &[Frame], opts: &EncodeOptions) -> Result<Vec<u8>> {
+    let Some(first) = frames.first() else {
+        return Err(Error::invalid("JPEG XL encoder: no frame to encode"));
+    };
+    if frames.len() == 1 {
+        return encode(&first.image, opts);
+    }
+    let (anim, ticks): (AnimationSpec, Vec<u32>) = match opts.animation {
+        Some(a) => (
+            AnimationSpec {
+                tps_numerator: a.ticks_per_second.0,
+                tps_denominator: a.ticks_per_second.1,
+                num_loops: a.loops,
+            },
+            frames.iter().map(|f| f.ticks).collect(),
+        ),
+        None => (
+            AnimationSpec {
+                tps_numerator: 1000,
+                tps_denominator: 1,
+                num_loops: 0,
+            },
+            frames
+                .iter()
+                .map(|f| {
+                    f.delay
+                        .map(|d| {
+                            (d.as_secs_f64() * 1000.0)
+                                .round()
+                                .clamp(0.0, f64::from(u32::MAX)) as u32
+                        })
+                        .unwrap_or(100)
+                })
+                .collect(),
+        ),
+    };
+    let first_input = encode_input(&first.image)?;
+    let spec = encode_spec(&first_input, &first.image, opts, Some(anim));
+    let mut inputs = Vec::with_capacity(frames.len());
+    inputs.push(FrameInput {
+        channels: first_input.channels,
+        duration: ticks[0],
+    });
+    for (i, f) in frames.iter().enumerate().skip(1) {
+        let img = &f.image;
+        if img.width != first.image.width
+            || img.height != first.image.height
+            || img.format != first.image.format
+            || img.bits_per_sample != first.image.bits_per_sample
+        {
+            return Err(Error::unsupported(format!(
+                "JPEG XL encoder: frame {i} is {}×{} {:?} at {} bits, frame 0 is {}×{} {:?} at {} bits — \
+                 an animation has one geometry",
+                img.width,
+                img.height,
+                img.format,
+                img.bits_per_sample,
+                first.image.width,
+                first.image.height,
+                first.image.format,
+                first.image.bits_per_sample
+            )));
+        }
+        let input = encode_input(img)?;
+        inputs.push(FrameInput {
+            channels: input.channels,
+            duration: ticks[i],
+        });
+    }
+    let cs = crate::encoder::encode_codestream(&spec, &inputs)?;
+    finish_file(cs, &first.image.metadata, opts)
 }
 
 /// Parse the committee-draft (2019) `SizeHeader` + `ImageMetadata`
@@ -594,7 +829,7 @@ fn animation_info(md: &ImageMetadataFdis) -> Option<AnimationInfo> {
 /// unspecified with the exponent in [`Metadata::gamma`]. With an ICC
 /// profile the enumerated fields are not meaningful and only the
 /// (always full) range is reported.
-fn color_info(md: &ImageMetadataFdis) -> ColorInfo {
+pub(crate) fn color_info(md: &ImageMetadataFdis) -> ColorInfo {
     let ce = &md.colour_encoding;
     if ce.want_icc {
         return ColorInfo::unspecified().with_range(ColorRange::Full);
@@ -635,7 +870,7 @@ fn gamma(md: &ImageMetadataFdis) -> Option<f32> {
 }
 
 /// Exif / XMP from the container boxes (first of each kind).
-fn container_metadata(file: Option<&container::JxlFile<'_>>, meta: &mut Metadata) {
+pub(crate) fn container_metadata(file: Option<&container::JxlFile<'_>>, meta: &mut Metadata) {
     let Some(file) = file else { return };
     for m in &file.metadata {
         match m.kind {
@@ -871,23 +1106,42 @@ mod tests {
     }
 
     #[test]
-    fn encode_is_unsupported() {
-        let img = JxlImage::from_rgb8(1, 1, vec![0, 0, 0]).unwrap();
-        assert!(matches!(
-            encode(&img, &EncodeOptions::default()),
-            Err(Error::Unsupported(_))
-        ));
-        assert!(matches!(
-            encode_rgb8(1, 1, &[0, 0, 0], &EncodeOptions::default()),
-            Err(Error::Unsupported(_))
-        ));
-        assert!(matches!(
-            encode_rgba8(1, 1, &[0, 0, 0, 0], &EncodeOptions::default()),
-            Err(Error::Unsupported(_))
-        ));
+    fn encode_round_trips_through_decode() {
+        let mut data = Vec::new();
+        for i in 0..(7 * 5 * 3) as u32 {
+            data.push(((i * 37) ^ (i >> 2)) as u8);
+        }
+        let img = JxlImage::from_rgb8(7, 5, data).unwrap();
+        let bytes = encode(&img, &EncodeOptions::default()).unwrap();
+        assert!(probe(&bytes));
+        assert_eq!(&bytes[..2], &[0xFF, 0x0A]);
+        let back = decode(&bytes).unwrap();
+        assert_eq!(back.format, PixelFormat::Rgb24);
+        assert_eq!(back.as_bytes(), img.as_bytes());
         let mut sink = Vec::new();
+        encode_to(&img, &EncodeOptions::default(), &mut sink).unwrap();
+        assert_eq!(sink, bytes);
+        assert_eq!(
+            encode_rgb8(7, 5, img.as_bytes().unwrap(), &EncodeOptions::default()).unwrap(),
+            bytes
+        );
+    }
+
+    #[test]
+    fn planar_layouts_are_refused_by_type() {
+        let yuv = JxlImage::new(
+            2,
+            2,
+            PixelFormat::YuvJ444P,
+            vec![
+                Plane::new(2, vec![0; 4]),
+                Plane::new(2, vec![0; 4]),
+                Plane::new(2, vec![0; 4]),
+            ],
+        )
+        .unwrap();
         assert!(matches!(
-            encode_to(&img, &EncodeOptions::default(), &mut sink),
+            encode(&yuv, &EncodeOptions::default()),
             Err(Error::Unsupported(_))
         ));
     }

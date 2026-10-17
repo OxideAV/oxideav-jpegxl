@@ -301,29 +301,26 @@ fn hostile_inputs_fail_cleanly() {
 }
 
 #[test]
-fn encoding_is_unsupported() {
+fn encoding_round_trips_the_contract_helpers() {
     let img = decode(PIXEL_1X1).unwrap();
     let opts = EncodeOptions::default();
-    assert!(matches!(encode(&img, &opts), Err(Error::Unsupported(_))));
-    assert!(matches!(
-        encode_rgb8(1, 1, &[1, 2, 3], &opts),
-        Err(Error::Unsupported(_))
-    ));
-    assert!(matches!(
-        encode_rgba8(1, 1, &[1, 2, 3, 4], &opts),
-        Err(Error::Unsupported(_))
-    ));
+    let bytes = encode(&img, &opts).unwrap();
+    assert_eq!(decode(&bytes).unwrap().as_bytes(), img.as_bytes());
+    let rgb = encode_rgb8(1, 1, &[1, 2, 3], &opts).unwrap();
+    assert_eq!(decode(&rgb).unwrap().to_rgb8(), vec![1, 2, 3]);
+    let rgba = encode_rgba8(1, 1, &[1, 2, 3, 4], &opts).unwrap();
+    assert_eq!(decode(&rgba).unwrap().to_rgba8(), vec![1, 2, 3, 4]);
     let mut sink = Vec::new();
-    assert!(matches!(
-        encode_to(&img, &opts, &mut sink),
-        Err(Error::Unsupported(_))
-    ));
-    assert!(sink.is_empty());
+    encode_to(&img, &opts, &mut sink).unwrap();
+    assert_eq!(sink, bytes);
     let frames = decode_all(ANIMATION).unwrap();
-    assert!(matches!(
-        encode_all(&frames, &opts),
-        Err(Error::Unsupported(_))
-    ));
+    let anim = encode_all(&frames, &opts).unwrap();
+    let back = decode_all(&anim).unwrap();
+    assert_eq!(back.len(), frames.len());
+    for (a, b) in frames.iter().zip(&back) {
+        assert_eq!(a.image.as_bytes(), b.image.as_bytes());
+        assert_eq!(a.delay, b.delay);
+    }
 }
 
 #[test]
@@ -431,10 +428,12 @@ mod registry {
         assert_eq!(legacy.planes.len(), 3);
         let all = oxideav_jpegxl::decode_all_frames(ANIMATION, None).unwrap();
         assert_eq!(all.len(), 3);
+        // The encoder is live (round 477); without geometry the factory
+        // reports what is missing.
         assert_eq!(
             oxideav_jpegxl::make_encoder(&CodecParameters::video(CodecId::new("jpegxl")))
                 .err()
-                .map(|e| matches!(e, oxideav_core::Error::Unsupported(_))),
+                .map(|e| matches!(e, oxideav_core::Error::InvalidData(_))),
             Some(true)
         );
     }

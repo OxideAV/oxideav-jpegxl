@@ -1,5 +1,7 @@
 //! [`DecodeOptions`] and [`EncodeOptions`].
 
+use crate::api::AnimationInfo;
+
 /// Decode limits and behaviour switches.
 ///
 /// Limits are checked against the codestream's `SizeHeader` /
@@ -107,18 +109,76 @@ impl Default for DecodeOptions {
 
 /// Encoder options.
 ///
-/// This crate has no JPEG XL encoder: every `encode*` function returns
-/// [`Error::Unsupported`](crate::Error::Unsupported). The struct exists
-/// so the contract surface is complete and so callers can be written
-/// against it today; options arrive with the encoder.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+/// `#[non_exhaustive]`: build with [`new`](Self::new) / `Default` and
+/// the `with_*` builders.
+#[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
-pub struct EncodeOptions {}
+pub struct EncodeOptions {
+    /// Advisory quality `0..=100` (default `100`). `100` is lossless
+    /// Modular; below it the Modular residuals are quantised with the
+    /// step [`crate::encoder::quantizer_for_quality`] documents
+    /// (`round(2^((100 − q) / 12))` at 8 bits, scaled with the depth),
+    /// so a lower quality never produces a larger file on textured
+    /// content.
+    pub quality: u8,
+    /// Always write the 18181-2 box file (signature, `ftyp`, `jxlc`).
+    /// Default `false`: a bare codestream unless an `Exif` / `xml `
+    /// box is needed for the image's metadata.
+    pub container: bool,
+    /// `group_dim = 128 << group_size_shift` (F.2), `0..=3`; default
+    /// `1` (256-pixel groups).
+    pub group_size_shift: u8,
+    /// Tick rate and loop count for [`encode_all`](crate::encode_all):
+    /// frame durations are then the frames' `ticks`. `None` (default)
+    /// writes a 1000 Hz tick and takes each frame's `delay` rounded to
+    /// milliseconds (`100` ms when a frame has none).
+    pub animation: Option<AnimationInfo>,
+}
 
 impl EncodeOptions {
     /// Same as [`Default::default`].
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Builder: set `quality` (clamped to `100`).
+    pub fn with_quality(mut self, quality: u8) -> Self {
+        self.quality = quality.min(100);
+        self
+    }
+
+    /// Builder: set `container`.
+    pub fn with_container(mut self, container: bool) -> Self {
+        self.container = container;
+        self
+    }
+
+    /// Builder: set `group_size_shift` (clamped to `3`).
+    pub fn with_group_size_shift(mut self, shift: u8) -> Self {
+        self.group_size_shift = shift.min(3);
+        self
+    }
+
+    /// Builder: set `animation`.
+    pub fn with_animation(mut self, animation: impl Into<Option<AnimationInfo>>) -> Self {
+        self.animation = animation.into();
+        self
+    }
+
+    /// `true` when the residuals are quantised (`quality < 100`).
+    pub fn is_lossy(&self) -> bool {
+        self.quality < 100
+    }
+}
+
+impl Default for EncodeOptions {
+    fn default() -> Self {
+        Self {
+            quality: 100,
+            container: false,
+            group_size_shift: 1,
+            animation: None,
+        }
     }
 }
 
@@ -135,5 +195,21 @@ mod tests {
         assert!(d.coalesce);
         let u = d.unlimited();
         assert!(u.max_width.is_none() && u.max_bytes.is_none() && u.max_pixels.is_none());
+    }
+
+    #[test]
+    fn encode_defaults_are_lossless_bare_codestream() {
+        let e = EncodeOptions::default();
+        assert_eq!(e.quality, 100);
+        assert!(!e.container && !e.is_lossy());
+        assert_eq!(e.group_size_shift, 1);
+        assert!(e.animation.is_none());
+        let e = e
+            .with_quality(200)
+            .with_group_size_shift(9)
+            .with_container(true);
+        assert_eq!((e.quality, e.group_size_shift), (100, 3));
+        assert!(e.container);
+        assert!(EncodeOptions::new().with_quality(50).is_lossy());
     }
 }

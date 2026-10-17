@@ -754,7 +754,19 @@ impl FrameHeader {
         // The in-repo 2024 IS PDF is an image-only scan, so the
         // changed table row cannot be cross-quoted textually; the
         // reading above is fixture-measured.
-        let save_before_ct = if frame_type != FrameType::LfFrame && !is_last {
+        // Table F.2: the field is present for a kReferenceOnly frame or
+        // for a frame that can be referenced — `can_reference =
+        // !is_last && (duration == 0 || save_as_reference != 0)`, never
+        // an LF frame. Pinned on the committed streams (round 477): a
+        // zero-duration layer carries the bit whatever its blend mode,
+        // a presented animation frame carries it only when it is saved
+        // as a reference; a presented frame with save_as_reference = 0
+        // has none (the earlier `!is_last` reading mis-aligned every
+        // header after it on such streams).
+        let can_reference = !is_last
+            && (duration == 0 || save_as_reference != 0)
+            && frame_type != FrameType::LfFrame;
+        let save_before_ct = if frame_type == FrameType::ReferenceOnly || can_reference {
             br.read_bool()?
         } else {
             d_sbct

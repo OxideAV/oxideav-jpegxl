@@ -3,8 +3,8 @@
 [![CI](https://github.com/OxideAV/oxideav-jpegxl/actions/workflows/ci.yml/badge.svg)](https://github.com/OxideAV/oxideav-jpegxl/actions/workflows/ci.yml) [![crates.io](https://img.shields.io/crates/v/oxideav-jpegxl.svg)](https://crates.io/crates/oxideav-jpegxl) [![docs.rs](https://docs.rs/oxideav-jpegxl/badge.svg)](https://docs.rs/oxideav-jpegxl) [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 Pure-Rust **JPEG XL** (JXL, ISO/IEC 18181-1 codestream + 18181-2 box
-file format) decoder, usable standalone or through the
-[oxideav](https://github.com/OxideAV/oxideav-workspace) framework. Built
+file format) decoder and Modular encoder, usable standalone or through
+the [oxideav](https://github.com/OxideAV/oxideav-workspace) framework. Built
 clean-room from the published specification and the conformance /
 behavioural-trace fixtures committed under `docs/image/jpegxl/` only —
 no external codec source is consulted. Zero C dependencies, zero FFI,
@@ -12,9 +12,11 @@ zero `*-sys`.
 
 The crate follows the workspace's image-crate API contract
 (`IMAGE_CRATE_API.md`): `probe` / `info` / `decode` / `decode_rgba8` /
-`decode_all` over a packed `JxlImage`, with `oxideav-core` optional
-behind the default-on `registry` feature. **Decoder only** — every
-`encode*` function returns `Error::Unsupported`.
+`decode_all` / `encode` / `encode_all` over a packed `JxlImage`, with
+`oxideav-core` optional behind the default-on `registry` feature. The
+decoder covers Modular and VarDCT codestreams; the encoder (round 477)
+writes Modular codestreams — lossless by default, quantised below
+quality 100 — with ICC / Exif / XMP carriage and animations.
 
 ## Standalone use
 
@@ -38,6 +40,13 @@ if oxideav_jpegxl::probe(&bytes) {
     for frame in oxideav_jpegxl::decode_all(&bytes)? {
         let _ = (frame.image.width(), frame.delay);
     }
+
+    // Encode: lossless Modular by default; `quality < 100` quantises.
+    let out = oxideav_jpegxl::encode(&img, &oxideav_jpegxl::EncodeOptions::new())?;
+    assert_eq!(oxideav_jpegxl::decode(&out)?.as_bytes(), img.as_bytes());
+    let smaller = oxideav_jpegxl::encode(
+        &img, &oxideav_jpegxl::EncodeOptions::new().with_quality(80))?;
+    let _ = smaller;
 }
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
@@ -46,8 +55,9 @@ Root items: `probe(&[u8]) -> bool`, `info -> ImageInfo`,
 `decode -> JxlImage`, `decode_with(&DecodeOptions)`,
 `decode_rgb8 -> RgbImage`, `decode_rgba8 -> RgbaImage`,
 `decode_all -> Vec<Frame>` (+ `decode_all_with`), `decode_from<R: Read>`,
-`encode` / `encode_rgb8` / `encode_rgba8` / `encode_to` (all
-`Error::Unsupported`), types `JxlImage`, `Plane`, `ColorInfo`,
+`encode` / `encode_rgb8` / `encode_rgba8` / `encode_to` /
+`encode_all` (Modular encoder, see *Encoding* below), types
+`JxlImage`, `Plane`, `ColorInfo`,
 `ColorRange`, `Metadata`, `RgbImage`, `RgbaImage`, `PixelFormat`
 (= `JxlPixelFormat`), `ImageInfo`, `Frame`, `AnimationInfo`,
 `DecodeOptions`, `EncodeOptions`, `Error` (= `JxlError`).
@@ -71,19 +81,41 @@ With the default `registry` feature:
 
 ```rust
 let mut ctx = oxideav_core::RuntimeContext::new();
-oxideav_jpegxl::register(&mut ctx);               // codec "jpegxl", decoder only
-let params = oxideav_core::CodecParameters::video(
+oxideav_jpegxl::register(&mut ctx);               // codec "jpegxl", decoder + encoder
+let mut params = oxideav_core::CodecParameters::video(
     oxideav_core::CodecId::new(oxideav_jpegxl::CODEC_ID_STR));
 let decoder = oxideav_jpegxl::make_decoder(&params)?;  // one .jxl file per packet
+params.width = Some(64);
+params.height = Some(64);
+params.pixel_format = Some(oxideav_core::PixelFormat::Rgb24);
+params.options.insert("quality", "90");
+let encoder = oxideav_jpegxl::make_encoder(&params)?;  // one still file per frame
+# let _ = (decoder, encoder);
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
 * `register(&mut RuntimeContext)` / `register_codecs(&mut CodecRegistry)`
-  / `register_containers(&mut ContainerRegistry)`; `make_decoder` (live)
-  and `make_encoder` (always `Unsupported`).
+  / `register_containers(&mut ContainerRegistry)`; `make_decoder` and
+  `make_encoder` are both live.
+* **Encoder** (`make_encoder`): one complete still file per frame
+  received (packet `pts` = frame `pts`, keyframe). It declares the
+  eight layouts it codes in `CodecCapabilities::accepted_pixel_formats`
+  (`registry::ACCEPTED_PIXEL_FORMATS`: `Rgb24`, `Rgba`, `Rgb48Le`,
+  `Rgba64Le`, `Gray8`, `Ya8`, `Gray16Le`, `Ya16Le`) — any other
+  `pixel_format` is a typed `Unsupported`, never a silent conversion —
+  and the `JxlEncoderOptions` schema: `quality` (`0..=100`, default
+  `100` = lossless), `container` (bool), `group_size_shift` (`0..=3`).
+  The significant-bits side-channel sets the codestream depth
+  (`Rgb48Le` at 12 significant bits is a 12-bit codestream).
+* **Metadata blobs** (`oxideav_core::blob`, core 0.1.40): the demuxer
+  puts the codestream ICC profile and the `Exif` / `xml ` box payloads
+  on the stream's `CodecParameters::blobs` as `BlobKind::ICC` / `EXIF`
+  / `XMP`, the decoder repeats them on the first frame; the encoder
+  reads the frame's blobs first and the stream's second (a frame blob
+  overrides the stream blob of the same kind) and writes the ICC into
+  the codestream, Exif / XMP as boxes. See *Metadata and colour*.
 * The `jpegxl` container (`oxideav_jpegxl::demux`, extension `.jxl`,
-  both signatures probed) is a **demuxer only** — the crate is
-  decoder-only by ruling, so there is nothing a muxer could receive. It
+  both signatures probed) has a demuxer and a muxer. The demuxer
   declares one video stream the way `info` describes the file (native
   `pixel_format`, the enumerated `ColourEncoding` as `color_signal`,
   `pixel_format = None` when the channel set has no contract layout)
@@ -94,8 +126,20 @@ let decoder = oxideav_jpegxl::make_decoder(&params)?;  // one .jxl file per pack
   count and `pts` the running sum; because JPEG XL frames are not
   independently decodable, only the first packet carries bytes and the
   rest are zero-length pacing packets. `metadata()` carries
-  `("loop_count", n)` and `("icc" | "exif" | "xmp", "present")` flags
-  (the blobs have no framework carriage yet).
+  `("loop_count", n)` and `("icc" | "exif" | "xmp", "present")` flags.
+* **Muxer** (`demux::open_muxer`, one `jpegxl` video stream): one
+  packet is written verbatim; several packets — one still per picture,
+  as the registry encoder and the gateway's per-picture re-encode
+  produce — are **spliced** into one animated codestream: the image
+  headers are rewritten with an `AnimationHeader` whose tick is the
+  stream time base, each frame header is re-emitted with the packet's
+  `duration` in ticks (else the gap to the next `pts`, else the
+  previous duration; the last packet becomes `is_last`), and the TOCs
+  and section bytes are copied verbatim; the first packet's metadata
+  boxes are kept. Only this crate's frame shape (plain `kModular`,
+  `kReplace`, no crop / upsampling / restoration filter / TOC
+  permutation, matching geometry, depth and channel set) can be
+  re-timed; anything else is `Unsupported` naming the mismatch.
 * Decoder option `pacing`: `all` (default — every frame of the file
   comes out of the packet that carried it) or `packet` (one frame per
   packet received, the remainder at `flush`; a packet lends its `pts` to
@@ -175,11 +219,65 @@ uses the same label):
   `as_bytes()` is `None` for the planar layouts (`into_raw` concatenates
   the three planes).
 
-Encode: none. `encode`, `encode_rgb8`, `encode_rgba8`, `encode_to`
-return `Error::Unsupported("JPEG XL encoding is not implemented")`;
-`EncodeOptions` is an empty `#[non_exhaustive]` struct so callers can
-be written against it today. A lossless Modular encoder is a later
-seat.
+### Encoding
+
+`encode` / `encode_rgb8` / `encode_rgba8` / `encode_to` /
+`encode_all` write a `kModular` codestream (Annex H). Declared input
+layouts — the same table in both directions, the output label is what
+`decode` returns:
+
+| Input `PixelFormat` | codestream | notes |
+|---|---|---|
+| `Gray8` | grey, `bits_per_sample` 1..=8 | depth from `JxlImage::bits_per_sample` |
+| `Ya8` | grey + alpha extra channel, ≤ 8 | |
+| `Rgb24` | RGB, ≤ 8 | YCoCg RCT (`rct_type = 6`) in front of the three channels |
+| `Rgba` | RGB + alpha, ≤ 8 | |
+| `Gray16Le` | grey, 9..=16 | |
+| `Ya16Le` | grey + alpha, 9..=16 | |
+| `Rgb48Le` | RGB, 9..=16 | `bits_per_sample = 12` writes a 12-bit codestream |
+| `Rgba64Le` | RGB + alpha, 9..=16 | |
+| `YuvJ444P` / `YuvJ422P` / `YuvJ420P` / `Yuv440P` | — | `Error::Unsupported` (planar transcode layouts are decode-only; never converted) |
+
+* **Lossless at quality 100** (the default): every layout above
+  round-trips bit-exactly, on one-group and multi-group geometries
+  (the committed tests pin 1×1 … 2100×40 and 513×257 pictures, every
+  depth, and a black-box decoder agrees where one is installed).
+* **Quality < 100** quantises the Modular residuals: the MA-tree leaf
+  `multiplier` is `round(2^((100 − q) / 12))` at 8 bits (`q90 → 2`,
+  `q75 → 4`, `q50 → 18`, `q0 → 322`), scaled by `2^(bits − 8)` for
+  deeper samples, with closed-loop prediction so the error per sample
+  is bounded by the step. The size ladder is monotone on textured
+  content (`q50 < q90 < q100`, pinned); lower quality never yields a
+  larger file.
+* **Structure**: one global MA tree with one leaf per channel (a
+  balanced split on the channel index); each leaf's predictor is
+  picked per channel among West / North / Select / Gradient by
+  residual energy (predictors without integer division, so no
+  rounding convention is involved); prefix-coded entropy streams
+  (`use_prefix_code = 1`, no LZ77, simple clustering); pictures up to
+  `group_dim` (default 256, `group_size_shift`) are coded in
+  `GlobalModular`, larger ones as one `PassGroup` section per group
+  sharing the global tree (empty `ModularLfGroup` / `HfGlobal`
+  sections). The `SizeHeader` short form is used when it applies.
+* **Metadata**: an ICC profile is embedded in the codestream (E.4,
+  written as a header residual stream plus one verbatim main-content
+  command, so any profile round-trips byte for byte); Exif / XMP
+  become `Exif` (zero TIFF-header offset) / `xml ` boxes ahead of the
+  `jxlc` box, which turns the output into the 18181-2 box file
+  (`EncodeOptions::container` forces the box file). The enumerated
+  `ColourEncoding` comes from `JxlImage::color` (sRGB → `all_default`;
+  BT.2100 / P3 primaries, BT.709 / linear / sRGB / PQ / DCI / HLG
+  transfer).
+* **Animations** (`encode_all`): one frame per picture, `kReplace`,
+  `have_animation` with `EncodeOptions::animation` (`AnimationInfo`:
+  tick rate + loops, frames' `ticks` used) or a 1000 Hz tick and the
+  frames' `delay` in milliseconds (`100` ms without one). Frames share
+  one geometry / layout / depth — a mismatch is `Error::Unsupported`
+  naming both shapes. Metadata is the first frame's.
+* Not written: VarDCT (lossy XYB), the self-correcting predictor,
+  Palette / Squeeze transforms, LZ77 / ANS streams, patches, splines,
+  noise, upsampling, crops, previews, extra channels beyond one alpha,
+  float samples, `bits_per_sample > 16`.
 
 ## Options
 
@@ -196,6 +294,19 @@ dimension, `2^30` max pixels, `strict = false`, `coalesce = true`):
 any preceding layers and oriented (Table A.17) — for a multi-layer
 still image that is the finished picture, not the bare first layer.
 
+`EncodeOptions` (`Default`: `quality = 100`, `container = false`,
+`group_size_shift = 1`, `animation = None`):
+
+| Field | Meaning |
+|---|---|
+| `quality` | `0..=100`; `100` = lossless Modular, below it the residual quantiser `round(2^((100 − q) / 12))` scaled with the depth (see *Encoding*) |
+| `container` | always write the 18181-2 box file; otherwise a bare codestream unless Exif / XMP need boxes |
+| `group_size_shift` | `group_dim = 128 << shift`, `0..=3` |
+| `animation` | `AnimationInfo` (tick rate, loops) for `encode_all`; `None` = 1000 Hz tick, frame delays in ms |
+
+The registry schema (`registry::JxlEncoderOptions`) carries `quality`
+/ `container` / `group_size_shift` under the same names.
+
 ## Metadata and colour
 
 * `JxlImage::color` (`ColorInfo { range, primaries, transfer, matrix }`,
@@ -207,12 +318,25 @@ still image that is the finished picture, not the bare first layer.
   is always 0 (RGB output). With an embedded ICC profile the enumerated
   fields are unspecified (2) and the profile is in `metadata.icc`.
   The default `all_default` encoding is sRGB (`ColorInfo::srgb()`).
-* `Metadata { icc, exif, xmp, gamma }`: `icc` is the Annex B encoded ICC
+* `Metadata { icc, exif, xmp, gamma }`: `icc` is the E.4 encoded ICC
   stream reconstructed to profile bytes; `exif` is the container's
   `Exif` box payload from its TIFF header (18181-2 Table 6 offset
   applied); `xmp` the `xml ` box; `brob`-compressed boxes are
   decompressed up to 64 MiB. Metadata rides on the first frame of
-  `decode_all`.
+  `decode_all`. The encoder writes the same three back (ICC into the
+  codestream, Exif / XMP as boxes).
+* **Blob carriage** (`registry` feature, `oxideav_core::blob`):
+
+  | blob | decode: stream (`CodecParameters::blobs`) | decode: frame (first) | encode: read from | written as |
+  |---|---|---|---|---|
+  | `BlobKind::ICC` | codestream E.4 profile | yes | frame, else stream | codestream (E.4) |
+  | `BlobKind::EXIF` | `Exif` box payload after the TIFF-header offset | yes | frame, else stream | `Exif` box, offset 0 |
+  | `BlobKind::XMP` (`application/rdf+xml`) | `xml ` box | yes | frame, else stream | `xml ` box |
+  | other kinds | — | — | ignored | — |
+
+  A losslessly recompressed JPEG reports the same blobs its byte-exact
+  reconstruction (`jpeg_reconstruct::reconstruct_jpeg`) re-emits as
+  `APP1` Exif / XMP and `APP2 ICC_PROFILE` segments (pinned).
 * `ImageInfo` extras: `bits_per_sample`, `float_sample`, `xyb_encoded`,
   `orientation`, `num_extra_channels`, `animation`
   (`AnimationInfo { ticks_per_second, loops }`), `signature`,
@@ -976,8 +1100,10 @@ generated `cjxl` transcode pairs:
   pipeline would be wrong for them).
 - The LfFrame (`lf_level > 0`) dimension scaling `progressive-dc`
   needs.
-- The encoder (`encode*` return `Error::Unsupported`; a lossless
-  Modular encoder is a later seat).
+- On the encoder: VarDCT (lossy XYB) output, the self-correcting
+  predictor, Palette / Squeeze, LZ77 / ANS coding, context modelling
+  beyond one leaf per channel (the lossless ratio is PNG-class, not a
+  reference encoder's), extra channels beyond one alpha, float samples.
 
 Unsupported inputs surface as `Error::Unsupported` rather than a silent
 misparse.
@@ -999,6 +1125,8 @@ across runs, crashing inputs uploaded as artifacts):
 | `decode_modular` | structure-aware single-channel Modular decode (header + MA tree + pixel loop) under fuzz-chosen geometry |
 | `jpeg_recon` | Annex A JPEG bitstream reconstruction over container + `jbrd` |
 | `decode_partial` | truncation driver: the capped decode over fuzz-chosen prefixes of valid streams |
+| `encode_roundtrip` | the Modular encoder over fuzz-chosen geometry / layout / depth / quality / group size / metadata: the output must parse and decode, bit-exactly (samples + ICC / Exif / XMP) at quality 100; animations via `encode_all` |
+| `mux_splice` | the `jpegxl` muxer's animation splice over hostile packets and over genuine (possibly byte-flipped) stills — never a panic, genuine stills always splice |
 
 Decode harnesses pre-probe the preamble and skip inputs declaring more
 than 2^20 pixels or more than 4 extra channels (a JXL SizeHeader can

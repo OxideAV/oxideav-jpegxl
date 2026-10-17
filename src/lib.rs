@@ -518,6 +518,8 @@ pub mod ans;
 pub mod begabrac;
 #[doc(hidden)] // internal: LSB-first bitstream reader plumbing
 pub mod bitreader;
+#[doc(hidden)] // internal: LSB-first bitstream writer (encoder plumbing)
+pub mod bitwriter;
 #[doc(hidden)] // internal: VarDCT block-context resolution
 pub mod block_context_resolver;
 #[doc(hidden)] // internal: per-block dequantisation
@@ -622,6 +624,11 @@ pub mod vardct;
 pub mod vardct_reconstruct;
 #[doc(hidden)] // internal: Annex L colour transforms (XYB / YCbCr)
 pub mod xyb;
+
+#[doc(hidden)] // internal: Modular codestream writer plumbing
+pub mod encoder;
+#[doc(hidden)] // internal: prefix-code entropy writer plumbing
+pub mod entropy_write;
 
 mod api;
 pub mod error;
