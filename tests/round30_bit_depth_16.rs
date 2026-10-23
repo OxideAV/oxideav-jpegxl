@@ -37,7 +37,7 @@
 //! time.
 
 mod common;
-use common::png::{decode_png, BitDepth, ColorType};
+use common::png::{BitDepth, ColorType, decode_png};
 use oxideav_jpegxl::decode_planar;
 
 const BD16_JXL: &[u8] = include_bytes!("fixtures/bit_depth_16.jxl");
@@ -65,7 +65,7 @@ fn png_to_planes_rgb16(bytes: &[u8]) -> (u32, u32, [Vec<u16>; 3]) {
     let mut b = Vec::with_capacity(n);
     // PNG ships 16-bit samples big-endian (RFC 2083 §2.1) and the
     // png crate preserves that on the output buffer.
-    for px in bytes.chunks_exact(6) {
+    for px in bytes.as_chunks::<6>().0 {
         r.push(u16::from_be_bytes([px[0], px[1]]));
         g.push(u16::from_be_bytes([px[2], px[3]]));
         b.push(u16::from_be_bytes([px[4], px[5]]));
@@ -82,7 +82,9 @@ fn plane_to_u16_le(data: &[u8]) -> Vec<u16> {
         0,
         "round-30 16-bit plane bytes must be a multiple of 2",
     );
-    data.chunks_exact(2)
+    data.as_chunks::<2>()
+        .0
+        .iter()
         .map(|c| u16::from_le_bytes([c[0], c[1]]))
         .collect()
 }
@@ -136,7 +138,7 @@ fn bit_depth_16_le_pack_convention_self_consistent() {
     for plane in &vf.planes {
         assert_eq!(plane.stride, 64 * 2);
         assert_eq!(plane.data.len(), 64 * 64 * 2);
-        for chunk in plane.data.chunks_exact(2) {
+        for chunk in plane.data.as_chunks::<2>().0 {
             let s = u16::from_le_bytes([chunk[0], chunk[1]]);
             let back = s.to_le_bytes();
             assert_eq!(back, [chunk[0], chunk[1]]);

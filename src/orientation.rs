@@ -52,7 +52,7 @@ pub fn apply_orientation(
 }
 
 fn orient_plane(p: Plane, orientation: u8, bytes: usize) -> Result<Plane> {
-    if p.stride == 0 || p.stride % bytes != 0 || p.data.len() % p.stride != 0 {
+    if p.stride == 0 || !p.stride.is_multiple_of(bytes) || !p.data.len().is_multiple_of(p.stride) {
         return Err(Error::InvalidData(format!(
             "JXL orientation: plane geometry (stride {}, {} bytes) not sample-aligned",
             p.stride,

@@ -228,11 +228,7 @@ impl ComposeState {
 
     /// Bytes per sample of the integer plane layout (1 or 2).
     fn bytes_per_sample(&self) -> usize {
-        if self.bits_per_sample > 8 {
-            2
-        } else {
-            1
-        }
+        if self.bits_per_sample > 8 { 2 } else { 1 }
     }
 
     /// Compose one decoded frame per §C.2 and return the composed
@@ -250,7 +246,7 @@ impl ComposeState {
         let two = bytes == 2;
         let max = ((1u32 << self.bits_per_sample) - 1) as f32;
         let stride = decoded.planes[0].stride;
-        if stride == 0 || stride % bytes != 0 {
+        if stride == 0 || !stride.is_multiple_of(bytes) {
             return Err(Error::InvalidData(format!(
                 "JXL frame composition: plane stride {stride} is not a multiple of the \
                  {bytes}-byte sample layout"
@@ -319,13 +315,13 @@ impl ComposeState {
                 )));
             }
         }
-        if let Some(a) = meta.alpha_plane {
-            if a < 3 || a >= n_planes {
-                return Err(Error::InvalidData(format!(
-                    "JXL frame composition: alpha plane index {a} out of range for a \
+        if let Some(a) = meta.alpha_plane
+            && (a < 3 || a >= n_planes)
+        {
+            return Err(Error::InvalidData(format!(
+                "JXL frame composition: alpha plane index {a} out of range for a \
                      {n_planes}-plane frame"
-                )));
-            }
+            )));
         }
         let needs_alpha = matches!(meta.mode, BlendMode::Blend | BlendMode::AlphaWeightedAdd);
         if needs_alpha && meta.alpha_plane.is_none() {

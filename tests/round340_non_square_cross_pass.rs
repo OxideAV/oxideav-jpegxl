@@ -21,7 +21,7 @@ use oxideav_jpegxl::metadata_fdis::OpsinInverseMatrix;
 use oxideav_jpegxl::multi_pass_decode::MultiPassThreeChannelOutput;
 use oxideav_jpegxl::pass_group_hf::DecodedHfBlock;
 use oxideav_jpegxl::varblock_walk::Varblock;
-use oxideav_jpegxl::vardct_reconstruct::{reconstruct_lf_group_cross_pass, DequantContext};
+use oxideav_jpegxl::vardct_reconstruct::{DequantContext, reconstruct_lf_group_cross_pass};
 
 fn passes(num_passes: u32, shift: Vec<u32>) -> Passes {
     Passes {

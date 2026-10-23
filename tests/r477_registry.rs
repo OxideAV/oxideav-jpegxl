@@ -14,9 +14,9 @@ use oxideav_core::{
     NullCodecResolver, Packet, PixelFormat, ReadSeek, RuntimeContext, StreamInfo, TimeBase,
     VideoFrame, WriteSeek,
 };
-use oxideav_jpegxl::demux::{open_demuxer, open_muxer, CONTAINER_NAME};
+use oxideav_jpegxl::demux::{CONTAINER_NAME, open_demuxer, open_muxer};
 use oxideav_jpegxl::registry::ACCEPTED_PIXEL_FORMATS;
-use oxideav_jpegxl::{decode, decode_all, info, register, JxlImage, Signature, CODEC_ID_STR};
+use oxideav_jpegxl::{CODEC_ID_STR, JxlImage, Signature, decode, decode_all, info, register};
 
 const ICC_FIXTURE: &[u8] = include_bytes!("fixtures/r451_icc.jxl");
 const EXIF_XMP_TRANSCODE: &[u8] = include_bytes!("fixtures/r477_exif_xmp.jxl");
@@ -317,10 +317,10 @@ fn reconstructed_jpeg_app_segments_are_the_decoder_blobs() {
         let marker = jpeg[pos + 1];
         let len = usize::from(u16::from_be_bytes([jpeg[pos + 2], jpeg[pos + 3]]));
         let payload = &jpeg[pos + 4..pos + 2 + len];
-        if marker == 0xE2 {
-            if let Some(rest) = payload.strip_prefix(b"ICC_PROFILE\0") {
-                chunks.push((rest[0], rest[2..].to_vec()));
-            }
+        if marker == 0xE2
+            && let Some(rest) = payload.strip_prefix(b"ICC_PROFILE\0")
+        {
+            chunks.push((rest[0], rest[2..].to_vec()));
         }
         pos += 2 + len;
     }

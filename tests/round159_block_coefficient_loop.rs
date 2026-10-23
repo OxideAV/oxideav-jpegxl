@@ -15,10 +15,10 @@
 //! All truth is from the FDIS PDF Listing C.13 + Listing C.14 + the
 //! surrounding §C.8.3 prose. No external library consulted.
 
-use oxideav_jpegxl::coeff_order::{natural_coeff_order, OrderId};
+use oxideav_jpegxl::coeff_order::{OrderId, natural_coeff_order};
 use oxideav_jpegxl::pass_group_hf::{
-    coefficient_context, decode_block_coefficients, non_zeros_context, prev_for_context,
-    read_non_zeros_and_decode_block, COEFF_FREQ_CONTEXT, COEFF_NUM_NONZERO_CONTEXT,
+    COEFF_FREQ_CONTEXT, COEFF_NUM_NONZERO_CONTEXT, coefficient_context, decode_block_coefficients,
+    non_zeros_context, prev_for_context, read_non_zeros_and_decode_block,
 };
 
 /// At the first iteration (k == num_blocks), prev depends on

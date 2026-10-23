@@ -33,7 +33,7 @@ use oxideav_jpegxl::hf_coeff_histogram_size::HfCoefficientHistogramSize;
 use oxideav_jpegxl::hf_coefficient_histograms::HfCoefficientHistograms;
 use oxideav_jpegxl::multi_pass_hf_header::PerPassHfHeaders;
 use oxideav_jpegxl::multi_pass_hf_histogram_decoder::HfHistogramDecodeContext;
-use oxideav_jpegxl::pass_group_hf::{coefficient_context, non_zeros_context, PassGroupHfHeader};
+use oxideav_jpegxl::pass_group_hf::{PassGroupHfHeader, coefficient_context, non_zeros_context};
 
 /// §D.3 prelude that reads as a single-cluster, prefix-coded
 /// histogram block where every distribution maps to cluster 0 and

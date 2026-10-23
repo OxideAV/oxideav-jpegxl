@@ -1,8 +1,8 @@
 [package]
 name = "oxideav-jpegxl"
 version = "0.0.14"
-edition = "2021"
-rust-version = "1.80"
+edition = "2024"
+rust-version = "1.95"
 license = "MIT"
 repository = "https://github.com/OxideAV/oxideav-jpegxl"
 # crates.io 10 MiB cap: fixtures and the fuzz corpus stay in the

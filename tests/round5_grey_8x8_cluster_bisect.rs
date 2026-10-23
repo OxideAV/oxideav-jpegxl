@@ -12,8 +12,8 @@
 use oxideav_jpegxl::ans::cluster::{num_clusters, read_clustering};
 use oxideav_jpegxl::ans::hybrid::{HybridUintState, Lz77Params};
 use oxideav_jpegxl::ans::hybrid_config::HybridUintConfig;
-use oxideav_jpegxl::ans::prefix::{diagnose_complex_prefix, read_prefix_code_traced, ClclTrace};
-use oxideav_jpegxl::bitreader::{unpack_signed, BitReader, U32Dist};
+use oxideav_jpegxl::ans::prefix::{ClclTrace, diagnose_complex_prefix, read_prefix_code_traced};
+use oxideav_jpegxl::bitreader::{BitReader, U32Dist, unpack_signed};
 use oxideav_jpegxl::container;
 use oxideav_jpegxl::frame_header::{FrameDecodeParams, FrameHeader};
 use oxideav_jpegxl::lf_global::LfChannelDequantization;
@@ -260,7 +260,7 @@ fn r5_grey_8x8_per_cluster_prefix_trace() {
                     let nonzero_lens: Vec<(usize, u32)> = lengths
                         .iter()
                         .enumerate()
-                        .filter(|(_, &l)| l != 0)
+                        .filter(|&(_, &l)| l != 0)
                         .map(|(i, &l)| (i, l))
                         .collect();
                     eprintln!("  cluster[{c}] non-zero code-lengths: {:?}", nonzero_lens);
@@ -300,7 +300,7 @@ fn r5_grey_8x8_per_cluster_prefix_trace() {
                     let nonzero_lens: Vec<(usize, u32)> = lengths
                         .iter()
                         .enumerate()
-                        .filter(|(_, &l)| l != 0)
+                        .filter(|&(_, &l)| l != 0)
                         .map(|(i, &l)| (i, l))
                         .collect();
                     eprintln!(

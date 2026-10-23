@@ -10,11 +10,11 @@
 //! materialisation. The closures abstract over the §C.7.2 entropy
 //! decode (#799 DOCS-GAP).
 
-use oxideav_jpegxl::dct_select::{derive_dct_select, DctSelectCell, DctSelectGrid, TransformType};
+use oxideav_jpegxl::dct_select::{DctSelectCell, DctSelectGrid, TransformType, derive_dct_select};
 use oxideav_jpegxl::lf_group::HfMetadata;
 use oxideav_jpegxl::per_pass_non_zeros::PerPassNonZerosGrids;
 use oxideav_jpegxl::varblock_walk::{
-    count_varblocks, decode_varblocks_for_pass_channel, Varblock, VarblockWalk,
+    Varblock, VarblockWalk, count_varblocks, decode_varblocks_for_pass_channel,
 };
 
 fn make_hf(block_info: Vec<i32>, nb_blocks: u32, info_w: u32) -> HfMetadata {

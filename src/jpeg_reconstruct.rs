@@ -723,7 +723,7 @@ impl JpegBitWriter {
     /// signalled `has_padding`, the next bits come from `bbit`;
     /// otherwise the padding bits are zero.
     fn pad_to_byte(&mut self, padding: &mut PaddingBits<'_>) -> Result<()> {
-        while self.nbits % 8 != 0 {
+        while !self.nbits.is_multiple_of(8) {
             let bit = padding.next()?;
             self.put_bits(bit as u32, 1);
         }
@@ -806,9 +806,9 @@ impl BuiltHuffman {
             .flatten()
             .ok_or_else(|| {
                 Error::InvalidData(format!(
-                "JXL jpeg_reconstruct: symbol {symbol:#x} has no code in the signalled Huffman \
+                    "JXL jpeg_reconstruct: symbol {symbol:#x} has no code in the signalled Huffman \
                  table"
-            ))
+                ))
             })?;
         bw.put_bits(code, len);
         Ok(())
@@ -1429,11 +1429,11 @@ fn encode_sequential_scan(
 
                         // Extra ZRL data for this block, if any.
                         let mut extra_runs = 0u32;
-                        if let Some(ezr) = ezr_it.peek() {
-                            if ezr.block_idx == block_idx_in_scan {
-                                extra_runs = ezr.num_runs;
-                                ezr_it.next();
-                            }
+                        if let Some(ezr) = ezr_it.peek()
+                            && ezr.block_idx == block_idx_in_scan
+                        {
+                            extra_runs = ezr.num_runs;
+                            ezr_it.next();
                         }
 
                         let mut pred = sc.pred;
@@ -1519,11 +1519,7 @@ fn encode_sequential_block(
 /// AC point transform (10918-1 A.4, G.1.2.2): signed integer division
 /// by `2^al` — sign-magnitude, NOT an arithmetic shift.
 fn pt_ac(v: i32, al: u32) -> i32 {
-    if v >= 0 {
-        v >> al
-    } else {
-        -((-v) >> al)
-    }
+    if v >= 0 { v >> al } else { -((-v) >> al) }
 }
 
 /// Pending end-of-band run state for progressive AC scans (10918-1
@@ -1759,18 +1755,18 @@ fn encode_progressive_ac_scan(
                 rst_m = (rst_m + 1) & 7;
                 mcu_count = 0;
             }
-            if let Some(&&rp) = rp_it.peek() {
-                if rp == block_idx {
-                    eob.flush(bw, ac)?;
-                    rp_it.next();
-                }
+            if let Some(&&rp) = rp_it.peek()
+                && rp == block_idx
+            {
+                eob.flush(bw, ac)?;
+                rp_it.next();
             }
             let mut extra_runs = 0u32;
-            if let Some(ezr) = ezr_it.peek() {
-                if ezr.block_idx == block_idx {
-                    extra_runs = ezr.num_runs;
-                    ezr_it.next();
-                }
+            if let Some(ezr) = ezr_it.peek()
+                && ezr.block_idx == block_idx
+            {
+                extra_runs = ezr.num_runs;
+                ezr_it.next();
             }
             let base = (by * cw + bx) * 64;
             let block = &tc.coeffs[fc.jxl_channel][base..base + 64];

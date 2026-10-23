@@ -65,7 +65,7 @@ use crate::error::{Error, Result};
 
 use crate::ans::hybrid::HybridUintState;
 use crate::bitreader::BitReader;
-use crate::modular_fdis::{decode_uint_in_with_dist_pub, EntropyStream};
+use crate::modular_fdis::{EntropyStream, decode_uint_in_with_dist_pub};
 
 /// Fixed number of pre-clustered distributions for the ICC entropy
 /// stream — Annex E.4.1 first paragraph.

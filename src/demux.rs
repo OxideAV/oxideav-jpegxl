@@ -46,18 +46,18 @@
 use std::io::{Read, SeekFrom, Write};
 
 use oxideav_core::{
-    CodecId, CodecParameters, CodecResolver, ContainerRegistry, Demuxer, Error, MediaType, Muxer,
-    Packet, PixelFormat, ProbeData, ProbeScore, ReadSeek, Result, StreamInfo, TimeBase, WriteSeek,
-    MAX_PROBE_SCORE, PROBE_SCORE_EXTENSION,
+    CodecId, CodecParameters, CodecResolver, ContainerRegistry, Demuxer, Error, MAX_PROBE_SCORE,
+    MediaType, Muxer, PROBE_SCORE_EXTENSION, Packet, PixelFormat, ProbeData, ProbeScore, ReadSeek,
+    Result, StreamInfo, TimeBase, WriteSeek,
 };
 
+use crate::CODEC_ID_STR;
 use crate::api::describe;
 use crate::bitwriter::BitWriter;
 use crate::encoder::{AnimationSpec, ColourSpec, EncodeSpec, FrameShape};
 use crate::frame_header::{BlendMode, Encoding, FrameType};
 use crate::metadata_fdis::{ColourSpace, ExtraChannelType};
-use crate::registry::{blobs_of_metadata, to_color_signal, OPTION_PACING, PACING_PACKET};
-use crate::CODEC_ID_STR;
+use crate::registry::{OPTION_PACING, PACING_PACKET, blobs_of_metadata, to_color_signal};
 
 /// The container name (both signatures).
 pub const CONTAINER_NAME: &str = "jpegxl";

@@ -40,7 +40,7 @@ use crate::error::{Error, Result};
 use crate::abrac::Abrac;
 use crate::bitreader::BitReader;
 use crate::matree::{MaTree, PropRange};
-use crate::predictors::{ch_zero, median3, Predictor};
+use crate::predictors::{Predictor, ch_zero, median3};
 
 /// Hard upper bound on a channel's width or height. Real-world JXL
 /// images go up to 2^30 samples per side per the FDIS, but anything
@@ -305,8 +305,8 @@ pub fn compute_properties(
     props.push(left); // n+3
     props.push(y as i32); // n+4
     props.push(x as i32); // n+5
-                          // Same i64+clamp fence as the extra-channel gradients above: the
-                          // decoded neighbours can sit at i32 extremes on hostile streams.
+    // Same i64+clamp fence as the extra-channel gradients above: the
+    // decoded neighbours can sit at i32 extremes on hostile streams.
     let cl = |v: i64| -> i32 { v.clamp(i32::MIN as i64, i32::MAX as i64) as i32 };
     props.push(cl(left as i64 + top as i64 - topleft as i64)); // n+6
     props.push(cl(topleft as i64 + topright as i64 - top as i64)); // n+7
@@ -792,8 +792,8 @@ mod tests {
         push_varint(&mut bytes, (Predictor::Zero as u64) << 2); // pack = 0
         push_varint(&mut bytes, 1); // min = 0 (1 - 1 = 0)
         push_varint(&mut bytes, 255); // span = 255 → max = 255
-                                      // Plenty of zero padding so a successful decode wouldn't trip an
-                                      // EOF later in the pipeline; the cap should fire first.
+        // Plenty of zero padding so a successful decode wouldn't trip an
+        // EOF later in the pipeline; the cap should fire first.
         bytes.extend_from_slice(&[0u8; 64]);
         let err = decode_single_channel(&bytes, 1_000_000, 1_000_000, 0).unwrap_err();
         match err {

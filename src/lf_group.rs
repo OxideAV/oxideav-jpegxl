@@ -105,7 +105,7 @@ use crate::global_modular::{apply_inverse_transforms, apply_transforms_to_channe
 use crate::lf_global::LfGlobal;
 use crate::metadata_fdis::ImageMetadataFdis;
 use crate::modular_fdis::{
-    decode_channels_at_stream, ChannelDesc, MaTreeFdis, TransformInfo, WpHeader,
+    ChannelDesc, MaTreeFdis, TransformInfo, WpHeader, decode_channels_at_stream,
 };
 
 /// LfGroup index within the frame, computed from

@@ -12,7 +12,7 @@
 //! ("3 channels but colour_space wants 1").
 
 mod common;
-use common::png::{decode_png, ColorType};
+use common::png::{ColorType, decode_png};
 #[test]
 fn grey_xyb_output_reference_band() {
     let jxl = include_bytes!("fixtures/r451_grey_xyb.jxl");

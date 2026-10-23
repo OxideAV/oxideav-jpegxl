@@ -8,7 +8,7 @@
 //! drawn geometry. No external decoder source is consulted; the token
 //! script is built by hand from the Listing C.3 structure.
 
-use oxideav_jpegxl::splines::{decode_splines_with, render_splines, Point, Spline, SPLINE_DCT_LEN};
+use oxideav_jpegxl::splines::{Point, SPLINE_DCT_LEN, Spline, decode_splines_with, render_splines};
 
 /// Build the token script for a single spline with two control points and
 /// a chosen (Y, σ) DC value, everything else zero. Mirrors the reader's

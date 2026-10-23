@@ -27,9 +27,9 @@ use crate::bitreader::{BitReader, U32Dist};
 use crate::frame_header::{Encoding, FrameHeader};
 use crate::metadata_fdis::{ColourSpace, ImageMetadataFdis};
 use crate::modular_fdis::{
-    decode_channels_at_stream, horiz_isqueeze, inverse_palette, inverse_rct, vert_isqueeze,
-    ChannelDesc, MaTreeFdis, ModularImage, SqueezeParam, TransformId, TransformInfo, WpHeader,
-    MAX_CHANNELS,
+    ChannelDesc, MAX_CHANNELS, MaTreeFdis, ModularImage, SqueezeParam, TransformId, TransformInfo,
+    WpHeader, decode_channels_at_stream, horiz_isqueeze, inverse_palette, inverse_rct,
+    vert_isqueeze,
 };
 
 /// Decoded `GlobalModular` — the channel descriptions and the actual
@@ -665,11 +665,7 @@ fn derive_channel_descs(
             let is_grey_1ch = !fh.do_ycbcr
                 && !metadata.xyb_encoded
                 && metadata.colour_encoding.colour_space == ColourSpace::Grey;
-            if is_grey_1ch {
-                1
-            } else {
-                3
-            }
+            if is_grey_1ch { 1 } else { 3 }
         }
     };
 

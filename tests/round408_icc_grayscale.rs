@@ -24,9 +24,9 @@
 //!   orders — `used_orders = 0x14`); when that gap closes this test's
 //!   final assertion flips to a pixel comparison.
 
-use oxideav_jpegxl::icc::{set_icc_start_trace_armed, ICC_START_TRACE};
+use oxideav_jpegxl::icc::{ICC_START_TRACE, set_icc_start_trace_armed};
 use oxideav_jpegxl::metadata_fdis::{
-    set_metadata_tail_trace_armed, ImageMetadataFdis, SizeHeaderFdis, METADATA_TAIL_TRACE,
+    ImageMetadataFdis, METADATA_TAIL_TRACE, SizeHeaderFdis, set_metadata_tail_trace_armed,
 };
 
 const GRAYSCALE: &[u8] = include_bytes!("fixtures/conformance_grayscale.jxl");

@@ -63,7 +63,7 @@
 use crate::error::{Error, Result};
 
 use crate::dct_select::TransformType;
-use crate::non_zeros_grid::{decode_block_at, NonZerosGrid};
+use crate::non_zeros_grid::{NonZerosGrid, decode_block_at};
 use crate::pass_group_hf::DecodedHfBlock;
 
 /// Canonical per-frame channel count for the VarDCT path (YCbCr /

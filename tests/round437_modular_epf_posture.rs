@@ -29,9 +29,9 @@
 //! the round-393 §F.2 ramp arbitration).
 
 mod common;
-use common::png::{decode_png, ColorType};
+use common::png::{ColorType, decode_png};
 use oxideav_jpegxl::{
-    set_modular_epf_posture_override, ModularEpfDomain, ModularEpfPosture, ModularGreyMapping,
+    ModularEpfDomain, ModularEpfPosture, ModularGreyMapping, set_modular_epf_posture_override,
 };
 
 fn png_grey(bytes: &[u8]) -> (usize, usize, Vec<u8>) {

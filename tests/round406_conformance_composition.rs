@@ -40,7 +40,7 @@
 //!   zero, §5.2), not floor.
 
 mod common;
-use common::png::{decode_png, BitDepth, ColorType};
+use common::png::{BitDepth, ColorType, decode_png};
 use oxideav_jpegxl::decode_all_planar;
 
 /// Decode a 16-bit RGBA expected.png into interleaved u16 samples.
@@ -51,7 +51,9 @@ fn png_rgba16(bytes: &[u8]) -> (usize, usize, Vec<u16>) {
     let (w, h) = (info.width as usize, info.height as usize);
     let raw = &info.data[..];
     let samples: Vec<u16> = raw
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|c| u16::from_be_bytes([c[0], c[1]]))
         .collect();
     assert_eq!(samples.len(), w * h * 4);

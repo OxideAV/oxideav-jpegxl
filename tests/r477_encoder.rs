@@ -10,10 +10,10 @@ mod common;
 use std::process::Command;
 use std::time::Duration;
 
-use common::png::{decode_png, BitDepth};
+use common::png::{BitDepth, decode_png};
 use oxideav_jpegxl::{
-    decode, decode_all, encode, encode_all, encode_rgba8, info, probe, AnimationInfo, ColorInfo,
-    EncodeOptions, Error, Frame, JxlImage, Metadata, PixelFormat, Plane, Signature,
+    AnimationInfo, ColorInfo, EncodeOptions, Error, Frame, JxlImage, Metadata, PixelFormat, Plane,
+    Signature, decode, decode_all, encode, encode_all, encode_rgba8, info, probe,
 };
 
 const ICC_FIXTURE: &[u8] = include_bytes!("fixtures/r451_icc.jxl");
@@ -414,7 +414,9 @@ fn black_box_decoder_agrees_when_installed() {
                 // The PNG helper is big-endian, our layouts little-endian.
                 let le: Vec<u8> = dec
                     .data
-                    .chunks_exact(2)
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
                     .flat_map(|p| [p[1], p[0]])
                     .collect();
                 assert_eq!(

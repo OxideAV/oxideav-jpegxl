@@ -111,11 +111,7 @@ impl JxlPixelFormat {
 
     /// Number of planes a [`JxlImage`] in this layout carries (1 or 3).
     pub const fn plane_count(self) -> usize {
-        if self.is_planar() {
-            3
-        } else {
-            1
-        }
+        if self.is_planar() { 3 } else { 1 }
     }
 
     /// Chroma subsampling of the planar layouts as `(log2 horizontal,
@@ -179,7 +175,7 @@ impl JxlPixelFormat {
                 return Err(Error::unsupported(format!(
                     "JPEG XL: no packed layout for {colour_channels} colour channel(s), \
                      alpha={alpha}, {bytes_per_sample} byte(s) per sample"
-                )))
+                )));
             }
         })
     }
@@ -687,7 +683,7 @@ impl JxlImage {
                         "JxlImage: {:?} needs three planes, found {}",
                         self.format,
                         self.planes.len()
-                    )))
+                    )));
                 }
             };
             return crate::jpeg_pixels::planar_ycbcr_to_rgb(
@@ -747,13 +743,15 @@ mod tests {
     fn new_rejects_bad_geometry() {
         assert!(JxlImage::from_rgb8(2, 2, vec![0; 11]).is_err());
         assert!(JxlImage::from_rgb8(2, 2, vec![0; 12]).is_ok());
-        assert!(JxlImage::new(
-            1,
-            1,
-            PixelFormat::Rgb24,
-            vec![Plane::new(3, vec![0; 3]), Plane::new(3, vec![0; 3])]
-        )
-        .is_err());
+        assert!(
+            JxlImage::new(
+                1,
+                1,
+                PixelFormat::Rgb24,
+                vec![Plane::new(3, vec![0; 3]), Plane::new(3, vec![0; 3])]
+            )
+            .is_err()
+        );
         assert!(JxlImage::new(2, 1, PixelFormat::Rgb24, vec![Plane::new(3, vec![0; 6])]).is_err());
     }
 
@@ -819,17 +817,19 @@ mod tests {
         assert_eq!(ok.to_rgba8().len(), 60);
         assert_eq!(ok.into_raw().len(), 27);
         // Short chroma plane.
-        assert!(JxlImage::new(
-            5,
-            3,
-            f,
-            vec![
-                Plane::new(5, vec![0; 15]),
-                Plane::new(3, vec![128; 5]),
-                Plane::new(3, vec![128; 6]),
-            ],
-        )
-        .is_err());
+        assert!(
+            JxlImage::new(
+                5,
+                3,
+                f,
+                vec![
+                    Plane::new(5, vec![0; 15]),
+                    Plane::new(3, vec![128; 5]),
+                    Plane::new(3, vec![128; 6]),
+                ],
+            )
+            .is_err()
+        );
         // Plane count.
         assert!(JxlImage::new(5, 3, f, vec![Plane::new(5, vec![0; 15])]).is_err());
     }

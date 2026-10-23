@@ -47,9 +47,9 @@
 //!   3-channel XYB layouts the pairing fix unblocked.
 
 mod common;
-use common::png::{decode_png, ColorType};
+use common::png::{ColorType, decode_png};
 use oxideav_jpegxl::modular_fdis::{
-    horiz_isqueeze, squeeze_tendency_pub, vert_isqueeze, ChannelDesc, TransformId,
+    ChannelDesc, TransformId, horiz_isqueeze, squeeze_tendency_pub, vert_isqueeze,
 };
 
 fn png_grey(bytes: &[u8]) -> (usize, usize, Vec<u8>) {
@@ -293,23 +293,22 @@ fn run_oracle(jxl: &[u8], expected_png: &[u8], group_dim: u32) -> usize {
                         // Optional CSV dump of clean tendency ground
                         // truth (decode is ANS-invariant-verified, so
                         // `diff - got` is the encoder's tendency).
-                        if let Ok(path) = std::env::var("R420_TENDENCY_CSV") {
-                            if let Some((ta, tb, tc, tdiff)) =
+                        if let Ok(path) = std::env::var("R420_TENDENCY_CSV")
+                            && let Some((ta, tb, tc, tdiff)) =
                                 tlogs[i].get(y * d.width as usize + x).copied()
-                            {
-                                use std::io::Write;
-                                let mut f = std::fs::OpenOptions::new()
-                                    .create(true)
-                                    .append(true)
-                                    .open(path)
-                                    .unwrap();
-                                writeln!(
-                                    f,
-                                    "{i},{x},{y},{ta},{tb},{tc},{tdiff},{},{g},{t}",
-                                    tdiff.wrapping_sub(g)
-                                )
+                        {
+                            use std::io::Write;
+                            let mut f = std::fs::OpenOptions::new()
+                                .create(true)
+                                .append(true)
+                                .open(path)
                                 .unwrap();
-                            }
+                            writeln!(
+                                f,
+                                "{i},{x},{y},{ta},{tb},{tc},{tdiff},{},{g},{t}",
+                                tdiff.wrapping_sub(g)
+                            )
+                            .unwrap();
                         }
                     }
                 }
@@ -474,7 +473,7 @@ fn external_output_geometry_probe() {
     let bad_rows: Vec<(usize, usize)> = by_row
         .iter()
         .enumerate()
-        .filter(|(_, &c)| c > 0)
+        .filter(|&(_, &c)| c > 0)
         .map(|(i, &c)| (i, c))
         .take(30)
         .collect();

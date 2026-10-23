@@ -480,14 +480,14 @@ mod tests {
         let m_gamma_p = 0.5 - 0.1; // 0.4
         let l_gamma_m = 0.5 + (-0.1); // 0.4
         let m_gamma_m = 0.5 - (-0.1); // 0.6
-                                      // l_gamma_m == m_gamma_p, m_gamma_m == l_gamma_p. So with all
-                                      // three biases equal, swapping X sign should produce the same
-                                      // RGB output as keeping X and swapping inv_mat columns 0/1
-                                      // — but more directly, since L_mix(L_gamma_p) == M_mix(M_gamma_m)
-                                      // due to identical biases, we get:
-                                      //   r_p = im00 * f(0.6) + im01 * f(0.4) + im02 * f(0.3)
-                                      //   r_m = im00 * f(0.4) + im01 * f(0.6) + im02 * f(0.3)
-                                      // i.e. r_p - r_m = (im00 - im01) * (f(0.6) - f(0.4)).
+        // l_gamma_m == m_gamma_p, m_gamma_m == l_gamma_p. So with all
+        // three biases equal, swapping X sign should produce the same
+        // RGB output as keeping X and swapping inv_mat columns 0/1
+        // — but more directly, since L_mix(L_gamma_p) == M_mix(M_gamma_m)
+        // due to identical biases, we get:
+        //   r_p = im00 * f(0.6) + im01 * f(0.4) + im02 * f(0.3)
+        //   r_m = im00 * f(0.4) + im01 * f(0.6) + im02 * f(0.3)
+        // i.e. r_p - r_m = (im00 - im01) * (f(0.6) - f(0.4)).
         let cb0 = oim.opsin_bias[0].cbrt();
         let f = |gamma: f32| ((gamma - cb0).powi(3) + oim.opsin_bias[0]) * 1.0_f32;
         let f06 = f(l_gamma_p);

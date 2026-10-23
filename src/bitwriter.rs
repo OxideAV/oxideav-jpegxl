@@ -161,7 +161,7 @@ pub fn pack_signed(v: i32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bitreader::{unpack_signed, BitReader};
+    use crate::bitreader::{BitReader, unpack_signed};
 
     #[test]
     fn bits_round_trip_through_the_reader() {

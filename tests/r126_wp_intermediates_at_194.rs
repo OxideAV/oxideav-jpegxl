@@ -131,7 +131,7 @@ mod common;
 use common::png::decode_png;
 use oxideav_jpegxl::decode_planar;
 use oxideav_jpegxl::modular_fdis::{
-    encode_leaf_pick_target, LEAF_PICK_TRACE_TARGET, LEAF_PICK_TRACE_WP, WP_DEEP_TRACE,
+    LEAF_PICK_TRACE_TARGET, LEAF_PICK_TRACE_WP, WP_DEEP_TRACE, encode_leaf_pick_target,
 };
 use std::sync::atomic::Ordering;
 

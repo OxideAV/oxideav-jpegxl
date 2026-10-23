@@ -1099,9 +1099,9 @@ mod tests {
         lengths[0] = 1; // kraft 16384
         lengths[1] = 2; // 8192
         lengths[2] = 3; // 4096
-                        // Padding to reach exactly 32768
+        // Padding to reach exactly 32768
         lengths[3] = 3; // 4096 — total 32768
-                        // Now add an extra 9-bit symbol, taking us 64 over budget.
+        // Now add an extra 9-bit symbol, taking us 64 over budget.
         lengths[100] = 9;
         assert!(PrefixCode::from_lengths(&lengths).is_err());
     }

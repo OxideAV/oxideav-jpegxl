@@ -19,7 +19,7 @@ use crate::frame_header::FrameHeader;
 use crate::global_modular::{apply_inverse_transforms, apply_transforms_to_channel_layout};
 use crate::lf_global::LfGlobal;
 use crate::modular_fdis::{
-    decode_channels_at_stream, ChannelDesc, MaTreeFdis, ModularImage, TransformInfo, WpHeader,
+    ChannelDesc, MaTreeFdis, ModularImage, TransformInfo, WpHeader, decode_channels_at_stream,
 };
 
 /// `PassGroup` bundle — Table G.5.

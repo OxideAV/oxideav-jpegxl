@@ -32,10 +32,10 @@ use oxideav_core::{
     TimeBase, TransferCharacteristics, VideoFrame, VideoPlane,
 };
 
+use crate::CODEC_ID_STR;
 use crate::error::{JxlError, Result};
 use crate::image::{ColorInfo, ColorRange, JxlImage, JxlPixelFormat, Metadata, Plane, RawFrame};
 use crate::options::EncodeOptions;
-use crate::CODEC_ID_STR;
 
 impl From<JxlError> for oxideav_core::Error {
     fn from(e: JxlError) -> Self {
@@ -90,7 +90,7 @@ pub fn from_core_pixel_format(pf: PixelFormat) -> Result<JxlPixelFormat> {
         other => {
             return Err(JxlError::unsupported(format!(
                 "JPEG XL: pixel format {other:?} is not a JPEG XL output layout"
-            )))
+            )));
         }
     })
 }
@@ -335,8 +335,8 @@ pub fn make_decoder(params: &CodecParameters) -> oxideav_core::Result<Box<dyn De
         Some("all") => false,
         Some(other) => {
             return Err(oxideav_core::Error::invalid(format!(
-            "jxl decoder: option {OPTION_PACING}={other:?} is not \"{PACING_PACKET}\" or \"all\""
-        )))
+                "jxl decoder: option {OPTION_PACING}={other:?} is not \"{PACING_PACKET}\" or \"all\""
+            )));
         }
     };
     Ok(Box::new(JxlDecoder {
@@ -617,10 +617,10 @@ impl Decoder for JxlDecoder {
         }
         match self.ready.pop_front() {
             Some(mut vf) => {
-                if let Some(credit) = self.credits.pop_front() {
-                    if credit.is_some() {
-                        vf.pts = credit;
-                    }
+                if let Some(credit) = self.credits.pop_front()
+                    && credit.is_some()
+                {
+                    vf.pts = credit;
                 }
                 Ok(Frame::Video(vf))
             }

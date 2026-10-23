@@ -12,9 +12,9 @@ use oxideav_core::{
     CodecId, CodecParameters, Error, Frame, NullCodecResolver, Packet, PixelFormat, ProbeData,
     ReadSeek, RuntimeContext, StreamInfo, TimeBase, VideoFrame, WriteSeek,
 };
-use oxideav_jpegxl::demux::{open_demuxer, probe as probe_fn, CONTAINER_NAME};
+use oxideav_jpegxl::demux::{CONTAINER_NAME, open_demuxer, probe as probe_fn};
 use oxideav_jpegxl::registry::{OPTION_PACING, PACING_PACKET};
-use oxideav_jpegxl::{decode_all, info, make_decoder, register, Signature, CODEC_ID_STR};
+use oxideav_jpegxl::{CODEC_ID_STR, Signature, decode_all, info, make_decoder, register};
 
 const ANIMATION: &[u8] = include_bytes!("fixtures/animation_3frame.jxl");
 const ALPHA_64: &[u8] = include_bytes!("fixtures/alpha_64x64.jxl");
@@ -127,10 +127,11 @@ fn probe_names_the_container_for_both_signatures() {
         probe(&ctx, b"not a picture at all", Some("jxl")).unwrap(),
         CONTAINER_NAME
     );
-    assert!(ctx
-        .containers
-        .open_demuxer(CONTAINER_NAME, reader(b"not a picture at all"), &ctx.codecs)
-        .is_err());
+    assert!(
+        ctx.containers
+            .open_demuxer(CONTAINER_NAME, reader(b"not a picture at all"), &ctx.codecs)
+            .is_err()
+    );
     for foreign in [
         &b"farbfeld\0\0\0\x01\0\0\0\x01\0\0\0\0\0\0\0\0"[..],
         &b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR"[..],
@@ -270,9 +271,11 @@ fn animation_is_one_packet_per_frame_in_the_animation_tick() {
         .containers
         .open_demuxer(&name, reader(ANIMATION), &ctx.codecs)
         .unwrap();
-    assert!(demux
-        .metadata()
-        .contains(&("loop_count".to_owned(), anim.loops.to_string())));
+    assert!(
+        demux
+            .metadata()
+            .contains(&("loop_count".to_owned(), anim.loops.to_string()))
+    );
 }
 
 #[test]
@@ -280,9 +283,11 @@ fn demuxer_flags_embedded_metadata() {
     let i = info(ICC).unwrap();
     assert!(i.has_icc, "fixture premise");
     let demux = open_demuxer(reader(ICC), &NullCodecResolver).unwrap();
-    assert!(demux
-        .metadata()
-        .contains(&("icc".to_owned(), "present".to_owned())));
+    assert!(
+        demux
+            .metadata()
+            .contains(&("icc".to_owned(), "present".to_owned()))
+    );
     // An ICC-described image has no enumerated colour: the stream carries
     // what the decoder frame carries — the (always full) range only.
     let sig = demux.streams()[0].params.color_signal;

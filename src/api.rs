@@ -16,8 +16,8 @@ use crate::metadata_fdis::{
 };
 use crate::options::{DecodeOptions, EncodeOptions};
 use crate::{
-    decode_sequence, frame_params, open, read_prelude_at_level, walk_frame_headers, Opened,
-    Prelude, SequenceFrame, SequenceMode,
+    Opened, Prelude, SequenceFrame, SequenceMode, decode_sequence, frame_params, open,
+    read_prelude_at_level, walk_frame_headers,
 };
 
 /// Cap on a Brotli-compressed (`brob`) metadata box's decompressed
@@ -575,7 +575,7 @@ fn encode_input(image: &JxlImage) -> Result<EncodeInput> {
             return Err(Error::unsupported(format!(
                 "JPEG XL encoder: {other:?} is not an encoder input layout (packed Gray8 / Ya8 / \
                  Rgb24 / Rgba and their 16-bit forms are)"
-            )))
+            )));
         }
     };
     let bytes = fmt.bytes_per_sample();
@@ -908,23 +908,23 @@ fn check_limits(
     planar: Option<PixelFormat>,
 ) -> Result<()> {
     let (w, h) = oriented_size(prelude);
-    if let Some(mw) = opts.max_width {
-        if w > mw {
-            return Err(Error::limit(format!("width {w} exceeds max_width {mw}")));
-        }
+    if let Some(mw) = opts.max_width
+        && w > mw
+    {
+        return Err(Error::limit(format!("width {w} exceeds max_width {mw}")));
     }
-    if let Some(mh) = opts.max_height {
-        if h > mh {
-            return Err(Error::limit(format!("height {h} exceeds max_height {mh}")));
-        }
+    if let Some(mh) = opts.max_height
+        && h > mh
+    {
+        return Err(Error::limit(format!("height {h} exceeds max_height {mh}")));
     }
     let pixels = u64::from(w) * u64::from(h);
-    if let Some(mp) = opts.max_pixels {
-        if pixels > mp {
-            return Err(Error::limit(format!(
-                "{pixels} pixels exceed max_pixels {mp}"
-            )));
-        }
+    if let Some(mp) = opts.max_pixels
+        && pixels > mp
+    {
+        return Err(Error::limit(format!(
+            "{pixels} pixels exceed max_pixels {mp}"
+        )));
     }
     let md = &prelude.metadata;
     let bytes = match planar {
@@ -946,12 +946,12 @@ fn check_limits(
             pixels.saturating_mul(channels).saturating_mul(bps)
         }
     };
-    if let Some(mb) = opts.max_bytes {
-        if bytes > mb {
-            return Err(Error::limit(format!(
-                "decoded image of {bytes} bytes exceeds max_bytes {mb}"
-            )));
-        }
+    if let Some(mb) = opts.max_bytes
+        && bytes > mb
+    {
+        return Err(Error::limit(format!(
+            "decoded image of {bytes} bytes exceeds max_bytes {mb}"
+        )));
     }
     if bytes > usize::MAX as u64 {
         return Err(Error::unsupported(format!(
@@ -997,7 +997,7 @@ pub(crate) fn pack_frame(
         )));
     }
     let p0 = &frame.planes[0];
-    if p0.stride == 0 || p0.data.len() < p0.stride || p0.stride % bytes != 0 {
+    if p0.stride == 0 || p0.data.len() < p0.stride || !p0.stride.is_multiple_of(bytes) {
         return Err(Error::invalid("jxl decoder: degenerate plane geometry"));
     }
     let width = p0.stride / bytes;

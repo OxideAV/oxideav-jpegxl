@@ -19,7 +19,7 @@
 //! returns `Error::Unsupported` with a "round 14+" message AFTER the
 //! round-13 pipeline has parsed and dequantised all the LF data.
 
-use oxideav_jpegxl::dct_select::{derive_dct_select, DctSelectCell, TransformType};
+use oxideav_jpegxl::dct_select::{DctSelectCell, TransformType, derive_dct_select};
 use oxideav_jpegxl::decode_planar;
 use oxideav_jpegxl::lf_group::HfMetadata;
 

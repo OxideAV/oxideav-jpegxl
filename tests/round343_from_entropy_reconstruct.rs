@@ -31,7 +31,7 @@ use oxideav_jpegxl::metadata_fdis::OpsinInverseMatrix;
 use oxideav_jpegxl::multi_pass_decode::decode_multi_pass_three_channels_with_resolver;
 use oxideav_jpegxl::per_pass_non_zeros::PerPassNonZerosGrids;
 use oxideav_jpegxl::vardct_reconstruct::{
-    reconstruct_lf_group_cross_pass, reconstruct_lf_group_from_entropy, DequantContext,
+    DequantContext, reconstruct_lf_group_cross_pass, reconstruct_lf_group_from_entropy,
 };
 
 fn passes(num_passes: u32, shift: Vec<u32>) -> Passes {

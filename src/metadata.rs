@@ -17,7 +17,7 @@
 use crate::error::{Error, Result};
 
 use crate::bitreader::{BitReader, U32Dist};
-use crate::container::{detect, extract_codestream, Signature, RAW_CODESTREAM_SIGNATURE};
+use crate::container::{RAW_CODESTREAM_SIGNATURE, Signature, detect, extract_codestream};
 
 /// The seven fixed aspect ratios a `SizeHeader` can reference.
 ///

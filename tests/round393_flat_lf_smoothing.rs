@@ -39,11 +39,11 @@
 //! the clean-room crate).
 
 mod common;
-use common::png::{decode_png, BitDepth, ColorType};
+use common::png::{BitDepth, ColorType, decode_png};
 use oxideav_jpegxl::lf_dequant::{
-    set_lf_smooth_trace_armed, set_lf_smoothing_literal_ramp, LF_SMOOTH_TRACE,
+    LF_SMOOTH_TRACE, set_lf_smooth_trace_armed, set_lf_smoothing_literal_ramp,
 };
-use oxideav_jpegxl::{set_vardct_hf_coeff_capture_armed, VARDCT_HF_COEFF_CAPTURE};
+use oxideav_jpegxl::{VARDCT_HF_COEFF_CAPTURE, set_vardct_hf_coeff_capture_armed};
 
 const JXL: &[u8] = include_bytes!("fixtures/flat_content_lf_smoothing.jxl");
 const REF_PNG: &[u8] = include_bytes!("fixtures/flat_content_lf_smoothing_expected.png");

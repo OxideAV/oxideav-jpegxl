@@ -96,7 +96,7 @@
 
 use oxideav_jpegxl::decode_planar;
 use oxideav_jpegxl::modular_fdis::{
-    encode_leaf_pick_target, LEAF_PICK_TRACE_TARGET, LEAF_PICK_TRACE_WP,
+    LEAF_PICK_TRACE_TARGET, LEAF_PICK_TRACE_WP, encode_leaf_pick_target,
 };
 use serial_test::serial;
 use std::sync::atomic::Ordering;

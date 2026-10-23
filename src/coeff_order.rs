@@ -72,7 +72,7 @@ use crate::error::{Error, Result};
 use crate::ans::hybrid::HybridUintState;
 use crate::bitreader::BitReader;
 use crate::dct_select::TransformType;
-use crate::modular_fdis::{decode_uint_in_with_dist_pub, EntropyStream};
+use crate::modular_fdis::{EntropyStream, decode_uint_in_with_dist_pub};
 
 /// `Order ID` per Table I.1. Each DctSelect value maps to one of 13
 /// order IDs; orders 1, 4, 5, 6, 8, 10, 12 are shared by two or three
@@ -792,7 +792,7 @@ mod tests {
         assert_eq!(get_context(4, 7), 3); // ceil(log2(5)) = 3
         assert_eq!(get_context(7, 7), 3); // ceil(log2(8)) = 3
         assert_eq!(get_context(8, 7), 4); // ceil(log2(9)) = 4
-                                          // Saturates at the cap.
+        // Saturates at the cap.
         assert_eq!(get_context(255, 7), 7);
         assert_eq!(get_context(256, 7), 7);
         assert_eq!(get_context(u32::MAX, 7), 7);

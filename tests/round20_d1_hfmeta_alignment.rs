@@ -89,7 +89,9 @@ fn d1_hfmeta_alignment_scan_round_20() {
     eprintln!(
         "[r20-scan] Scanning HfMetadata candidate start positions in [lfc_end-270, lfc_end+5):"
     );
-    eprintln!("[r20-scan]   ideal: nb_blocks_minus_1 < 1024, iugt=true, default_wp=true, nb_transforms in {{0,1}}");
+    eprintln!(
+        "[r20-scan]   ideal: nb_blocks_minus_1 < 1024, iugt=true, default_wp=true, nb_transforms in {{0,1}}"
+    );
 
     let scan_lo = lfc_end.saturating_sub(270);
     let scan_hi = lfc_end + 5;
@@ -166,6 +168,8 @@ fn d1_hfmeta_alignment_scan_round_20() {
         );
     }
     if best_offsets.is_empty() {
-        eprintln!("[r20-scan] No high-score candidates found in scan range — HfMetadata's prefix may be more exotic, or LfCoeff drift is outside [-270, +5).");
+        eprintln!(
+            "[r20-scan] No high-score candidates found in scan range — HfMetadata's prefix may be more exotic, or LfCoeff drift is outside [-270, +5)."
+        );
     }
 }

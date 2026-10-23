@@ -74,8 +74,8 @@ use crate::error::{Error, Result};
 use crate::ans::hybrid::HybridUintState;
 use crate::bitreader::{BitReader, U32Dist};
 use crate::coeff_order::{
-    coefficient_count, decode_permutation_from_stream, natural_coeff_order, OrderId,
-    COEFFICIENTS_PER_ORDER, NUM_ORDERS,
+    COEFFICIENTS_PER_ORDER, NUM_ORDERS, OrderId, coefficient_count, decode_permutation_from_stream,
+    natural_coeff_order,
 };
 use crate::modular_fdis::EntropyStream;
 
@@ -180,15 +180,15 @@ impl HfPass {
             // stream was misparsed; erroring loudly upholds the
             // crate's no-silent-misparse contract. (Prefix-coded
             // streams carry no ANS state; nothing to check.)
-            if let Some(ans) = entropy.ans_state.as_ref() {
-                if !ans.final_state() {
-                    return Err(Error::InvalidData(format!(
-                        "JXL HfPass: ANS final-state invariant (0x130000) failed at the end \
+            if let Some(ans) = entropy.ans_state.as_ref()
+                && !ans.final_state()
+            {
+                return Err(Error::InvalidData(format!(
+                    "JXL HfPass: ANS final-state invariant (0x130000) failed at the end \
                          of the C.3.2 permutation stream (state {:#x}) - used_orders \
                          sub-stream misparsed",
-                        ans.state()
-                    )));
-                }
+                    ans.state()
+                )));
             }
             orders
         } else {

@@ -83,11 +83,7 @@ use crate::hf_global::{DequantMatrixParams, EncodingMode};
 /// ```
 #[inline]
 pub fn mult(v: f64) -> f64 {
-    if v > 0.0 {
-        1.0 + v
-    } else {
-        1.0 / (1.0 - v)
-    }
+    if v > 0.0 { 1.0 + v } else { 1.0 / (1.0 - v) }
 }
 
 /// `Interpolate(pos, max, bands)` per ISO/IEC 18181-1:2024 §I.2.4

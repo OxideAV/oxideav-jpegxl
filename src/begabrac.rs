@@ -142,11 +142,7 @@ impl Begabrac {
 /// Integer base-2 logarithm, floor (matches the spec's `ilog2`).
 /// `ilog2(0)` is treated as `0` for safety; callers shouldn't pass it.
 fn ilog2(x: u32) -> u32 {
-    if x == 0 {
-        0
-    } else {
-        31 - x.leading_zeros()
-    }
+    if x == 0 { 0 } else { 31 - x.leading_zeros() }
 }
 
 #[cfg(test)]

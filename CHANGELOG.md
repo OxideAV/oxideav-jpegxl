@@ -109,6 +109,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- edition 2024, MSRV 1.95
 - `info().format` and the `jpegxl` demuxer's `pixel_format` report the
   planar label for a recompressed JPEG still; `DecodeOptions::max_bytes`
   counts luma plus the two chroma planes for them.

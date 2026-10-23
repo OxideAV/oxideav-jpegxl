@@ -742,13 +742,13 @@ where
         .checked_add(1)
         .ok_or_else(|| Error::InvalidData("JXL splines: num_splines overflow".into()))?
         as usize;
-    if let Some(l) = limits {
-        if num_splines as u64 > l.max_splines {
-            return Err(Error::InvalidData(format!(
-                "JXL splines: num_splines {num_splines} exceeds the Annex M bound {}",
-                l.max_splines
-            )));
-        }
+    if let Some(l) = limits
+        && num_splines as u64 > l.max_splines
+    {
+        return Err(Error::InvalidData(format!(
+            "JXL splines: num_splines {num_splines} exceeds the Annex M bound {}",
+            l.max_splines
+        )));
     }
     let mut total_control_points: u64 = 0;
 
@@ -797,14 +797,14 @@ where
             .checked_add(1)
             .ok_or_else(|| Error::InvalidData("JXL splines: num_control_points overflow".into()))?;
         total_control_points = total_control_points.saturating_add(num_cp as u64);
-        if let Some(l) = limits {
-            if total_control_points > l.max_control_points {
-                return Err(Error::InvalidData(format!(
-                    "JXL splines: total num_control_points {total_control_points} exceeds the \
+        if let Some(l) = limits
+            && total_control_points > l.max_control_points
+        {
+            return Err(Error::InvalidData(format!(
+                "JXL splines: total num_control_points {total_control_points} exceeds the \
                      Annex M bound {}",
-                    l.max_control_points
-                )));
-            }
+                l.max_control_points
+            )));
         }
         // Interleaved (x1, y1, x2, y2, …) second-order deltas.
         let mut dx = Vec::with_capacity((num_cp - 1).min(1 << 20));
@@ -873,7 +873,7 @@ pub fn decode_splines_raw_limited(
     br: &mut crate::bitreader::BitReader<'_>,
     limits: Option<&SplineLimits>,
 ) -> Result<RawSplines> {
-    use crate::modular_fdis::{decode_uint_in_with_dist_pub, EntropyStream};
+    use crate::modular_fdis::{EntropyStream, decode_uint_in_with_dist_pub};
     let mut entropy = EntropyStream::read(br, SPLINE_NUM_CONTEXTS)?;
     entropy.read_ans_state_init(br)?;
     let mut hybrid = crate::ans::hybrid::HybridUintState::new(entropy.lz77, entropy.lz_len_conf);
@@ -881,14 +881,14 @@ pub fn decode_splines_raw_limited(
         |ctx| decode_uint_in_with_dist_pub(&mut hybrid, &mut entropy, br, ctx, 0),
         limits,
     )?;
-    if let Some(dec) = entropy.ans_state.as_ref() {
-        if !dec.final_state() {
-            return Err(Error::InvalidData(
-                "JXL splines: ANS final-state invariant (D.3.3) failed after the \
+    if let Some(dec) = entropy.ans_state.as_ref()
+        && !dec.final_state()
+    {
+        return Err(Error::InvalidData(
+            "JXL splines: ANS final-state invariant (D.3.3) failed after the \
                  §C.4.6 stream — misparse"
-                    .into(),
-            ));
-        }
+                .into(),
+        ));
     }
     Ok(raw)
 }
@@ -1152,9 +1152,11 @@ mod tests {
         };
         let mut x = vec![0.0f32; 10];
         let mut good = vec![0.0f32; 16];
-        assert!(spline
-            .render(&mut x, &mut good.clone(), &mut good, 4, 4)
-            .is_err());
+        assert!(
+            spline
+                .render(&mut x, &mut good.clone(), &mut good, 4, 4)
+                .is_err()
+        );
     }
 
     #[test]

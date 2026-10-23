@@ -271,10 +271,10 @@ pub fn coefficient_context(
     // non_zeros = (non_zeros + num_blocks - 1) Idiv num_blocks
     let nz = non_zeros.div_ceil(num_blocks);
     let nz = nz.min(63); // index COEFF_NUM_NONZERO_CONTEXT safely
-                         // k = k Idiv num_blocks
+    // k = k Idiv num_blocks
     let k_div = (k / num_blocks).min(63); // index COEFF_FREQ_CONTEXT safely
-                                          // (CoeffNumNonzeroContext[non_zeros] + CoeffFreqContext[k]) × 2 + prev
-                                          //   + BlockContext() × 458 + 37 × nb_block_ctx
+    // (CoeffNumNonzeroContext[non_zeros] + CoeffFreqContext[k]) × 2 + prev
+    //   + BlockContext() × 458 + 37 × nb_block_ctx
     let base = (COEFF_NUM_NONZERO_CONTEXT[nz as usize] + COEFF_FREQ_CONTEXT[k_div as usize]) * 2;
     let total: u64 =
         (base as u64) + (prev as u64) + (block_ctx as u64) * 458 + 37 * nb_block_ctx as u64;
@@ -377,11 +377,7 @@ where
         // pre-448 fixture left the two readings indistinguishable
         // (blocks opened with non_zeros = 0 or > size/16, or the
         // cluster map merged the two contexts).
-        if non_zeros > size / 16 {
-            0
-        } else {
-            1
-        }
+        if non_zeros > size / 16 { 0 } else { 1 }
     } else if prev_nonzero(k - 1) {
         1
     } else {
@@ -1005,7 +1001,7 @@ mod tests {
     // Round 159 — per-block coefficient decode loop tests.
     // ------------------------------------------------------------------------
 
-    use crate::coeff_order::{natural_coeff_order, OrderId};
+    use crate::coeff_order::{OrderId, natural_coeff_order};
 
     #[test]
     fn prev_for_context_first_iteration_high_non_zeros() {

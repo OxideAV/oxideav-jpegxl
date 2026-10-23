@@ -199,7 +199,7 @@
 
 use crate::error::{Error, Result};
 
-use crate::bitreader::{unpack_signed, BitReader};
+use crate::bitreader::{BitReader, unpack_signed};
 use crate::block_context_resolver::{BlockContextResolver, ThreeChannelVarblock};
 use crate::coeff_order::{natural_coeff_order, order_id_for_transform};
 use crate::dct_select::{DctSelectGrid, TransformType};
@@ -207,11 +207,11 @@ use crate::hf_coefficient_histograms::HfCoefficientHistograms;
 use crate::multi_pass_decode::MultiPassThreeChannelOutput;
 use crate::multi_pass_hf_header::PerPassHfHeaders;
 use crate::pass_group_hf::{
-    coefficient_context, non_zeros_context, prev_for_context, transform_block_params,
-    DecodedHfBlock,
+    DecodedHfBlock, coefficient_context, non_zeros_context, prev_for_context,
+    transform_block_params,
 };
 use crate::per_pass_non_zeros::PerPassNonZerosGrids;
-use crate::varblock_walk::{count_varblocks, Varblock, VarblockWalk};
+use crate::varblock_walk::{Varblock, VarblockWalk, count_varblocks};
 
 /// Per-pass HF histogram decode context — owns the §C.7.2 entropy
 /// stream + the per-pass §C.8.3 `histogram_offset` array.

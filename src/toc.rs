@@ -353,7 +353,7 @@ mod tests {
         // < 1024 → use distribution 0 (Bits(10))).
         let mut bw = TestBw::new();
         bw.w(0, 1); // permuted_toc = 0
-                    // ZeroPad to byte
+        // ZeroPad to byte
         bw.pad();
         for v in [7u32, 11, 0, 13, 17] {
             bw.w(0, 2); // sel = 0 → Bits(10)

@@ -83,8 +83,8 @@ use crate::error::{Error, Result};
 
 use crate::dct_select::TransformType;
 use crate::pass_group_hf::{
-    predicted_non_zeros, read_non_zeros_and_decode_block_for_transform, transform_block_params,
-    DecodedHfBlock,
+    DecodedHfBlock, predicted_non_zeros, read_non_zeros_and_decode_block_for_transform,
+    transform_block_params,
 };
 
 /// `NonZeros(x, y)` storage for a single pass-group / channel pair.
@@ -478,7 +478,7 @@ mod tests {
         let mut g = NonZerosGrid::new(4, 3).unwrap();
         g.set(1, 0, 10).unwrap(); // above
         g.set(0, 1, 3).unwrap(); // left
-                                 // (10 + 3 + 1) >> 1 = 7
+        // (10 + 3 + 1) >> 1 = 7
         assert_eq!(g.predicted(1, 1).unwrap(), 7);
 
         // Odd-sum exercise: above = 5, left = 4 → (5 + 4 + 1) >> 1 = 5.

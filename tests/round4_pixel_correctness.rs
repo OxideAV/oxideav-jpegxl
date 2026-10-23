@@ -11,7 +11,7 @@
 //! plus histogram statistics; round 4 graduates to byte-exact match.
 
 mod common;
-use common::png::{decode_png, BitDepth, ColorType};
+use common::png::{BitDepth, ColorType, decode_png};
 use oxideav_jpegxl::decode_planar;
 
 const PIXEL_1X1_JXL: &[u8] = include_bytes!("fixtures/pixel_1x1.jxl");
@@ -42,7 +42,7 @@ fn png_to_planes(bytes: &[u8]) -> (u32, u32, Vec<Vec<u8>>) {
                 Vec::with_capacity(n),
                 Vec::with_capacity(n),
             );
-            for px in bytes.chunks_exact(3) {
+            for px in bytes.as_chunks::<3>().0 {
                 r.push(px[0]);
                 g.push(px[1]);
                 b.push(px[2]);
@@ -52,7 +52,7 @@ fn png_to_planes(bytes: &[u8]) -> (u32, u32, Vec<Vec<u8>>) {
         ColorType::GrayscaleAlpha => {
             let n = (w * h) as usize;
             let mut grey = Vec::with_capacity(n);
-            for px in bytes.chunks_exact(2) {
+            for px in bytes.as_chunks::<2>().0 {
                 grey.push(px[0]);
             }
             vec![grey]
@@ -64,7 +64,7 @@ fn png_to_planes(bytes: &[u8]) -> (u32, u32, Vec<Vec<u8>>) {
                 Vec::with_capacity(n),
                 Vec::with_capacity(n),
             );
-            for px in bytes.chunks_exact(4) {
+            for px in bytes.as_chunks::<4>().0 {
                 r.push(px[0]);
                 g.push(px[1]);
                 b.push(px[2]);
@@ -156,8 +156,8 @@ fn palette_invasive_pixel_decode() {
     use oxideav_jpegxl::lf_global::LfChannelDequantization;
     use oxideav_jpegxl::metadata_fdis::{ImageMetadataFdis, SizeHeaderFdis};
     use oxideav_jpegxl::modular_fdis::{
-        decode_uint_in_with_dist_pub, evaluate_tree, get_properties, MaTreeFdis, TransformInfo,
-        WpHeader,
+        MaTreeFdis, TransformInfo, WpHeader, decode_uint_in_with_dist_pub, evaluate_tree,
+        get_properties,
     };
     use oxideav_jpegxl::toc::Toc;
 
@@ -271,7 +271,7 @@ fn palette_invasive_pixel_decode() {
                 let v = val as i32; // simplistic since predictor=5 gradient on first samples is 0
                 img.channels[i][(y * desc.width + x) as usize] = v;
                 total_tokens += 1;
-                if total_tokens <= 4 || total_tokens % 64 == 0 {
+                if total_tokens <= 4 || total_tokens.is_multiple_of(64) {
                     eprintln!(
                         "  tok #{total_tokens} ch={i} ({x},{y}) ctx={} token={token} (pre {} → {}, +{} bits)",
                         leaf.ctx,

@@ -20,8 +20,8 @@
 use oxideav_jpegxl::decode_planar;
 use oxideav_jpegxl::frame_header::flags;
 use oxideav_jpegxl::lf_dequant::{
-    apply_adaptive_lf_smoothing, dequant_lf, should_apply_adaptive_lf_smoothing, LfDequantOutput,
-    LfMultipliers,
+    LfDequantOutput, LfMultipliers, apply_adaptive_lf_smoothing, dequant_lf,
+    should_apply_adaptive_lf_smoothing,
 };
 use oxideav_jpegxl::lf_global::{LfChannelDequantization, Quantizer};
 

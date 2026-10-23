@@ -417,7 +417,7 @@ impl TranscodedPlanes {
         let mut r = Vec::with_capacity(w * h);
         let mut g = Vec::with_capacity(w * h);
         let mut b = Vec::with_capacity(w * h);
-        for px in packed.chunks_exact(3) {
+        for px in packed.as_chunks::<3>().0 {
             r.push(px[0]);
             g.push(px[1]);
             b.push(px[2]);
@@ -518,7 +518,7 @@ mod tests {
         let cr = [200u8; 4];
         let rgb = planar_ycbcr_to_rgb(3, 3, (&y, 3), (&cb, 2), (&cr, 2), (1, 1), 3).unwrap();
         let expect = ycbcr_to_rgb8(100.0, 128.0, 200.0);
-        for px in rgb.chunks_exact(3) {
+        for px in rgb.as_chunks::<3>().0 {
             assert_eq!(px, &expect);
         }
     }

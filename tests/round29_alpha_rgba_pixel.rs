@@ -33,7 +33,7 @@
 //!      (FDIS Annex G.1.3 colour-then-extras channel-order rule).
 
 mod common;
-use common::png::{decode_png, BitDepth, ColorType};
+use common::png::{BitDepth, ColorType, decode_png};
 use oxideav_jpegxl::decode_planar;
 
 const ALPHA_JXL: &[u8] = include_bytes!("fixtures/alpha_64x64.jxl");
@@ -56,7 +56,7 @@ fn png_to_planes_rgba(bytes: &[u8]) -> (u32, u32, Vec<Vec<u8>>) {
         Vec::with_capacity(n),
         Vec::with_capacity(n),
     );
-    for px in bytes.chunks_exact(4) {
+    for px in bytes.as_chunks::<4>().0 {
         r.push(px[0]);
         g.push(px[1]);
         b.push(px[2]);

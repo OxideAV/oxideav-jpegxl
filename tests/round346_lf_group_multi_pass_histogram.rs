@@ -48,7 +48,7 @@ use oxideav_jpegxl::multi_pass_hf_histogram_decoder::HfHistogramDecodeContext;
 use oxideav_jpegxl::pass_group_hf::PassGroupHfHeader;
 use oxideav_jpegxl::per_pass_non_zeros::PerPassNonZerosGrids;
 use oxideav_jpegxl::vardct_reconstruct::{
-    reconstruct_lf_group_cross_pass, reconstruct_lf_group_from_histogram, DequantContext,
+    DequantContext, reconstruct_lf_group_cross_pass, reconstruct_lf_group_from_histogram,
 };
 
 /// §D.3 prelude bytes for the minimal single-cluster, single-symbol

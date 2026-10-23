@@ -28,7 +28,7 @@
 mod common;
 
 use common::png::decode_png;
-use oxideav_jpegxl::{decode, decode_all, decode_rgb8, decode_rgba8, info, PixelFormat};
+use oxideav_jpegxl::{PixelFormat, decode, decode_all, decode_rgb8, decode_rgba8, info};
 
 fn fixture(name: &str) -> Vec<u8> {
     std::fs::read(format!(
@@ -140,7 +140,7 @@ fn check(jxl_name: &str, reference_png: &str, format: PixelFormat, tol: &Toleran
     );
     let rgba = decode_rgba8(&bytes).unwrap().data;
     assert_eq!(rgba.len(), (img.width * img.height * 4) as usize);
-    for (px, pa) in rgb.chunks_exact(3).zip(rgba.chunks_exact(4)) {
+    for (px, pa) in rgb.as_chunks::<3>().0.iter().zip(rgba.as_chunks::<4>().0) {
         assert_eq!(&pa[..3], px);
         assert_eq!(pa[3], 255);
     }
@@ -386,7 +386,7 @@ fn matrix_440() {
 
 #[test]
 fn max_bytes_counts_the_planar_planes() {
-    use oxideav_jpegxl::{decode_with, DecodeOptions, JxlError};
+    use oxideav_jpegxl::{DecodeOptions, JxlError, decode_with};
     let bytes = fixture("r451_odd420.jxl");
     // 100×60 luma + 2 × 50×30 chroma = 9 000 bytes.
     let ok = DecodeOptions::default().with_max_bytes(9_000u64);
@@ -404,7 +404,7 @@ fn max_bytes_counts_the_planar_planes() {
 mod registry {
     use super::*;
     use oxideav_core::{CodecId, CodecParameters, Frame, Packet, RuntimeContext};
-    use oxideav_jpegxl::{register, JxlImage, CODEC_ID_STR};
+    use oxideav_jpegxl::{CODEC_ID_STR, JxlImage, register};
 
     /// Layer 1 and the framework decoder hand out the same planes with
     /// the same label, for every sampling class.

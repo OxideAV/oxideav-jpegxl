@@ -1,6 +1,6 @@
 //! Round 469 — fuzz findings pinned as regression tests.
 
-use oxideav_jpegxl::{decode, decode_all, Error};
+use oxideav_jpegxl::{Error, decode, decode_all};
 
 /// Round-469 fuzz finding (`decode_full`, libFuzzer OOM): a 68-byte raw
 /// codestream whose LZ77-enabled tree sub-stream repeats a node pattern

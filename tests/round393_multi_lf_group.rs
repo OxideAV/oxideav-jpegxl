@@ -34,7 +34,7 @@
 //! source is consulted.
 
 mod common;
-use common::png::{decode_png, ColorType};
+use common::png::{ColorType, decode_png};
 use oxideav_jpegxl::bitreader::BitReader;
 use oxideav_jpegxl::container;
 use oxideav_jpegxl::frame_header::{Encoding, FrameDecodeParams, FrameHeader, RfEdition};

@@ -53,12 +53,12 @@ use crate::lf_dequant::LfDequantOutput;
 use crate::lf_global::LfChannelCorrelation;
 use crate::metadata_fdis::OpsinInverseMatrix;
 use crate::multi_pass_decode::{
-    decode_multi_pass_three_channels_with_resolver, MultiPassThreeChannelOutput,
+    MultiPassThreeChannelOutput, decode_multi_pass_three_channels_with_resolver,
 };
 use crate::multi_pass_hf_histogram_decoder::HfHistogramDecodeContext;
 use crate::pass_group_hf::DecodedHfBlock;
 use crate::per_pass_non_zeros::PerPassNonZerosGrids;
-use crate::residual_plane::{assemble_three_channel_planes_with_lf, ChannelResidualPlanes};
+use crate::residual_plane::{ChannelResidualPlanes, assemble_three_channel_planes_with_lf};
 use crate::varblock_walk::Varblock;
 
 /// F.3 dequantisation inputs shared by every varblock of an LfGroup: the

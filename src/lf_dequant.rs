@@ -63,7 +63,7 @@
 //! bytes (for the default group_dim of 256 pixels in a frame's
 //! coefficient grid that's 32x32 LF samples = ~12 KB).
 
-use crate::frame_header::{flags, FrameHeader};
+use crate::frame_header::{FrameHeader, flags};
 use crate::lf_global::{LfChannelDequantization, Quantizer};
 
 thread_local! {

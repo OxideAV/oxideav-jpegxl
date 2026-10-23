@@ -22,7 +22,7 @@
 //! All truth is from the FDIS PDF Listings C.13 + C.14 + §I.2.4 opening
 //! paragraph. No external library consulted.
 
-use oxideav_jpegxl::coeff_order::{natural_coeff_order, OrderId};
+use oxideav_jpegxl::coeff_order::{OrderId, natural_coeff_order};
 use oxideav_jpegxl::dct_select::TransformType;
 use oxideav_jpegxl::pass_group_hf::{
     decode_block_coefficients, decode_block_coefficients_for_transform,

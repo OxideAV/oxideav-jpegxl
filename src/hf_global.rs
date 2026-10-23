@@ -53,7 +53,7 @@ use crate::error::{Error, Result};
 use crate::bitreader::{BitReader, U32Dist};
 use crate::global_modular::{apply_inverse_transforms, apply_transforms_to_channel_layout};
 use crate::modular_fdis::{
-    decode_channels_at_stream, ChannelDesc, MaTreeFdis, TransformInfo, WpHeader,
+    ChannelDesc, MaTreeFdis, TransformInfo, WpHeader, decode_channels_at_stream,
 };
 
 /// Context required to decode `RAW`-mode dequantization matrices: their

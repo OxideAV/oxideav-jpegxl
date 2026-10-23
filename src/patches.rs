@@ -49,7 +49,7 @@
 //! the reference frames consumed here are the **pre-CT** recordings
 //! (§C.2 `save_before_ct`; see [`ReferenceFrames`]).
 
-use crate::bitreader::{unpack_signed, BitReader};
+use crate::bitreader::{BitReader, unpack_signed};
 use crate::error::{Error, Result};
 use std::cell::Cell;
 
@@ -92,7 +92,7 @@ impl PatchBlendMode {
             _ => {
                 return Err(Error::InvalidData(format!(
                     "JXL patches: blend mode {v} out of range (Listing C.2: mode < 8)"
-                )))
+                )));
             }
         })
     }
@@ -291,7 +291,7 @@ pub fn decode_patches(
     frame_width: u32,
     frame_height: u32,
 ) -> Result<Vec<Patch>> {
-    use crate::modular_fdis::{decode_uint_in_with_dist_pub, EntropyStream};
+    use crate::modular_fdis::{EntropyStream, decode_uint_in_with_dist_pub};
     let mut entropy = EntropyStream::read(br, PATCH_NUM_CONTEXTS)?;
     entropy.read_ans_state_init(br)?;
     let mut hybrid = crate::ans::hybrid::HybridUintState::new(entropy.lz77, entropy.lz_len_conf);
@@ -302,14 +302,14 @@ pub fn decode_patches(
         frame_width,
         frame_height,
     )?;
-    if let Some(dec) = entropy.ans_state.as_ref() {
-        if !dec.final_state() {
-            return Err(Error::InvalidData(
-                "JXL patches: ANS final-state invariant (D.3.3) failed after the \
+    if let Some(dec) = entropy.ans_state.as_ref()
+        && !dec.final_state()
+    {
+        return Err(Error::InvalidData(
+            "JXL patches: ANS final-state invariant (D.3.3) failed after the \
                  §C.4.5 stream — misparse"
-                    .into(),
-            ));
-        }
+                .into(),
+        ));
     }
     Ok(patches)
 }

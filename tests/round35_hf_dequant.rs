@@ -23,7 +23,7 @@ use oxideav_jpegxl::dct_quant_weights::{
 };
 use oxideav_jpegxl::dct_select::TransformType;
 use oxideav_jpegxl::hf_dequant::{
-    bias_adjust, dequant_hf_coefficient, dequant_hf_pre_matrix, QmScaleFactors,
+    QmScaleFactors, bias_adjust, dequant_hf_coefficient, dequant_hf_pre_matrix,
 };
 use oxideav_jpegxl::metadata_fdis::OpsinInverseMatrix;
 

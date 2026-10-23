@@ -191,10 +191,10 @@ impl HfCoefficientHistograms {
     /// to "refuses". Tests pin the failure count per fixture so the
     /// deficiency can never go silent again.
     pub fn finish_section(&mut self) -> Result<()> {
-        if let Some(ans) = &self.entropy.ans_state {
-            if !ans.final_state() {
-                SECTION_CLOSURE_FAILURES.with(|c| c.set(c.get() + 1));
-            }
+        if let Some(ans) = &self.entropy.ans_state
+            && !ans.final_state()
+        {
+            SECTION_CLOSURE_FAILURES.with(|c| c.set(c.get() + 1));
         }
         self.entropy.reset_ans_state();
         Ok(())
@@ -289,11 +289,11 @@ mod tests {
         // split_exponent != log_alphabet_size the two extra fields are
         // read; otherwise default (msb=0, lsb=0).
         parts.push((0, 4)); // split_exponent = 0
-                            // split_exponent (0) != log_alphabet_size (15), so the routine
-                            // reads the two extra fields:
-                            //   msb_in_token = u(ceil_log2(split_exponent+1)) = u(0) → no bits
-                            //   lsb_in_token = u(ceil_log2(split_exponent-msb+1)) = u(0) → no bits
-                            // (the ceil_log2(1) = 0 fast-path consumes zero bits)
+        // split_exponent (0) != log_alphabet_size (15), so the routine
+        // reads the two extra fields:
+        //   msb_in_token = u(ceil_log2(split_exponent+1)) = u(0) → no bits
+        //   lsb_in_token = u(ceil_log2(split_exponent-msb+1)) = u(0) → no bits
+        // (the ceil_log2(1) = 0 fast-path consumes zero bits)
 
         // Per-cluster prefix histogram: u(1) selector to choose
         // count=1 vs count from u(4)+payload.

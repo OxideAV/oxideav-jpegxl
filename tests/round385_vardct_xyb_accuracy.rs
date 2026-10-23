@@ -25,9 +25,9 @@
 //! implementation source is consulted.
 
 mod common;
-use common::png::{decode_png, ColorType};
+use common::png::{ColorType, decode_png};
 use oxideav_jpegxl::metadata_fdis::{OpsinInverseMatrix, ToneMapping};
-use oxideav_jpegxl::{set_vardct_xyb_capture_armed, VARDCT_XYB_CAPTURE};
+use oxideav_jpegxl::{VARDCT_XYB_CAPTURE, set_vardct_xyb_capture_armed};
 
 const JXL: &[u8] = include_bytes!("fixtures/vardct_256x256_d1.jxl");
 const REF_PNG: &[u8] = include_bytes!("fixtures/vardct_256x256_d1_expected.png");

@@ -36,9 +36,9 @@ use oxideav_jpegxl::lf_global::{
 use oxideav_jpegxl::lf_group::LfCoefficients;
 use oxideav_jpegxl::metadata_fdis::{ImageMetadataFdis, SizeHeaderFdis};
 use oxideav_jpegxl::modular_fdis::{
-    encode_leaf_pick_target, MaNode, MaTreeFdis, LEAF_PICK_LOG, LEAF_PICK_LOG_ENABLED,
-    LEAF_PICK_TRACE_BUF, LEAF_PICK_TRACE_LEAF, LEAF_PICK_TRACE_PROPS, LEAF_PICK_TRACE_TARGET,
-    LEAF_PICK_TRACE_WP, WP_ROUND_BIAS,
+    LEAF_PICK_LOG, LEAF_PICK_LOG_ENABLED, LEAF_PICK_TRACE_BUF, LEAF_PICK_TRACE_LEAF,
+    LEAF_PICK_TRACE_PROPS, LEAF_PICK_TRACE_TARGET, LEAF_PICK_TRACE_WP, MaNode, MaTreeFdis,
+    WP_ROUND_BIAS, encode_leaf_pick_target,
 };
 use oxideav_jpegxl::toc::Toc;
 
@@ -218,8 +218,16 @@ fn dump_run(label: &str, run: &LeafPickRun) {
     if !run.wp.is_empty() {
         eprintln!(
             "[r23]   WP intermediates: te_w={} te_n={} te_nw={} te_ne={} w8={} n8={} nw8={} ne8={} wp_pred8={} max_error={}",
-            run.wp[0], run.wp[1], run.wp[2], run.wp[3],
-            run.wp[4], run.wp[5], run.wp[6], run.wp[7], run.wp[8], run.wp[9],
+            run.wp[0],
+            run.wp[1],
+            run.wp[2],
+            run.wp[3],
+            run.wp[4],
+            run.wp[5],
+            run.wp[6],
+            run.wp[7],
+            run.wp[8],
+            run.wp[9],
         );
     }
     eprintln!(
@@ -472,7 +480,9 @@ fn d1_leafpick_at_y_sample_22_round_23() {
             "[r23] === WP y=0 / NE-boundary audit (bias=3) === te_w={te_w} te_n={te_n} te_nw={te_nw} te_ne={te_ne}",
         );
         if te_n != 0 || te_nw != 0 || te_ne != 0 {
-            eprintln!("[r23]   *** WP-y0 BUG: te_n / te_nw / te_ne nonzero at y=0 sample (these should be 0 per spec H.5.2 fallbacks) ***");
+            eprintln!(
+                "[r23]   *** WP-y0 BUG: te_n / te_nw / te_ne nonzero at y=0 sample (these should be 0 per spec H.5.2 fallbacks) ***"
+            );
         } else {
             eprintln!(
                 "[r23]   WP-y0 boundary clean: top-row te_n / te_nw / te_ne all 0 as expected"
@@ -679,7 +689,10 @@ fn d1_first_leaf_flip_bisect_round_23() {
             );
         }
     } else {
-        eprintln!("[r23] LEAF NEVER FLIPS — yet final state still differs ({:#x} vs {:#x}). This means the divergence is purely from token VALUE differences (different multiplier/offset interpretation) rather than leaf-context selection. The token COUNT and CONTEXT are identical → ANS state diverges due to different ANS distributions per context if and only if multiplier/offset propagate differently, OR (more likely) the SAME-leaf decode reads MORE bits because the prediction differs and the diff DIFFERS, requiring different hybrid-uint extra bits.", state3, state4);
+        eprintln!(
+            "[r23] LEAF NEVER FLIPS — yet final state still differs ({:#x} vs {:#x}). This means the divergence is purely from token VALUE differences (different multiplier/offset interpretation) rather than leaf-context selection. The token COUNT and CONTEXT are identical → ANS state diverges due to different ANS distributions per context if and only if multiplier/offset propagate differently, OR (more likely) the SAME-leaf decode reads MORE bits because the prediction differs and the diff DIFFERS, requiring different hybrid-uint extra bits.",
+            state3, state4
+        );
     }
     // Auditor-mode — never assert.
 }

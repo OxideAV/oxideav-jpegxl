@@ -16,7 +16,7 @@
 
 use std::sync::atomic::Ordering;
 
-use oxideav_jpegxl::ans::hybrid_config::{with_trace_records, TRACE_ENABLED};
+use oxideav_jpegxl::ans::hybrid_config::{TRACE_ENABLED, with_trace_records};
 use oxideav_jpegxl::ans::symbol::{STATE_TRACE_BUF, STATE_TRACE_ENABLED};
 use oxideav_jpegxl::bitreader::BitReader;
 use oxideav_jpegxl::container;
@@ -143,7 +143,7 @@ fn d1_cluster_and_refill_trace_round_19() {
                     let dump: Vec<String> = dist
                         .iter()
                         .enumerate()
-                        .filter(|(_, &x)| x != 0)
+                        .filter(|&(_, &x)| x != 0)
                         .map(|(j, &x)| format!("[{j}]={x}"))
                         .collect();
                     eprintln!("[r19]   {}", dump.join(" "));

@@ -8,7 +8,7 @@
 
 use std::sync::atomic::Ordering;
 
-use oxideav_jpegxl::ans::hybrid_config::{with_trace_records, TRACE_ENABLED};
+use oxideav_jpegxl::ans::hybrid_config::{TRACE_ENABLED, with_trace_records};
 use oxideav_jpegxl::bitreader::BitReader;
 use oxideav_jpegxl::container;
 use oxideav_jpegxl::frame_header::{Encoding, FrameDecodeParams, FrameHeader};
@@ -138,7 +138,12 @@ fn d1_per_token_trace_round_18() {
             total_extra += n_extra;
             eprintln!(
                 "[r18]   cfg(split_exp={}, msb={}, lsb={}): {} calls, {} extra-bit-reads, avg {:.3} extra/call",
-                key.0, key.1, key.2, n_calls, n_extra, n_extra as f64 / n_calls as f64
+                key.0,
+                key.1,
+                key.2,
+                n_calls,
+                n_extra,
+                n_extra as f64 / n_calls as f64
             );
         }
         eprintln!("[r18] TOTAL: {total_calls} calls, {total_extra} extra-bits-read");

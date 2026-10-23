@@ -18,7 +18,7 @@
 
 use crate::error::{Error, Result};
 
-use crate::bitreader::{unpack_signed, BitReader, U32Dist};
+use crate::bitreader::{BitReader, U32Dist, unpack_signed};
 use crate::extensions::Extensions;
 
 /// One tail-field entry of the [`MetadataTailTrace`] — field name, its

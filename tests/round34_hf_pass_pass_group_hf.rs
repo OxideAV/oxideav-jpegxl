@@ -27,12 +27,12 @@
 //! block coefficient decode loop.
 
 use oxideav_jpegxl::bitreader::BitReader;
-use oxideav_jpegxl::coeff_order::{natural_coeff_order, OrderId, NUM_ORDERS};
+use oxideav_jpegxl::coeff_order::{NUM_ORDERS, OrderId, natural_coeff_order};
 use oxideav_jpegxl::hf_pass::{HfPass, ORDER_COEFFICIENT_COUNTS};
 use oxideav_jpegxl::lf_global::HfBlockContext;
 use oxideav_jpegxl::pass_group_hf::{
-    block_context, coefficient_context, non_zeros_context, predicted_non_zeros, PassGroupHfHeader,
-    COEFF_FREQ_CONTEXT, COEFF_NUM_NONZERO_CONTEXT,
+    COEFF_FREQ_CONTEXT, COEFF_NUM_NONZERO_CONTEXT, PassGroupHfHeader, block_context,
+    coefficient_context, non_zeros_context, predicted_non_zeros,
 };
 
 /// Pack `(value, n_bits)` LSB-first. Mirrors the crate-private

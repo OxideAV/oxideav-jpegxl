@@ -420,11 +420,7 @@ pub fn distance_step_2(
 pub fn weight(distance: f32, inv_sigma: f32, position_multiplier: f32, zeroflush: f32) -> f32 {
     let scaled_distance = position_multiplier * distance;
     let v = 1.0_f32 - scaled_distance * inv_sigma;
-    if v <= zeroflush {
-        0.0
-    } else {
-        v * v
-    }
+    if v <= zeroflush { 0.0 } else { v * v }
 }
 
 /// Compute Listing J.2's `inv_sigma = step_multiplier × 4 ×
@@ -649,7 +645,7 @@ pub fn apply_step_5tap(
         Pass::Pass0 => {
             return Err(Error::InvalidData(
                 "JXL EPF: apply_step_5tap rejects Pass::Pass0; use apply_step_13tap".into(),
-            ))
+            ));
         }
         Pass::Pass1 => false,
         Pass::Pass2 => true,
@@ -2177,14 +2173,14 @@ mod tests {
     #[test]
     fn per_block_mixed_grid_skips_low_sigma_blocks() {
         let rf = modular_rf(1); // Step 1 only (5-tap, DistanceStep0and1)
-                                // 2×1 blocks across a 16×8 frame: left block skipped (0.1),
-                                // right block filtered. The filtered sigma must be large
-                                // enough that Weight() — a DECREASING function of distance
-                                // per the round-420 sign erratum — stays above the pass-1
-                                // zeroflush for this pattern's cross-tap distances
-                                // (|Δ| = 3 × Σ channel_scale × 5 taps ≈ 7e2), else the
-                                // kernel degenerates to the identity and the "changed"
-                                // probe below is vacuous.
+        // 2×1 blocks across a 16×8 frame: left block skipped (0.1),
+        // right block filtered. The filtered sigma must be large
+        // enough that Weight() — a DECREASING function of distance
+        // per the round-420 sign erratum — stays above the pass-1
+        // zeroflush for this pattern's cross-tap distances
+        // (|Δ| = 3 × Σ channel_scale × 5 taps ≈ 7e2), else the
+        // kernel degenerates to the identity and the "changed"
+        // probe below is vacuous.
         let (w, h) = (16, 8);
         let base: Vec<f32> = (0..(w * h)).map(|v| ((v * 3) % 19) as f32).collect();
         let grid = SigmaGrid::new(vec![0.1, 4000.0], 2, 1).unwrap();

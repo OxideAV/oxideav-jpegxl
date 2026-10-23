@@ -26,8 +26,8 @@
 //! via `eprintln!` under `--nocapture`. Sentinels for per-fixture decode
 //! + ANS final-state are inherited from rounds 11..24.
 
-use std::sync::atomic::Ordering;
 use std::sync::Mutex;
+use std::sync::atomic::Ordering;
 
 // Round-25: serialise the two tests in this file. The r25 instrumentation
 // uses thread-local rich-range bounds (so cross-test contamination there
@@ -49,7 +49,7 @@ use oxideav_jpegxl::lf_global::{
 use oxideav_jpegxl::lf_group::LfCoefficients;
 use oxideav_jpegxl::metadata_fdis::{ImageMetadataFdis, SizeHeaderFdis};
 use oxideav_jpegxl::modular_fdis::{
-    set_rich_range, RichLeafPickLog, RICH_LEAF_PICK_LOG, WP_ROUND_BIAS,
+    RICH_LEAF_PICK_LOG, RichLeafPickLog, WP_ROUND_BIAS, set_rich_range,
 };
 use oxideav_jpegxl::toc::Toc;
 

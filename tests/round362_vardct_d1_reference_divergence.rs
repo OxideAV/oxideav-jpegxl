@@ -51,7 +51,7 @@
 //! external implementation *source* is consulted.
 
 mod common;
-use common::png::{decode_png, BitDepth, ColorType};
+use common::png::{BitDepth, ColorType, decode_png};
 const VARDCT_D1_JXL: &[u8] = include_bytes!("fixtures/vardct_256x256_d1.jxl");
 const REF_PNG: &[u8] = include_bytes!("fixtures/vardct_256x256_d1_expected.png");
 

@@ -143,7 +143,7 @@ mod tests {
         // mask = U64(): sel=1 → BitsOffset(4, 1) → raw=0 → value=1.
         bw.w(1, 2); // sel=1
         bw.w(0, 4); // raw=0 → value=1
-                    // extension_bits[0] = U64() sel=1 → raw=7 → value=8.
+        // extension_bits[0] = U64() sel=1 → raw=7 → value=8.
         bw.w(1, 2);
         bw.w(7, 4);
         // 8 payload bits (all zero).

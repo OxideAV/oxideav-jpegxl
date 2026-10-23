@@ -6,14 +6,14 @@
 //! the committed `expected.png` references.
 
 mod common;
-use common::png::{decode_png, ColorType};
+use common::png::{ColorType, decode_png};
 use std::io::Cursor;
 
 use oxideav_jpegxl::{
-    decode, decode_all, decode_all_planar, decode_all_with, decode_from, decode_planar,
-    decode_rgb8, decode_rgba8, decode_with, encode, encode_all, encode_rgb8, encode_rgba8,
-    encode_to, info, probe, ColorInfo, ColorRange, DecodeOptions, EncodeOptions, Error, JxlImage,
-    PixelFormat, RawFrame, RgbImage, RgbaImage, Signature,
+    ColorInfo, ColorRange, DecodeOptions, EncodeOptions, Error, JxlImage, PixelFormat, RawFrame,
+    RgbImage, RgbaImage, Signature, decode, decode_all, decode_all_planar, decode_all_with,
+    decode_from, decode_planar, decode_rgb8, decode_rgba8, decode_with, encode, encode_all,
+    encode_rgb8, encode_rgba8, encode_to, info, probe,
 };
 
 const PIXEL_1X1: &[u8] = include_bytes!("fixtures/pixel_1x1.jxl");
@@ -149,17 +149,22 @@ fn decode_rgb8_and_rgba8_match_expected_png() {
     let rgb = decode_rgb8(ALPHA_64).unwrap();
     assert_eq!(rgb.data.len(), 64 * 64 * 3);
     let dropped: Vec<u8> = expected
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .flat_map(|p| [p[0], p[1], p[2]])
         .collect();
     assert_eq!(rgb.data, dropped);
 
     // Grey replicates to R = G = B; alpha opaque.
     let g = decode_rgba8(GRAY_64).unwrap();
-    assert!(g
-        .data
-        .chunks_exact(4)
-        .all(|p| p[0] == p[1] && p[1] == p[2] && p[3] == 255));
+    assert!(
+        g.data
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .all(|p| p[0] == p[1] && p[1] == p[2] && p[3] == 255)
+    );
 }
 
 #[test]

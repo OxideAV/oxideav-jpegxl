@@ -32,8 +32,8 @@
 //! pure-math step at the formula level.
 
 use oxideav_jpegxl::epf::{
-    apply_step_13tap, apply_step_5tap, distance_step_0_and_1, distance_step_2, inv_sigma_for_pass,
-    is_border_position, vardct_sigma_from_listing_j3, weight, Pass,
+    Pass, apply_step_5tap, apply_step_13tap, distance_step_0_and_1, distance_step_2,
+    inv_sigma_for_pass, is_border_position, vardct_sigma_from_listing_j3, weight,
 };
 use oxideav_jpegxl::frame_header::RestorationFilter;
 

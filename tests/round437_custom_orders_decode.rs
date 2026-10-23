@@ -44,7 +44,7 @@
 //! ratchet below bounds it against regression.
 
 mod common;
-use common::png::{decode_png, ColorType};
+use common::png::{ColorType, decode_png};
 fn png_rgb(bytes: &[u8]) -> (usize, usize, Vec<u8>) {
     let info = decode_png(bytes);
     let buf = info.data;

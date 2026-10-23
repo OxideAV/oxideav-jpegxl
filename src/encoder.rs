@@ -27,7 +27,7 @@
 //! installed).
 
 use crate::bitreader::U32Dist;
-use crate::bitwriter::{pack_signed, BitWriter};
+use crate::bitwriter::{BitWriter, pack_signed};
 use crate::entropy_write::{Coding, EntropyCodes, HybridConfig, SymbolStats};
 use crate::error::{Error, Result};
 use crate::icc::icc_context;
@@ -301,7 +301,8 @@ pub fn write_prelude(w: &mut BitWriter, spec: &EncodeSpec) -> Result<()> {
 }
 
 fn write_size_header(w: &mut BitWriter, width: u32, height: u32) -> Result<()> {
-    let small = width % 8 == 0 && height % 8 == 0 && width <= 256 && height <= 256;
+    let small =
+        width.is_multiple_of(8) && height.is_multiple_of(8) && width <= 256 && height <= 256;
     w.write_bool(small);
     if small {
         w.write_bits(5, height / 8 - 1);
@@ -870,21 +871,21 @@ pub fn write_frame_header_and_toc(
     w.write_bool(shape.is_last);
     if !shape.is_last {
         w.write_bits(2, 0); // save_as_reference
-                            // save_before_ct is present only for a frame that can be
-                            // referenced (`resets_canvas && can_reference`, Table F.2):
-                            // with save_as_reference = 0 that is a zero-duration frame.
+        // save_before_ct is present only for a frame that can be
+        // referenced (`resets_canvas && can_reference`, Table F.2):
+        // with save_as_reference = 0 that is a zero-duration frame.
         if !shape.have_animation || shape.duration == 0 {
             w.write_bool(false); // save_before_ct
         }
     }
     w.write_bits(2, 0); // name_len = 0
-                        // RestorationFilter (Table J.1): no Gabor, no EPF.
+    // RestorationFilter (Table J.1): no Gabor, no EPF.
     w.write_bool(false); // all_default
     w.write_bool(false); // gab
     w.write_bits(2, 0); // epf_iters
     w.write_u64(0); // rf extensions
     w.write_u64(0); // frame extensions
-                    // TOC.
+    // TOC.
     w.write_bool(false); // permuted_toc
     w.zero_pad_to_byte();
     for &entry in toc {
@@ -1129,9 +1130,11 @@ mod tests {
         ));
         assert!(matches!(t.nodes[1], TreeNode::Decision { value: 2, .. }));
         assert!(matches!(t.nodes[2], TreeNode::Decision { value: 0, .. }));
-        assert!(t.nodes[3..]
-            .iter()
-            .all(|n| matches!(n, TreeNode::Leaf { .. })));
+        assert!(
+            t.nodes[3..]
+                .iter()
+                .all(|n| matches!(n, TreeNode::Leaf { .. }))
+        );
         // Leaves 3..6 are channels 3, 2, 1, 0.
         assert_eq!(t.leaf_ctx, vec![3, 2, 1, 0]);
         let one = build_channel_tree(&[5], 3);

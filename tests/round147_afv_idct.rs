@@ -7,7 +7,7 @@
 //! the same primitive through its public API as a downstream consumer
 //! would.
 
-use oxideav_jpegxl::afv::{afv_idct, AFV_BASIS, AFV_CELL_LEN};
+use oxideav_jpegxl::afv::{AFV_BASIS, AFV_CELL_LEN, afv_idct};
 
 #[test]
 fn public_api_cell_len_is_16() {

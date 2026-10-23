@@ -7,9 +7,9 @@
 //! layers are pure-control-flow against FDIS §C.8.3 + Listing C.13 /
 //! Listing C.14.
 
-use oxideav_jpegxl::dct_select::TransformType;
-use oxideav_jpegxl::per_channel_non_zeros::{PerChannelNonZerosGrids, DEFAULT_NUM_CHANNELS};
 use oxideav_jpegxl::Result;
+use oxideav_jpegxl::dct_select::TransformType;
+use oxideav_jpegxl::per_channel_non_zeros::{DEFAULT_NUM_CHANNELS, PerChannelNonZerosGrids};
 
 #[test]
 fn r183_default_num_channels_constant_is_three() {
@@ -230,13 +230,14 @@ fn r183_oob_channel_errors_on_every_entry_point() {
     assert!(p.get(99, 0, 0).is_err());
     assert!(p.set(99, 0, 0, 5).is_err());
     assert!(p.update_after_block(99, 0, 0, 1, 1).is_err());
-    assert!(p
-        .update_after_block_for_transform(99, 0, 0, 1, TransformType::Dct8x8)
-        .is_err());
+    assert!(
+        p.update_after_block_for_transform(99, 0, 0, 1, TransformType::Dct8x8)
+            .is_err()
+    );
     let read_non_zeros = |_ctx: u32| -> Result<u32> { Ok(0u32) };
     let decode_symbol = |_ctx: u32| -> Result<u32> { Ok(0u32) };
-    assert!(p
-        .decode_block_at_for_channel(
+    assert!(
+        p.decode_block_at_for_channel(
             99,
             0,
             0,
@@ -246,5 +247,6 @@ fn r183_oob_channel_errors_on_every_entry_point() {
             read_non_zeros,
             decode_symbol
         )
-        .is_err());
+        .is_err()
+    );
 }

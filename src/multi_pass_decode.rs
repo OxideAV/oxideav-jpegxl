@@ -86,7 +86,7 @@
 use crate::error::{Error, Result};
 
 use crate::block_context_resolver::{
-    decode_varblocks_three_channels_with_resolver, BlockContextResolver, ThreeChannelVarblock,
+    BlockContextResolver, ThreeChannelVarblock, decode_varblocks_three_channels_with_resolver,
 };
 use crate::dct_select::DctSelectGrid;
 use crate::per_pass_non_zeros::PerPassNonZerosGrids;
@@ -197,7 +197,7 @@ pub fn count_decoded_blocks(grid: &DctSelectGrid, num_passes: u32) -> Result<u64
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dct_select::{derive_dct_select, TransformType};
+    use crate::dct_select::{TransformType, derive_dct_select};
     use crate::lf_global::HfBlockContext;
     use crate::lf_group::HfMetadata;
 
@@ -606,11 +606,7 @@ mod tests {
             &resolver,
             |_p, _vb| Ok([0, 0, 0]),
             |p, c, _pred| {
-                if p == 0 {
-                    Ok(0)
-                } else {
-                    Ok(2 + c)
-                }
+                if p == 0 { Ok(0) } else { Ok(2 + c) }
             },
             |_p, _c, _coef| Ok(2),
         )

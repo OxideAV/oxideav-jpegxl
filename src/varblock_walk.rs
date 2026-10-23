@@ -258,7 +258,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dct_select::{derive_dct_select, TransformType};
+    use crate::dct_select::{TransformType, derive_dct_select};
     use crate::lf_group::HfMetadata;
 
     fn make_hf(block_info: Vec<i32>, nb_blocks: u32, info_w: u32) -> HfMetadata {

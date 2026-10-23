@@ -640,11 +640,11 @@ pub mod registry;
 #[allow(deprecated)]
 pub use api::detect;
 pub use api::{
-    decode, decode_all, decode_all_with, decode_from, decode_rgb8, decode_rgba8, decode_with,
-    encode, encode_all, encode_rgb8, encode_rgba8, encode_to, headers, info, probe, AnimationInfo,
-    Frame, ImageInfo,
+    AnimationInfo, Frame, ImageInfo, decode, decode_all, decode_all_with, decode_from, decode_rgb8,
+    decode_rgba8, decode_with, encode, encode_all, encode_rgb8, encode_rgba8, encode_to, headers,
+    info, probe,
 };
-pub use container::{extract_codestream, Signature};
+pub use container::{Signature, extract_codestream};
 pub use error::{Error, JxlError, Result};
 #[doc(hidden)]
 pub use image::RawFrame;
@@ -652,7 +652,7 @@ pub use image::{
     ColorInfo, ColorRange, JxlImage, JxlPixelFormat, Metadata, PixelFormat, Plane, RgbImage,
     RgbaImage,
 };
-pub use metadata::{parse_headers, BitDepth, Headers, ImageMetadata, SizeHeader};
+pub use metadata::{BitDepth, Headers, ImageMetadata, SizeHeader, parse_headers};
 pub use options::{DecodeOptions, EncodeOptions};
 #[cfg(feature = "registry")]
 #[doc(hidden)]
@@ -1092,10 +1092,10 @@ pub(crate) fn decode_sequence(
                     // plane count trimmed by the colour transform) —
                     // clear the dangling index so alpha-less modes
                     // still compose.
-                    if let Some(a) = meta.alpha_plane {
-                        if a >= decoded.frame.planes.len() {
-                            meta.alpha_plane = None;
-                        }
+                    if let Some(a) = meta.alpha_plane
+                        && a >= decoded.frame.planes.len()
+                    {
+                        meta.alpha_plane = None;
                     }
                     // Prefer the unclamped float planes when the decode
                     // path preserved them (Modular pass-through):
@@ -2651,7 +2651,7 @@ fn finish_vardct_decode(
     use crate::multi_pass_hf_header::PerPassHfHeaders;
     use crate::per_pass_non_zeros::PerPassNonZerosGrids;
     use crate::residual_plane::{ChannelResidualPlanes, ResidualPlane};
-    use crate::vardct_reconstruct::{reconstruct_lf_group_cross_pass, DequantContext};
+    use crate::vardct_reconstruct::{DequantContext, reconstruct_lf_group_cross_pass};
 
     let VarDctFinishInputs {
         fh,
@@ -3640,10 +3640,10 @@ mod tests {
         use frame_header::flags;
         assert!(reject_undrawn_image_features(flags::USE_LF_FRAME).is_ok());
         assert!(reject_undrawn_image_features(flags::SKIP_ADAPTIVE_LF_SMOOTHING).is_ok());
-        assert!(reject_undrawn_image_features(
-            flags::USE_LF_FRAME | flags::SKIP_ADAPTIVE_LF_SMOOTHING
-        )
-        .is_ok());
+        assert!(
+            reject_undrawn_image_features(flags::USE_LF_FRAME | flags::SKIP_ADAPTIVE_LF_SMOOTHING)
+                .is_ok()
+        );
     }
 
     #[test]

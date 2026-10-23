@@ -126,7 +126,7 @@ fn d1_per_cluster_distribution_and_alias_dump_round_21() {
                 let dump: Vec<String> = dist
                     .iter()
                     .enumerate()
-                    .filter(|(_, &x)| x != 0)
+                    .filter(|&(_, &x)| x != 0)
                     .map(|(j, &x)| format!("[{j}]={x}"))
                     .collect();
                 eprintln!("[r21]   D nonzero entries: {}", dump.join(" "));

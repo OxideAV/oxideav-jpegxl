@@ -15,9 +15,9 @@
 //! §C.7.2 entropy decode (#799 DOCS-GAP).
 
 use oxideav_jpegxl::block_context_resolver::{
-    decode_varblocks_three_channels_with_resolver, BlockContextResolver,
+    BlockContextResolver, decode_varblocks_three_channels_with_resolver,
 };
-use oxideav_jpegxl::dct_select::{derive_dct_select, TransformType};
+use oxideav_jpegxl::dct_select::{TransformType, derive_dct_select};
 use oxideav_jpegxl::lf_global::HfBlockContext;
 use oxideav_jpegxl::lf_group::HfMetadata;
 use oxideav_jpegxl::per_pass_non_zeros::PerPassNonZerosGrids;

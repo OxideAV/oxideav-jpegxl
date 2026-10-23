@@ -118,7 +118,11 @@ fn xyb_inverse_neutral_grey_returns_neutral_grey_via_round_trip() {
         // The (col, row) of the inverse is cofactor(row, col) / det.
         let minor = m_skip(col, row);
         let cofactor = (minor[0][0] * minor[1][1] - minor[0][1] * minor[1][0])
-            * if (row + col) % 2 == 0 { 1.0 } else { -1.0 };
+            * if (row + col).is_multiple_of(2) {
+                1.0
+            } else {
+                -1.0
+            };
         cofactor / det
     };
 

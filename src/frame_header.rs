@@ -1074,7 +1074,7 @@ mod tests {
         params.image_height = 300;
         let mut fh = FrameHeader::default_with(&params);
         fh.group_size_shift = 1; // kGroupDim = 256
-                                 // ceil(600/256)=3, ceil(300/256)=2 → 6
+        // ceil(600/256)=3, ceil(300/256)=2 → 6
         assert_eq!(fh.group_dim(), 256);
         assert_eq!(fh.num_groups(), 6);
     }

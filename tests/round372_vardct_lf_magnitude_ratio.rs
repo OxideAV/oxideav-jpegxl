@@ -33,10 +33,10 @@
 //! OpsinInverseMatrix). No external implementation source is consulted.
 
 mod common;
-use common::png::{decode_png, ColorType};
+use common::png::{ColorType, decode_png};
 use oxideav_jpegxl::bitreader::BitReader;
 use oxideav_jpegxl::frame_header::{FrameDecodeParams, FrameHeader};
-use oxideav_jpegxl::lf_dequant::{dequant_lf, LfMultipliers};
+use oxideav_jpegxl::lf_dequant::{LfMultipliers, dequant_lf};
 use oxideav_jpegxl::lf_global::LfGlobal;
 use oxideav_jpegxl::lf_group::LfGroup;
 use oxideav_jpegxl::metadata_fdis::{

@@ -69,7 +69,7 @@
 //!   the residual band so any change in either direction is loud.
 
 mod common;
-use common::png::{decode_png, ColorType};
+use common::png::{ColorType, decode_png};
 use oxideav_jpegxl::decode_all_planar;
 use oxideav_jpegxl::hf_coefficient_histograms::{
     reset_section_closure_failures, section_closure_failures,

@@ -86,7 +86,7 @@
 //! Provenance: `docs/image/jpegxl/fixtures/noise-64x64-lossless/
 //! wp-trace-provenance.md`.
 
-use oxideav_jpegxl::modular_fdis::{wp_predict_pub, Neighbours, WpHeader, WpState};
+use oxideav_jpegxl::modular_fdis::{Neighbours, WpHeader, WpState, wp_predict_pub};
 
 /// Sample 194 trace data — every value reproduced from the in-repo
 /// docs trace doc, with the FDIS conventions (left-shifted by 3 for

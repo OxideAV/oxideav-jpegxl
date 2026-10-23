@@ -90,9 +90,9 @@ use crate::error::Result;
 use crate::coeff_order::order_id_for_transform;
 use crate::dct_select::DctSelectGrid;
 use crate::lf_global::HfBlockContext;
-use crate::pass_group_hf::{block_context, DecodedHfBlock};
+use crate::pass_group_hf::{DecodedHfBlock, block_context};
 use crate::per_pass_non_zeros::PerPassNonZerosGrids;
-use crate::varblock_walk::{count_varblocks, Varblock, VarblockWalk};
+use crate::varblock_walk::{Varblock, VarblockWalk, count_varblocks};
 
 /// Borrow-based wrapper around a [`HfBlockContext`] that exposes a
 /// per-varblock `(channel, qdc) -> block_ctx` resolver matching the
@@ -328,7 +328,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dct_select::{derive_dct_select, TransformType};
+    use crate::dct_select::{TransformType, derive_dct_select};
     use crate::lf_group::HfMetadata;
 
     fn make_hf(block_info: Vec<i32>, nb_blocks: u32, info_w: u32) -> HfMetadata {

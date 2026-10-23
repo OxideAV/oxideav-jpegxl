@@ -17,7 +17,7 @@ use oxideav_jpegxl::hf_dequant::QmScaleFactors;
 use oxideav_jpegxl::metadata_fdis::OpsinInverseMatrix;
 use oxideav_jpegxl::pass_group_hf::DecodedHfBlock;
 use oxideav_jpegxl::residual_plane::{
-    assemble_channel_plane, block_pixel_dims, place_block, ResidualPlane,
+    ResidualPlane, assemble_channel_plane, block_pixel_dims, place_block,
 };
 use oxideav_jpegxl::varblock_walk::Varblock;
 

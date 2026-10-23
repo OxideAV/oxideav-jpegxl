@@ -55,8 +55,8 @@
 
 use oxideav_jpegxl::decode_planar;
 use oxideav_jpegxl::modular_fdis::{
-    encode_leaf_pick_target, WpHeader, LEAF_PICK_TRACE_TARGET, LEAF_PICK_TRACE_WP, WP_DEEP_TRACE,
-    WP_DEEP_TRACE_ARMED,
+    LEAF_PICK_TRACE_TARGET, LEAF_PICK_TRACE_WP, WP_DEEP_TRACE, WP_DEEP_TRACE_ARMED, WpHeader,
+    encode_leaf_pick_target,
 };
 use serial_test::serial;
 use std::sync::atomic::Ordering;

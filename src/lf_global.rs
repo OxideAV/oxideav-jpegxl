@@ -24,8 +24,8 @@
 use crate::error::{Error, Result};
 
 use crate::ans::cluster::{num_clusters, read_clustering};
-use crate::bitreader::{unpack_signed, BitReader, U32Dist};
-use crate::frame_header::{flags, Encoding, FrameHeader};
+use crate::bitreader::{BitReader, U32Dist, unpack_signed};
+use crate::frame_header::{Encoding, FrameHeader, flags};
 use crate::global_modular::GlobalModular;
 use crate::metadata_fdis::ImageMetadataFdis;
 

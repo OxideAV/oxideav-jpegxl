@@ -526,7 +526,7 @@ fn write_distribution(w: &mut BitWriter, dist: &[u16]) {
     }
     w.write_bool(false);
     w.write_bool(false); // not flat
-                         // shift = 13: three 1-bits then u(3) = 13 - 7.
+    // shift = 13: three 1-bits then u(3) = 13 - 7.
     w.write_bits(3, 0b111);
     w.write_bits(3, 6);
     let alphabet_size = (used[used.len() - 1] + 1).max(3);
@@ -830,7 +830,7 @@ mod tests {
     use super::*;
     use crate::ans::hybrid::HybridUintState;
     use crate::bitreader::BitReader;
-    use crate::modular_fdis::{decode_uint_in_with_dist_pub, EntropyStream};
+    use crate::modular_fdis::{EntropyStream, decode_uint_in_with_dist_pub};
 
     fn round_trip(stats_fn: impl Fn() -> SymbolStats, symbols: &[(u32, u32)]) {
         for coding in [Coding::Prefix, Coding::Ans] {

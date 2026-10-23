@@ -35,7 +35,7 @@
 //! committed stream.
 
 mod common;
-use common::png::{decode_png, ColorType};
+use common::png::{ColorType, decode_png};
 use oxideav_jpegxl::decode_all_planar;
 
 fn png_rgb(bytes: &[u8]) -> (usize, usize, Vec<u8>) {
@@ -279,8 +279,8 @@ fn build_spline_codestream() -> Vec<u8> {
     w.push(0, 2); // blending_info.mode U32 selector 0 → kReplace
     w.push(1, 1); // is_last = 1
     w.push(0, 2); // name_len U32 selector 0 → 0
-                  // RestorationFilter (2024 Table J.1): all_default=0, gab=0,
-                  // epf_iters=0, extensions=0 — filters explicitly off.
+    // RestorationFilter (2024 Table J.1): all_default=0, gab=0,
+    // epf_iters=0, extensions=0 — filters explicitly off.
     w.push(0, 1);
     w.push(0, 1);
     w.push(0, 2);
@@ -330,7 +330,7 @@ fn build_spline_codestream() -> Vec<u8> {
     es.push(8, 6);
     es.push(32, 6);
     es.push(0, 1); // tree_select = 0 → lengths {2, 2, 2, 2}
-                   // cluster 1 prefix histogram: simple, nsym=3 → lengths {1, 2, 2}.
+    // cluster 1 prefix histogram: simple, nsym=3 → lengths {1, 2, 2}.
     es.push(1, 2);
     es.push(2, 2); // nsym - 1 = 2
     es.push(0, 6);
@@ -381,7 +381,7 @@ fn build_spline_codestream() -> Vec<u8> {
     w.push(p0_0, l0_0); // dy1
     w.push(p0_0, l0_0); // dx2
     w.push(p0_0, l0_0); // dy2
-                        // X channel: 32 zeros.
+    // X channel: 32 zeros.
     for _ in 0..32 {
         w.push(p5_0, l5_0);
     }
@@ -408,24 +408,24 @@ fn build_spline_codestream() -> Vec<u8> {
     w.push(0, 1); // inner use_global_tree = 0
     w.push(1, 1); // WPHeader: default_wp = 1
     w.push(0, 2); // nb_transforms U32 selector 0 → 0
-                  // MA tree stream (D.4.2): 6 distributions, single cluster, prefix,
-                  // 1-symbol alphabet → every token is 0 at zero bits. The tree is a
-                  // single leaf: property+1=0 → leaf(predictor 0, offset 0, mul_log 0,
-                  // mul_bits 0).
+    // MA tree stream (D.4.2): 6 distributions, single cluster, prefix,
+    // 1-symbol alphabet → every token is 0 at zero bits. The tree is a
+    // single leaf: property+1=0 → leaf(predictor 0, offset 0, mul_log 0,
+    // mul_bits 0).
     w.push(0, 1); // lz77 = 0
     w.push(1, 1); // clustering: is_simple
     w.push(0, 2); // nbits = 0 → all zero cluster map
     w.push(1, 1); // use_prefix_code
     w.push(15, 4); // config split_exponent = 15
     w.push(0, 1); // alphabet count bit = 0 → count 1 (0-bit tokens)
-                  // Symbol stream for num_ctx = 1: same degenerate shape (no
-                  // clustering read when num_dist == 1).
+    // Symbol stream for num_ctx = 1: same degenerate shape (no
+    // clustering read when num_dist == 1).
     w.push(0, 1); // lz77 = 0
     w.push(1, 1); // use_prefix_code
     w.push(15, 4); // config split_exponent = 15
     w.push(0, 1); // count bit = 0 → 1-symbol alphabet
-                  // Channel samples: 3 × 64×64 tokens, all from the 1-symbol
-                  // alphabet — zero bits on the wire.
+    // Channel samples: 3 × 64×64 tokens, all from the 1-symbol
+    // alphabet — zero bits on the wire.
 
     w.pad_to_byte();
     let section_len = w.bytes.len() - section_start;

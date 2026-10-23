@@ -67,7 +67,7 @@ use crate::bitreader::BitReader;
 use crate::block_context_resolver::BlockContextResolver;
 use crate::dct_select::DctSelectGrid;
 use crate::multi_pass_decode::{
-    decode_multi_pass_three_channels_with_resolver, MultiPassThreeChannelOutput,
+    MultiPassThreeChannelOutput, decode_multi_pass_three_channels_with_resolver,
 };
 use crate::pass_group_hf::PassGroupHfHeader;
 use crate::per_pass_non_zeros::PerPassNonZerosGrids;
@@ -318,7 +318,7 @@ impl PerPassHfHeaders {
 mod tests {
     use super::*;
     use crate::bitreader::BitReader;
-    use crate::dct_select::{derive_dct_select, TransformType};
+    use crate::dct_select::{TransformType, derive_dct_select};
     use crate::lf_global::HfBlockContext;
     use crate::lf_group::HfMetadata;
 
@@ -566,7 +566,7 @@ mod tests {
                 // each channel's 63-read walk, so every read still
                 // happens (and the round-444 declared-count guard is
                 // satisfied).
-                if decode_symbol_pass_offsets.len() % 63 == 0 {
+                if decode_symbol_pass_offsets.len().is_multiple_of(63) {
                     Ok(2)
                 } else {
                     Ok(0)
@@ -734,9 +734,11 @@ mod tests {
         // Pass 1: 3 calls with offset 7425.
         assert_eq!(observed.len(), 6);
         assert!(observed[..3].iter().all(|&(p, _, off)| p == 0 && off == 0));
-        assert!(observed[3..]
-            .iter()
-            .all(|&(p, _, off)| p == 1 && off == 7425));
+        assert!(
+            observed[3..]
+                .iter()
+                .all(|&(p, _, off)| p == 1 && off == 7425)
+        );
     }
 
     // ---------- read_and_decode_multi_pass_with_hf_headers ----------

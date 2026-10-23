@@ -71,7 +71,7 @@ pub fn group_rects_in_blocks(
             "JXL group_rects: zero-dimension image".into(),
         ));
     }
-    if group_dim_px == 0 || group_dim_px % 8 != 0 {
+    if group_dim_px == 0 || !group_dim_px.is_multiple_of(8) {
         return Err(Error::InvalidData(format!(
             "JXL group_rects: group_dim {group_dim_px} must be a positive multiple of 8"
         )));
@@ -220,7 +220,7 @@ pub fn slice_tiles_rect(
             tiles.len()
         )));
     }
-    if rect.bx0 % 8 != 0 || rect.by0 % 8 != 0 {
+    if !rect.bx0.is_multiple_of(8) || !rect.by0.is_multiple_of(8) {
         return Err(Error::InvalidData(format!(
             "JXL slice_tiles_rect: rect origin ({}, {}) not 64×64-tile aligned",
             rect.bx0, rect.by0

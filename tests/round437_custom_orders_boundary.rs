@@ -26,7 +26,7 @@
 //!    shipped default.
 
 mod common;
-use common::png::{decode_png, ColorType};
+use common::png::{ColorType, decode_png};
 use oxideav_jpegxl::coeff_order::{PermPrevContext, PermStreamConfig};
 
 const FIXTURE: &[u8] = include_bytes!("fixtures/progressive_ac_multipass.jxl");

@@ -44,9 +44,9 @@ use crate::ans::cluster::{num_clusters, read_clustering};
 use crate::ans::distribution::read_distribution;
 use crate::ans::hybrid::{HybridUintState, Lz77Params};
 use crate::ans::hybrid_config::HybridUintConfig;
-use crate::ans::prefix::{read_prefix_code, PrefixCode};
+use crate::ans::prefix::{PrefixCode, read_prefix_code};
 use crate::ans::symbol::AnsDecoder;
-use crate::bitreader::{unpack_signed, BitReader, U32Dist};
+use crate::bitreader::{BitReader, U32Dist, unpack_signed};
 
 /// Maximum channels per modular sub-bitstream we accept. The FDIS does
 /// not impose an explicit limit, but real frames carry at most a
@@ -1576,11 +1576,7 @@ fn predict(
             // Spec text: abs(N - NW) < abs(W - NW)
             let lhs = (nb.n as i64 - nb.nw as i64).abs();
             let rhs = (nb.w as i64 - nb.nw as i64).abs();
-            if lhs < rhs {
-                nb.w
-            } else {
-                nb.n
-            }
+            if lhs < rhs { nb.w } else { nb.n }
         }
         5 => {
             // Gradient: clamp(W + N - NW, min(W, N), max(W, N))
@@ -1658,7 +1654,7 @@ pub fn get_properties(
     //               NW' = if x>1 && y>0 img(x-2, y-1) else W'
     let prop8 = if x > 0 {
         let wm1 = nb.w; // value at (x-1, y), already decoded (was W of (x,y))
-                        // Re-derive W'/N'/NW' for the previous sample.
+        // Re-derive W'/N'/NW' for the previous sample.
         let w_prev = if x > 1 {
             img.get(i, x - 2, y)
         } else if y > 0 {

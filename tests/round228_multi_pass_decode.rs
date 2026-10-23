@@ -14,7 +14,7 @@
 //! `hfp` selection to the caller's pass-aware closure dispatch.
 
 use oxideav_jpegxl::block_context_resolver::BlockContextResolver;
-use oxideav_jpegxl::dct_select::{derive_dct_select, TransformType};
+use oxideav_jpegxl::dct_select::{TransformType, derive_dct_select};
 use oxideav_jpegxl::lf_global::HfBlockContext;
 use oxideav_jpegxl::lf_group::HfMetadata;
 use oxideav_jpegxl::multi_pass_decode::{
@@ -63,11 +63,7 @@ fn r228_two_pass_single_dct8x8_per_pass_writeback_isolated() {
         &resolver,
         |_p, _vb| Ok([0, 0, 0]),
         |p, c, _pred| {
-            if p == 0 {
-                Ok(3 + c * 2)
-            } else {
-                Ok(4 + c * 2)
-            }
+            if p == 0 { Ok(3 + c * 2) } else { Ok(4 + c * 2) }
         },
         |_p, _c, _coef| Ok(0),
     )
@@ -346,11 +342,7 @@ fn r228_inner_driver_error_propagates_through_outer_loop() {
         &resolver,
         |_p, _vb| Ok([0, 0, 0]),
         |p, _c, _pred| {
-            if p == 1 {
-                Ok(1)
-            } else {
-                Ok(0)
-            }
+            if p == 1 { Ok(1) } else { Ok(0) }
         },
         |p, c, _coef| {
             if p == 1 && c == 0 {
