@@ -119,6 +119,7 @@ impl PatchBlendMode {
 
 /// One per-(position, plane-group) blend descriptor (Listing C.2).
 #[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
 pub struct PatchBlending {
     pub mode: PatchBlendMode,
     /// Extra-channel index of "the alpha channel" (Table K.1); 0 when
@@ -130,6 +131,7 @@ pub struct PatchBlending {
 
 /// One decoded patch (§C.4.5).
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct Patch {
     /// `Reference[ref]` slot the patch samples come from.
     pub reference: u32,
@@ -320,6 +322,7 @@ pub fn decode_patches(
 /// `xyb_encoded` frames; samples normalised to `[0, 1]` for integer
 /// Modular frames with no colour transform).
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct PreCtFrame {
     pub width: usize,
     pub height: usize,
@@ -333,6 +336,7 @@ pub struct PreCtFrame {
 /// a patch referencing such a slot is a precise error, never a silent
 /// zero-fill (§C.4.5 requires the referenced samples to exist).
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct ReferenceFrames {
     pub slots: [Option<PreCtFrame>; 4],
 }

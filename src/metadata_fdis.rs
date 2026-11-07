@@ -87,6 +87,7 @@ pub fn set_metadata_tail_trace_armed(on: bool) {
 /// the existing [`crate::metadata::SizeHeader`]; lifted here so the
 /// FDIS-side parsers do not have to depend on the older module.
 #[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
 pub struct SizeHeaderFdis {
     pub width: u32,
     pub height: u32,
@@ -147,6 +148,7 @@ impl SizeHeaderFdis {
 
 /// `BitDepth` per FDIS Table A.15.
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[non_exhaustive]
 pub struct BitDepthFdis {
     pub float_sample: bool,
     pub bits_per_sample: u32,
@@ -237,6 +239,7 @@ impl Customxy {
 
 /// `ColourSpace` enum — FDIS Table A.7.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ColourSpace {
     Rgb = 0,
     Grey = 1,
@@ -260,6 +263,7 @@ impl ColourSpace {
 
 /// `WhitePoint` enum — FDIS Table A.8.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum WhitePoint {
     D65 = 1,
     Custom = 2,
@@ -283,6 +287,7 @@ impl WhitePoint {
 
 /// `Primaries` enum — FDIS Table A.9.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Primaries {
     SRgb = 1,
     Custom = 2,
@@ -306,6 +311,7 @@ impl Primaries {
 
 /// `TransferFunction` enum — FDIS Table A.10.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum TransferFunction {
     Bt709 = 1,
     Unknown = 2,
@@ -335,6 +341,7 @@ impl TransferFunction {
 
 /// `RenderingIntent` enum — FDIS Table A.12.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum RenderingIntent {
     Perceptual = 0,
     Relative = 1,
@@ -375,6 +382,7 @@ fn read_enum_u32(br: &mut BitReader<'_>) -> Result<u32> {
 
 /// `CustomTransferFunction` per FDIS Table A.11.
 #[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
 pub struct CustomTransferFunction {
     pub have_gamma: bool,
     /// Only valid when `have_gamma == true`. Decoded from `u(24)`.
@@ -422,6 +430,7 @@ impl CustomTransferFunction {
 
 /// `ColourEncoding` bundle — FDIS Table A.13.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct ColourEncoding {
     pub all_default: bool,
     pub want_icc: bool,
@@ -514,6 +523,7 @@ impl ColourEncoding {
 
 /// `ToneMapping` bundle — FDIS Table A.18.
 #[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
 pub struct ToneMapping {
     pub all_default: bool,
     pub intensity_target: f32,
@@ -569,6 +579,7 @@ impl ToneMapping {
 
 /// `ExtraChannelType` enum — FDIS Table A.21.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ExtraChannelType {
     Alpha = 0,
     Depth = 1,
@@ -602,6 +613,7 @@ impl ExtraChannelType {
 
 /// `ExtraChannelInfo` bundle — FDIS Table A.22.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct ExtraChannelInfo {
     pub all_default: bool,
     pub kind: ExtraChannelType,
@@ -711,6 +723,7 @@ impl ExtraChannelInfo {
 
 /// `AnimationHeader` bundle — FDIS Table A.19.
 #[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
 pub struct AnimationHeader {
     pub tps_numerator: u32,
     pub tps_denominator: u32,
@@ -751,6 +764,7 @@ impl AnimationHeader {
 /// `PreviewHeader` bundle — FDIS Table A.5. Width/height are bounded to
 /// 4096 per the spec.
 #[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
 pub struct PreviewHeader {
     pub width: u32,
     pub height: u32,
@@ -817,6 +831,7 @@ impl PreviewHeader {
 /// upsampling weight tables (cw_mask) live alongside `ImageMetadataFdis`
 /// because they're not part of this bundle.
 #[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
 pub struct OpsinInverseMatrix {
     pub all_default: bool,
     pub inv_mat: [[f32; 3]; 3],
@@ -900,6 +915,7 @@ impl OpsinInverseMatrix {
 /// 2021 published spec, including ColourEncoding, ToneMapping, and the
 /// `default_transform` / cw_mask custom-upsampling-weights tail.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct ImageMetadataFdis {
     pub all_default: bool,
     pub extra_fields: bool,

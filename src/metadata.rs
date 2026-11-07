@@ -30,6 +30,7 @@ pub const FIXED_ASPECT_RATIOS: [(u32, u32); 7] =
 /// Decoded JXL image size, with the raw encoding flags preserved for
 /// diagnostics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct SizeHeader {
     pub width: u32,
     pub height: u32,
@@ -45,6 +46,7 @@ pub struct SizeHeader {
 /// fields this crate currently decodes are present; fuller parsing lands
 /// with the actual pixel pipeline.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ImageMetadata {
     /// True when the bundle's `all_default` bit was set: orientation is 1,
     /// no preview/animation, 8-bit unsigned samples, sRGB, no XYB encoding.
@@ -80,6 +82,7 @@ impl BitDepth {
 
 /// Full result of a best-effort header parse.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Headers {
     pub signature: Signature,
     pub size: SizeHeader,

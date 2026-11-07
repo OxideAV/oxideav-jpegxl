@@ -63,6 +63,7 @@ pub fn detect(data: &[u8]) -> Option<Signature> {
 /// (4 bytes) + optional `XLBox` (u64, present iff `LBox == 1`) +
 /// `DBox` (the remaining bytes).
 #[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
 pub struct RawBox<'a> {
     /// The 4-byte `TBox` box type.
     pub box_type: [u8; 4],
@@ -197,6 +198,7 @@ fn read_u32_be(data: &[u8], pos: &mut usize) -> Result<u32> {
 
 /// One entry of the Frame Index box (18181-2 Table 9).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct FrameIndexEntry {
     /// `OFFi` — offset of the start byte of this frame relative to the
     /// start byte of the previous indexed frame in the codestream (for
@@ -216,6 +218,7 @@ pub struct FrameIndexEntry {
 
 /// Parsed Frame Index box (`jxli`, 18181-2 §9.8).
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct FrameIndex {
     /// `TNUM` — numerator of the tick unit.
     pub tick_numerator: u32,
@@ -275,6 +278,7 @@ impl FrameIndex {
 
 /// Metadata box kind for the ordered [`JxlFile::metadata`] list.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum MetadataKind {
     /// `Exif` box (§9.5): payload is a 4-byte tiff-header offset
     /// followed by the Exif payload.
@@ -289,6 +293,7 @@ pub enum MetadataKind {
 
 /// One metadata box, in file order.
 #[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
 pub struct MetadataBox<'a> {
     pub kind: MetadataKind,
     /// The box payload. When `brotli_compressed` is set this is the
@@ -318,6 +323,7 @@ impl MetadataBox<'_> {
 /// Typed, validated view of a box-structured JPEG XL file
 /// (18181-2 Clauses 5, 8 and 9).
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct JxlFile<'a> {
     /// Level box value (`jxll`, §9.3); 5 when absent.
     pub level: u8,

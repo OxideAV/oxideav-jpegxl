@@ -57,6 +57,7 @@ const ZIGZAG: [usize; 64] = [
 /// Quantized DCT coefficients recovered from a lossless JPEG→JXL
 /// transcode, plus the JPEG quantization tables the codestream carries.
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct TranscodedCoefficients {
     /// Image width / height in pixels (SizeHeader).
     pub width: u32,

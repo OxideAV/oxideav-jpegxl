@@ -24,6 +24,7 @@ use crate::bitreader::BitReader;
 /// in which case `extension_bits` is empty and [`Self::skip_payload`]
 /// is a no-op.
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct Extensions {
     /// Bitmask of present extensions: bit `i` set means extension with
     /// `ext_i = i` is present. `i` ranges over `[0, 63)`.

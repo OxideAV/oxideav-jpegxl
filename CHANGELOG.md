@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- `#[non_exhaustive]` on the growable enums `ColourSpace`, `ExtraChannelType`, `MetadataKind`, `Primaries`, `RenderingIntent`, `TransferFunction`, `WhitePoint`.
+- `#[non_exhaustive]` on the parsed header / container / JPEG-reconstruction
+  records `AnimationHeader`, `AppMarker`, `BitDepthFdis`, `ColourEncoding`, `CustomTransferFunction`, `Extensions`, `ExtraChannelInfo`, `ExtraZeroRun`, `FrameIndex`, `FrameIndexEntry`, `Headers`, `HeadersFdis`, `HuffmanCode`, `ImageMetadata`, `ImageMetadataFdis`, `JpegBitstreamData`, `JxlFile`, `MetadataBox`, `OpsinInverseMatrix`, `Patch`, `PatchBlending`, `PreCtFrame`, `PreviewHeader`, `QuantTable`, `RawBox`, `ReferenceFrames`, `ScanComponentInfo`, `ScanInfo`, `ScanMoreInfo`, `SizeHeader`, `SizeHeaderFdis`, `ToneMapping`, `TrailingData`, `TranscodedCoefficients`. `Signature`, `PatchBlendMode` (spec-fixed) and
+  `BitDepth` (built by callers) stay exhaustive.
+
 ## [0.0.15](https://github.com/OxideAV/oxideav-jpegxl/compare/v0.0.14...v0.0.15) - 2026-10-23
 
 ### Other
@@ -533,7 +540,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   signature bytes were parsed as SizeHeader bits, coincidentally
   yielding a plausible-but-wrong header for 256-px-tall images).
 
-
 - Round 444 — **the round-437/441 "synthetic-content VarDCT accuracy
   deficiency" (vanishing impulses) is root-caused and FIXED**: six
   stacked defects across the §C.8.3 entropy layer and the VarDCT
@@ -967,7 +973,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   gate desyncs every single-extra-channel stream whose frame uses
   kBlend / kAlphaWeightedAdd / kMul (pinned by exact-cover parses of
   the `blendmodes` five-frame chain and both `sunset_logo` layers).
-
 
 - Round 393 — flat-content fixture arbitration + alpha blending +
   multi-LfGroup framing:

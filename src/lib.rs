@@ -3489,6 +3489,7 @@ pub fn decode_vardct_frame_with_refs(
 /// FDIS-side `Headers` returned by [`probe_fdis`]. Mirrors the
 /// committee-draft [`Headers`] but uses the FDIS bundle types.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct HeadersFdis {
     pub signature: container::Signature,
     pub size: SizeHeaderFdis,

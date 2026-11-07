@@ -40,6 +40,7 @@ pub const MAX_BROTLI_OUTPUT: usize = 64 << 20;
 
 /// `AppMarker` bundle (Table 12).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct AppMarker {
     /// Marker payload disposition: 0 = unknown (verbatim bytes in the
     /// trailing stream), 1 = ICC profile fragment, 2 = Exif metadata,
@@ -51,6 +52,7 @@ pub struct AppMarker {
 
 /// `QuantTable` bundle (Table 13).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct QuantTable {
     /// `Pq` — 0 for 8-bit factors, 1 for 16-bit factors.
     pub precision: u32,
@@ -62,6 +64,7 @@ pub struct QuantTable {
 
 /// `HuffmanCode` bundle (Table 14).
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct HuffmanCode {
     /// `Tc` — false for a DC (or lossless) table, true for an AC table.
     pub is_ac: bool,
@@ -88,6 +91,7 @@ pub struct HuffmanCode {
 
 /// `ScanComponentInfo` bundle (Table 16).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ScanComponentInfo {
     /// Index into the frame's component list.
     pub comp_idx: u32,
@@ -99,6 +103,7 @@ pub struct ScanComponentInfo {
 
 /// `ScanInfo` bundle (Table 15).
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ScanInfo {
     /// `Ss` — start of spectral selection.
     pub ss: u32,
@@ -122,6 +127,7 @@ pub struct ScanInfo {
 /// index — the field is used as the block index of the block before
 /// which `num_runs` extra "ZRL" symbols are emitted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ExtraZeroRun {
     /// Number of extra "ZRL" (run of 16 zeros) symbols to emit.
     pub num_runs: u32,
@@ -131,6 +137,7 @@ pub struct ExtraZeroRun {
 
 /// `ScanMoreInfo` bundle (Table 17).
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ScanMoreInfo {
     /// Block indices (in the scan) at which "Encode_EOBRUN" is invoked
     /// before encoding the block (A.6).
@@ -142,6 +149,7 @@ pub struct ScanMoreInfo {
 /// The verbatim byte streams recovered from the Brotli-compressed tail of
 /// the `jbrd` box (§9.11 final paragraphs).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub struct TrailingData {
     /// For each `app_marker[i]` with kind 0, its `length` verbatim bytes
     /// (the APPn segment after its `0xFF` byte); `None` for kinds 1..=3,
@@ -160,6 +168,7 @@ pub struct TrailingData {
 /// Parsed JPEG Bitstream Reconstruction Data (`JPEGBitstream` bundle,
 /// Table 11, plus the decompressed trailing streams).
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct JpegBitstreamData {
     /// Whether the JPEG is a 1-component greyscale image.
     pub is_grey: bool,
