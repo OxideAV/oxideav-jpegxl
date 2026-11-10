@@ -12,8 +12,10 @@ use crate::error::{Error, Result};
 #[derive(Debug, Default, Clone)]
 pub struct BitWriter {
     bytes: Vec<u8>,
-    /// Bits used in the last byte of `bytes` (0 when byte-aligned).
-    bit_pos: u32,
+    /// Pending bits (fewer than eight between calls), LSB first.
+    acc: u64,
+    /// Number of pending bits in `acc`.
+    pending: u32,
 }
 
 impl BitWriter {
@@ -24,30 +26,36 @@ impl BitWriter {
 
     /// Total bits written so far.
     pub fn bit_len(&self) -> usize {
-        self.bytes.len() * 8
-            - if self.bit_pos == 0 {
-                0
-            } else {
-                (8 - self.bit_pos) as usize
-            }
+        self.bytes.len() * 8 + self.pending as usize
     }
 
     /// `u(n)`: the low `n` bits of `value`, LSB first (`n <= 32`).
+    #[inline]
     pub fn write_bits(&mut self, n: u32, value: u32) {
         debug_assert!(n <= 32);
         debug_assert!(
             n == 32 || value >> n == 0,
             "value {value} does not fit in {n} bits"
         );
-        for i in 0..n {
-            let bit = ((value >> i) & 1) as u8;
-            if self.bit_pos == 0 {
-                self.bytes.push(0);
-            }
-            let last = self.bytes.len() - 1;
-            self.bytes[last] |= bit << self.bit_pos;
-            self.bit_pos = (self.bit_pos + 1) & 7;
+        self.acc |= u64::from(value) << self.pending;
+        self.pending += n;
+        while self.pending >= 8 {
+            self.bytes.push(self.acc as u8);
+            self.acc >>= 8;
+            self.pending -= 8;
         }
+    }
+
+    /// Append every bit of `other` (which need not be byte-aligned).
+    pub fn append(&mut self, other: &BitWriter) {
+        if self.pending == 0 {
+            self.bytes.extend_from_slice(&other.bytes);
+        } else {
+            for &b in &other.bytes {
+                self.write_bits(8, u32::from(b));
+            }
+        }
+        self.write_bits(other.pending, other.acc as u32);
     }
 
     /// `Bool()`.
@@ -128,24 +136,28 @@ impl BitWriter {
 
     /// `ZeroPadToByte()` (B.2.7).
     pub fn zero_pad_to_byte(&mut self) {
-        self.bit_pos = 0;
+        if self.pending > 0 {
+            self.bytes.push(self.acc as u8);
+            self.acc = 0;
+            self.pending = 0;
+        }
     }
 
     /// Append whole bytes (the writer must be byte-aligned).
     pub fn write_bytes(&mut self, bytes: &[u8]) {
-        debug_assert_eq!(self.bit_pos, 0);
-        self.bit_pos = 0;
+        debug_assert_eq!(self.pending, 0);
         self.bytes.extend_from_slice(bytes);
     }
 
     /// The bytes written so far (padded with zero bits to a byte).
-    pub fn into_bytes(self) -> Vec<u8> {
+    pub fn into_bytes(mut self) -> Vec<u8> {
+        self.zero_pad_to_byte();
         self.bytes
     }
 
     /// Byte length once padded.
     pub fn byte_len(&self) -> usize {
-        self.bytes.len()
+        self.bytes.len() + usize::from(self.pending > 0)
     }
 }
 

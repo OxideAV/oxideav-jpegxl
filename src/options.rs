@@ -107,6 +107,21 @@ impl Default for DecodeOptions {
     }
 }
 
+/// How much work the encoder spends on context modelling: a
+/// speed / density trade-off that never changes the decoded pixels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum Effort {
+    /// A small MA tree over the simple predictors, no self-correcting
+    /// predictor: the fastest.
+    Fast,
+    /// A learned MA tree with the self-correcting predictor (default).
+    #[default]
+    Balanced,
+    /// A larger learning sample and a deeper tree.
+    Thorough,
+}
+
 /// Encoder options.
 ///
 /// `#[non_exhaustive]`: build with [`new`](Self::new) / `Default` and
@@ -133,9 +148,18 @@ pub struct EncodeOptions {
     /// writes a 1000 Hz tick and takes each frame's `delay` rounded to
     /// milliseconds (`100` ms when a frame has none).
     pub animation: Option<AnimationInfo>,
+    /// Speed / density trade-off of the Modular coder (default
+    /// [`Effort::Balanced`]).
+    pub effort: Effort,
 }
 
 impl EncodeOptions {
+    /// Builder: set `effort`.
+    pub fn with_effort(mut self, effort: Effort) -> Self {
+        self.effort = effort;
+        self
+    }
+
     /// Same as [`Default::default`].
     pub fn new() -> Self {
         Self::default()
@@ -178,6 +202,7 @@ impl Default for EncodeOptions {
             container: false,
             group_size_shift: 1,
             animation: None,
+            effort: Effort::default(),
         }
     }
 }

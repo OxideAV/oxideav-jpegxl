@@ -249,20 +249,27 @@ layouts — the same table in both directions, the output label is what
   is bounded by the step. The size ladder is monotone on textured
   content (`q50 < q90 < q100`, pinned); lower quality never yields a
   larger file.
-* **Structure**: one global MA tree with one leaf per channel (a
-  balanced split on the channel index); each leaf's predictor is
-  picked per channel among West / North / Select / Gradient by
-  residual energy (predictors without integer division, so no
-  rounding convention is involved); **ANS** entropy streams (C.2.5
-  distributions at full 12-bit precision, C.3.2 rANS with a 16-bit
-  renormalisation word, one state per stream ending on `0x130000`)
-  for every stream of 64 symbols or more — the MA tree and other tiny
-  streams keep prefix codes, whose histograms are cheaper than the
-  32-bit state initialiser — no LZ77, simple clustering; pictures up to
+* **Structure**: one global MA tree **learned from the picture** — a
+  sample of it is scanned with the decoder's own property vector
+  (Table H.4, previous-channel properties included) and every node
+  takes the property / threshold split and per-side predictors that
+  minimise the estimated coded size while the saving pays for the new
+  context; all fourteen predictors of Table H.3 are candidates,
+  including the **self-correcting (weighted) predictor** and its
+  `max_error` property. In front of the channels: a **palette** over
+  all channels for pictures with few colours, **channel palettes** for
+  channels using a sparse subset of their range, and otherwise the
+  **RCT** (any of the 42 `rct_type`s) with the cheapest output — each
+  elected on estimated size. Entropy coding: contexts are
+  **clustered** (general cluster map beyond eight clusters), every
+  cluster elects its hybrid-integer configuration, every stream elects
+  **prefix codes or ANS** (C.2.5 distributions at full 12-bit
+  precision, C.3.2 rANS ending on `0x130000`). Pictures up to
   `group_dim` (default 256, `group_size_shift`) are coded in
   `GlobalModular`, larger ones as one `PassGroup` section per group
-  sharing the global tree (empty `ModularLfGroup` / `HfGlobal`
-  sections). The `SizeHeader` short form is used when it applies.
+  sharing the global tree. `EncodeOptions::effort` (`Fast` /
+  `Balanced` / `Thorough`) trades learning time for density and never
+  changes the pixels.
 * **Metadata**: an ICC profile is embedded in the codestream (E.4,
   written as a header residual stream plus one verbatim main-content
   command, so any profile round-trips byte for byte); Exif / XMP
@@ -278,15 +285,24 @@ layouts — the same table in both directions, the output label is what
   frames' `delay` in milliseconds (`100` ms without one). Frames share
   one geometry / layout / depth — a mismatch is `Error::Unsupported`
   naming both shapes. Metadata is the first frame's.
-* **Size, lossless** (bytes, this crate vs a black-box encoder at its
-  efforts 1 / 3 / 7 on the committed content): a 924×1386 RGBA logo
-  864 464 vs 1 115 085 / 846 578 / 480 409; a 1024×768 photo 520 370
-  vs 628 091 / 504 402 / 358 738; 64×64 noise 13 635 vs 14 564 /
-  13 730 / 13 507; a 64×64 gradient 828 vs 2 335 / 702 / 107; a flat
-  64×64 grey 29 vs 1 279 / 247 / 37 — between that encoder's efforts
-  1 and 3 throughout.
-* Not written: VarDCT (lossy XYB), the self-correcting predictor,
-  Palette / Squeeze transforms, LZ77, patches, splines, noise,
+* **Size, lossless** (bytes; round 477 → now at the default effort,
+  then a black-box encoder at its efforts 1 / 3 / 7 / 9; the corpus is
+  synthesised from the staged fixtures, see `tests/r487_corpus.rs`):
+
+  | picture | r477 | now | black-box e1 / e3 / e7 / e9 |
+  |---|---|---|---|
+  | 1280×960 grey photo | 447 570 | **335 659** | 478 023 / 374 361 / 345 427 / 338 111 |
+  | 1440×810 16-bit grey photo | 1 659 189 | **1 576 041** | 1 695 629 / 1 560 146 / 1 594 352 / 1 585 659 |
+  | 1280×960 RGB photo-like | 1 978 719 | **1 789 652** | 2 038 896 / 1 893 782 / 1 746 868 / 1 738 870 |
+  | 640×480 pixel art, 14 colours | 10 300 | **2 310** | 4 386 / 5 706 / 2 329 / 2 262 |
+  | 1280×800 screenshot (text) | 127 211 | **58 221** | 106 545 / 111 034 / 79 260 / 54 147 |
+  | 1024×1024 RGBA triangles | 392 307 | **2 426** | 492 942 / 404 030 / 9 687 / 4 206 |
+  | 924×1386 16-bit RGBA logo | 2 726 962 | **1 343 437** | 3 404 627 / 3 210 948 / 888 081 / 755 407 |
+
+  Every file decodes bit-exactly in this crate and in the black-box
+  decoder.
+* Not written: VarDCT (lossy XYB), delta palettes, the Squeeze
+  transform, LZ77, patches, splines, noise,
   upsampling, crops, previews, extra channels beyond one alpha, float
   samples, `bits_per_sample > 16`.
 
@@ -1111,10 +1127,8 @@ generated `cjxl` transcode pairs:
   pipeline would be wrong for them).
 - The LfFrame (`lf_level > 0`) dimension scaling `progressive-dc`
   needs.
-- On the encoder: VarDCT (lossy XYB) output, the self-correcting
-  predictor, Palette / Squeeze, LZ77, context modelling beyond one
-  leaf per channel (richer context modelling is follow-up material),
-  extra channels beyond one alpha, float samples.
+- On the encoder: VarDCT (lossy XYB) output, delta palettes, Squeeze,
+  LZ77, extra channels beyond one alpha, float samples.
 
 Unsupported inputs surface as `Error::Unsupported` rather than a silent
 misparse.

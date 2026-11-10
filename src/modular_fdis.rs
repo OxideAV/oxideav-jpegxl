@@ -1547,6 +1547,18 @@ pub fn wp_predict_pub(
     wp_predict(state, nb, x, y, wp)
 }
 
+/// Record the decoded value `v` at `(x, y)` in the predictor history
+/// exactly as the channel decode loop does (test oracle for the
+/// encoder's rolling-row implementation).
+#[doc(hidden)]
+pub fn wp_store_pub(state: &mut WpState, nb: &Neighbours, x: i32, y: i32, wp: &WpHeader, v: i32) {
+    let (p8, preds, _) = wp_predict(state, nb, x, y, wp);
+    state.set_true_err(x as u32, y as u32, p8.wrapping_sub(v.wrapping_shl(3)));
+    for (k, p) in preds.iter().enumerate() {
+        state.set_sub_err(k, x as u32, y as u32, sub_err_for(*p, v));
+    }
+}
+
 /// Apply 2024-spec Table H.3 — `prediction(x, y, k)` for sample at
 /// `(x, y)` in channel `i`. Predictor 6 (Self-correcting) requires the
 /// caller to pass the per-channel `WpState` and `WpHeader`.

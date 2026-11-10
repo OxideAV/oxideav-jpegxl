@@ -41,6 +41,9 @@ pub const PREFIX_LOG_ALPHABET_SIZE: u32 = 15;
 /// can name.
 pub const MAX_SIMPLE_CLUSTERS: usize = 8;
 
+/// Largest cluster count of any stream (C.2.2: indices are bytes).
+pub const MAX_CLUSTERS: usize = 256;
+
 /// `ceil(log2(x))` for `x >= 1` (`0` for `x == 1`).
 fn ceil_log2(x: u32) -> u32 {
     if x <= 1 {
@@ -609,9 +612,9 @@ impl SymbolStats {
     /// clusters are `0..configs.len()` and every one must be named.
     pub fn new(cluster_map: Vec<u32>, configs: Vec<HybridConfig>) -> Result<Self> {
         let n_clusters = configs.len();
-        if n_clusters == 0 || n_clusters > MAX_SIMPLE_CLUSTERS {
+        if n_clusters == 0 || n_clusters > MAX_CLUSTERS {
             return Err(Error::invalid(format!(
-                "JXL writer: {n_clusters} clusters (1..={MAX_SIMPLE_CLUSTERS} supported)"
+                "JXL writer: {n_clusters} clusters (1..={MAX_CLUSTERS} supported)"
             )));
         }
         for &c in &cluster_map {
@@ -653,6 +656,264 @@ impl SymbolStats {
     }
 }
 
+/// Number of keys of the value histogram [`ValueStats`] keeps per
+/// context: values below 256 exactly, larger ones by bit length and
+/// the two bits under the leading one — enough to derive the token of
+/// any hybrid configuration with `split_exponent <= 8`,
+/// `msb_in_token <= 2` and `lsb_in_token = 0`.
+const VALUE_KEYS: usize = 256 + 24 * 4;
+
+#[inline]
+fn value_key(v: u32) -> usize {
+    if v < 256 {
+        v as usize
+    } else {
+        let l = 31 - v.leading_zeros();
+        256 + ((l - 8) * 4 + ((v >> (l - 2)) & 3)) as usize
+    }
+}
+
+/// A value with the given key (the smallest one).
+fn key_value(key: usize) -> u32 {
+    if key < 256 {
+        key as u32
+    } else {
+        let k = (key - 256) as u32;
+        let l = 8 + k / 4;
+        (1 << l) | ((k & 3) << (l - 2))
+    }
+}
+
+/// Hybrid configurations the encoder elects among per cluster.
+const CONFIG_CANDIDATES: [(u32, u32); 12] = [
+    (4, 2),
+    (4, 1),
+    (4, 0),
+    (5, 2),
+    (5, 1),
+    (6, 2),
+    (6, 1),
+    (3, 1),
+    (3, 0),
+    (2, 0),
+    (1, 0),
+    (0, 0),
+];
+
+/// Estimated header cost of one clustered histogram: a base plus a
+/// per-used-symbol term (bits). Tuned on the lossless corpus; only the
+/// relative order of merge candidates depends on it.
+const HEADER_BASE_BITS: f64 = 12.0;
+const HEADER_SYMBOL_BITS: f64 = 7.0;
+
+/// Shannon cost in bits of coding the histogram with its own ideal
+/// code.
+fn entropy_bits(h: &[u64]) -> f64 {
+    let mut n = 0u64;
+    let mut s = 0.0f64;
+    for &c in h {
+        if c > 0 {
+            n += c;
+            s += c as f64 * (c as f64).log2();
+        }
+    }
+    if n == 0 {
+        0.0
+    } else {
+        n as f64 * (n as f64).log2() - s
+    }
+}
+
+fn header_bits(h: &[u64]) -> f64 {
+    let nz = h.iter().filter(|&&c| c > 0).count();
+    if nz <= 1 {
+        4.0
+    } else {
+        HEADER_BASE_BITS + HEADER_SYMBOL_BITS * nz as f64
+    }
+}
+
+/// Cost increase (bits, may be negative) of coding `a` and `b` with
+/// one shared histogram instead of two.
+fn merge_delta(a: &[u64], b: &[u64], cost_a: f64, cost_b: f64) -> f64 {
+    let n = a.len().max(b.len());
+    let mut m = vec![0u64; n];
+    for (i, slot) in m.iter_mut().enumerate() {
+        *slot = a.get(i).copied().unwrap_or(0) + b.get(i).copied().unwrap_or(0);
+    }
+    entropy_bits(&m) + header_bits(&m) - cost_a - cost_b
+}
+
+/// Greedy agglomerative clustering of token histograms: repeatedly
+/// merge the pair whose shared histogram costs least extra, while that
+/// saves bits or more than `max_clusters` remain. Returns the cluster
+/// of each input (numbered in order of first appearance) and the
+/// cluster count. Empty histograms join the first cluster.
+pub fn cluster_histograms(hists: &[Vec<u64>], max_clusters: usize) -> (Vec<u32>, usize) {
+    let n = hists.len();
+    let live_ids: Vec<usize> = (0..n)
+        .filter(|&i| hists[i].iter().any(|&c| c > 0))
+        .collect();
+    if live_ids.len() <= 1 {
+        return (vec![0; n], 1);
+    }
+    let mut h: Vec<Vec<u64>> = live_ids.iter().map(|&i| hists[i].clone()).collect();
+    let m = h.len();
+    let mut cost: Vec<f64> = h.iter().map(|x| entropy_bits(x) + header_bits(x)).collect();
+    let mut alive = vec![true; m];
+    let mut parent: Vec<usize> = (0..m).collect();
+    // best[i] = (delta, j): the cheapest partner of cluster i.
+    let mut best: Vec<(f64, usize)> = vec![(f64::INFINITY, usize::MAX); m];
+    let recompute = |i: usize, h: &[Vec<u64>], cost: &[f64], alive: &[bool]| -> (f64, usize) {
+        let mut b = (f64::INFINITY, usize::MAX);
+        for j in 0..h.len() {
+            if j != i && alive[j] {
+                let d = merge_delta(&h[i], &h[j], cost[i], cost[j]);
+                if d < b.0 {
+                    b = (d, j);
+                }
+            }
+        }
+        b
+    };
+    for (i, slot) in best.iter_mut().enumerate() {
+        *slot = recompute(i, &h, &cost, &alive);
+    }
+    let mut count = m;
+    loop {
+        let mut pick = usize::MAX;
+        let mut pd = f64::INFINITY;
+        for i in 0..m {
+            if alive[i] && best[i].0 < pd {
+                pd = best[i].0;
+                pick = i;
+            }
+        }
+        if pick == usize::MAX || (pd >= 0.0 && count <= max_clusters) {
+            break;
+        }
+        let (a, b) = (pick.min(best[pick].1), pick.max(best[pick].1));
+        // Merge b into a.
+        let hb = std::mem::take(&mut h[b]);
+        if h[a].len() < hb.len() {
+            h[a].resize(hb.len(), 0);
+        }
+        for (i, &c) in hb.iter().enumerate() {
+            h[a][i] += c;
+        }
+        alive[b] = false;
+        parent[b] = a;
+        count -= 1;
+        cost[a] = entropy_bits(&h[a]) + header_bits(&h[a]);
+        if count == 1 {
+            break;
+        }
+        best[a] = recompute(a, &h, &cost, &alive);
+        for k in 0..m {
+            if !alive[k] || k == a {
+                continue;
+            }
+            if best[k].1 == a || best[k].1 == b {
+                best[k] = recompute(k, &h, &cost, &alive);
+            } else {
+                let d = merge_delta(&h[k], &h[a], cost[k], cost[a]);
+                if d < best[k].0 {
+                    best[k] = (d, a);
+                }
+            }
+        }
+    }
+    let root = |mut i: usize| {
+        while parent[i] != i {
+            i = parent[i];
+        }
+        i
+    };
+    let mut ids = vec![u32::MAX; m];
+    let mut next = 0u32;
+    let mut map = vec![u32::MAX; n];
+    for (k, &ctx) in live_ids.iter().enumerate() {
+        let r = root(k);
+        if ids[r] == u32::MAX {
+            ids[r] = next;
+            next += 1;
+        }
+        map[ctx] = ids[r];
+    }
+    for slot in map.iter_mut() {
+        if *slot == u32::MAX {
+            *slot = 0;
+        }
+    }
+    (map, next as usize)
+}
+
+/// Per-context value statistics of a stream whose clustering and
+/// hybrid configurations the encoder elects itself
+/// ([`EntropyCodes::build_clustered`]).
+#[derive(Debug, Clone)]
+pub struct ValueStats {
+    hists: Vec<Vec<u32>>,
+}
+
+impl ValueStats {
+    /// Statistics for `num_dist` contexts.
+    pub fn new(num_dist: usize) -> Self {
+        Self {
+            hists: vec![Vec::new(); num_dist],
+        }
+    }
+
+    /// Record one value.
+    #[inline]
+    pub fn add(&mut self, ctx: u32, value: u32) {
+        let h = &mut self.hists[ctx as usize];
+        if h.is_empty() {
+            h.resize(VALUE_KEYS, 0);
+        }
+        h[value_key(value)] += 1;
+    }
+
+    /// Add every count of `other` (same context count).
+    pub fn merge(&mut self, other: &ValueStats) {
+        for (a, b) in self.hists.iter_mut().zip(&other.hists) {
+            if b.is_empty() {
+                continue;
+            }
+            if a.is_empty() {
+                a.resize(VALUE_KEYS, 0);
+            }
+            for (x, &y) in a.iter_mut().zip(b) {
+                *x += y;
+            }
+        }
+    }
+
+    /// Number of contexts.
+    pub fn num_dist(&self) -> usize {
+        self.hists.len()
+    }
+}
+
+/// Token histogram and extra-bit total of a value histogram under a
+/// configuration.
+fn tokens_of(keys: &[u64], cfg: HybridConfig) -> (Vec<u64>, f64) {
+    let mut out: Vec<u64> = Vec::new();
+    let mut extra = 0.0;
+    for (k, &c) in keys.iter().enumerate() {
+        if c == 0 {
+            continue;
+        }
+        let (token, nbits, _) = cfg.tokenize(key_value(k));
+        if out.len() <= token as usize {
+            out.resize(token as usize + 1, 0);
+        }
+        out[token as usize] += c;
+        extra += c as f64 * f64::from(nbits);
+    }
+    (out, extra)
+}
+
 /// The codes of one stream, ready to write the C.2.1 prelude and the
 /// symbols.
 #[derive(Debug, Clone)]
@@ -686,6 +947,73 @@ impl EntropyCodes {
         }
     }
 
+    /// Elect everything from the value statistics: one provisional
+    /// hybrid configuration to tokenise with, the context clustering
+    /// (at most `max_clusters`), the configuration of each cluster,
+    /// and prefix codes versus ANS for `n_streams` symbol streams.
+    pub fn build_clustered(
+        stats: &ValueStats,
+        n_streams: usize,
+        max_clusters: usize,
+    ) -> Result<Self> {
+        let cfg_of = |(s, m): (u32, u32)| HybridConfig {
+            split_exponent: s,
+            msb_in_token: m,
+            lsb_in_token: 0,
+        };
+        let keys: Vec<Vec<u64>> = stats
+            .hists
+            .iter()
+            .map(|h| h.iter().map(|&c| u64::from(c)).collect())
+            .collect();
+        let cost_under = |k: &[u64], cfg: HybridConfig| {
+            let (t, extra) = tokens_of(k, cfg);
+            entropy_bits(&t) + header_bits(&t) + extra
+        };
+        // Provisional configuration: least total cost, contexts apart.
+        let mut provisional = cfg_of(CONFIG_CANDIDATES[0]);
+        let mut best = f64::INFINITY;
+        for &cand in &CONFIG_CANDIDATES {
+            let cfg = cfg_of(cand);
+            let total: f64 = keys.iter().map(|k| cost_under(k, cfg)).sum();
+            if total < best {
+                best = total;
+                provisional = cfg;
+            }
+        }
+        let token_hists: Vec<Vec<u64>> = keys.iter().map(|k| tokens_of(k, provisional).0).collect();
+        let (cluster_map, n_clusters) =
+            cluster_histograms(&token_hists, max_clusters.clamp(1, MAX_CLUSTERS));
+        let mut merged = vec![vec![0u64; VALUE_KEYS]; n_clusters];
+        for (ctx, k) in keys.iter().enumerate() {
+            for (slot, &c) in merged[cluster_map[ctx] as usize].iter_mut().zip(k) {
+                *slot += c;
+            }
+        }
+        let mut configs = Vec::with_capacity(n_clusters);
+        let mut counts = Vec::with_capacity(n_clusters);
+        for k in &merged {
+            let mut pick = provisional;
+            let mut best = cost_under(k, provisional);
+            for &cand in &CONFIG_CANDIDATES {
+                let cfg = cfg_of(cand);
+                let c = cost_under(k, cfg);
+                if c < best {
+                    best = c;
+                    pick = cfg;
+                }
+            }
+            configs.push(pick);
+            counts.push(tokens_of(k, pick).0);
+        }
+        let stats = SymbolStats {
+            cluster_map,
+            configs,
+            counts,
+        };
+        Self::build_cheapest(&stats, n_streams)
+    }
+
     /// Build with the given coding. ANS needs every token below 256
     /// (`log_alphabet_size <= 8`); larger tokens fall back to prefix
     /// codes.
@@ -716,6 +1044,55 @@ impl EntropyCodes {
         Ok(codes)
     }
 
+    /// Estimated size in bits of the prelude plus every token of the
+    /// statistics (hybrid-integer extra bits excluded — they do not
+    /// depend on the coding), for `n_streams` separately initialised
+    /// symbol streams.
+    fn estimated_bits(&self, stats: &SymbolStats, n_streams: usize) -> f64 {
+        let mut w = BitWriter::new();
+        self.write_prelude(&mut w);
+        let mut bits = w.bit_len() as f64;
+        match &self.ans {
+            None => {
+                for (code, counts) in self.codes.iter().zip(&stats.counts) {
+                    for (t, &c) in counts.iter().enumerate() {
+                        if c > 0 {
+                            bits += c as f64 * f64::from(code.lengths[t]);
+                        }
+                    }
+                }
+            }
+            Some((_, clusters)) => {
+                bits += 32.0 * n_streams as f64;
+                for (cl, counts) in clusters.iter().zip(&stats.counts) {
+                    for (t, &c) in counts.iter().enumerate() {
+                        if c > 0 {
+                            bits += c as f64 * (12.0 - f64::from(cl.dist[t]).log2());
+                        }
+                    }
+                }
+            }
+        }
+        bits
+    }
+
+    /// Build both codings and keep the one with the smaller estimated
+    /// output (`n_streams` = how many separately initialised symbol
+    /// streams will share these codes; each ANS stream pays a 32-bit
+    /// state).
+    pub fn build_cheapest(stats: &SymbolStats, n_streams: usize) -> Result<Self> {
+        let prefix = Self::build(stats);
+        let ans = Self::build_with(stats, Coding::Ans)?;
+        if ans.ans.is_none() {
+            return Ok(prefix);
+        }
+        if ans.estimated_bits(stats, n_streams) < prefix.estimated_bits(stats, n_streams) {
+            Ok(ans)
+        } else {
+            Ok(prefix)
+        }
+    }
+
     /// The coding this stream uses.
     pub fn coding(&self) -> Coding {
         if self.ans.is_some() {
@@ -730,16 +1107,7 @@ impl EntropyCodes {
     /// ANS alphabet size + distributions.
     pub fn write_prelude(&self, w: &mut BitWriter) {
         w.write_bool(false); // lz77.enabled
-        let num_dist = self.cluster_map.len();
-        if num_dist > 1 {
-            let n_clusters = self.configs.len() as u32;
-            w.write_bool(true); // is_simple
-            let nbits = ceil_log2(n_clusters);
-            w.write_bits(2, nbits);
-            for &c in &self.cluster_map {
-                w.write_bits(nbits, c);
-            }
-        }
+        self.write_cluster_map(w);
         match &self.ans {
             None => {
                 w.write_bool(true); // use_prefix_code
@@ -764,6 +1132,56 @@ impl EntropyCodes {
                 }
             }
         }
+    }
+
+    /// C.2.2: the context → cluster map, in whichever of the two
+    /// codings is shorter (the simple one names at most eight
+    /// clusters).
+    fn write_cluster_map(&self, w: &mut BitWriter) {
+        let num_dist = self.cluster_map.len();
+        if num_dist <= 1 {
+            return;
+        }
+        let n_clusters = self.configs.len() as u32;
+        let simple = (n_clusters as usize <= MAX_SIMPLE_CLUSTERS).then(|| {
+            let mut s = BitWriter::new();
+            s.write_bool(true); // is_simple
+            let nbits = ceil_log2(n_clusters);
+            s.write_bits(2, nbits);
+            for &c in &self.cluster_map {
+                s.write_bits(nbits, c);
+            }
+            s
+        });
+        // General form: the indices as a one-distribution entropy
+        // stream of their own (no move-to-front).
+        let general = (|| -> Result<BitWriter> {
+            let mut g = BitWriter::new();
+            g.write_bool(false); // is_simple
+            g.write_bool(false); // use_mtf
+            let mut stats = SymbolStats::single(1, HybridConfig::BYTES)?;
+            for &c in &self.cluster_map {
+                stats.add(0, c);
+            }
+            let nested = EntropyCodes::build_cheapest(&stats, 1)?;
+            nested.write_prelude(&mut g);
+            nested.write_symbols(&mut g, self.cluster_map.iter().map(|&c| (0, c)));
+            Ok(g)
+        })()
+        .ok();
+        let pick = match (simple, general) {
+            (Some(s), Some(g)) => {
+                if g.bit_len() < s.bit_len() {
+                    g
+                } else {
+                    s
+                }
+            }
+            (Some(s), None) => s,
+            (None, Some(g)) => g,
+            (None, None) => unreachable!("the general cluster map always builds"),
+        };
+        w.append(&pick);
     }
 
     /// Write one hybrid integer in context `ctx` (prefix streams only;

@@ -10,16 +10,17 @@
 //!   (D.3.4) for multi-frame input;
 //! * one `kModular` frame per picture (F.2): no upsampling, no crop,
 //!   `kReplace` blending, no restoration filter, `group_size_shift`
-//!   from the options; a global MA tree (H.4.2) with one leaf per
-//!   channel — the leaf's predictor is picked per channel among West /
-//!   North / Select / Gradient by residual energy, its `multiplier`
-//!   is the quality quantiser (`1` = lossless) — and the YCoCg RCT
-//!   (H.6.3, `rct_type = 6`) in front of three colour channels;
+//!   from the options; one global MA tree (H.4.2) learned from the
+//!   picture ([`crate::modular_enc`]: property splits, any of the
+//!   fourteen predictors per leaf, the leaf `multiplier` as the
+//!   quality quantiser — `1` = lossless) and the RCT (H.6.3) whose
+//!   output is cheapest in front of three colour channels;
 //! * the channel residuals (H.3), closed-loop quantised when
-//!   `multiplier > 1`, entropy coded with prefix codes
-//!   ([`crate::entropy_write`]); the whole picture in `GlobalModular`
-//!   when it fits one group, else one `PassGroup` section per group
-//!   (G.4.2) sharing the global tree.
+//!   `multiplier > 1`, entropy coded ([`crate::entropy_write`]) with
+//!   clustered contexts and whichever of prefix codes and ANS is
+//!   smaller; the whole picture in `GlobalModular` when it fits one
+//!   group, else one `PassGroup` section per group (G.4.2) sharing the
+//!   global tree.
 //!
 //! Everything produced here is decodable by [`crate::decode`] and
 //! round-trips bit-exactly at quality 100 (the integration tests pin
@@ -27,11 +28,14 @@
 //! installed).
 
 use crate::bitreader::U32Dist;
-use crate::bitwriter::{BitWriter, pack_signed};
-use crate::entropy_write::{Coding, EntropyCodes, HybridConfig, SymbolStats};
+use crate::bitwriter::BitWriter;
+use crate::enc_transforms::{Transform, plan_transforms};
+use crate::entropy_write::{Coding, EntropyCodes, HybridConfig, SymbolStats, ValueStats};
 use crate::error::{Error, Result};
 use crate::icc::icc_context;
 use crate::image::ColorInfo;
+use crate::modular_enc::{Chan, LearnParams, Section, encode_section, learn_tree};
+pub use crate::options::Effort;
 
 /// `U32(1 + u(9), 1 + u(13), 1 + u(18), 1 + u(30))` — SizeHeader dims.
 const SIZE_DIST: [U32Dist; 4] = [
@@ -55,6 +59,14 @@ const NB_TRANSFORMS_DIST: [U32Dist; 4] = [
     U32Dist::Val(1),
     U32Dist::BitsOffset(4, 2),
     U32Dist::BitsOffset(8, 18),
+];
+
+/// `U32(u(3), 8 + u(6), 72 + u(10), 1096 + u(13))` — `begin_c`.
+const BEGIN_C_DIST: [U32Dist; 4] = [
+    U32Dist::Bits(3),
+    U32Dist::BitsOffset(6, 8),
+    U32Dist::BitsOffset(10, 72),
+    U32Dist::BitsOffset(13, 1096),
 ];
 
 /// Largest section the TOC can describe.
@@ -120,6 +132,8 @@ pub struct EncodeSpec {
     pub quality: u8,
     /// `group_dim = 128 << group_size_shift`, 0..=3.
     pub group_size_shift: u32,
+    /// Speed / density trade-off of the Modular coder.
+    pub effort: Effort,
 }
 
 impl EncodeSpec {
@@ -128,10 +142,6 @@ impl EncodeSpec {
     }
     fn group_dim(&self) -> u32 {
         128 << self.group_size_shift
-    }
-    fn num_groups(&self) -> u64 {
-        let g = u64::from(self.group_dim());
-        u64::from(self.width).div_ceil(g) * u64::from(self.height).div_ceil(g)
     }
     fn num_lf_groups(&self) -> u64 {
         let g = u64::from(self.group_dim()) * 8;
@@ -148,6 +158,23 @@ pub struct FrameInput {
     /// Frame duration in animation ticks (ignored without an
     /// `AnimationSpec`).
     pub duration: u32,
+}
+
+fn learn_params_for(effort: Effort) -> LearnParams {
+    match effort {
+        Effort::Fast => LearnParams {
+            max_samples: 60_000,
+            max_leaves: 48,
+            use_wp: false,
+            ..LearnParams::default()
+        },
+        Effort::Thorough => LearnParams {
+            max_samples: 1_200_000,
+            max_leaves: 2048,
+            ..LearnParams::default()
+        },
+        _ => LearnParams::default(),
+    }
 }
 
 /// The Modular residual quantiser for `quality` at `bits` per sample:
@@ -460,269 +487,20 @@ pub fn write_icc_stream(w: &mut BitWriter, profile: &[u8]) -> Result<()> {
     Ok(())
 }
 
-// ---- MA tree ---------------------------------------------------------------
-
-#[derive(Debug, Clone)]
-enum TreeNode {
-    Decision { property: u32, value: i32 },
-    Leaf { predictor: u32, multiplier: u32 },
-}
-
-/// A tree with one leaf per channel, splitting on property 0 (the
-/// channel index); `leaf_ctx[c]` is channel `c`'s context.
-struct ChannelTree {
-    /// Nodes in bitstream (breadth-first) order.
-    nodes: Vec<TreeNode>,
-    leaf_ctx: Vec<u32>,
-}
-
-fn build_channel_tree(predictors: &[u32], multiplier: u32) -> ChannelTree {
-    // Build as a binary split of the channel range, then serialise
-    // breadth-first (the H.4.2 reading order: children are appended
-    // at `tree.size() + nodes_left`).
-    #[derive(Clone)]
-    enum Tmp {
-        Dec(u32, i32, Box<Tmp>, Box<Tmp>),
-        Leaf(usize),
-    }
-    fn split(lo: usize, hi: usize) -> Tmp {
-        if lo == hi {
-            Tmp::Leaf(lo)
-        } else {
-            let mid = lo + (hi - lo) / 2;
-            // property[0] > mid → channels mid+1..=hi (left branch).
-            Tmp::Dec(
-                0,
-                mid as i32,
-                Box::new(split(mid + 1, hi)),
-                Box::new(split(lo, mid)),
-            )
-        }
-    }
-    let n = predictors.len();
-    let root = split(0, n - 1);
-    let mut queue: std::collections::VecDeque<Tmp> = std::collections::VecDeque::new();
-    queue.push_back(root);
-    let mut nodes = Vec::new();
-    let mut leaf_ctx = vec![0u32; n];
-    let mut ctx = 0u32;
-    while let Some(t) = queue.pop_front() {
-        match t {
-            Tmp::Dec(p, v, l, r) => {
-                // The reader places this node's children at
-                // `tree.size() + nodes_left + {1, 2}`: exactly the next
-                // two queue slots of a breadth-first walk.
-                nodes.push(TreeNode::Decision {
-                    property: p,
-                    value: v,
-                });
-                queue.push_back(*l);
-                queue.push_back(*r);
-            }
-            Tmp::Leaf(c) => {
-                nodes.push(TreeNode::Leaf {
-                    predictor: predictors[c],
-                    multiplier,
-                });
-                leaf_ctx[c] = ctx;
-                ctx += 1;
-            }
-        }
-    }
-    ChannelTree { nodes, leaf_ctx }
-}
-
-/// Tree symbols in H.4.2 order as `(context, value)`.
-fn tree_symbols(tree: &ChannelTree) -> Vec<(u32, u32)> {
-    let mut out = Vec::new();
-    for n in &tree.nodes {
-        match n {
-            TreeNode::Decision {
-                property, value, ..
-            } => {
-                out.push((1, property + 1));
-                out.push((0, pack_signed(*value)));
-            }
-            TreeNode::Leaf {
-                predictor,
-                multiplier,
-            } => {
-                out.push((1, 0));
-                out.push((2, *predictor));
-                out.push((3, 0)); // offset
-                let mul_log = multiplier.trailing_zeros().min(30);
-                let mul_bits = (multiplier >> mul_log) - 1;
-                out.push((4, mul_log));
-                out.push((5, mul_bits));
-            }
-        }
-    }
-    out
-}
-
-// ---- Modular channel coding -----------------------------------------------
-
-/// Forward YCoCg RCT (`rct_type = 6`, permutation 0) in place — the
-/// exact inverse of the decoder's H.6.3 arithmetic.
-fn forward_rct(r: &mut [i32], g: &mut [i32], b: &mut [i32]) {
-    for i in 0..r.len() {
-        let (d, e, f) = (r[i], g[i], b[i]);
-        let bb = d.wrapping_sub(f);
-        let tmp = f.wrapping_add(bb >> 1);
-        let c = e.wrapping_sub(tmp);
-        let a = tmp.wrapping_add(c >> 1);
-        r[i] = a;
-        g[i] = bb;
-        b[i] = c;
-    }
-}
-
-/// H.3 neighbour fetch inside a rectangle of `buf` (`stride` wide):
-/// `(W, N, NW, NE)` with the edge rules of Table H.2.
-#[inline]
-fn neighbours(
-    buf: &[i32],
-    stride: usize,
-    x0: usize,
-    y0: usize,
-    rw: usize,
-    x: usize,
-    y: usize,
-) -> (i32, i32, i32, i32) {
-    let at = |xx: usize, yy: usize| buf[(y0 + yy) * stride + x0 + xx];
-    let w = if x > 0 {
-        at(x - 1, y)
-    } else if y > 0 {
-        at(x, y - 1)
-    } else {
-        0
-    };
-    let n = if y > 0 { at(x, y - 1) } else { w };
-    let nw = if x > 0 && y > 0 { at(x - 1, y - 1) } else { w };
-    let ne = if x + 1 < rw && y > 0 {
-        at(x + 1, y - 1)
-    } else {
-        n
-    };
-    (w, n, nw, ne)
-}
-
-#[inline]
-fn predict(predictor: u32, w: i32, n: i32, nw: i32, ne: i32) -> i32 {
-    match predictor {
-        0 => 0,
-        1 => w,
-        2 => n,
-        4 => {
-            if (i64::from(n) - i64::from(nw)).abs() < (i64::from(w) - i64::from(nw)).abs() {
-                w
-            } else {
-                n
-            }
-        }
-        5 => w.wrapping_add(n).wrapping_sub(nw).clamp(w.min(n), w.max(n)),
-        7 => ne,
-        8 => nw,
-        _ => unreachable!("encoder predictors are 0, 1, 2, 4, 5, 7, 8"),
-    }
-}
-
-/// Predictors the encoder chooses among (all free of integer division
-/// so no rounding convention is involved).
-const CANDIDATE_PREDICTORS: [u32; 4] = [1, 2, 4, 5];
-
-/// The candidate with the least absolute residual over the (unquantised)
-/// channel, measured as the decoder will see it (full-image edges).
-fn pick_predictor(ch: &[i32], width: usize, height: usize) -> u32 {
-    let mut best = (u64::MAX, 5u32);
-    for &p in &CANDIDATE_PREDICTORS {
-        let mut sum = 0u64;
-        for y in 0..height {
-            for x in 0..width {
-                let (w, n, nw, ne) = neighbours(ch, width, 0, 0, width, x, y);
-                let r = i64::from(ch[y * width + x]) - i64::from(predict(p, w, n, nw, ne));
-                sum = sum.saturating_add(r.unsigned_abs());
-            }
-            if sum >= best.0 {
-                break;
-            }
-        }
-        if sum < best.0 {
-            best = (sum, p);
-        }
-    }
-    best.1
-}
-
-/// A group rectangle inside a channel (samples).
-#[derive(Debug, Clone, Copy)]
-struct Rect {
-    x0: usize,
-    y0: usize,
-    w: usize,
-    h: usize,
-}
-
-/// Code one channel rectangle: residuals (packed, possibly quantised)
-/// in raster order; `buf` is updated in place with the reconstruction
-/// the decoder will hold (identity at multiplier 1).
-fn code_rect(
-    buf: &mut [i32],
-    stride: usize,
-    rect: Rect,
-    predictor: u32,
-    multiplier: u32,
-) -> Vec<u32> {
-    let Rect {
-        x0,
-        y0,
-        w: rw,
-        h: rh,
-    } = rect;
-    let mut out = Vec::with_capacity(rw * rh);
-    let m = i64::from(multiplier);
-    for y in 0..rh {
-        for x in 0..rw {
-            let (w, n, nw, ne) = neighbours(buf, stride, x0, y0, rw, x, y);
-            let pred = predict(predictor, w, n, nw, ne);
-            let idx = (y0 + y) * stride + x0 + x;
-            let r = i64::from(buf[idx]) - i64::from(pred);
-            let q = if m == 1 {
-                r
-            } else {
-                // Round half away from zero.
-                let half = m / 2;
-                if r >= 0 {
-                    (r + half) / m
-                } else {
-                    -((-r + half) / m)
-                }
-            };
-            let q = q.clamp(i64::from(i32::MIN) + 1, i64::from(i32::MAX));
-            out.push(pack_signed(q as i32));
-            if m != 1 {
-                buf[idx] = (i64::from(pred) + q * m).clamp(i64::from(i32::MIN), i64::from(i32::MAX))
-                    as i32;
-            }
-        }
-    }
-    out
-}
-
-/// Per-section residual symbols: `(context, packed residual)` streams.
-struct CodedSection {
-    symbols: Vec<(u32, Vec<u32>)>,
-}
+// ---- Modular frame coding --------------------------------------------------
 
 /// Everything needed to serialise one frame.
 struct CodedFrame {
     tree_codes: EntropyCodes,
     tree_syms: Vec<(u32, u32)>,
     leaf_codes: EntropyCodes,
-    /// One entry when the picture fits one group (GlobalModular carries
-    /// the samples), else one per group in raster order.
-    sections: Vec<CodedSection>,
-    use_rct: bool,
+    transforms: Vec<Transform>,
+    /// Symbols of the channels carried by `GlobalModular` (empty when
+    /// it carries none).
+    global: Vec<(u32, u32)>,
+    /// One entry per group in raster order (empty for a one-group
+    /// picture).
+    groups: Vec<Vec<(u32, u32)>>,
 }
 
 fn code_frame(spec: &EncodeSpec, frame: &FrameInput) -> Result<CodedFrame> {
@@ -750,74 +528,92 @@ fn code_frame(spec: &EncodeSpec, frame: &FrameInput) -> Result<CodedFrame> {
             )));
         }
     }
-    let mut chans: Vec<Vec<i32>> = frame.channels.clone();
-    let use_rct = !spec.grey;
-    if use_rct {
-        let (r, rest) = chans.split_at_mut(1);
-        let (g, rest) = rest.split_at_mut(1);
-        forward_rct(&mut r[0], &mut g[0], &mut rest[0]);
-    }
-    let multiplier = quantizer_for_quality(spec.quality, spec.bits);
-    let predictors: Vec<u32> = chans
+    let chans: Vec<Chan> = frame
+        .channels
         .iter()
-        .map(|c| pick_predictor(c, width, height))
+        .map(|c| Chan::new(width, height, c.clone()))
         .collect();
-    let tree = build_channel_tree(&predictors, multiplier);
-    let tree_syms = tree_symbols(&tree);
-    let mut tree_stats = SymbolStats::single(6, HybridConfig::RESIDUALS)?;
-    for &(c, v) in &tree_syms {
-        tree_stats.add(c, v);
-    }
-    let tree_codes = EntropyCodes::build(&tree_stats);
+    let multiplier = quantizer_for_quality(spec.quality, spec.bits);
+    let planned = plan_transforms(
+        chans,
+        if spec.grey { 1 } else { 3 },
+        spec.bits,
+        multiplier == 1,
+    );
+    let transforms = planned.transforms;
+    let n_meta = planned.n_meta;
+    let mut chans = planned.chans;
 
+    // Split into independently decoded sections: the meta channels
+    // and — when the picture fits one group — everything else go into
+    // GlobalModular; otherwise each group carries its rectangle of
+    // every non-meta channel.
     let group_dim = spec.group_dim() as usize;
     let single = width <= group_dim && height <= group_dim;
-    let mut leaf_stats = SymbolStats::identity(n_ch, HybridConfig::RESIDUALS)?;
-    let mut sections = Vec::new();
-    let rects: Vec<Rect> = if single {
-        vec![Rect {
-            x0: 0,
-            y0: 0,
-            w: width,
-            h: height,
-        }]
+    let mut sections: Vec<Section> = Vec::new();
+    if single {
+        sections.push(Section {
+            stream_index: 0,
+            chans,
+        });
     } else {
+        let image: Vec<Chan> = chans.split_off(n_meta);
+        sections.push(Section {
+            stream_index: 0,
+            chans,
+        });
         let gx = width.div_ceil(group_dim);
         let gy = height.div_ceil(group_dim);
-        let mut v = Vec::with_capacity(gx * gy);
+        let base = 1 + 3 * spec.num_lf_groups() as i64 + 17;
         for j in 0..gy {
             for i in 0..gx {
                 let x0 = i * group_dim;
                 let y0 = j * group_dim;
-                v.push(Rect {
-                    x0,
-                    y0,
-                    w: group_dim.min(width - x0),
-                    h: group_dim.min(height - y0),
+                let rw = group_dim.min(width - x0);
+                let rh = group_dim.min(height - y0);
+                let stream_index = i32::try_from(base + (j * gx + i) as i64).map_err(|_| {
+                    Error::unsupported("JXL encoder: too many groups for a stream index")
+                })?;
+                sections.push(Section {
+                    stream_index,
+                    chans: image.iter().map(|c| c.rect(x0, y0, rw, rh)).collect(),
                 });
             }
         }
-        v
-    };
-    for rect in rects {
-        let mut symbols = Vec::with_capacity(n_ch);
-        for (c, ch) in chans.iter_mut().enumerate() {
-            let ctx = tree.leaf_ctx[c];
-            let vals = code_rect(ch, width, rect, predictors[c], multiplier);
-            for &v in &vals {
-                leaf_stats.add(ctx, v);
-            }
-            symbols.push((ctx, vals));
-        }
-        sections.push(CodedSection { symbols });
     }
-    let leaf_codes = EntropyCodes::build_with(&leaf_stats, coding_for(width * height))?;
+
+    let params = LearnParams {
+        multiplier,
+        ..learn_params_for(spec.effort)
+    };
+    let tree = learn_tree(&sections, &params);
+    let tree_syms = tree.symbols();
+    let mut tree_stats = ValueStats::new(6);
+    for &(c, v) in &tree_syms {
+        tree_stats.add(c, v);
+    }
+    let tree_codes = EntropyCodes::build_clustered(&tree_stats, 1, 6)?;
+
+    let mut leaf_stats = ValueStats::new(tree.num_ctx);
+    let mut coded: Vec<Vec<(u32, u32)>> = Vec::with_capacity(sections.len());
+    for mut section in sections {
+        let syms = encode_section(&mut section, &tree);
+        for &(c, v) in &syms {
+            leaf_stats.add(c, v);
+        }
+        coded.push(syms);
+    }
+    let n_streams = coded.iter().filter(|s| !s.is_empty()).count().max(1);
+    let leaf_codes = EntropyCodes::build_clustered(&leaf_stats, n_streams, 256)?;
+    let mut it = coded.into_iter();
+    let global = it.next().unwrap_or_default();
     Ok(CodedFrame {
         tree_codes,
         tree_syms,
         leaf_codes,
-        sections,
-        use_rct,
+        transforms,
+        global,
+        groups: it.collect(),
     })
 }
 
@@ -895,6 +691,64 @@ pub fn write_frame_header_and_toc(
     Ok(())
 }
 
+fn write_transforms(w: &mut BitWriter, transforms: &[Transform]) -> Result<()> {
+    w.write_u32(NB_TRANSFORMS_DIST, transforms.len() as u32)?;
+    for t in transforms {
+        match *t {
+            Transform::Palette {
+                begin_c,
+                num_c,
+                nb_colours,
+            } => {
+                w.write_bits(2, 1); // kPalette
+                w.write_u32(BEGIN_C_DIST, begin_c)?;
+                w.write_u32(
+                    [
+                        U32Dist::Val(1),
+                        U32Dist::Val(3),
+                        U32Dist::Val(4),
+                        U32Dist::BitsOffset(13, 1),
+                    ],
+                    num_c,
+                )?;
+                w.write_u32(
+                    [
+                        U32Dist::BitsOffset(8, 0),
+                        U32Dist::BitsOffset(10, 256),
+                        U32Dist::BitsOffset(12, 1280),
+                        U32Dist::BitsOffset(16, 5376),
+                    ],
+                    nb_colours,
+                )?;
+                w.write_u32(
+                    [
+                        U32Dist::Val(0),
+                        U32Dist::BitsOffset(8, 1),
+                        U32Dist::BitsOffset(10, 257),
+                        U32Dist::BitsOffset(16, 1281),
+                    ],
+                    0,
+                )?; // nb_deltas
+                w.write_bits(4, 0); // d_pred
+            }
+            Transform::Rct { begin_c, rct_type } => {
+                w.write_bits(2, 0); // kRCT
+                w.write_u32(BEGIN_C_DIST, begin_c)?;
+                w.write_u32(
+                    [
+                        U32Dist::Val(6),
+                        U32Dist::Bits(2),
+                        U32Dist::BitsOffset(4, 2),
+                        U32Dist::BitsOffset(6, 10),
+                    ],
+                    rct_type,
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
 fn write_global_modular_header(w: &mut BitWriter, coded: &CodedFrame) -> Result<()> {
     // LfChannelDequantization: all_default.
     w.write_bool(true);
@@ -908,41 +762,7 @@ fn write_global_modular_header(w: &mut BitWriter, coded: &CodedFrame) -> Result<
     // Inner ModularHeader.
     w.write_bool(true); // use_global_tree
     w.write_bool(true); // wp_params.default_wp
-    if coded.use_rct {
-        w.write_u32(NB_TRANSFORMS_DIST, 1)?;
-        w.write_bits(2, 0); // kRCT
-        w.write_u32(
-            [
-                U32Dist::Bits(3),
-                U32Dist::BitsOffset(6, 8),
-                U32Dist::BitsOffset(10, 72),
-                U32Dist::BitsOffset(13, 1096),
-            ],
-            0,
-        )?; // begin_c
-        w.write_u32(
-            [
-                U32Dist::Val(6),
-                U32Dist::Bits(2),
-                U32Dist::BitsOffset(4, 2),
-                U32Dist::BitsOffset(6, 10),
-            ],
-            6,
-        )?; // rct_type YCoCg
-    } else {
-        w.write_u32(NB_TRANSFORMS_DIST, 0)?;
-    }
-    Ok(())
-}
-
-/// One section's symbols as one stream (an ANS section carries its own
-/// state initialiser, so every section is a stream of its own).
-fn write_section_symbols(w: &mut BitWriter, codes: &EntropyCodes, section: &CodedSection) {
-    let symbols = section
-        .symbols
-        .iter()
-        .flat_map(|(ctx, vals)| vals.iter().map(move |&v| (*ctx, v)));
-    codes.write_symbols(w, symbols);
+    write_transforms(w, &coded.transforms)
 }
 
 /// Append one frame (header, TOC, sections) to a byte-aligned writer.
@@ -953,13 +773,15 @@ fn write_frame(
     is_last: bool,
 ) -> Result<()> {
     let coded = code_frame(spec, frame)?;
-    let single = coded.sections.len() == 1 && spec.num_groups() == 1;
+    let single = coded.groups.is_empty();
     let mut sections: Vec<Vec<u8>> = Vec::new();
     {
         let mut lf = BitWriter::new();
         write_global_modular_header(&mut lf, &coded)?;
-        if single {
-            write_section_symbols(&mut lf, &coded.leaf_codes, &coded.sections[0]);
+        if !coded.global.is_empty() {
+            coded
+                .leaf_codes
+                .write_symbols(&mut lf, coded.global.iter().copied());
         }
         lf.zero_pad_to_byte();
         sections.push(lf.into_bytes());
@@ -969,12 +791,14 @@ fn write_frame(
             sections.push(Vec::new()); // ModularLfGroup: nothing to code
         }
         sections.push(Vec::new()); // HfGlobal: absent for kModular
-        for section in &coded.sections {
+        for group in &coded.groups {
             let mut gw = BitWriter::new();
             gw.write_bool(true); // use_global_tree
             gw.write_bool(true); // default_wp
             gw.write_u32(NB_TRANSFORMS_DIST, 0)?;
-            write_section_symbols(&mut gw, &coded.leaf_codes, section);
+            coded
+                .leaf_codes
+                .write_symbols(&mut gw, group.iter().copied());
             gw.zero_pad_to_byte();
             sections.push(gw.into_bytes());
         }
@@ -1086,60 +910,6 @@ mod tests {
         );
         assert_eq!(quantizer_for_quality(90, 8), 2);
         assert_eq!(quantizer_for_quality(50, 8), 18);
-    }
-
-    #[test]
-    fn rct_is_inverted_by_the_decoder_arithmetic() {
-        let src: Vec<[i32; 3]> = vec![
-            [0, 0, 0],
-            [255, 0, 0],
-            [0, 255, 0],
-            [0, 0, 255],
-            [17, 200, 99],
-            [65535, 1, 65535],
-        ];
-        let mut r: Vec<i32> = src.iter().map(|p| p[0]).collect();
-        let mut g: Vec<i32> = src.iter().map(|p| p[1]).collect();
-        let mut b: Vec<i32> = src.iter().map(|p| p[2]).collect();
-        forward_rct(&mut r, &mut g, &mut b);
-        for i in 0..src.len() {
-            // H.6.3 type 6 inverse.
-            let (a, bb, c) = (r[i], g[i], b[i]);
-            let tmp = a.wrapping_sub(c >> 1);
-            let e = c.wrapping_add(tmp);
-            let f = tmp.wrapping_sub(bb >> 1);
-            let d = f.wrapping_add(bb);
-            assert_eq!([d, e, f], src[i]);
-        }
-    }
-
-    #[test]
-    fn channel_tree_serialises_breadth_first() {
-        let t = build_channel_tree(&[1, 2, 4, 5], 1);
-        // Root: channel > 1 → left (2..=3), right (0..=1); leaves are
-        // numbered in reading order.
-        assert_eq!(t.nodes.len(), 7);
-        // Root: channel > 1 → left (2..=3), right (0..=1); the next two
-        // nodes are the second-level decisions, then four leaves.
-        assert!(matches!(
-            t.nodes[0],
-            TreeNode::Decision {
-                property: 0,
-                value: 1
-            }
-        ));
-        assert!(matches!(t.nodes[1], TreeNode::Decision { value: 2, .. }));
-        assert!(matches!(t.nodes[2], TreeNode::Decision { value: 0, .. }));
-        assert!(
-            t.nodes[3..]
-                .iter()
-                .all(|n| matches!(n, TreeNode::Leaf { .. }))
-        );
-        // Leaves 3..6 are channels 3, 2, 1, 0.
-        assert_eq!(t.leaf_ctx, vec![3, 2, 1, 0]);
-        let one = build_channel_tree(&[5], 3);
-        assert_eq!(one.nodes.len(), 1);
-        assert_eq!(one.leaf_ctx, vec![0]);
     }
 
     #[test]

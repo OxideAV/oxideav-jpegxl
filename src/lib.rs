@@ -626,9 +626,11 @@ pub mod vardct_reconstruct;
 pub mod xyb;
 
 #[doc(hidden)] // internal: Modular codestream writer plumbing
+mod enc_transforms;
 pub mod encoder;
 #[doc(hidden)] // internal: prefix-code entropy writer plumbing
 pub mod entropy_write;
+mod modular_enc;
 
 mod api;
 pub mod error;
@@ -653,7 +655,7 @@ pub use image::{
     RgbaImage,
 };
 pub use metadata::{BitDepth, Headers, ImageMetadata, SizeHeader, parse_headers};
-pub use options::{DecodeOptions, EncodeOptions};
+pub use options::{DecodeOptions, Effort, EncodeOptions};
 #[cfg(feature = "registry")]
 #[doc(hidden)]
 pub use registry::__oxideav_entry;

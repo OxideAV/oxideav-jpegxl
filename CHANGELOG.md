@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Modular density** (round 487). The encoder learns one MA tree per
+  frame instead of fixing one leaf per channel: a sample of the
+  picture is scanned with the decoder's own property vector (Table
+  H.4, including the previous-channel properties) and every node takes
+  the property / threshold split and per-side predictors that minimise
+  the estimated coded size, as long as the saving pays for the new
+  context. All fourteen predictors of Table H.3 are candidates,
+  including the **self-correcting (weighted) predictor** of H.5 and its
+  `max_error` property. Contexts are **clustered** (greedy
+  agglomerative merge on estimated cost, general cluster-map coding of
+  C.2.2 beyond eight clusters), each cluster elects its hybrid-integer
+  configuration, and every stream elects **prefix codes or ANS** by
+  estimated size. The RCT is elected among all 42 `rct_type`s on a row
+  sample.
+- **Palette transforms** (H.6.4) in the lossless encoder: a palette
+  over all channels (brightness-sorted colour table, pixels as indices
+  the MA tree models from their neighbours) for pictures with few
+  distinct colours, and one-channel palettes for channels — taken
+  after the RCT — whose values are a sparse subset of their span
+  (8-bit content in a 16-bit container, quantised gradients): the
+  samples become ranks. Both elected on estimated size.
+- `EncodeOptions::effort` / `with_effort` and the `Effort` enum
+  (`Fast` / `Balanced` (default) / `Thorough`): how large a sample the
+  tree is learned from and whether the self-correcting predictor is
+  offered. Never changes the decoded pixels.
+
 ### Changed
 
 - `#[non_exhaustive]` on the growable enums `ColourSpace`, `ExtraChannelType`, `MetadataKind`, `Primaries`, `RenderingIntent`, `TransferFunction`, `WhitePoint`.

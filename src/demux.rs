@@ -366,6 +366,7 @@ fn parse_still(bytes: &[u8]) -> Result<StillParts> {
             animation: None,
             quality: 100,
             group_size_shift: fh.group_size_shift,
+            effort: crate::options::Effort::default(),
         },
         group_size_shift: fh.group_size_shift,
         toc: toc.entries.clone(),

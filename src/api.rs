@@ -644,6 +644,7 @@ fn encode_spec(
         animation,
         quality: opts.quality.min(100),
         group_size_shift: u32::from(opts.group_size_shift.min(3)),
+        effort: opts.effort,
     }
 }
 
