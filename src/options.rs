@@ -34,6 +34,9 @@ pub struct DecodeOptions {
     /// frame-rectangle geometry, un-blended, including zero-duration
     /// layers. Default `true`.
     pub coalesce: bool,
+    /// Worker budget for the decoder (default `1`: serial). Advisory —
+    /// the decoded pixels never depend on it.
+    pub threads: usize,
 }
 
 impl DecodeOptions {
@@ -84,6 +87,12 @@ impl DecodeOptions {
         self
     }
 
+    /// Builder: set `threads` (`0` is treated as `1`).
+    pub fn with_threads(mut self, threads: usize) -> Self {
+        self.threads = threads.max(1);
+        self
+    }
+
     /// Remove every limit (`strict` and `coalesce` unchanged).
     pub fn unlimited(mut self) -> Self {
         self.max_width = None;
@@ -103,6 +112,7 @@ impl Default for DecodeOptions {
             max_bytes: Some(Self::DEFAULT_MAX_BYTES),
             strict: false,
             coalesce: true,
+            threads: 1,
         }
     }
 }
@@ -126,7 +136,7 @@ pub enum Effort {
 ///
 /// `#[non_exhaustive]`: build with [`new`](Self::new) / `Default` and
 /// the `with_*` builders.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 #[non_exhaustive]
 pub struct EncodeOptions {
     /// Advisory quality `0..=100` (default `100`). `100` is lossless
@@ -151,9 +161,41 @@ pub struct EncodeOptions {
     /// Speed / density trade-off of the Modular coder (default
     /// [`Effort::Balanced`]).
     pub effort: Effort,
+    /// Lossy target as a distance instead of a quality: about `1.0` is
+    /// visually lossless, larger is smaller and worse, `0.0` is
+    /// lossless. `None` (default) derives it from `quality`
+    /// (`(100 − quality) / 10` down to quality 50, then steeper).
+    pub distance: Option<f32>,
+    /// Keep lossy requests on the Modular coder (quantised residuals)
+    /// instead of VarDCT. Default `false`.
+    pub modular: bool,
+    /// Worker budget for the per-group work of the encoder (default
+    /// `1`: serial). The output bytes are identical at every budget.
+    /// The registry encoder sets it from the framework's
+    /// `ExecutionContext`; this crate never asks the host for its
+    /// core count.
+    pub threads: usize,
 }
 
 impl EncodeOptions {
+    /// Builder: set `distance` (negative values are treated as 0).
+    pub fn with_distance(mut self, distance: impl Into<Option<f32>>) -> Self {
+        self.distance = distance.into().map(|d| d.max(0.0));
+        self
+    }
+
+    /// Builder: set `modular`.
+    pub fn with_modular(mut self, modular: bool) -> Self {
+        self.modular = modular;
+        self
+    }
+
+    /// Builder: set `threads` (`0` is treated as `1`).
+    pub fn with_threads(mut self, threads: usize) -> Self {
+        self.threads = threads.max(1);
+        self
+    }
+
     /// Builder: set `effort`.
     pub fn with_effort(mut self, effort: Effort) -> Self {
         self.effort = effort;
@@ -189,11 +231,31 @@ impl EncodeOptions {
         self
     }
 
-    /// `true` when the residuals are quantised (`quality < 100`).
+    /// `true` when the output is lossy (`quality < 100` or a positive
+    /// `distance`).
     pub fn is_lossy(&self) -> bool {
-        self.quality < 100
+        match self.distance {
+            Some(d) => d > 0.0,
+            None => self.quality < 100,
+        }
     }
 }
+
+impl PartialEq for EncodeOptions {
+    fn eq(&self, other: &Self) -> bool {
+        // The distance compares by bit pattern so equality stays total.
+        self.quality == other.quality
+            && self.container == other.container
+            && self.group_size_shift == other.group_size_shift
+            && self.animation == other.animation
+            && self.effort == other.effort
+            && self.distance.map(f32::to_bits) == other.distance.map(f32::to_bits)
+            && self.modular == other.modular
+            && self.threads == other.threads
+    }
+}
+
+impl Eq for EncodeOptions {}
 
 impl Default for EncodeOptions {
     fn default() -> Self {
@@ -203,6 +265,9 @@ impl Default for EncodeOptions {
             group_size_shift: 1,
             animation: None,
             effort: Effort::default(),
+            distance: None,
+            modular: false,
+            threads: 1,
         }
     }
 }

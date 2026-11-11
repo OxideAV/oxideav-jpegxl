@@ -634,6 +634,24 @@ fn encode_spec(
     opts: &EncodeOptions,
     animation: Option<AnimationSpec>,
 ) -> EncodeSpec {
+    // Lossy requests go to VarDCT whenever the picture qualifies (8-bit
+    // sRGB); everything else — and `modular` on request — keeps the
+    // Modular coder, quantised below quality 100.
+    let distance = match opts.distance {
+        Some(d) if d > 0.0 => Some(d),
+        Some(_) => None,
+        None if opts.quality < 100 => Some(crate::vardct_enc::distance_for_quality(opts.quality)),
+        None => None,
+    };
+    let vardct_distance = distance
+        .filter(|_| !opts.modular && crate::encoder::vardct_applies(input.bits, &input.colour));
+    // A distance without a quality still means lossy on the Modular
+    // fallback: map it back onto the quality ladder.
+    let quality = match (opts.distance, vardct_distance) {
+        (Some(d), None) if d > 0.0 => (100.0 - d * 10.0).clamp(0.0, 99.0) as u8,
+        (Some(_), None) => 100,
+        _ => opts.quality.min(100),
+    };
     EncodeSpec {
         width: image.width,
         height: image.height,
@@ -642,9 +660,11 @@ fn encode_spec(
         alpha: input.alpha,
         colour: input.colour.clone(),
         animation,
-        quality: opts.quality.min(100),
+        quality,
         group_size_shift: u32::from(opts.group_size_shift.min(3)),
         effort: opts.effort,
+        vardct_distance,
+        threads: opts.threads,
     }
 }
 

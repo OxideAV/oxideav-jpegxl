@@ -12,8 +12,8 @@ use std::time::Duration;
 
 use common::png::{BitDepth, decode_png};
 use oxideav_jpegxl::{
-    AnimationInfo, ColorInfo, EncodeOptions, Error, Frame, JxlImage, Metadata, PixelFormat, Plane,
-    Signature, decode, decode_all, encode, encode_all, encode_rgba8, info, probe,
+    AnimationInfo, ColorInfo, Effort, EncodeOptions, Error, Frame, JxlImage, Metadata, PixelFormat,
+    Plane, Signature, decode, decode_all, encode, encode_all, encode_rgba8, info, probe,
 };
 
 const ICC_FIXTURE: &[u8] = include_bytes!("fixtures/r451_icc.jxl");
@@ -85,7 +85,15 @@ fn every_layout_round_trips_losslessly_on_one_group() {
     for &(fmt, bits) in &LAYOUTS {
         for &(w, h) in &[(1u32, 1u32), (7, 5), (64, 64), (256, 256), (255, 3)] {
             let img = image(w, h, fmt, bits, w * 31 + h);
-            let bytes = encode(&img, &EncodeOptions::default()).unwrap();
+            // The default effort on the small pictures, the fast one on
+            // the full group (the learned tree is exercised at size in
+            // `r487_modular`; this test is about layouts).
+            let effort = if w * h > 10_000 {
+                Effort::Fast
+            } else {
+                Effort::Balanced
+            };
+            let bytes = encode(&img, &EncodeOptions::default().with_effort(effort)).unwrap();
             assert!(probe(&bytes));
             let i = info(&bytes).unwrap();
             assert_eq!(
@@ -118,7 +126,14 @@ fn multi_group_geometries_round_trip() {
         (1030, 20, PixelFormat::Rgb24, 8, 3),
     ] {
         let img = image(w, h, fmt, bits, 7);
-        let opts = EncodeOptions::default().with_group_size_shift(shift);
+        let effort = if fmt == PixelFormat::Rgb24 {
+            Effort::Balanced
+        } else {
+            Effort::Fast
+        };
+        let opts = EncodeOptions::default()
+            .with_group_size_shift(shift)
+            .with_effort(effort);
         let bytes = encode(&img, &opts).unwrap();
         let back = decode(&bytes).unwrap();
         assert_same_pixels(&img, &back, &format!("{fmt:?} {w}x{h} shift {shift}"));
@@ -267,7 +282,13 @@ fn quality_is_a_monotone_size_ladder_with_bounded_error() {
     let mut prev_len = 0usize;
     let mut prev_err = u32::MAX;
     for q in [0u8, 25, 50, 75, 90, 100] {
-        let bytes = encode(&img, &EncodeOptions::default().with_quality(q)).unwrap();
+        // The Modular quantiser (VarDCT is the default lossy coder for
+        // 8-bit sRGB since round 487 and is pinned in `r487_vardct`).
+        let bytes = encode(
+            &img,
+            &EncodeOptions::default().with_quality(q).with_modular(true),
+        )
+        .unwrap();
         assert!(
             bytes.len() > prev_len,
             "q{q}: {} bytes after {prev_len}",
@@ -387,7 +408,11 @@ fn black_box_decoder_agrees_when_installed() {
         ("wide_lf", image(2100, 40, PixelFormat::Gray8, 8, 11), 100),
     ];
     for (name, img, q) in cases {
-        let bytes = encode(&img, &EncodeOptions::default().with_quality(q)).unwrap();
+        let bytes = encode(
+            &img,
+            &EncodeOptions::default().with_quality(q).with_modular(true),
+        )
+        .unwrap();
         let jxl = dir.join(format!("{name}.jxl"));
         let png = dir.join(format!("{name}.png"));
         std::fs::write(&jxl, &bytes).unwrap();

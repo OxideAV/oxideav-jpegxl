@@ -36,6 +36,69 @@ fn load(path: &std::path::Path) -> JxlImage {
         .with_bits_per_sample(bits)
 }
 
+fn psnr(a: &JxlImage, b: &JxlImage) -> f64 {
+    let (a_bytes, b_bytes) = (a.as_bytes().unwrap(), b.as_bytes().unwrap());
+    assert_eq!(a_bytes.len(), b_bytes.len(), "decoded size");
+    let step = a.format.bytes_per_sample();
+    let peak = if step == 1 { 255.0f64 } else { 65535.0 };
+    let mut sse = 0.0f64;
+    let mut n = 0u64;
+    for i in (0..a_bytes.len()).step_by(step) {
+        let (x, y) = if step == 1 {
+            (f64::from(a_bytes[i]), f64::from(b_bytes[i]))
+        } else {
+            (
+                f64::from(u16::from_le_bytes([a_bytes[i], a_bytes[i + 1]])),
+                f64::from(u16::from_le_bytes([b_bytes[i], b_bytes[i + 1]])),
+            )
+        };
+        sse += (x - y) * (x - y);
+        n += 1;
+    }
+    10.0 * (peak * peak / (sse / n as f64).max(1e-12)).log10()
+}
+
+/// Rate–distortion sweep: `JXL_CORPUS_DISTANCES=0.5,1,2,4` encodes
+/// every corpus picture at each distance and prints size and PSNR
+/// (through this crate's decoder).
+#[test]
+fn corpus_rate_distortion() {
+    let (Ok(dir), Ok(list)) = (
+        std::env::var("JXL_CORPUS_DIR"),
+        std::env::var("JXL_CORPUS_DISTANCES"),
+    ) else {
+        return;
+    };
+    let out_dir = std::env::var("JXL_CORPUS_OUT").ok();
+    let mut paths: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap()
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|e| e == "png"))
+        .collect();
+    paths.sort();
+    for path in paths {
+        let name = path.file_stem().unwrap().to_string_lossy().to_string();
+        let img = load(&path);
+        for d in list.split(',').filter_map(|d| d.trim().parse::<f32>().ok()) {
+            let opts = EncodeOptions::new().with_distance(d);
+            let t = Instant::now();
+            let bytes = encode(&img, &opts).unwrap();
+            let enc_ms = t.elapsed().as_millis();
+            if let Some(out) = &out_dir {
+                std::fs::write(format!("{out}/{name}.d{d}.jxl"), &bytes).unwrap();
+            }
+            let t = Instant::now();
+            let back = decode(&bytes).unwrap();
+            let dec_ms = t.elapsed().as_millis();
+            println!(
+                "RD {name} d{d} {} bytes psnr {:.2} dB enc {enc_ms} ms dec {dec_ms} ms",
+                bytes.len(),
+                psnr(&img, &back)
+            );
+        }
+    }
+}
+
 #[test]
 fn corpus_report() {
     let Ok(dir) = std::env::var("JXL_CORPUS_DIR") else {
@@ -55,30 +118,38 @@ fn corpus_report() {
     for path in paths {
         let name = path.file_stem().unwrap().to_string_lossy().to_string();
         let img = load(&path);
-        for (label, effort) in [
-            ("fast", Effort::Fast),
-            ("balanced", Effort::Balanced),
-            ("thorough", Effort::Thorough),
-        ] {
+        let efforts: &[(&str, Effort)] = if quality == 100 {
+            &[
+                ("fast", Effort::Fast),
+                ("balanced", Effort::Balanced),
+                ("thorough", Effort::Thorough),
+            ]
+        } else {
+            &[("balanced", Effort::Balanced)]
+        };
+        for &(label, effort) in efforts {
             let opts = EncodeOptions::new()
                 .with_quality(quality)
                 .with_effort(effort);
             let t = Instant::now();
             let bytes = encode(&img, &opts).unwrap();
             let enc_ms = t.elapsed().as_millis();
+            if let Some(out) = &out_dir {
+                std::fs::write(format!("{out}/{name}.{label}.q{quality}.jxl"), &bytes).unwrap();
+            }
             let t = Instant::now();
             let back = decode(&bytes).unwrap();
             let dec_ms = t.elapsed().as_millis();
+            let mut psnr = String::new();
             if quality == 100 {
                 assert_eq!(back.as_bytes().unwrap(), img.as_bytes().unwrap(), "{name}");
+            } else {
+                psnr = format!(" psnr {:.2} dB", self::psnr(&img, &back));
             }
             println!(
-                "CORPUS {name} {label} {} bytes enc {enc_ms} ms dec {dec_ms} ms",
+                "CORPUS {name} {label} {} bytes enc {enc_ms} ms dec {dec_ms} ms{psnr}",
                 bytes.len()
             );
-            if let Some(out) = &out_dir {
-                std::fs::write(format!("{out}/{name}.{label}.jxl"), &bytes).unwrap();
-            }
         }
     }
 }

@@ -631,6 +631,8 @@ pub mod encoder;
 #[doc(hidden)] // internal: prefix-code entropy writer plumbing
 pub mod entropy_write;
 mod modular_enc;
+mod par;
+mod vardct_enc;
 
 mod api;
 pub mod error;
@@ -2647,6 +2649,7 @@ fn finish_vardct_decode(
     hf_section: &mut crate::hf_global_section::HfGlobalSection,
     group_readers: Vec<(crate::group_rect::GroupRect, Vec<BitReader<'_>>)>,
     pts: Option<i64>,
+    after_hf: &mut dyn FnMut(u32, u32, &mut BitReader<'_>) -> Result<()>,
 ) -> Result<(RawFrame, Option<crate::patches::PreCtFrame>)> {
     use crate::block_context_resolver::BlockContextResolver;
     use crate::hf_dequant::QmScaleFactors;
@@ -2810,6 +2813,9 @@ fn finish_vardct_decode(
                 .pass_data_mut(p as u32)?
                 .histograms
                 .finish_section()?;
+            // G.4: the group's Modular data (extra channels) follows
+            // its HF coefficients on the same bit cursor.
+            after_hf(rect.index, p as u32, &mut gbr)?;
             stacks.push(out.pop().ok_or_else(|| {
                 Error::InvalidData(
                     "jxl VarDCT integrated decode: empty per-pass decode output".into(),
@@ -3173,7 +3179,7 @@ pub fn decode_vardct_frame_with_refs(
     // The per-group bit readers positioned at each PassGroup start.
     // Single-TOC: one reader sharing the whole frame buffer, advanced
     // past HfGlobal. Multi-TOC: fresh section readers per PassGroup slot.
-    let (lf_global, lf_groups, mut hf_global_section, pass_group_readers) = if single_toc {
+    let (mut lf_global, lf_groups, mut hf_global_section, pass_group_readers) = if single_toc {
         // Single-TOC-entry path: chain section reads on the same bit
         // reader, no byte-aligned slicing between sections.
         let lf_global_bytes = section_byte_range(lf_global_slot)?;
@@ -3472,8 +3478,8 @@ pub fn decode_vardct_frame_with_refs(
         b_from_y: &b_from_y,
         sharpness: &sharpness,
         cfl,
-        patches: lf_global.patches,
-        splines: lf_global.splines,
+        patches: lf_global.patches.take(),
+        splines: lf_global.splines.take(),
         refs,
         want_pre_ct,
         noise: lf_global.noise,
@@ -3485,7 +3491,73 @@ pub fn decode_vardct_frame_with_refs(
         frame_height: scaffold.height,
         global_scale: quantizer.global_scale,
     };
-    finish_vardct_decode(finish_inputs, &mut hf_global_section, group_readers, pts)
+    // Extra channels: whatever GlobalModular did not carry is in the
+    // PassGroup sections, right after each group's HF coefficients.
+    let has_extra = metadata.num_extra_channels > 0;
+    let extra_in_groups = has_extra && !lf_global.global_modular.fully_decoded;
+    let (mut frame, pre_ct) = {
+        let lf_global_ref = &mut lf_global;
+        let mut after_hf = |group: u32, pass: u32, gbr: &mut BitReader<'_>| -> Result<()> {
+            if extra_in_groups {
+                crate::pass_group::decode_modular_group_into(gbr, fh, lf_global_ref, pass, group)?;
+            }
+            Ok(())
+        };
+        finish_vardct_decode(
+            finish_inputs,
+            &mut hf_global_section,
+            group_readers,
+            pts,
+            &mut after_hf,
+        )?
+    };
+    if has_extra {
+        if extra_in_groups {
+            let transforms = lf_global.global_modular.transforms.clone();
+            let bit_depth = metadata.bit_depth.bits_per_sample.max(1);
+            crate::global_modular::apply_inverse_transforms(
+                &mut lf_global.global_modular.image,
+                &transforms,
+                bit_depth,
+            )?;
+        }
+        let img = &lf_global.global_modular.image;
+        let (w, h) = (scaffold.width as usize, scaffold.height as usize);
+        let n_extra = metadata.num_extra_channels as usize;
+        if img.channels.len() != n_extra {
+            return Err(Error::InvalidData(format!(
+                "jxl VarDCT decoder: {} Modular channels for {n_extra} extra channels",
+                img.channels.len()
+            )));
+        }
+        for (i, ch) in img.channels.iter().enumerate() {
+            if ch.len() != w * h {
+                return Err(Error::InvalidData(format!(
+                    "jxl VarDCT decoder: extra channel {i} has {} samples, {} expected",
+                    ch.len(),
+                    w * h
+                )));
+            }
+            // The colour planes of a VarDCT frame are 8-bit: bring the
+            // extra channel to the same depth.
+            let bits = metadata
+                .extra_channel_info
+                .get(i)
+                .map(|ec| ec.bit_depth.bits_per_sample)
+                .unwrap_or(8)
+                .clamp(1, 31);
+            let max = (1i64 << bits) - 1;
+            let data: Vec<u8> = ch
+                .iter()
+                .map(|&v| {
+                    let v = i64::from(v).clamp(0, max);
+                    ((v * 255 + max / 2) / max) as u8
+                })
+                .collect();
+            frame.planes.push(Plane { stride: w, data });
+        }
+    }
+    Ok((frame, pre_ct))
 }
 
 /// FDIS-side `Headers` returned by [`probe_fdis`]. Mirrors the

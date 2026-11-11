@@ -114,7 +114,7 @@ pub struct AnimationSpec {
 }
 
 /// The image-level parameters of one codestream.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct EncodeSpec {
     pub width: u32,
     pub height: u32,
@@ -134,6 +134,12 @@ pub struct EncodeSpec {
     pub group_size_shift: u32,
     /// Speed / density trade-off of the Modular coder.
     pub effort: Effort,
+    /// `Some(distance)` codes lossy VarDCT frames in XYB (8-bit sRGB
+    /// input only); `None` codes Modular frames.
+    pub vardct_distance: Option<f32>,
+    /// Worker budget for the per-group work (`0` and `1` are serial).
+    /// The output does not depend on it.
+    pub threads: usize,
 }
 
 impl EncodeSpec {
@@ -312,7 +318,7 @@ pub fn write_prelude(w: &mut BitWriter, spec: &EncodeSpec) -> Result<()> {
             w.write_bool(false); // alpha_associated
         }
     }
-    w.write_bool(false); // xyb_encoded
+    w.write_bool(spec.vardct_distance.is_some()); // xyb_encoded
     write_colour_encoding(w, spec)?;
     if extra_fields {
         w.write_bool(true); // tone_mapping.all_default
@@ -594,13 +600,19 @@ fn code_frame(spec: &EncodeSpec, frame: &FrameInput) -> Result<CodedFrame> {
     }
     let tree_codes = EntropyCodes::build_clustered(&tree_stats, 1, 6)?;
 
+    // Sections are independent given the tree: one worker each, the
+    // statistics merged in section order.
     let mut leaf_stats = ValueStats::new(tree.num_ctx);
     let mut coded: Vec<Vec<(u32, u32)>> = Vec::with_capacity(sections.len());
-    for mut section in sections {
+    for (syms, stats) in crate::par::par_map(spec.threads, sections, |_, mut section| {
         let syms = encode_section(&mut section, &tree);
+        let mut stats = ValueStats::new(tree.num_ctx);
         for &(c, v) in &syms {
-            leaf_stats.add(c, v);
+            stats.add(c, v);
         }
+        (syms, stats)
+    }) {
+        leaf_stats.merge(&stats);
         coded.push(syms);
     }
     let n_streams = coded.iter().filter(|s| !s.is_empty()).count().max(1);
@@ -622,6 +634,9 @@ fn code_frame(spec: &EncodeSpec, frame: &FrameInput) -> Result<CodedFrame> {
 /// The frame-header fields this writer emits (F.2, `kModular`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FrameShape {
+    /// `Some((x_qm_scale, b_qm_scale))` for a VarDCT frame (XYB,
+    /// adaptive LF smoothing off), `None` for a Modular one.
+    pub vardct: Option<(u32, u32)>,
     pub group_size_shift: u32,
     pub num_extra: u32,
     pub have_animation: bool,
@@ -639,14 +654,25 @@ pub fn write_frame_header_and_toc(
 ) -> Result<()> {
     w.write_bool(false); // all_default
     w.write_bits(2, 0); // frame_type kRegularFrame
-    w.write_bits(1, 1); // encoding kModular
-    w.write_u64(0); // flags
-    w.write_bool(false); // do_YCbCr
+    if shape.vardct.is_some() {
+        w.write_bits(1, 0); // encoding kVarDCT
+        w.write_u64(0x80); // flags: kSkipAdaptiveLFSmoothing
+    // do_YCbCr is absent: the image is xyb_encoded.
+    } else {
+        w.write_bits(1, 1); // encoding kModular
+        w.write_u64(0); // flags
+        w.write_bool(false); // do_YCbCr
+    }
     w.write_bits(2, 0); // upsampling = 1
     for _ in 0..shape.num_extra {
         w.write_bits(2, 0); // ec_upsampling = 1
     }
-    w.write_bits(2, shape.group_size_shift);
+    if let Some((x_qm_scale, b_qm_scale)) = shape.vardct {
+        w.write_bits(3, x_qm_scale);
+        w.write_bits(3, b_qm_scale);
+    } else {
+        w.write_bits(2, shape.group_size_shift);
+    }
     w.write_bits(2, 0); // passes.num_passes = 1
     w.write_bool(false); // have_crop
     w.write_bits(2, 0); // blending_info.mode kReplace
@@ -772,6 +798,9 @@ fn write_frame(
     frame: &FrameInput,
     is_last: bool,
 ) -> Result<()> {
+    if let Some(distance) = spec.vardct_distance {
+        return write_vardct_frame(w, spec, frame, is_last, distance);
+    }
     let coded = code_frame(spec, frame)?;
     let single = coded.groups.is_empty();
     let mut sections: Vec<Vec<u8>> = Vec::new();
@@ -791,17 +820,17 @@ fn write_frame(
             sections.push(Vec::new()); // ModularLfGroup: nothing to code
         }
         sections.push(Vec::new()); // HfGlobal: absent for kModular
-        for group in &coded.groups {
+        let groups: Vec<&Vec<(u32, u32)>> = coded.groups.iter().collect();
+        sections.extend(crate::par::par_map(spec.threads, groups, |_, group| {
             let mut gw = BitWriter::new();
             gw.write_bool(true); // use_global_tree
             gw.write_bool(true); // default_wp
-            gw.write_u32(NB_TRANSFORMS_DIST, 0)?;
+            gw.write_bits(2, 0); // nb_transforms = 0
             coded
                 .leaf_codes
                 .write_symbols(&mut gw, group.iter().copied());
-            gw.zero_pad_to_byte();
-            sections.push(gw.into_bytes());
-        }
+            gw.into_bytes()
+        }));
     }
     let mut toc = Vec::with_capacity(sections.len());
     for s in &sections {
@@ -813,6 +842,7 @@ fn write_frame(
         toc.push(s.len() as u32);
     }
     let shape = FrameShape {
+        vardct: None,
         group_size_shift: spec.group_size_shift,
         num_extra: u32::from(spec.alpha),
         have_animation: spec.animation.is_some(),
@@ -824,6 +854,82 @@ fn write_frame(
         w.write_bytes(s);
     }
     Ok(())
+}
+
+/// Append one VarDCT frame.
+fn write_vardct_frame(
+    w: &mut BitWriter,
+    spec: &EncodeSpec,
+    frame: &FrameInput,
+    is_last: bool,
+    distance: f32,
+) -> Result<()> {
+    let n_colour = if spec.grey { 1 } else { 3 };
+    if frame.channels.len() != spec.num_channels() {
+        return Err(Error::invalid(format!(
+            "JXL encoder: frame carries {} channel(s), {} expected",
+            frame.channels.len(),
+            spec.num_channels()
+        )));
+    }
+    let pixels = spec.width as usize * spec.height as usize;
+    let max = (1i64 << spec.bits) - 1;
+    for (c, ch) in frame.channels.iter().enumerate() {
+        if ch.len() != pixels {
+            return Err(Error::invalid(format!(
+                "JXL encoder: channel {c} has {} samples, {pixels} expected",
+                ch.len()
+            )));
+        }
+        if ch.iter().any(|&v| v < 0 || i64::from(v) > max) {
+            return Err(Error::invalid(format!(
+                "JXL encoder: channel {c} sample outside 0..={max}"
+            )));
+        }
+    }
+    let input = crate::vardct_enc::VarDctInput {
+        width: spec.width as usize,
+        height: spec.height as usize,
+        bits: spec.bits,
+        colour: &frame.channels[..n_colour],
+        extra: &frame.channels[n_colour..],
+    };
+    let (sections, rate) = crate::vardct_enc::encode_frame(
+        &input,
+        distance,
+        &learn_params_for(spec.effort),
+        spec.threads,
+    )?;
+    let mut toc = Vec::with_capacity(sections.len());
+    for s in &sections {
+        if s.len() > MAX_SECTION_BYTES {
+            return Err(Error::unsupported(
+                "JXL encoder: section exceeds the TOC range",
+            ));
+        }
+        toc.push(s.len() as u32);
+    }
+    let shape = FrameShape {
+        vardct: Some((rate.x_qm_scale, rate.b_qm_scale)),
+        group_size_shift: 1,
+        num_extra: u32::from(spec.alpha),
+        have_animation: spec.animation.is_some(),
+        duration: frame.duration,
+        is_last,
+    };
+    write_frame_header_and_toc(w, &shape, &toc)?;
+    for s in &sections {
+        w.write_bytes(s);
+    }
+    Ok(())
+}
+
+/// Whether the VarDCT coder takes this picture: 8-bit samples in sRGB
+/// (the forward XYB transform here is defined from sRGB).
+pub fn vardct_applies(bits: u32, colour: &ColourSpec) -> bool {
+    bits == 8
+        && matches!(colour, ColourSpec::Enumerated { primaries, transfer }
+            if enum_primaries(*primaries) == 1 && enum_transfer(*transfer) == 13)
 }
 
 /// Encode `frames` as one bare codestream (`FF 0A` …). One frame

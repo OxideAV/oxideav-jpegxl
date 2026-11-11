@@ -121,6 +121,34 @@ impl BitWriter {
         }
     }
 
+    /// `F16()` (B.2.4): `value` as an IEEE 754 binary16, rounded to
+    /// nearest. `Err` for values a half float cannot carry (NaN,
+    /// infinities, magnitudes of 65520 and above).
+    pub fn write_f16(&mut self, value: f32) -> Result<()> {
+        if !value.is_finite() || value.abs() >= 65520.0 {
+            return Err(Error::invalid(format!(
+                "JXL writer: {value} is not an F16 value"
+            )));
+        }
+        let bits = value.to_bits();
+        let sign = (bits >> 31) << 15;
+        let exp = ((bits >> 23) & 0xFF) as i32 - 127;
+        let mant = bits & 0x7F_FFFF;
+        let half = if value == 0.0 || exp < -25 {
+            0
+        } else if exp < -14 {
+            // Subnormal half: shift the implicit one into the mantissa.
+            let full = mant | 0x80_0000;
+            let shift = (-14 - exp) as u32 + 13;
+            (full + (1 << (shift - 1))) >> shift
+        } else {
+            let rounded = (((exp + 15) as u32) << 10) + ((mant + 0x1000) >> 13);
+            rounded.min(0x7BFF)
+        };
+        self.write_bits(16, sign | half);
+        Ok(())
+    }
+
     /// `Enum(...)` (B.2.6): `U32(0, 1, 2 + u(4), 18 + u(6))`.
     pub fn write_enum(&mut self, value: u32) -> Result<()> {
         self.write_u32(
@@ -210,6 +238,40 @@ mod tests {
         assert_eq!(r.read_u32(en).unwrap(), 40);
         r.pu0().unwrap();
         assert_eq!(r.read_bits(8).unwrap(), 0xAA);
+    }
+
+    #[test]
+    fn f16_round_trips_through_the_reader() {
+        for v in [
+            0.0f32,
+            1.0,
+            -1.0,
+            0.5,
+            1.0 / 32.0,
+            1.0 / 64.0,
+            0.25,
+            3.5,
+            40.0,
+            0.115169525,
+            -0.0037930732,
+            65504.0,
+            6.1e-5,
+            1.0e-6,
+        ] {
+            let mut w = BitWriter::new();
+            w.write_f16(v).unwrap();
+            let bytes = w.into_bytes();
+            let got = BitReader::new(&bytes).read_f16().unwrap();
+            let tol = (v.abs() * 0.0005).max(4e-8);
+            assert!((got - v).abs() <= tol, "{v} read back as {got}");
+        }
+        // Exactly representable values are exact.
+        let mut w = BitWriter::new();
+        w.write_f16(1.0 / 64.0).unwrap();
+        let bytes = w.into_bytes();
+        assert_eq!(BitReader::new(&bytes).read_f16().unwrap(), 1.0 / 64.0);
+        assert!(BitWriter::new().write_f16(f32::NAN).is_err());
+        assert!(BitWriter::new().write_f16(70000.0).is_err());
     }
 
     #[test]

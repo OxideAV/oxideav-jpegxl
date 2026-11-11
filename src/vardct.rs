@@ -131,11 +131,33 @@ pub fn recognise_vardct_codestream(
     // walk, per-pass §C.7 orders/histograms and the §C.8.3 cross-pass
     // accumulation (round 389) drive `num_passes > 1` frames end to end
     // (pinned on the staged `progressive-ac-multipass` fixture).
+    // Extra channels (alpha, …) ride a VarDCT frame as Modular data
+    // (G.1.3 / G.4.2); the frame decode appends them to the colour
+    // planes. Full-size integer channels only — a dimension shift or
+    // extra-channel upsampling would need their own resampling.
     if metadata.num_extra_channels > 0 {
-        return Err(Error::Unsupported(format!(
-            "jxl VarDCT (round 8 scaffold): {} extra channels not yet supported",
-            metadata.num_extra_channels
-        )));
+        if let Some((i, ec)) = metadata
+            .extra_channel_info
+            .iter()
+            .enumerate()
+            .find(|(_, ec)| ec.dim_shift != 0 || ec.bit_depth.float_sample)
+        {
+            return Err(Error::Unsupported(format!(
+                "jxl VarDCT decoder: extra channel {i} (dim_shift {}, float {}) is not a \
+                 full-size integer channel",
+                ec.dim_shift, ec.bit_depth.float_sample
+            )));
+        }
+        if fh.ec_upsampling.iter().any(|&u| u != 1) {
+            return Err(Error::Unsupported(
+                "jxl VarDCT decoder: upsampled extra channels".into(),
+            ));
+        }
+        if fh.passes.num_passes != 1 {
+            return Err(Error::Unsupported(
+                "jxl VarDCT decoder: extra channels on a multi-pass frame".into(),
+            ));
+        }
     }
     let num_colour_channels = match metadata.colour_encoding.colour_space {
         crate::metadata_fdis::ColourSpace::Grey => 1,

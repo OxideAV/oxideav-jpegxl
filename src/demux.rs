@@ -269,6 +269,8 @@ impl Muxer for JxlMuxer {
 #[derive(Clone)]
 struct StillParts {
     spec: EncodeSpec,
+    /// `Some((x_qm_scale, b_qm_scale))` for a VarDCT still.
+    vardct: Option<(u32, u32)>,
     group_size_shift: u32,
     toc: Vec<u32>,
     sections: Vec<u8>,
@@ -286,10 +288,9 @@ fn parse_still(bytes: &[u8]) -> Result<StillParts> {
                 .into(),
         ));
     }
-    if md.bit_depth.float_sample || md.xyb_encoded || md.orientation != 1 || md.have_preview {
+    if md.bit_depth.float_sample || md.orientation != 1 || md.have_preview {
         return Err(Error::Unsupported(
-            "jpegxl muxer: only integer, non-XYB, upright stills without preview can be re-timed"
-                .into(),
+            "jpegxl muxer: only integer, upright stills without preview can be re-timed".into(),
         ));
     }
     let alpha =
@@ -320,9 +321,17 @@ fn parse_still(bytes: &[u8]) -> Result<StillParts> {
     let mut br = crate::bitreader::BitReader::new(slice);
     let (fh, toc) = crate::read_frame_header_and_toc(&mut br, &params, slice)?;
     let rf = &fh.restoration_filter;
+    // The two frame shapes this crate's encoder writes: a plain
+    // Modular frame, or an XYB VarDCT frame with adaptive LF smoothing
+    // off and nothing else flagged.
+    let vardct = fh.encoding == Encoding::VarDct;
+    let shape_ok = if vardct {
+        md.xyb_encoded && fh.flags == crate::frame_header::flags::SKIP_ADAPTIVE_LF_SMOOTHING
+    } else {
+        !md.xyb_encoded && fh.flags == 0
+    };
     let canonical = fh.frame_type == FrameType::Regular
-        && fh.encoding == Encoding::Modular
-        && fh.flags == 0
+        && shape_ok
         && !fh.do_ycbcr
         && fh.upsampling == 1
         && fh.ec_upsampling.iter().all(|&u| u == 1)
@@ -342,8 +351,9 @@ fn parse_still(bytes: &[u8]) -> Result<StillParts> {
         && !toc.permuted;
     if !canonical {
         return Err(Error::Unsupported(
-            "jpegxl muxer: the frame is not a plain Modular still (kReplace, no crop / upsampling / \
-             restoration filter / TOC permutation) and cannot be re-timed"
+            "jpegxl muxer: the frame is not a plain Modular or XYB VarDCT still (kReplace, no \
+             crop / upsampling / image features / restoration filter / TOC permutation) and \
+             cannot be re-timed"
                 .into(),
         ));
     }
@@ -367,7 +377,11 @@ fn parse_still(bytes: &[u8]) -> Result<StillParts> {
             quality: 100,
             group_size_shift: fh.group_size_shift,
             effort: crate::options::Effort::default(),
+            // Only "is this an XYB codestream" matters to the prelude.
+            vardct_distance: vardct.then_some(1.0),
+            threads: 1,
         },
+        vardct: vardct.then_some((fh.x_qm_scale, fh.b_qm_scale)),
         group_size_shift: fh.group_size_shift,
         toc: toc.entries.clone(),
         sections,
@@ -441,6 +455,7 @@ fn splice_animation(packets: &[Packet], time_base: TimeBase) -> Result<Vec<u8>> 
             )));
         }
         let shape = FrameShape {
+            vardct: parts.vardct,
             group_size_shift: parts.group_size_shift,
             num_extra: u32::from(spec.alpha),
             have_animation: true,

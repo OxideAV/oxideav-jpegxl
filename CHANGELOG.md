@@ -9,6 +9,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **VarDCT lossy encoder** (round 487). Any lossy request
+  (`quality < 100` or `EncodeOptions::distance > 0`) on 8-bit sRGB
+  input now writes `kVarDCT` frames in XYB: sRGB → linear → XYB (the
+  inverse of L.2.2), 8×8 DCT on every block, quantisation against the
+  default dequantisation matrices scaled by `global_scale` and
+  `HfMul`, chroma-from-luma with the default correlation (B and X
+  coded against the *dequantised* Y, for LF and HF alike), the LF
+  image as a Modular sub-bitstream with signalled LF weights (X and B
+  twice as fine as the defaults), HF coefficients in the natural order
+  with the I.4 context model and clustered histograms, one `PassGroup`
+  per 256×256 group, restoration filters off. An alpha channel rides
+  the frame losslessly as Modular data; `encode_all` writes lossy
+  animations. Decoded by this crate and by a black-box decoder to the
+  same picture (worst sample difference ≤ 3, mean < 0.5 — pinned).
+  Other inputs (16-bit, non-sRGB, ICC) keep the quantised Modular
+  coder; `EncodeOptions::modular` forces it.
+- `EncodeOptions::distance` / `with_distance` (about 1 = visually
+  lossless; `quality` maps to `(100 − q) / 10` down to 50, then
+  steeper) and `EncodeOptions::modular` / `with_modular`; registry
+  options `distance`, `modular`, `effort`.
+- `EncodeOptions::threads` / `with_threads` (and the registry
+  encoder's `set_execution_context`): per-group work — Modular
+  residual coding, VarDCT colour conversion / transform / quantisation
+  / tokenisation, section serialisation — runs on that many scoped
+  workers. Serial by default; the bytes are identical at every budget
+  (pinned). `DecodeOptions::threads` is accepted for symmetry.
+- The `jpegxl` muxer splices VarDCT stills (this encoder's lossy
+  output) into animations, as it does Modular ones.
+- `benches/codec.rs`: an encode / decode timing harness on a
+  synthesised photo-like picture (one process per measurement, for
+  peak-memory readings).
+- Decoder: **extra channels on VarDCT frames** (alpha next to lossy
+  colour — `GlobalModular` for one-group frames, the Modular tail of
+  every `PassGroup` otherwise); previously `Unsupported`.
+
+### Fixed
+
+- Decoder: signalled (non-default) `LfChannelDequantization` weights
+  were used as read instead of as the `128 / m` divisors the LF
+  dequantiser works with — any VarDCT stream with custom LF weights
+  decoded with wrong LF. Pinned against a black-box decoder through
+  the encoder, which signals such weights.
+- Entropy writer: an ANS stream whose hybrid configuration had a
+  `split_exponent` above the alphabet's log size wrote an unreadable
+  prelude (reachable through the general cluster map).
+
 - **Modular density** (round 487). The encoder learns one MA tree per
   frame instead of fixing one leaf per channel: a sample of the
   picture is scanned with the decoder's own property vector (Table

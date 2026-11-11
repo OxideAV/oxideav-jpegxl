@@ -58,9 +58,23 @@ impl LfChannelDequantization {
         if all_default {
             return Ok(Self::default());
         }
-        let m_x_lf_unscaled = br.read_f16()?;
-        let m_y_lf_unscaled = br.read_f16()?;
-        let m_b_lf_unscaled = br.read_f16()?;
+        // The fields of this struct are the 16.16 *divisors* the LF
+        // dequantiser uses (`128 / m`, so the Table G.2 defaults 1/32,
+        // 1/4, 1/2 are 4096, 512, 256): convert the signalled weights
+        // the same way. A non-positive weight has no dequantiser.
+        let mut divisor = || -> Result<f32> {
+            let m = br.read_f16()?;
+            if m > 0.0 {
+                Ok(128.0 / m)
+            } else {
+                Err(Error::InvalidData(format!(
+                    "JXL LfChannelDequantization: non-positive weight {m}"
+                )))
+            }
+        };
+        let m_x_lf_unscaled = divisor()?;
+        let m_y_lf_unscaled = divisor()?;
+        let m_b_lf_unscaled = divisor()?;
         Ok(Self {
             all_default: false,
             m_x_lf_unscaled,
@@ -715,24 +729,35 @@ mod tests {
 
     #[test]
     fn lf_dequant_explicit_values() {
-        // all_default = 0, then three F16 values: 1.0, -2.0, 0.5.
-        // F16 1.0 = 0x3C00, -2.0 = 0xC000, 0.5 = 0x3800.
-        let mut bw = Vec::new();
-        // bit 0: all_default = 0, then 16 bits = 0x3C00, etc.
-        // pack_lsb expects (value, n_bits) — but F16 is read via
-        // read_bits(16), and we pack the byte LSB-first ordering; F16
-        // bits 0..15 correspond to the 16 packed bits.
-        bw.extend_from_slice(&pack_lsb(&[
-            (0, 1),
-            (0x3C00, 16),
-            (0xC000, 16),
-            (0x3800, 16),
-        ]));
+        // all_default = 0, then three F16 weights: 1.0 (0x3C00), 2.0
+        // (0x4000), 0.5 (0x3800). The struct holds the `128 / m`
+        // divisors the dequantiser uses (the defaults 1/32, 1/4, 1/2
+        // are 4096, 512, 256).
+        let bw = pack_lsb(&[(0, 1), (0x3C00, 16), (0x4000, 16), (0x3800, 16)]);
         let mut br = BitReader::new(&bw);
         let d = LfChannelDequantization::read(&mut br).unwrap();
         assert!(!d.all_default);
-        assert_eq!(d.m_x_lf_unscaled, 1.0);
-        assert_eq!(d.m_y_lf_unscaled, -2.0);
-        assert_eq!(d.m_b_lf_unscaled, 0.5);
+        assert_eq!(d.m_x_lf_unscaled, 128.0);
+        assert_eq!(d.m_y_lf_unscaled, 64.0);
+        assert_eq!(d.m_b_lf_unscaled, 256.0);
+        // The defaults spelled out explicitly equal `all_default`.
+        // F16 1/32 = 0x2800, 1/4 = 0x3400, 1/2 = 0x3800.
+        let bw = pack_lsb(&[(0, 1), (0x2800, 16), (0x3400, 16), (0x3800, 16)]);
+        let d = LfChannelDequantization::read(&mut BitReader::new(&bw)).unwrap();
+        let dflt = LfChannelDequantization::default();
+        assert_eq!(
+            (d.m_x_lf_unscaled, d.m_y_lf_unscaled, d.m_b_lf_unscaled),
+            (
+                dflt.m_x_lf_unscaled,
+                dflt.m_y_lf_unscaled,
+                dflt.m_b_lf_unscaled
+            )
+        );
+        // A non-positive weight has no dequantiser: -2.0 = 0xC000.
+        let bw = pack_lsb(&[(0, 1), (0x3C00, 16), (0xC000, 16), (0x3800, 16)]);
+        assert!(matches!(
+            LfChannelDequantization::read(&mut BitReader::new(&bw)),
+            Err(Error::InvalidData(_))
+        ));
     }
 }

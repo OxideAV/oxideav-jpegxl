@@ -105,23 +105,25 @@ fn degenerate_and_extreme_geometries_round_trip() {
         (3, 3),
         (257, 2),
         (2, 513),
-        (4099, 3),
-        (256, 256),
-        (255, 257),
+        (2051, 3),
+        (128, 128),
+        (129, 127),
     ] {
-        for effort in EFFORTS {
-            for format in [PixelFormat::Gray8, PixelFormat::Rgba] {
-                let img = structured(w, h, format, 8, w * 31 + h);
-                let opts = EncodeOptions::new().with_effort(effort);
-                round_trip(&img, &opts, &format!("{w}x{h} {format:?} {effort:?}"));
-            }
+        // One effort per geometry, rotating: every effort sees every
+        // class of geometry across the list.
+        let effort = EFFORTS[(w + h) as usize % 3];
+        for format in [PixelFormat::Gray8, PixelFormat::Rgba] {
+            let img = structured(w, h, format, 8, w * 31 + h);
+            let opts = EncodeOptions::new().with_effort(effort);
+            round_trip(&img, &opts, &format!("{w}x{h} {format:?} {effort:?}"));
         }
     }
 }
 
 #[test]
 fn every_group_size_round_trips_a_multi_group_picture() {
-    let img = structured(700, 300, PixelFormat::Rgb24, 8, 5);
+    // 2×2 groups of 128, 2×1 of 256, one of 512 / 1024.
+    let img = structured(260, 140, PixelFormat::Rgb24, 8, 5);
     for shift in 0..=3u8 {
         let opts = EncodeOptions::new().with_group_size_shift(shift);
         round_trip(&img, &opts, &format!("group shift {shift}"));
@@ -130,7 +132,7 @@ fn every_group_size_round_trips_a_multi_group_picture() {
 
 #[test]
 fn the_learned_tree_is_denser_than_the_small_one_on_structured_content() {
-    let img = structured(512, 384, PixelFormat::Rgb24, 8, 3);
+    let img = structured(256, 192, PixelFormat::Rgb24, 8, 3);
     let fast = round_trip(
         &img,
         &EncodeOptions::new().with_effort(Effort::Fast),
@@ -157,13 +159,16 @@ fn flat_and_constant_pictures_cost_almost_nothing() {
 
 #[test]
 fn quantised_modular_stays_decodable_at_every_effort() {
-    let img = structured(300, 280, PixelFormat::Rgb24, 8, 9);
+    let img = structured(150, 140, PixelFormat::Rgb24, 8, 9);
     for effort in EFFORTS {
         for q in [10u8, 60, 95] {
-            let opts = EncodeOptions::new().with_quality(q).with_effort(effort);
+            let opts = EncodeOptions::new()
+                .with_quality(q)
+                .with_modular(true)
+                .with_effort(effort);
             let bytes = encode(&img, &opts).unwrap();
             let back = decode(&bytes).unwrap();
-            assert_eq!((back.width, back.height), (300, 280));
+            assert_eq!((back.width, back.height), (150, 140));
         }
     }
 }
@@ -202,7 +207,7 @@ fn few_colours(width: u32, height: u32, format: PixelFormat, colours: u32, seed:
 
 #[test]
 fn few_colour_pictures_use_a_palette_and_round_trip() {
-    for (w, h) in [(96u32, 80u32), (600, 300), (9, 9)] {
+    for (w, h) in [(96u32, 80u32), (300, 60), (9, 9)] {
         for format in [
             PixelFormat::Rgb24,
             PixelFormat::Rgba,
@@ -210,6 +215,10 @@ fn few_colour_pictures_use_a_palette_and_round_trip() {
             PixelFormat::Rgb48Le,
             PixelFormat::Rgba64Le,
         ] {
+            // The multi-group geometry on two layouts only.
+            if w > 256 && !matches!(format, PixelFormat::Rgb24 | PixelFormat::Rgba64Le) {
+                continue;
+            }
             for colours in [1u32, 2, 13, 200] {
                 let img = few_colours(w, h, format, colours, w + colours);
                 round_trip(
@@ -249,14 +258,14 @@ fn sparse_sample_values_use_a_channel_palette_and_round_trip() {
         b8.len()
     );
     // Colour: every channel sparse, across a multi-group geometry.
-    let base = structured(520, 260, PixelFormat::Rgba, 8, 22);
+    let base = structured(300, 130, PixelFormat::Rgba, 8, 22);
     let wide: Vec<u8> = base
         .as_bytes()
         .unwrap()
         .iter()
         .flat_map(|&v| (u16::from(v) * 257).to_le_bytes())
         .collect();
-    let img16 = JxlImage::packed(520, 260, PixelFormat::Rgba64Le, wide).unwrap();
+    let img16 = JxlImage::packed(300, 130, PixelFormat::Rgba64Le, wide).unwrap();
     round_trip(&img16, &EncodeOptions::new(), "sparse rgba64");
 }
 

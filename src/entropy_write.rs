@@ -1032,9 +1032,21 @@ impl EntropyCodes {
         if max_tokens > 256 {
             return Ok(codes);
         }
+        // C.2.3 codes `split_exponent` in `ceil(log2(log_alphabet_size
+        // + 1))` bits with `split_exponent <= log_alphabet_size`: the
+        // alphabet has to be at least as wide as the widest split.
+        let widest_split = stats
+            .configs
+            .iter()
+            .map(|c| c.split_exponent)
+            .max()
+            .unwrap_or(0);
+        if widest_split > 8 {
+            return Ok(codes);
+        }
         let log_alphabet_size = (5..=8u32)
-            .find(|&l| (1usize << l) >= max_tokens)
-            .expect("max_tokens <= 256");
+            .find(|&l| (1usize << l) >= max_tokens && l >= widest_split)
+            .expect("max_tokens <= 256 and split_exponent <= 8");
         let clusters = stats
             .counts
             .iter()
@@ -1272,7 +1284,12 @@ mod tests {
                 es.use_prefix_code,
                 coding == Coding::Prefix || codes.coding() == Coding::Prefix
             );
-            assert_eq!(br.read_bits(5).unwrap(), 0b10110);
+            assert_eq!(
+                br.read_bits(5).unwrap(),
+                0b10110,
+                "{coding:?}: bit position after the prelude ({} symbols)",
+                symbols.len()
+            );
             es.read_ans_state_init(&mut br).unwrap();
             let mut hy = HybridUintState::new(es.lz77, es.lz_len_conf);
             for &(c, v) in symbols {
@@ -1450,6 +1467,110 @@ mod tests {
             || SymbolStats::identity(3, HybridConfig::RESIDUALS).unwrap(),
             &[(2, 5); 300],
         );
+    }
+
+    /// Random many-context streams through `build_clustered`: the
+    /// clustering, the per-cluster configurations and the general
+    /// cluster map all have to read back.
+    #[test]
+    fn clustered_streams_of_many_contexts_round_trip() {
+        let mut s = 0x1234_5678u32;
+        let mut next = move || {
+            s ^= s << 13;
+            s ^= s >> 17;
+            s ^= s << 5;
+            s
+        };
+        for (num_dist, n_syms, max_clusters) in [
+            (3usize, 50usize, 256usize),
+            (40, 3000, 256),
+            (700, 20000, 256),
+            (7425, 30000, 128),
+            (900, 800, 4),
+            (64, 100000, 256),
+        ] {
+            // Contexts fall into a few behaviours so clustering has
+            // something to find; most contexts stay empty.
+            let mut symbols: Vec<(u32, u32)> = Vec::with_capacity(n_syms);
+            for _ in 0..n_syms {
+                let ctx = (next() as usize % num_dist.min(300)) * (num_dist / num_dist.min(300));
+                let kind = ctx % 7;
+                let r = next();
+                let v = match kind {
+                    0 => 0,
+                    1 => r % 2,
+                    2 => r % 40,
+                    3 => (r % 16) * (r % 16),
+                    4 => 1 << (r % 18),
+                    5 => r % 3000,
+                    _ => r % 5,
+                };
+                symbols.push((ctx as u32, v));
+            }
+            let mut stats = ValueStats::new(num_dist);
+            for &(c, v) in &symbols {
+                stats.add(c, v);
+            }
+            let codes = EntropyCodes::build_clustered(&stats, 1, max_clusters).unwrap();
+            assert!(codes.configs.len() <= max_clusters);
+            let mut w = BitWriter::new();
+            w.write_bits(3, 0b011);
+            codes.write_prelude(&mut w);
+            codes.write_symbols(&mut w, symbols.iter().copied());
+            w.write_bits(5, 0b10101);
+            let bytes = w.into_bytes();
+            let mut br = BitReader::new(&bytes);
+            assert_eq!(br.read_bits(3).unwrap(), 0b011);
+            let mut es = EntropyStream::read(&mut br, num_dist)
+                .unwrap_or_else(|e| panic!("{num_dist} contexts: prelude: {e}"));
+            let first_bad = es
+                .cluster_map
+                .iter()
+                .zip(&codes.cluster_map)
+                .position(|(a, b)| a != b);
+            assert_eq!(
+                first_bad,
+                None,
+                "{num_dist} contexts: cluster map differs: read {:?} wrote {:?} ({} clusters, coding {:?})",
+                first_bad.map(|i| es.cluster_map[i]),
+                first_bad.map(|i| codes.cluster_map[i]),
+                codes.configs.len(),
+                codes.coding()
+            );
+            es.read_ans_state_init(&mut br).unwrap();
+            let mut hy = HybridUintState::new(es.lz77, es.lz_len_conf);
+            for (i, &(c, v)) in symbols.iter().enumerate() {
+                let got = decode_uint_in_with_dist_pub(&mut hy, &mut es, &mut br, c, 0)
+                    .unwrap_or_else(|e| panic!("{num_dist} contexts: symbol {i}: {e}"));
+                assert_eq!(got, v, "{num_dist} contexts: symbol {i} ctx {c}");
+            }
+            assert_eq!(
+                br.read_bits(5).unwrap(),
+                0b10101,
+                "{num_dist} contexts: tail"
+            );
+        }
+    }
+
+    #[test]
+    fn heavily_skewed_byte_streams_round_trip() {
+        // The shape of a general cluster map: thousands of zeros with a
+        // few other indices sprinkled in.
+        for n in [100usize, 2000, 7425, 40000] {
+            let mut syms = vec![(0u32, 0u32); n];
+            for (i, s) in syms.iter_mut().enumerate() {
+                if i % 97 == 24 {
+                    s.1 = 1 + (i as u32 / 97) % 6;
+                }
+                if i % 1013 == 500 {
+                    s.1 = 200;
+                }
+            }
+            round_trip(
+                || SymbolStats::single(1, HybridConfig::BYTES).unwrap(),
+                &syms,
+            );
+        }
     }
 
     #[test]

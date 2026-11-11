@@ -354,15 +354,24 @@ pub fn make_decoder(params: &CodecParameters) -> oxideav_core::Result<Box<dyn De
 ///
 /// | key | kind | default | meaning |
 /// |---|---|---|---|
-/// | `quality` | u32 `0..=100` | `100` | `100` = lossless Modular; below it the residual quantiser of [`crate::encoder::quantizer_for_quality`] |
+/// | `quality` | u32 `0..=100` | `100` | `100` = lossless Modular; below it lossy — VarDCT for 8-bit sRGB input, the residual quantiser of [`crate::encoder::quantizer_for_quality`] otherwise |
 /// | `container` | bool | `false` | always write the 18181-2 box file (a bare codestream otherwise, unless Exif / XMP blobs need boxes) |
 /// | `group_size_shift` | u32 `0..=3` | `1` | `group_dim = 128 << shift` |
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// | `distance` | f32 | `0` | lossy target as a distance (`0` = use `quality`) |
+/// | `modular` | bool | `false` | keep lossy requests on the Modular coder |
+/// | `effort` | `fast` / `balanced` / `thorough` | `balanced` | context-modelling effort |
+#[derive(Clone, Debug, PartialEq)]
 #[non_exhaustive]
 pub struct JxlEncoderOptions {
     pub quality: u32,
     pub container: bool,
     pub group_size_shift: u32,
+    /// Lossy target as a distance (`0` = unset: `quality` decides).
+    pub distance: f32,
+    /// Keep lossy requests on the Modular coder.
+    pub modular: bool,
+    /// `fast` / `balanced` / `thorough`.
+    pub effort: String,
 }
 
 impl Default for JxlEncoderOptions {
@@ -371,6 +380,9 @@ impl Default for JxlEncoderOptions {
             quality: 100,
             container: false,
             group_size_shift: 1,
+            distance: 0.0,
+            modular: false,
+            effort: "balanced".into(),
         }
     }
 }
@@ -410,10 +422,28 @@ impl JxlEncoderOptions {
                 "jxl encoder: group_size_shift must be in 0..=3",
             ));
         }
+        if !self.distance.is_finite() || self.distance < 0.0 {
+            return Err(oxideav_core::Error::invalid(
+                "jxl encoder: distance must be a non-negative number",
+            ));
+        }
+        let effort = match self.effort.as_str() {
+            "fast" => crate::options::Effort::Fast,
+            "balanced" => crate::options::Effort::Balanced,
+            "thorough" => crate::options::Effort::Thorough,
+            other => {
+                return Err(oxideav_core::Error::invalid(format!(
+                    "jxl encoder: effort {other:?} (fast / balanced / thorough)"
+                )));
+            }
+        };
         Ok(EncodeOptions::new()
             .with_quality(self.quality as u8)
             .with_container(self.container)
-            .with_group_size_shift(self.group_size_shift as u8))
+            .with_group_size_shift(self.group_size_shift as u8)
+            .with_distance((self.distance > 0.0).then_some(self.distance))
+            .with_modular(self.modular)
+            .with_effort(effort))
     }
 }
 
@@ -423,7 +453,7 @@ impl CodecOptionsStruct for JxlEncoderOptions {
             name: "quality",
             kind: OptionKind::U32,
             default: OptionValue::U32(100),
-            help: "0..=100; 100 = lossless Modular, lower quantises the Modular residuals",
+            help: "0..=100; 100 = lossless Modular, lower = lossy (VarDCT for 8-bit sRGB, quantised Modular otherwise)",
         },
         OptionField {
             name: "container",
@@ -437,6 +467,24 @@ impl CodecOptionsStruct for JxlEncoderOptions {
             default: OptionValue::U32(1),
             help: "0..=3; group_dim = 128 << shift",
         },
+        OptionField {
+            name: "distance",
+            kind: OptionKind::F32,
+            default: OptionValue::F32(0.0),
+            help: "lossy target as a distance (about 1 = visually lossless, larger = smaller); 0 = use quality",
+        },
+        OptionField {
+            name: "modular",
+            kind: OptionKind::Bool,
+            default: OptionValue::Bool(false),
+            help: "keep lossy requests on the Modular coder instead of VarDCT",
+        },
+        OptionField {
+            name: "effort",
+            kind: OptionKind::Enum(&["fast", "balanced", "thorough"]),
+            default: OptionValue::String(String::new()),
+            help: "context-modelling effort: fast / balanced (default) / thorough",
+        },
     ];
 
     fn apply(&mut self, key: &str, value: &OptionValue) -> oxideav_core::Result<()> {
@@ -444,6 +492,9 @@ impl CodecOptionsStruct for JxlEncoderOptions {
             "quality" => self.quality = value.as_u32()?,
             "container" => self.container = value.as_bool()?,
             "group_size_shift" => self.group_size_shift = value.as_u32()?,
+            "distance" => self.distance = value.as_f32()?,
+            "modular" => self.modular = value.as_bool()?,
+            "effort" => self.effort = value.as_str()?.to_string(),
             _ => unreachable!("guarded by SCHEMA"),
         }
         Ok(())
@@ -536,6 +587,12 @@ impl Encoder for JxlEncoder {
     fn flush(&mut self) -> oxideav_core::Result<()> {
         self.eof = true;
         Ok(())
+    }
+
+    fn set_execution_context(&mut self, ctx: &oxideav_core::ExecutionContext) {
+        // Groups are independent work units; the bytes written do not
+        // depend on the budget.
+        self.opts = self.opts.clone().with_threads(ctx.threads);
     }
 }
 

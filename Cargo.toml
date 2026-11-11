@@ -47,3 +47,10 @@ oxideav-png = { version = "0.1.11", default-features = false }
 # r195+ WP trace tests require sequential execution due to shared
 # thread-local trace state.
 serial_test = "3"
+
+# Encode / decode timing and peak-memory harness on a synthesised
+# picture (`cargo bench --bench codec -- <megapixels> <lossless|lossy>
+# <threads>`); a plain binary, no benchmarking framework.
+[[bench]]
+name = "codec"
+harness = false

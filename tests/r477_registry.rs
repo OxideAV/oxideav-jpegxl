@@ -106,7 +106,17 @@ fn encoder_is_registered_with_declared_layouts_and_quality_schema() {
     assert!(caps.lossless && caps.lossy);
     let schema = ctx.codecs.encoder_options_schema(&id).unwrap();
     let names: Vec<&str> = schema.iter().map(|f| f.name).collect();
-    assert_eq!(names, ["quality", "container", "group_size_shift"]);
+    assert_eq!(
+        names,
+        [
+            "quality",
+            "container",
+            "group_size_shift",
+            "distance",
+            "modular",
+            "effort"
+        ]
+    );
     assert!(ctx.containers.muxer_names().any(|n| n == CONTAINER_NAME));
     assert_eq!(
         ctx.containers.container_for_extension("jxl"),

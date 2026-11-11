@@ -222,7 +222,9 @@ uses the same label):
 ### Encoding
 
 `encode` / `encode_rgb8` / `encode_rgba8` / `encode_to` /
-`encode_all` write a `kModular` codestream (Annex H). Declared input
+`encode_all` write a `kModular` codestream (Annex H) when lossless and
+— for 8-bit sRGB input — a `kVarDCT` codestream (Annex I, XYB) when
+lossy. Declared input
 layouts — the same table in both directions, the output label is what
 `decode` returns:
 
@@ -242,13 +244,43 @@ layouts — the same table in both directions, the output label is what
   round-trips bit-exactly, on one-group and multi-group geometries
   (the committed tests pin 1×1 … 2100×40 and 513×257 pictures, every
   depth, and a black-box decoder agrees where one is installed).
-* **Quality < 100** quantises the Modular residuals: the MA-tree leaf
-  `multiplier` is `round(2^((100 − q) / 12))` at 8 bits (`q90 → 2`,
-  `q75 → 4`, `q50 → 18`, `q0 → 322`), scaled by `2^(bits − 8)` for
-  deeper samples, with closed-loop prediction so the error per sample
-  is bounded by the step. The size ladder is monotone on textured
-  content (`q50 < q90 < q100`, pinned); lower quality never yields a
-  larger file.
+* **Lossy** (`quality < 100`, or `EncodeOptions::distance` — about
+  `1.0` is visually lossless, `quality` maps to `(100 − q) / 10` down
+  to 50 and steeper below). 8-bit sRGB input (`Gray8` / `Ya8` /
+  `Rgb24` / `Rgba`, no ICC profile) is coded as **VarDCT in XYB**:
+  forward XYB from linear light (the inverse of L.2.2), an 8×8 DCT per
+  block, quantisation against the default dequantisation matrices
+  through `global_scale` × `HfMul`, chroma-from-luma with the default
+  correlation taken from the dequantised luma, the LF image as a
+  Modular sub-bitstream (learned MA tree, signalled LF weights), HF
+  coefficients in natural order under the I.4 context model with
+  clustered histograms, one `PassGroup` per 256×256 group; restoration
+  filters, noise, patches and splines off. Alpha is carried losslessly
+  next to the lossy colour. Anything else (16-bit, non-sRGB transfer or
+  primaries, ICC) — or everything with `EncodeOptions::modular` —
+  quantises the Modular residuals instead: the MA-tree leaf
+  `multiplier` is `round(2^((100 − q) / 12))` at 8 bits, scaled by
+  `2^(bits − 8)`, closed-loop, so the error per sample is bounded by
+  the step.
+* **Rate–distortion, VarDCT** (bytes / PSNR in dB through this
+  crate's decoder; a black-box encoder at its default effort for
+  reference — its distances are not on the same scale, compare at
+  matched sizes):
+
+  | distance | 1280×960 grey photo | 1280×960 RGB photo-like |
+  |---|---|---|
+  | 0.5 | 129 138 / 45.37 | 187 174 / 37.21 |
+  | 1 | 82 548 / 41.50 | 104 626 / 35.76 |
+  | 2 | 50 937 / 37.85 | 62 252 / 33.97 |
+  | 4 | 30 566 / 34.53 | 37 866 / 31.92 |
+  | 8 | 18 081 / 31.25 | 23 197 / 29.28 |
+  | black-box 0.5 / 1 | 232 908 / 50.55, 139 950 / 48.27 | 435 189 / 38.64, 214 968 / 37.61 |
+  | black-box 2 / 4 / 8 | 93 001 / 44.99, 60 426 / 41.12, 35 731 / 36.01 | 110 171 / 36.72, 67 916 / 35.53, 41 530 / 33.08 |
+
+  At matched sizes the black-box encoder is ahead by about 3 dB on the
+  grey photo and 1–2 dB on the colour one: variable block sizes,
+  adaptive quantisation and the restoration filters are not written
+  yet.
 * **Structure**: one global MA tree **learned from the picture** — a
   sample of it is scanned with the decoder's own property vector
   (Table H.4, previous-channel properties included) and every node
@@ -301,8 +333,10 @@ layouts — the same table in both directions, the output label is what
 
   Every file decodes bit-exactly in this crate and in the black-box
   decoder.
-* Not written: VarDCT (lossy XYB), delta palettes, the Squeeze
-  transform, LZ77, patches, splines, noise,
+* Not written: transforms other than DCT8×8, an adaptive
+  quantisation field, per-tile chroma-from-luma factors, Gaborish /
+  EPF, custom coefficient orders, progressive passes; delta palettes,
+  the Squeeze transform, LZ77, patches, splines, noise,
   upsampling, crops, previews, extra channels beyond one alpha, float
   samples, `bits_per_sample > 16`.
 
@@ -1127,8 +1161,11 @@ generated `cjxl` transcode pairs:
   pipeline would be wrong for them).
 - The LfFrame (`lf_level > 0`) dimension scaling `progressive-dc`
   needs.
-- On the encoder: VarDCT (lossy XYB) output, delta palettes, Squeeze,
-  LZ77, extra channels beyond one alpha, float samples.
+- On the encoder: VarDCT beyond DCT8×8 with a uniform quantisation
+  field (variable block sizes, adaptive quantisation, per-tile
+  chroma-from-luma, restoration filters, progressive passes), VarDCT
+  for 16-bit / non-sRGB input, delta palettes, Squeeze, LZ77, extra
+  channels beyond one alpha, float samples.
 
 Unsupported inputs surface as `Error::Unsupported` rather than a silent
 misparse.

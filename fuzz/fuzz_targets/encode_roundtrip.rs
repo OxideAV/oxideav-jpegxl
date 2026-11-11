@@ -1,7 +1,8 @@
 #![no_main]
 
 //! Encoder robustness + correctness target: a fuzz-chosen geometry,
-//! layout, depth, quality, group size and metadata set drive the
+//! layout, depth, quality, effort, coder (VarDCT / Modular), group
+//! size and metadata set drive the
 //! contract `encode` / `encode_all`; the output must parse (`probe` /
 //! `info`), decode, and — at quality 100 — reproduce the input samples
 //! and metadata bit for bit. Lossy output must decode to the same
@@ -9,8 +10,8 @@
 
 use libfuzzer_sys::fuzz_target;
 use oxideav_jpegxl::{
-    decode, decode_all, encode, encode_all, info, probe, AnimationInfo, ColorInfo, EncodeOptions,
-    Frame, JxlImage, Metadata, PixelFormat,
+    decode, decode_all, encode, encode_all, info, probe, AnimationInfo, ColorInfo, Effort,
+    EncodeOptions, Frame, JxlImage, Metadata, PixelFormat,
 };
 
 const FORMATS: [(PixelFormat, u8); 10] = [
@@ -77,10 +78,19 @@ fuzz_target!(|data: &[u8]| {
         .with_bits_per_sample(bits)
         .with_metadata(meta)
         .with_color(ColorInfo::srgb().with_primaries(if flags & 8 != 0 { 9 } else { 1 }));
+    // Bits 6..8 pick the effort; bit 5 keeps lossy requests on the
+    // Modular coder (VarDCT otherwise takes 8-bit sRGB input).
+    let effort = match flags >> 6 {
+        0 => Effort::Fast,
+        1 | 2 => Effort::Balanced,
+        _ => Effort::Thorough,
+    };
     let opts = EncodeOptions::new()
         .with_quality(quality)
         .with_group_size_shift(shift)
-        .with_container(flags & 16 != 0);
+        .with_container(flags & 16 != 0)
+        .with_modular(flags & 32 != 0)
+        .with_effort(effort);
     let out = encode(&image, &opts).expect("encode accepts every valid packed image");
     assert!(probe(&out));
     let i = info(&out).expect("own output parses");

@@ -774,7 +774,7 @@ impl Learner {
         let mut best = (node_cost - self.min_gain, usize::MAX, 0usize);
         let mut order: Vec<u32> = vec![0; n];
         for prop in 0..min_props {
-            if prop == 1 || self.thresholds[prop].is_empty() {
+            if self.thresholds[prop].is_empty() {
                 continue;
             }
             let nb = self.thresholds[prop].len() + 1;
