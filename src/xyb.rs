@@ -146,20 +146,25 @@ fn pow3_minus_cbrt_bias(gamma: f32, opsin_bias: f32, itscale: f32) -> f32 {
 /// dictionary is a Modular XYB frame recorded pre-CT). Hence:
 ///
 /// ```text
-/// X = X' × m_x_lf_unscaled / 128
-/// Y = Y' × m_y_lf_unscaled / 128
-/// B = (B' + Y') × m_b_lf_unscaled / 128
+/// X = X' × m_x_lf / 128
+/// Y = Y' × m_y_lf / 128
+/// B = (B' + Y') × m_b_lf / 128
 /// ```
+///
+/// with `m_*_lf` the weights on the wire (Table G.2). The
+/// [`LfChannelDequantization`] fields hold their `128 / m` divisors
+/// (round 487: the same representation for signalled and default
+/// weights), so each product above is a division by the field — the
+/// defaults give `X'/4096`, `Y'/512`, `(B' + Y')/256`.
 pub fn modular_xyb_rescale(
     y_prime: i32,
     x_prime: i32,
     b_prime: i32,
     lf_dequant: &LfChannelDequantization,
 ) -> (f32, f32, f32) {
-    const INV_SCALE: f32 = 1.0 / 128.0;
-    let x = (x_prime as f32) * lf_dequant.m_x_lf_unscaled * INV_SCALE;
-    let y = (y_prime as f32) * lf_dequant.m_y_lf_unscaled * INV_SCALE;
-    let b = ((b_prime + y_prime) as f32) * lf_dequant.m_b_lf_unscaled * INV_SCALE;
+    let x = (x_prime as f32) / lf_dequant.m_x_lf_unscaled;
+    let y = (y_prime as f32) / lf_dequant.m_y_lf_unscaled;
+    let b = ((b_prime + y_prime) as f32) / lf_dequant.m_b_lf_unscaled;
     (x, y, b)
 }
 
@@ -392,20 +397,33 @@ mod tests {
     }
 
     /// kModular preamble: rescale `(Y', X', B')` integer samples by
-    /// `m_*_lf_unscaled / 128` (the round-441 §L.2 erratum — the FDIS
-    /// prose omits the /128; see [`modular_xyb_rescale`]). The B
-    /// channel adds Y' before scaling per §L.2.2 first paragraph.
+    /// `m_*_lf / 128` (§L.2.2 with G.1.2's `m_*_lf_unscaled = m_*_lf /
+    /// 128`; see [`modular_xyb_rescale`]). The fields hold the `128 /
+    /// m` divisors, so the default weights 1/32, 1/4, 1/2 divide by
+    /// 4096, 512, 256. The B channel adds Y' before scaling.
     #[test]
     fn modular_xyb_rescale_applies_lf_multipliers() {
         let lf = LfChannelDequantization::default();
-        // Y'=10, X'=2, B'=3. With defaults m_x=4096, m_y=512, m_b=256:
-        //   X = 2 * 4096 / 128 = 64
-        //   Y = 10 * 512 / 128 = 40
-        //   B = (3 + 10) * 256 / 128 = 26
+        // Y'=10, X'=2, B'=3:
+        //   X = 2 / 4096
+        //   Y = 10 / 512
+        //   B = (3 + 10) / 256
         let (x, y, b) = modular_xyb_rescale(10, 2, 3, &lf);
-        assert!(approx_eq(x, 64.0, 1e-4), "X={x}");
-        assert!(approx_eq(y, 40.0, 1e-4), "Y={y}");
-        assert!(approx_eq(b, 26.0, 1e-4), "B={b}");
+        assert!(approx_eq(x, 2.0 / 4096.0, 1e-7), "X={x}");
+        assert!(approx_eq(y, 10.0 / 512.0, 1e-7), "Y={y}");
+        assert!(approx_eq(b, 13.0 / 256.0, 1e-7), "B={b}");
+        // Signalled weights m = 2, 4, 8 arrive as divisors 64, 32, 16:
+        // X = X' × m / 128.
+        let lf = LfChannelDequantization {
+            all_default: false,
+            m_x_lf_unscaled: 64.0,
+            m_y_lf_unscaled: 32.0,
+            m_b_lf_unscaled: 16.0,
+        };
+        let (x, y, b) = modular_xyb_rescale(10, 2, 3, &lf);
+        assert!(approx_eq(x, 2.0 * 2.0 / 128.0, 1e-7), "X={x}");
+        assert!(approx_eq(y, 10.0 * 4.0 / 128.0, 1e-7), "Y={y}");
+        assert!(approx_eq(b, 13.0 * 8.0 / 128.0, 1e-7), "B={b}");
     }
 
     /// Modular path produces a sane RGB triple from a small +ve XYB

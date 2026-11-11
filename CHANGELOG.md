@@ -44,13 +44,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   colour — `GlobalModular` for one-group frames, the Modular tail of
   every `PassGroup` otherwise); previously `Unsupported`.
 
+### Changed
+
+- Modular channel decode runs on rolling row state (the neighbours,
+  Table H.4 properties and the self-correcting predictor's history
+  are kept for two rows instead of being re-derived, with an
+  allocation, per sample); the sample-by-sample walk remains behind
+  the diagnostic hooks. Modular groups of a pass decode on the
+  `DecodeOptions::threads` budget. MA-tree learning in the encoder
+  samples sections and searches properties on the worker budget; the
+  tree, and so the file, is the same at every budget.
+
+- The inverse DCT tabulates its cosines once per transform size
+  instead of evaluating one per term of every vector (same values,
+  same order of operations: bit-identical output).
+- Fuzz: `encode_roundtrip` also drives the effort and the lossy coder
+  (VarDCT / Modular).
+
 ### Fixed
 
 - Decoder: signalled (non-default) `LfChannelDequantization` weights
   were used as read instead of as the `128 / m` divisors the LF
   dequantiser works with — any VarDCT stream with custom LF weights
   decoded with wrong LF. Pinned against a black-box decoder through
-  the encoder, which signals such weights.
+  the encoder, which signals such weights. The Modular-XYB rescale
+  (L.2.2) reads the same fields and now divides by them: signalled
+  weights decode as before (the round-441 fixtures hold), default
+  weights — previously scaled by `m` instead of `1/m` there — now
+  follow the same rule.
 - Entropy writer: an ANS stream whose hybrid configuration had a
   `split_exponent` above the alphabet's log size wrote an unreadable
   prelude (reachable through the general cluster map).

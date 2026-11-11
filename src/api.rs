@@ -433,12 +433,14 @@ pub fn decode_with(bytes: &[u8], opts: &DecodeOptions) -> Result<JxlImage> {
     if let Some(t) = &transcode {
         return decode_transcode_image(&opened, &prelude, t, None, true);
     }
-    let mut seq = decode_sequence(
-        &opened.codestream,
-        &prelude,
-        None,
-        SequenceMode::FirstPresented,
-    )?;
+    let mut seq = crate::par::with_decode_threads(opts.threads, || {
+        decode_sequence(
+            &opened.codestream,
+            &prelude,
+            None,
+            SequenceMode::FirstPresented,
+        )
+    })?;
     let frame = seq
         .frames
         .pop()
@@ -508,7 +510,9 @@ pub fn decode_all_with(bytes: &[u8], opts: &DecodeOptions) -> Result<Vec<Frame>>
     } else {
         SequenceMode::Layers
     };
-    let seq = decode_sequence(&opened.codestream, &prelude, None, mode)?;
+    let seq = crate::par::with_decode_threads(opts.threads, || {
+        decode_sequence(&opened.codestream, &prelude, None, mode)
+    })?;
     let anim = animation_info(&prelude.metadata);
     let mut out = Vec::with_capacity(seq.frames.len());
     for (i, f) in seq.frames.into_iter().enumerate() {

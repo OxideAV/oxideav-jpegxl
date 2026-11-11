@@ -90,6 +90,40 @@ pub fn decode_modular_group_into(
     pass_index: u32,
     group_index: u32,
 ) -> Result<()> {
+    if let Some(pixels) = decode_modular_group(br, fh, lf_global, pass_index, group_index)? {
+        paste_modular_group(&pixels, lf_global)?;
+    }
+    Ok(())
+}
+
+/// The decoded channels of one Modular group and where they go in the
+/// frame's Modular image.
+pub(crate) struct ModularGroupPixels {
+    image: ModularImage,
+    contributing: Vec<PerGroupChannel>,
+}
+
+/// Copy a decoded group into the frame's Modular image (G.4.2: "the
+/// decoded modular group data is then copied into the partially
+/// decoded GlobalModular image in the corresponding positions").
+pub(crate) fn paste_modular_group(
+    pixels: &ModularGroupPixels,
+    lf_global: &mut LfGlobal,
+) -> Result<()> {
+    copy_group_into_parent(&pixels.image, pixels.contributing.as_slice(), lf_global)
+}
+
+/// Decode one Modular group (G.4.2) without touching the frame's
+/// image: groups only read the shared global state, so they can be
+/// decoded on separate workers and pasted afterwards. `None` when the
+/// group carries no Modular data in this pass.
+pub(crate) fn decode_modular_group(
+    br: &mut BitReader<'_>,
+    fh: &FrameHeader,
+    lf_global: &LfGlobal,
+    pass_index: u32,
+    group_index: u32,
+) -> Result<Option<ModularGroupPixels>> {
     let num_groups = fh.num_groups();
     let num_passes = fh.passes.num_passes;
     if group_index as u64 >= num_groups {
@@ -184,7 +218,7 @@ pub fn decode_modular_group_into(
         // Nothing to decode in this group; the TOC slot may still
         // contain padding, but per spec the slot byte length is fixed
         // and the bit reader will simply not read further.
-        return Ok(());
+        return Ok(None);
     }
 
     // Read the inner ModularHeader (Table H.1).
@@ -270,12 +304,10 @@ pub fn decode_modular_group_into(
         )));
     }
 
-    // Copy decoded samples back into the parent image at the per-channel
-    // rectangle (x0, y0, w, h). Per spec: "The decoded modular group
-    // data is then copied into the partially decoded GlobalModular
-    // image in the corresponding positions."
-    copy_group_into_parent(&group_image, contributing.as_slice(), lf_global)?;
-    Ok(())
+    Ok(Some(ModularGroupPixels {
+        image: group_image,
+        contributing,
+    }))
 }
 
 /// Decode a single ModularLfGroup sub-bitstream (§C.5.2) and copy the

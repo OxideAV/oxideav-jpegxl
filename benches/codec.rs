@@ -13,7 +13,7 @@
 //! one operation; `decode` reads the file a previous `encode` run left
 //! in the directory named by `JXL_BENCH_DIR` (the system temp
 //! directory by default). Prints one line per operation with the
-//! median of three runs (one run for pictures above 4 MP).
+//! median of three runs.
 
 use std::time::Instant;
 
@@ -93,7 +93,7 @@ fn main() {
     let what = args.get(3).map(String::as_str).unwrap_or("both");
     let height = ((mp * 1.0e6 * 3.0 / 4.0).sqrt().round() as u32).max(8);
     let width = height * 4 / 3;
-    let runs = if mp > 4.0 { 1 } else { 3 };
+    let runs = 3;
     let dir = std::env::var("JXL_BENCH_DIR")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|_| std::env::temp_dir());

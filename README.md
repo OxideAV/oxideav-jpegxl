@@ -3,7 +3,8 @@
 [![CI](https://github.com/OxideAV/oxideav-jpegxl/actions/workflows/ci.yml/badge.svg)](https://github.com/OxideAV/oxideav-jpegxl/actions/workflows/ci.yml) [![crates.io](https://img.shields.io/crates/v/oxideav-jpegxl.svg)](https://crates.io/crates/oxideav-jpegxl) [![docs.rs](https://docs.rs/oxideav-jpegxl/badge.svg)](https://docs.rs/oxideav-jpegxl) [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 Pure-Rust **JPEG XL** (JXL, ISO/IEC 18181-1 codestream + 18181-2 box
-file format) decoder and Modular encoder, usable standalone or through
+file format) decoder and encoder (lossless Modular, lossy VarDCT),
+usable standalone or through
 the [oxideav](https://github.com/OxideAV/oxideav-workspace) framework. Built
 clean-room from the published specification and the conformance /
 behavioural-trace fixtures committed under `docs/image/jpegxl/` only —
@@ -14,9 +15,10 @@ The crate follows the workspace's image-crate API contract
 (`IMAGE_CRATE_API.md`): `probe` / `info` / `decode` / `decode_rgba8` /
 `decode_all` / `encode` / `encode_all` over a packed `JxlImage`, with
 `oxideav-core` optional behind the default-on `registry` feature. The
-decoder covers Modular and VarDCT codestreams; the encoder (round 477)
-writes Modular codestreams — lossless by default, quantised below
-quality 100 — with ICC / Exif / XMP carriage and animations.
+decoder covers Modular and VarDCT codestreams; the encoder writes
+Modular codestreams when lossless (learned MA trees, palettes) and
+VarDCT codestreams in XYB when lossy, with ICC / Exif / XMP carriage
+and animations.
 
 ## Standalone use
 
@@ -323,16 +325,48 @@ layouts — the same table in both directions, the output label is what
 
   | picture | r477 | now | black-box e1 / e3 / e7 / e9 |
   |---|---|---|---|
-  | 1280×960 grey photo | 447 570 | **335 659** | 478 023 / 374 361 / 345 427 / 338 111 |
-  | 1440×810 16-bit grey photo | 1 659 189 | **1 576 041** | 1 695 629 / 1 560 146 / 1 594 352 / 1 585 659 |
-  | 1280×960 RGB photo-like | 1 978 719 | **1 789 652** | 2 038 896 / 1 893 782 / 1 746 868 / 1 738 870 |
+  | 1280×960 grey photo | 447 570 | **338 042** | 478 023 / 374 361 / 345 427 / 338 111 |
+  | 1440×810 16-bit grey photo | 1 659 189 | **1 577 221** | 1 695 629 / 1 560 146 / 1 594 352 / 1 585 659 |
+  | 1280×960 RGB photo-like | 1 978 719 | **1 783 897** | 2 038 896 / 1 893 782 / 1 746 868 / 1 738 870 |
   | 640×480 pixel art, 14 colours | 10 300 | **2 310** | 4 386 / 5 706 / 2 329 / 2 262 |
-  | 1280×800 screenshot (text) | 127 211 | **58 221** | 106 545 / 111 034 / 79 260 / 54 147 |
-  | 1024×1024 RGBA triangles | 392 307 | **2 426** | 492 942 / 404 030 / 9 687 / 4 206 |
-  | 924×1386 16-bit RGBA logo | 2 726 962 | **1 343 437** | 3 404 627 / 3 210 948 / 888 081 / 755 407 |
+  | 1280×800 screenshot (text) | 127 211 | **57 286** | 106 545 / 111 034 / 79 260 / 54 147 |
+  | 1024×1024 RGBA triangles | 392 307 | **2 365** | 492 942 / 404 030 / 9 687 / 4 206 |
+  | 924×1386 16-bit RGBA logo | 2 726 962 | **1 338 243** | 3 404 627 / 3 210 948 / 888 081 / 755 407 |
 
   Every file decodes bit-exactly in this crate and in the black-box
-  decoder.
+  decoder. `Effort::Thorough` goes further where context modelling
+  pays (grey photo 296 252, 16-bit grey 1 508 055, screenshot 54 861,
+  logo 1 292 215) at five to fifteen times the encode time;
+  `Effort::Fast` gives 414 416 / 1 623 756 / 93 042 / 1 434 825 on the
+  same four in about a tenth of it.
+* **Time and memory** (`benches/codec.rs`, a synthesised photo-like
+  RGB picture; median of three, one process per measurement, peak
+  resident set of that process; an 18-core machine shared with other
+  builds, so read the ratios rather than the digits). "Before" is this
+  round's first VarDCT commit — for decoding, the round-477 decoder:
+
+  | 1 worker → 8 workers | 1 MP before | 1 MP now | 12 MP before | 12 MP now |
+  |---|---|---|---|---|
+  | lossless encode, ms | 960 → 1184 | 652 → 372 | 4240 → 1443 | 2258 → 772 |
+  | lossless decode, ms | 771 → 659 | 268 → 44 | 8411 → 4517 | 2289 → 575 |
+  | lossy (d 1) encode, ms | 244 → 180 | 118 → 81 | 1074 → 913 | 861 → 495 |
+  | lossy (d 1) decode, ms | 298 → 278 | 170 → 133 | 2307 → 2295 | 1264 → 1231 |
+  | lossless encode, peak MiB | 242 → 252 | 210 → 249 | 1048 → 1002 | 856 → 1053 |
+  | lossless decode, peak MiB | 47 → 49 | 45 → 67 | 384 → 384 | 374 → 435 |
+  | lossy encode, peak MiB | 77 → 78 | 75 → 94 | 418 → 418 | 394 → 424 |
+  | lossy decode, peak MiB | 52 → 52 | 51 → 51 | 388 → 379 | 388 → 389 |
+
+  What changed: Modular channel decode on rolling row state (no
+  per-sample allocation, no history planes), Modular groups decoded
+  and encoded on the worker budget, MA-tree learning sampled and
+  searched on the worker budget, the IDCT's cosines tabulated once per
+  size instead of evaluated per term, VarDCT groups colour-converted /
+  transformed / quantised / tokenised per group on the budget. The
+  bytes written and the pixels decoded are the same at every budget
+  (`EncodeOptions::threads`, `DecodeOptions::threads`; the registry
+  encoder takes the framework's `ExecutionContext`). VarDCT decode is
+  still serial, and the lossless encoder still holds every residual
+  symbol (about 24 bytes per pixel) until the histograms are built.
 * Not written: transforms other than DCT8×8, an adaptive
   quantisation field, per-tile chroma-from-luma factors, Gaborish /
   EPF, custom coefficient orders, progressive passes; delta palettes,
@@ -350,23 +384,31 @@ dimension, `2^30` max pixels, `strict = false`, `coalesce = true`):
 | `max_width`, `max_height`, `max_pixels`, `max_bytes` | checked against the headers **before** any pixel buffer is allocated; `None` = unlimited; a hit is `Error::LimitExceeded`. `max_bytes` bounds the native output size (`width × height × channels × bytes_per_sample`) — the decoder's working set is about four bytes per sample per channel on top |
 | `strict` | reject trailing bytes after the `is_last` frame of a raw codestream (a box file's structure is always validated) |
 | `coalesce` | `decode_all` composes frames onto the canvas per §C.2 and returns only presented frames (`true`), or returns every frame of the array as decoded — frame-rectangle geometry, un-blended, un-oriented, `Frame::x` / `y` offsets, zero-duration layers included (`false`) |
+| `threads` | worker budget (default `1`): Modular groups decode on that many workers; the pixels never depend on it |
 
 `decode` is always the first **presented** frame, §C.2-composed over
 any preceding layers and oriented (Table A.17) — for a multi-layer
 still image that is the finished picture, not the bare first layer.
 
 `EncodeOptions` (`Default`: `quality = 100`, `container = false`,
-`group_size_shift = 1`, `animation = None`):
+`group_size_shift = 1`, `animation = None`, `effort = Balanced`,
+`distance = None`, `modular = false`, `threads = 1`):
 
 | Field | Meaning |
 |---|---|
-| `quality` | `0..=100`; `100` = lossless Modular, below it the residual quantiser `round(2^((100 − q) / 12))` scaled with the depth (see *Encoding*) |
-| `container` | always write the 18181-2 box file; otherwise a bare codestream unless Exif / XMP need boxes |
-| `group_size_shift` | `group_dim = 128 << shift`, `0..=3` |
-| `animation` | `AnimationInfo` (tick rate, loops) for `encode_all`; `None` = 1000 Hz tick, frame delays in ms |
+| `quality` | `0..=100`; `100` = lossless Modular; below it lossy — VarDCT at distance `(100 − q) / 10` (steeper under 50) for 8-bit sRGB input, the Modular residual quantiser otherwise (see *Encoding*) |
+| `distance` | lossy target as a distance instead (`Some(0.0)` = lossless, about `1.0` visually lossless); overrides `quality` |
+| `modular` | keep lossy requests on the Modular coder |
+| `effort` | `Fast` / `Balanced` / `Thorough`: how much the Modular coder learns; never changes the pixels |
+| `threads` | worker budget for per-group work; the bytes are the same at every budget |
+| `container` | always write the 18181-2 box file |
+| `group_size_shift` | `group_dim = 128 << shift`, `0..=3` (Modular frames) |
+| `animation` | tick rate and loop count for `encode_all` |
 
 The registry schema (`registry::JxlEncoderOptions`) carries `quality`
-/ `container` / `group_size_shift` under the same names.
+/ `container` / `group_size_shift` / `distance` / `modular` / `effort`
+under the same names; the worker budget comes from the framework's
+`ExecutionContext`.
 
 ## Metadata and colour
 

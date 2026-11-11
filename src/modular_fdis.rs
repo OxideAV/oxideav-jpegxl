@@ -1900,6 +1900,16 @@ pub fn decode_channels_at_stream(
     // pixel-decode call against the stream.
     tree.entropy.read_ans_state_init(br)?;
 
+    // The production path: one rolling-row scan per channel. The
+    // sample-by-sample walk below is kept for the diagnostic hooks
+    // (leaf-pick traces, rich logs, the rounding-bias override) and
+    // for trees the fast walker does not take.
+    if !diagnostics_armed()
+        && let Some(fast) = FastTree::new(tree)
+    {
+        return decode_channels_fast(br, descs, tree, &fast, wp, stream_index);
+    }
+
     let mut channels: Vec<Vec<i32>> = Vec::with_capacity(descs.len());
     for d in descs.iter() {
         let n = (d.width as usize).saturating_mul(d.height as usize);
@@ -2194,6 +2204,179 @@ pub fn decode_channels_at_stream(
     }
 
     Ok(img)
+}
+
+/// Any per-sample diagnostic hook of [`decode_channels_at_stream`] is
+/// switched on for this thread (or the rounding bias is overridden).
+fn diagnostics_armed() -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    let (rich_lo, rich_hi) = rich_range_snapshot();
+    LEAF_PICK_TRACE_TARGET.load(Relaxed) != u64::MAX
+        || LEAF_PICK_LOG_ENABLED.load(Relaxed)
+        || (rich_lo != u32::MAX && rich_hi != u32::MAX)
+        || WP_ROUND_BIAS.load(Relaxed) != 3
+        || WP_DEEP_TRACE_ARMED.with(|c| c.get())
+}
+
+/// The MA tree flattened for the scan-based decode loop.
+struct FastTree {
+    nodes: Vec<crate::modular_enc::Node>,
+    /// Previous channels whose properties some decision reads.
+    max_prev: usize,
+    uses_wp: bool,
+}
+
+impl FastTree {
+    /// `None` when the tree is not one the fast walker takes (a child
+    /// or context index out of range — the reference walk reports
+    /// those at the sample that reaches them).
+    fn new(tree: &MaTreeFdis) -> Option<Self> {
+        use crate::modular_enc::Node;
+        let n = tree.nodes.len();
+        let mut nodes = Vec::with_capacity(n);
+        let mut max_prop = 0u32;
+        let mut uses_wp = false;
+        for (k, node) in tree.nodes.iter().enumerate() {
+            match node {
+                MaNode::Decision {
+                    property,
+                    value,
+                    left_child,
+                    right_child,
+                } => {
+                    // Children lie strictly ahead, so every walk ends.
+                    let (l, r) = (*left_child as usize, *right_child as usize);
+                    if l >= n || r >= n || l <= k || r <= k || *property > 4096 {
+                        return None;
+                    }
+                    max_prop = max_prop.max(*property);
+                    uses_wp |= *property == 15;
+                    nodes.push(Node::Split {
+                        prop: *property,
+                        value: *value,
+                        gt: *left_child,
+                        le: *right_child,
+                    });
+                }
+                MaNode::Leaf(l) => {
+                    if l.ctx as usize >= tree.num_ctx || l.predictor > 13 {
+                        return None;
+                    }
+                    uses_wp |= l.predictor == 6;
+                    nodes.push(Node::Leaf {
+                        ctx: l.ctx,
+                        predictor: l.predictor,
+                        offset: l.offset,
+                        multiplier: l.multiplier,
+                    });
+                }
+            }
+        }
+        Some(Self {
+            nodes,
+            max_prev: (max_prop as usize + 1).saturating_sub(16).div_ceil(4),
+            uses_wp,
+        })
+    }
+
+    /// `(ctx, predictor, offset, multiplier)` of the leaf `props` reach.
+    #[inline]
+    fn leaf(&self, props: &[i32]) -> (u32, u32, i32, u32) {
+        use crate::modular_enc::Node;
+        let mut k = 0usize;
+        loop {
+            match self.nodes[k] {
+                Node::Split {
+                    prop,
+                    value,
+                    gt,
+                    le,
+                } => {
+                    k = if props[prop as usize] > value { gt } else { le } as usize;
+                }
+                Node::Leaf {
+                    ctx,
+                    predictor,
+                    offset,
+                    multiplier,
+                } => return (ctx, predictor, offset, multiplier),
+            }
+        }
+    }
+}
+
+/// [`decode_channels_at_stream`] on rolling row state: the same
+/// neighbours, properties, self-correcting prediction and sample
+/// arithmetic, without per-sample allocation or history planes.
+fn decode_channels_fast(
+    br: &mut BitReader<'_>,
+    descs: &[ChannelDesc],
+    tree: &mut MaTreeFdis,
+    fast: &FastTree,
+    wp: &WpHeader,
+    stream_index: i32,
+) -> Result<ModularImage> {
+    use crate::modular_enc::{Chan, ScanParams, WpParams, predict as predict_sample};
+    let dist_multiplier = descs.iter().map(|d| d.width).max().unwrap_or(0);
+    let mut chans: Vec<Chan> = descs
+        .iter()
+        .map(|d| {
+            let (w, h) = (d.width as usize, d.height as usize);
+            let mut c = Chan::new(w, h, vec![0i32; w.saturating_mul(h)]);
+            c.hshift = d.hshift;
+            c.vshift = d.vshift;
+            c
+        })
+        .collect();
+    let params = ScanParams {
+        stream_index,
+        wp: fast.uses_wp.then_some(WpParams {
+            p1: i64::from(wp.p1),
+            p2: i64::from(wp.p2),
+            p3: [
+                i64::from(wp.p3a),
+                i64::from(wp.p3b),
+                i64::from(wp.p3c),
+                i64::from(wp.p3d),
+                i64::from(wp.p3e),
+            ],
+            w: [
+                u64::from(wp.w0),
+                u64::from(wp.w1),
+                u64::from(wp.w2),
+                u64::from(wp.w3),
+            ],
+        }),
+        max_prev: fast.max_prev,
+    };
+    for i in 0..chans.len() {
+        crate::modular_enc::try_scan_channel(&mut chans, i, &params, |s| {
+            let (ctx, predictor, offset, multiplier) = fast.leaf(s.props);
+            let token = decode_uint_in_with_dist(
+                &mut tree.hybrid,
+                &mut tree.entropy,
+                br,
+                ctx,
+                dist_multiplier,
+            )?;
+            let diff = unpack_signed(token);
+            let p = predict_sample(predictor, &s.nb, s.wp);
+            let val = i64::from(diff)
+                .saturating_mul(i64::from(multiplier))
+                .saturating_add(i64::from(offset))
+                .saturating_add(i64::from(p));
+            if !(i64::from(i32::MIN)..=i64::from(i32::MAX)).contains(&val) {
+                return Err(Error::InvalidData(format!(
+                    "JXL Modular: decoded sample value {val} out of i32 range"
+                )));
+            }
+            Ok(val as i32)
+        })?;
+    }
+    Ok(ModularImage {
+        channels: chans.into_iter().map(|c| c.data).collect(),
+        descs: descs.to_vec(),
+    })
 }
 
 /// Public diagnostic re-export of `decode_uint_in_with_dist` for use by

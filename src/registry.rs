@@ -360,7 +360,7 @@ pub fn make_decoder(params: &CodecParameters) -> oxideav_core::Result<Box<dyn De
 /// | `distance` | f32 | `0` | lossy target as a distance (`0` = use `quality`) |
 /// | `modular` | bool | `false` | keep lossy requests on the Modular coder |
 /// | `effort` | `fast` / `balanced` / `thorough` | `balanced` | context-modelling effort |
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 #[non_exhaustive]
 pub struct JxlEncoderOptions {
     pub quality: u32,
@@ -373,6 +373,20 @@ pub struct JxlEncoderOptions {
     /// `fast` / `balanced` / `thorough`.
     pub effort: String,
 }
+
+impl PartialEq for JxlEncoderOptions {
+    fn eq(&self, other: &Self) -> bool {
+        // The distance compares by bit pattern so equality stays total.
+        self.quality == other.quality
+            && self.container == other.container
+            && self.group_size_shift == other.group_size_shift
+            && self.distance.to_bits() == other.distance.to_bits()
+            && self.modular == other.modular
+            && self.effort == other.effort
+    }
+}
+
+impl Eq for JxlEncoderOptions {}
 
 impl Default for JxlEncoderOptions {
     fn default() -> Self {

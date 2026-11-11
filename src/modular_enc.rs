@@ -82,7 +82,7 @@ impl Section {
 
 /// What the callback of [`scan_channel`] sees for one sample.
 pub(crate) struct Sample<'a> {
-    pub props: &'a [i32; MAX_PROPS],
+    pub props: &'a [i32],
     /// Properties that exist for this channel (`16 + 4 ×` matching
     /// previous channels, capped at [`MAX_PROPS`]).
     pub nprops: usize,
@@ -142,15 +142,43 @@ const DIV24: [u32; 65] = {
     t
 };
 
-/// Default `WPHeader` parameters (H.5.1).
-const WP_P1: i64 = 16;
-const WP_P2: i64 = 10;
-const WP_P3: [i64; 5] = [7, 7, 7, 0, 0];
-const WP_W: [u64; 4] = [13, 12, 12, 12];
+/// `WPHeader` parameters (H.5.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct WpParams {
+    pub p1: i64,
+    pub p2: i64,
+    pub p3: [i64; 5],
+    pub w: [u64; 4],
+}
+
+impl Default for WpParams {
+    fn default() -> Self {
+        Self {
+            p1: 16,
+            p2: 10,
+            p3: [7, 7, 7, 0, 0],
+            w: [13, 12, 12, 12],
+        }
+    }
+}
+
+/// What a scan computes per sample.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ScanParams {
+    /// Stream index (property 1).
+    pub stream_index: i32,
+    /// Run the self-correcting predictor (`Some`) or leave its
+    /// prediction and property 15 at zero.
+    pub wp: Option<WpParams>,
+    /// Previous channels whose four properties each are filled in.
+    pub max_prev: usize,
+}
 
 #[inline]
 fn error2weight(err_sum: u32, maxweight: u64) -> u64 {
-    let bits = 32 - (err_sum.wrapping_add(1)).leading_zeros();
+    // `err_sum + 1` in 64 bits: the sum is taken modulo 2^32 and may
+    // be `u32::MAX` on hostile input.
+    let bits = 64 - (u64::from(err_sum) + 1).leading_zeros();
     let shift = bits.saturating_sub(1).saturating_sub(5);
     let denom = ((err_sum >> shift) as usize + 1).min(64);
     4 + ((maxweight * u64::from(DIV24[denom])) >> shift)
@@ -158,6 +186,7 @@ fn error2weight(err_sum: u32, maxweight: u64) -> u64 {
 
 /// Rolling state of the self-correcting predictor for one channel.
 struct WpRows {
+    params: WpParams,
     te_prev: Vec<i32>,
     te_cur: Vec<i32>,
     se_prev: [Vec<i32>; 4],
@@ -165,8 +194,9 @@ struct WpRows {
 }
 
 impl WpRows {
-    fn new(w: usize) -> Self {
+    fn new(w: usize, params: WpParams) -> Self {
         Self {
+            params,
             te_prev: vec![0; w],
             te_cur: vec![0; w],
             se_prev: std::array::from_fn(|_| vec![0; w]),
@@ -205,21 +235,22 @@ impl WpRows {
         };
         let p0 = w8.wrapping_add(ne8).wrapping_sub(n8);
         let p1 = n8.wrapping_sub(
-            (((i64::from(te_w) + i64::from(te_n) + i64::from(te_ne)) * WP_P1) >> 5) as i32,
+            (((i64::from(te_w) + i64::from(te_n) + i64::from(te_ne)) * self.params.p1) >> 5) as i32,
         );
         let p2 = w8.wrapping_sub(
-            (((i64::from(te_w) + i64::from(te_n) + i64::from(te_nw)) * WP_P2) >> 5) as i32,
+            (((i64::from(te_w) + i64::from(te_n) + i64::from(te_nw)) * self.params.p2) >> 5) as i32,
         );
         let p3 = n8.wrapping_sub(
-            ((i64::from(te_nw) * WP_P3[0]
-                + i64::from(te_n) * WP_P3[1]
-                + i64::from(te_ne) * WP_P3[2]
-                + (i64::from(nn8) - i64::from(n8)) * WP_P3[3]
-                + (i64::from(nw8) - i64::from(w8)) * WP_P3[4])
+            ((i64::from(te_nw) * self.params.p3[0]
+                + i64::from(te_n) * self.params.p3[1]
+                + i64::from(te_ne) * self.params.p3[2]
+                + (i64::from(nn8) - i64::from(n8)) * self.params.p3[3]
+                + (i64::from(nw8) - i64::from(w8)) * self.params.p3[4])
                 >> 5) as i32,
         );
         let preds = [p0, p1, p2, p3];
         let mut weights = [0u64; 4];
+        #[allow(clippy::needless_range_loop)] // k indexes four parallel arrays
         for k in 0..4 {
             let n_se = if y > 0 { self.se_prev[k][x] } else { 0 };
             let w_se = if x > 0 { self.se_cur[k][x - 1] } else { 0 };
@@ -243,7 +274,7 @@ impl WpRows {
             if x + 1 == w {
                 err_sum = (err_sum + w_se as u64) & 0xFFFF_FFFF;
             }
-            weights[k] = error2weight(err_sum as u32, WP_W[k]);
+            weights[k] = error2weight(err_sum as u32, self.params.w[k]);
         }
         let sum_pre = weights[0] + weights[1] + weights[2] + weights[3];
         let log_weight = 64 - sum_pre.leading_zeros();
@@ -255,16 +286,20 @@ impl WpRows {
             weights[3] >> sh,
         ];
         let sum = shifted[0] + shifted[1] + shifted[2] + shifted[3];
+        if sum == 0 {
+            // All-zero weight parameters: the decoder's fallback.
+            return (w8.wrapping_add(n8).wrapping_sub(nw8), preds, 0);
+        }
         let mut s: i64 = (sum >> 1) as i64 - 1;
         for (p, sh) in preds.iter().zip(&shifted) {
             s += i64::from(*p) * *sh as i64;
         }
-        let recip = if (1..=64).contains(&sum) {
+        let recip = if sum <= 64 {
             i64::from(DIV24[sum as usize])
         } else {
-            (1i64 << 24) / (sum as i64).max(1)
+            (1i64 << 24) / sum as i64
         };
-        let mut prediction = ((s * recip) >> 24) as i32;
+        let mut prediction = (s.wrapping_mul(recip) >> 24) as i32;
         if (te_n ^ te_w) | (te_n ^ te_nw) <= 0 {
             let lo = w8.min(n8).min(ne8);
             let hi = w8.max(n8).max(ne8);
@@ -307,21 +342,48 @@ pub(crate) fn scan_channel<F>(
 ) where
     F: FnMut(&Sample<'_>) -> i32,
 {
+    let params = ScanParams {
+        stream_index,
+        wp: use_wp.then(WpParams::default),
+        max_prev: MAX_PREV,
+    };
+    let done: Result<(), std::convert::Infallible> =
+        try_scan_channel(chans, i, &params, |s| Ok(f(s)));
+    match done {
+        Ok(()) => {}
+        Err(never) => match never {},
+    }
+}
+
+/// [`scan_channel`] with every knob and a fallible callback: the walk
+/// stops at the first error. `Sample::props` has `16 + 4 ×
+/// params.max_prev` entries; those of previous channels that do not
+/// exist are zero.
+pub(crate) fn try_scan_channel<F, E>(
+    chans: &mut [Chan],
+    i: usize,
+    params: &ScanParams,
+    mut f: F,
+) -> Result<(), E>
+where
+    F: FnMut(&Sample<'_>) -> Result<i32, E>,
+{
+    let stream_index = params.stream_index;
     let (prev, rest) = chans.split_at_mut(i);
     let cur = &mut rest[0];
     let (w, h) = (cur.w, cur.h);
     if w == 0 || h == 0 {
-        return;
+        return Ok(());
     }
     let refs: Vec<&Chan> = prev
         .iter()
         .rev()
         .filter(|p| p.w == w && p.h == h && p.hshift == cur.hshift && p.vshift == cur.vshift)
-        .take(MAX_PREV)
+        .take(params.max_prev)
         .collect();
     let nprops = BASE_PROPS + 4 * refs.len();
-    let mut wp_rows = use_wp.then(|| WpRows::new(w));
-    let mut props = [0i32; MAX_PROPS];
+    let mut wp_rows = params.wp.map(|p| WpRows::new(w, p));
+    let mut props = vec![0i32; BASE_PROPS + 4 * params.max_prev];
     props[0] = i as i32;
     props[1] = stream_index;
     let d = &mut cur.data;
@@ -414,7 +476,7 @@ pub(crate) fn scan_channel<F>(
                 wp: pred8.wrapping_add(3) >> 3,
                 value: d[row + x],
             };
-            let v = f(&sample);
+            let v = f(&sample)?;
             d[row + x] = v;
             if let Some(rows) = &mut wp_rows {
                 rows.store(x, pred8, &preds, v);
@@ -424,6 +486,7 @@ pub(crate) fn scan_channel<F>(
             rows.next_row();
         }
     }
+    Ok(())
 }
 
 // ---- the tree ------------------------------------------------------------
@@ -441,6 +504,7 @@ pub(crate) enum Node {
     Leaf {
         ctx: u32,
         predictor: u32,
+        offset: i32,
         multiplier: u32,
     },
 }
@@ -503,6 +567,7 @@ fn finish_tree(arena: &[Build], root: usize, multiplier: u32) -> Tree {
                 nodes.push(Node::Leaf {
                     ctx: num_ctx,
                     predictor,
+                    offset: 0,
                     multiplier,
                 });
                 num_ctx += 1;
@@ -525,7 +590,7 @@ impl Tree {
 
     /// `(context, predictor, multiplier)` of the leaf `props` reach.
     #[inline]
-    pub(crate) fn leaf(&self, props: &[i32; MAX_PROPS]) -> (u32, u32, u32) {
+    pub(crate) fn leaf(&self, props: &[i32]) -> (u32, u32, u32) {
         let mut k = 0usize;
         loop {
             match self.nodes[k] {
@@ -541,6 +606,7 @@ impl Tree {
                     ctx,
                     predictor,
                     multiplier,
+                    ..
                 } => return (ctx, predictor, multiplier),
             }
         }
@@ -633,6 +699,8 @@ pub(crate) struct LearnParams {
     pub multiplier: u32,
     /// Offer the self-correcting predictor and property 15.
     pub use_wp: bool,
+    /// Worker budget (the learned tree does not depend on it).
+    pub threads: usize,
 }
 
 impl Default for LearnParams {
@@ -643,6 +711,7 @@ impl Default for LearnParams {
             max_leaves: 768,
             multiplier: 1,
             use_wp: true,
+            threads: 1,
         }
     }
 }
@@ -675,10 +744,23 @@ const MAX_THRESHOLDS: usize = 63;
 /// Predictors kept in lock-step during a node's split search.
 const SEARCH_PREDICTORS: usize = 3;
 
+/// What the split search of one node shares across properties.
+struct NodeStats<'a> {
+    idx: &'a [u32],
+    /// Predictors kept in lock-step.
+    search: &'a [u32],
+    /// Token histogram of the node per search predictor, its
+    /// `Σ c·log2(c)` and its extra bits.
+    total: &'a [[u32; TOKENS]],
+    total_s: &'a [f64],
+    total_extra: &'a [u64],
+}
+
 struct Learner {
     n: usize,
-    /// `n × MAX_PROPS` threshold buckets.
-    bucket: Vec<u8>,
+    /// Threshold bucket of every sample, one column per property.
+    bucket: Vec<Vec<u8>>,
+    threads: usize,
     /// `n × NUM_PREDICTORS` residual tokens.
     tok: Vec<u8>,
     /// Properties available per sample.
@@ -736,6 +818,76 @@ impl Learner {
         out
     }
 
+    /// The cheapest threshold of `prop` for a node: `(cost of the two
+    /// sides, bucket index)`, or `None` when the property cannot split
+    /// it.
+    fn best_split(&self, node: &NodeStats<'_>, prop: usize) -> Option<(f64, usize)> {
+        if self.thresholds[prop].is_empty() {
+            return None;
+        }
+        let idx = node.idx;
+        let n = idx.len();
+        let k_n = node.search.len();
+        let column = &self.bucket[prop];
+        let nb = self.thresholds[prop].len() + 1;
+        // Counting sort by bucket.
+        let mut starts = vec![0usize; nb + 1];
+        for &s in idx {
+            starts[column[s as usize] as usize + 1] += 1;
+        }
+        if starts.iter().filter(|&&c| c > 0).count() < 2 {
+            return None;
+        }
+        for b in 0..nb {
+            starts[b + 1] += starts[b];
+        }
+        let mut order: Vec<u32> = vec![0; n];
+        let mut fill = starts.clone();
+        for &s in idx {
+            let b = column[s as usize] as usize;
+            order[fill[b]] = s;
+            fill[b] += 1;
+        }
+        let mut left = vec![[0u32; TOKENS]; k_n];
+        let mut right = node.total.to_vec();
+        let mut s_left = vec![0.0f64; k_n];
+        let mut s_right = node.total_s.to_vec();
+        let mut extra_left = vec![0u64; k_n];
+        let mut best: Option<(f64, usize)> = None;
+        for b in 0..nb - 1 {
+            for &s in &order[starts[b]..starts[b + 1]] {
+                for (k, &p) in node.search.iter().enumerate() {
+                    let t = self.tok[s as usize * NUM_PREDICTORS + p as usize] as usize;
+                    let cl = left[k][t];
+                    s_left[k] += self.f(cl + 1) - self.f(cl);
+                    left[k][t] = cl + 1;
+                    let cr = right[k][t];
+                    s_right[k] += self.f(cr - 1) - self.f(cr);
+                    right[k][t] = cr - 1;
+                    extra_left[k] += u64::from(token_extra_bits(t as u8));
+                }
+            }
+            let n_left = starts[b + 1];
+            let n_right = n - n_left;
+            if starts[b + 1] == starts[b] || n_left < 12 || n_right < 12 {
+                continue;
+            }
+            let mut cl = f64::INFINITY;
+            let mut cr = f64::INFINITY;
+            for k in 0..k_n {
+                cl = cl.min(self.f(n_left as u32) - s_left[k] + extra_left[k] as f64);
+                cr = cr.min(
+                    self.f(n_right as u32) - s_right[k]
+                        + (node.total_extra[k] - extra_left[k]) as f64,
+                );
+            }
+            if best.is_none_or(|(c, _)| cl + cr < c) {
+                best = Some((cl + cr, b));
+            }
+        }
+        best
+    }
+
     fn build(&mut self, idx: Vec<u32>, depth: usize) -> usize {
         let costs = self.predictor_costs(&idx);
         let (node_cost, node_pred) = costs[0];
@@ -771,65 +923,26 @@ impl Learner {
             .iter()
             .map(|h| h.iter().map(|&c| self.f(c)).sum())
             .collect();
+        let node = NodeStats {
+            idx: &idx,
+            search: &search,
+            total: &total,
+            total_s: &total_s,
+            total_extra: &total_extra,
+        };
+        // Every property is searched independently; large nodes spread
+        // the properties over the worker budget. The winner is the
+        // lowest cost, the lowest property index on a tie — whatever
+        // the budget.
+        let props: Vec<usize> = (0..min_props).collect();
+        let workers = if n >= 16_384 { self.threads } else { 1 };
+        let found = crate::par::par_map(workers, props, |_, prop| self.best_split(&node, prop));
         let mut best = (node_cost - self.min_gain, usize::MAX, 0usize);
-        let mut order: Vec<u32> = vec![0; n];
-        for prop in 0..min_props {
-            if self.thresholds[prop].is_empty() {
-                continue;
-            }
-            let nb = self.thresholds[prop].len() + 1;
-            // Counting sort by bucket.
-            let mut starts = vec![0usize; nb + 1];
-            for &s in &idx {
-                starts[self.bucket[s as usize * MAX_PROPS + prop] as usize + 1] += 1;
-            }
-            if starts.iter().filter(|&&c| c > 0).count() < 2 {
-                continue;
-            }
-            for b in 0..nb {
-                starts[b + 1] += starts[b];
-            }
-            let mut fill = starts.clone();
-            for &s in &idx {
-                let b = self.bucket[s as usize * MAX_PROPS + prop] as usize;
-                order[fill[b]] = s;
-                fill[b] += 1;
-            }
-            let mut left = vec![[0u32; TOKENS]; k_n];
-            let mut right = total.clone();
-            let mut s_left = vec![0.0f64; k_n];
-            let mut s_right = total_s.clone();
-            let mut extra_left = vec![0u64; k_n];
-            for b in 0..nb - 1 {
-                for &s in &order[starts[b]..starts[b + 1]] {
-                    for (k, &p) in search.iter().enumerate() {
-                        let t = self.tok[s as usize * NUM_PREDICTORS + p as usize] as usize;
-                        let cl = left[k][t];
-                        s_left[k] += self.f(cl + 1) - self.f(cl);
-                        left[k][t] = cl + 1;
-                        let cr = right[k][t];
-                        s_right[k] += self.f(cr - 1) - self.f(cr);
-                        right[k][t] = cr - 1;
-                        extra_left[k] += u64::from(token_extra_bits(t as u8));
-                    }
-                }
-                let n_left = starts[b + 1];
-                let n_right = n - n_left;
-                if starts[b + 1] == starts[b] || n_left < 12 || n_right < 12 {
-                    continue;
-                }
-                let mut cl = f64::INFINITY;
-                let mut cr = f64::INFINITY;
-                for k in 0..k_n {
-                    cl = cl.min(self.f(n_left as u32) - s_left[k] + extra_left[k] as f64);
-                    cr = cr.min(
-                        self.f(n_right as u32) - s_right[k]
-                            + (total_extra[k] - extra_left[k]) as f64,
-                    );
-                }
-                if cl + cr < best.0 {
-                    best = (cl + cr, prop, b);
-                }
+        for (prop, candidate) in found.into_iter().enumerate() {
+            if let Some((cost, b)) = candidate
+                && cost < best.0
+            {
+                best = (cost, prop, b);
             }
         }
         if best.1 == usize::MAX {
@@ -842,7 +955,7 @@ impl Learner {
         // Samples of buckets 0..=b have `property <= threshold[b]`.
         let (le, gt): (Vec<u32>, Vec<u32>) = idx
             .into_iter()
-            .partition(|&s| self.bucket[s as usize * MAX_PROPS + prop] as usize <= b);
+            .partition(|&s| self.bucket[prop][s as usize] as usize <= b);
         let slot = self.arena.len();
         self.arena.push(Build::Leaf {
             predictor: node_pred,
@@ -884,57 +997,59 @@ pub(crate) fn learn_tree(sections: &[Section], params: &LearnParams) -> Tree {
     };
     let fraction = (keep as f64 / (1u64 << 32) as f64) * (scanned as f64 / total as f64);
     let m = i64::from(multiplier);
+    let use_wp = params.use_wp;
+    // One sample stream per scanned section, seeded by its index, so
+    // the sample does not depend on how the sections are scheduled.
+    let sampled = crate::par::par_map(params.threads, picked, |_, si| {
+        let mut raw_props: Vec<i32> = Vec::new();
+        let mut tok: Vec<u8> = Vec::new();
+        let mut nprops: Vec<u8> = Vec::new();
+        let mut rng = 0x9E37_79B9_7F4A_7C15u64 ^ (si as u64).wrapping_mul(0xD6E8_FEB8_6659_FD93);
+        let mut section = sections[si].clone();
+        for i in 0..section.chans.len() {
+            scan_channel(&mut section.chans, i, section.stream_index, use_wp, |s| {
+                rng = rng
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                if (rng >> 32) < keep {
+                    raw_props.extend_from_slice(&s.props[..MAX_PROPS]);
+                    nprops.push(s.nprops as u8);
+                    for p in 0..NUM_PREDICTORS as u32 {
+                        let r = i64::from(s.value) - i64::from(predict(p, &s.nb, s.wp));
+                        let q = quantise(r, m).clamp(i64::from(i32::MIN) + 1, i64::from(i32::MAX));
+                        tok.push(cost_token(pack_signed(q as i32)));
+                    }
+                }
+                if m == 1 {
+                    s.value
+                } else {
+                    // Quantised coding is closed-loop: learn on the
+                    // kind of neighbourhood the decoder will see.
+                    let pred = predict(5, &s.nb, s.wp);
+                    let q = quantise(i64::from(s.value) - i64::from(pred), m);
+                    (i64::from(pred) + q * m).clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
+                }
+            });
+        }
+        (raw_props, tok, nprops)
+    });
     let mut raw_props: Vec<i32> = Vec::new();
     let mut tok: Vec<u8> = Vec::new();
     let mut nprops: Vec<u8> = Vec::new();
-    let mut rng = 0x9E37_79B9_7F4A_7C15u64;
-    for &si in &picked {
-        let mut section = sections[si].clone();
-        for i in 0..section.chans.len() {
-            scan_channel(
-                &mut section.chans,
-                i,
-                section.stream_index,
-                params.use_wp,
-                |s| {
-                    rng = rng
-                        .wrapping_mul(6364136223846793005)
-                        .wrapping_add(1442695040888963407);
-                    if (rng >> 32) < keep {
-                        raw_props.extend_from_slice(s.props);
-                        nprops.push(s.nprops as u8);
-                        for p in 0..NUM_PREDICTORS as u32 {
-                            let r = i64::from(s.value) - i64::from(predict(p, &s.nb, s.wp));
-                            let q =
-                                quantise(r, m).clamp(i64::from(i32::MIN) + 1, i64::from(i32::MAX));
-                            tok.push(cost_token(pack_signed(q as i32)));
-                        }
-                    }
-                    if m == 1 {
-                        s.value
-                    } else {
-                        // Quantised coding is closed-loop: learn on the
-                        // kind of neighbourhood the decoder will see.
-                        let pred = predict(5, &s.nb, s.wp);
-                        let q = quantise(i64::from(s.value) - i64::from(pred), m);
-                        (i64::from(pred) + q * m).clamp(i64::from(i32::MIN), i64::from(i32::MAX))
-                            as i32
-                    }
-                },
-            );
-        }
+    for (p, t, np) in sampled {
+        raw_props.extend_from_slice(&p);
+        tok.extend_from_slice(&t);
+        nprops.extend_from_slice(&np);
     }
     let n = nprops.len();
     if n == 0 {
         return Tree::single(5, multiplier);
     }
-    // Thresholds: quantiles of each property's sampled values.
-    let mut thresholds: Vec<Vec<i32>> = Vec::with_capacity(MAX_PROPS);
-    let mut bucket = vec![0u8; n * MAX_PROPS];
-    let mut column: Vec<i32> = Vec::with_capacity(n);
-    for prop in 0..MAX_PROPS {
-        column.clear();
-        column.extend((0..n).map(|s| raw_props[s * MAX_PROPS + prop]));
+    // Thresholds: quantiles of each property's sampled values; one
+    // bucket column per property.
+    let raw = &raw_props;
+    let columns = crate::par::par_map(params.threads, (0..MAX_PROPS).collect(), |_, prop| {
+        let mut column: Vec<i32> = (0..n).map(|s| raw[s * MAX_PROPS + prop]).collect();
         column.sort_unstable();
         let mut t: Vec<i32> = Vec::new();
         for q in 1..=MAX_THRESHOLDS {
@@ -949,11 +1064,19 @@ pub(crate) fn learn_tree(sections: &[Section], params: &LearnParams) -> Tree {
         if column[0] < column[n - 1] && t.first() != Some(&column[0]) && t.len() < MAX_THRESHOLDS {
             t.insert(0, column[0]);
         }
-        for s in 0..n {
-            let v = raw_props[s * MAX_PROPS + prop];
-            bucket[s * MAX_PROPS + prop] = t.partition_point(|&x| x < v) as u8;
-        }
+        let buckets: Vec<u8> = (0..n)
+            .map(|s| {
+                let v = raw[s * MAX_PROPS + prop];
+                t.partition_point(|&x| x < v) as u8
+            })
+            .collect();
+        (t, buckets)
+    });
+    let mut thresholds: Vec<Vec<i32>> = Vec::with_capacity(MAX_PROPS);
+    let mut bucket: Vec<Vec<u8>> = Vec::with_capacity(MAX_PROPS);
+    for (t, b) in columns {
         thresholds.push(t);
+        bucket.push(b);
     }
     drop(raw_props);
     let table = (n + 2).min(1 << 20);
@@ -970,6 +1093,7 @@ pub(crate) fn learn_tree(sections: &[Section], params: &LearnParams) -> Tree {
     let mut learner = Learner {
         n,
         bucket,
+        threads: params.threads.max(1),
         tok,
         nprops,
         thresholds,

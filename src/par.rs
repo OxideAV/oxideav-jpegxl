@@ -62,6 +62,30 @@ where
         .collect()
 }
 
+thread_local! {
+    /// Worker budget of the decode running on this thread (set from
+    /// `DecodeOptions::threads` for the duration of the call).
+    static DECODE_THREADS: std::cell::Cell<usize> = const { std::cell::Cell::new(1) };
+}
+
+/// The decode worker budget in force on this thread (`1` outside
+/// [`with_decode_threads`]).
+pub(crate) fn decode_threads() -> usize {
+    DECODE_THREADS.with(|c| c.get())
+}
+
+/// Run `f` with `threads` as this thread's decode worker budget.
+pub(crate) fn with_decode_threads<R>(threads: usize, f: impl FnOnce() -> R) -> R {
+    struct Restore(usize);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            DECODE_THREADS.with(|c| c.set(self.0));
+        }
+    }
+    let _restore = Restore(DECODE_THREADS.with(|c| c.replace(threads.max(1))));
+    f()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

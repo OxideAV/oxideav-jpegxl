@@ -561,26 +561,32 @@ fn code(
     let gx_n = width.div_ceil(GROUP_DIM);
     let gy_n = height.div_ceil(GROUP_DIM);
     let num_groups = gx_n * gy_n;
-    let group_ids: Vec<usize> = (0..num_groups).collect();
-    let outs = crate::par::par_map(threads, group_ids, |_, g| {
-        code_group(&ctx, g % gx_n, g / gx_n)
-    });
     let n_blocks = bw * bh;
     let mut lf_q: [Vec<i32>; 3] = std::array::from_fn(|_| vec![0i32; n_blocks]);
     let mut hf_stats = ValueStats::new(495 * nb_block_ctx as usize);
     let mut hf_syms: Vec<Symbols> = Vec::with_capacity(num_groups);
-    for (g, out) in outs.into_iter().enumerate() {
-        let out = out?;
-        let (bx0, by0) = ((g % gx_n) * GROUP_BLOCKS, (g / gx_n) * GROUP_BLOCKS);
-        let gw = GROUP_BLOCKS.min(bw - bx0);
-        for (dst, src) in lf_q.iter_mut().zip(&out.lf) {
-            for (row, line) in src.chunks_exact(gw).enumerate() {
-                let o = (by0 + row) * bw + bx0;
-                dst[o..o + gw].copy_from_slice(line);
+    // A batch of groups at a time, so only a few per-group histograms
+    // exist next to the merged one.
+    let batch = threads.max(1) * 2;
+    let mut first = 0usize;
+    while first < num_groups {
+        let ids: Vec<usize> = (first..num_groups.min(first + batch)).collect();
+        let outs = crate::par::par_map(threads, ids, |_, g| code_group(&ctx, g % gx_n, g / gx_n));
+        for (k, out) in outs.into_iter().enumerate() {
+            let out = out?;
+            let g = first + k;
+            let (bx0, by0) = ((g % gx_n) * GROUP_BLOCKS, (g / gx_n) * GROUP_BLOCKS);
+            let gw = GROUP_BLOCKS.min(bw - bx0);
+            for (dst, src) in lf_q.iter_mut().zip(&out.lf) {
+                for (row, line) in src.chunks_exact(gw).enumerate() {
+                    let o = (by0 + row) * bw + bx0;
+                    dst[o..o + gw].copy_from_slice(line);
+                }
             }
+            hf_stats.merge(&out.stats);
+            hf_syms.push(out.syms);
         }
-        hf_stats.merge(&out.stats);
-        hf_syms.push(out.syms);
+        first += batch;
     }
     let hf_codes = EntropyCodes::build_clustered(&hf_stats, num_groups, 128)?;
 

@@ -586,10 +586,13 @@ fn code_frame(spec: &EncodeSpec, frame: &FrameInput) -> Result<CodedFrame> {
                 });
             }
         }
+        // The whole-picture planes are not needed past this point.
+        drop(image);
     }
 
     let params = LearnParams {
         multiplier,
+        threads: spec.threads,
         ..learn_params_for(spec.effort)
     };
     let tree = learn_tree(&sections, &params);
@@ -604,16 +607,26 @@ fn code_frame(spec: &EncodeSpec, frame: &FrameInput) -> Result<CodedFrame> {
     // statistics merged in section order.
     let mut leaf_stats = ValueStats::new(tree.num_ctx);
     let mut coded: Vec<Vec<(u32, u32)>> = Vec::with_capacity(sections.len());
-    for (syms, stats) in crate::par::par_map(spec.threads, sections, |_, mut section| {
-        let syms = encode_section(&mut section, &tree);
-        let mut stats = ValueStats::new(tree.num_ctx);
-        for &(c, v) in &syms {
-            stats.add(c, v);
+    // A batch at a time, so only a few per-section histograms exist
+    // next to the merged one.
+    let batch = spec.threads.max(1) * 2;
+    let mut pending = sections.into_iter();
+    loop {
+        let chunk: Vec<Section> = pending.by_ref().take(batch).collect();
+        if chunk.is_empty() {
+            break;
         }
-        (syms, stats)
-    }) {
-        leaf_stats.merge(&stats);
-        coded.push(syms);
+        for (syms, stats) in crate::par::par_map(spec.threads, chunk, |_, mut section| {
+            let syms = encode_section(&mut section, &tree);
+            let mut stats = ValueStats::new(tree.num_ctx);
+            for &(c, v) in &syms {
+                stats.add(c, v);
+            }
+            (syms, stats)
+        }) {
+            leaf_stats.merge(&stats);
+            coded.push(syms);
+        }
     }
     let n_streams = coded.iter().filter(|s| !s.is_empty()).count().max(1);
     let leaf_codes = EntropyCodes::build_clustered(&leaf_stats, n_streams, 256)?;
@@ -894,12 +907,11 @@ fn write_vardct_frame(
         colour: &frame.channels[..n_colour],
         extra: &frame.channels[n_colour..],
     };
-    let (sections, rate) = crate::vardct_enc::encode_frame(
-        &input,
-        distance,
-        &learn_params_for(spec.effort),
-        spec.threads,
-    )?;
+    let learn = LearnParams {
+        threads: spec.threads,
+        ..learn_params_for(spec.effort)
+    };
+    let (sections, rate) = crate::vardct_enc::encode_frame(&input, distance, &learn, spec.threads)?;
     let mut toc = Vec::with_capacity(sections.len());
     for s in &sections {
         if s.len() > MAX_SECTION_BYTES {

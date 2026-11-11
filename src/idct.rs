@@ -105,17 +105,37 @@ pub fn idct_1d(input: &[f32]) -> Result<Vec<f32>> {
         )));
     }
     let mut out = vec![0.0f32; s];
-    let s_f = s as f32;
     let sqrt2 = 2f32.sqrt();
+    let table = cos_table(s);
     for (k, slot) in out.iter_mut().enumerate() {
+        let row = &table[k * s..(k + 1) * s];
         let mut acc = input[0]; // n=0 term, scale 1, cos(0) = 1
-        for (n, &val) in input.iter().enumerate().skip(1) {
-            let angle = std::f32::consts::PI * (n as f32) * (k as f32 + 0.5) / s_f;
-            acc += sqrt2 * val * angle.cos();
+        for (&val, &c) in input.iter().zip(row).skip(1) {
+            acc += sqrt2 * val * c;
         }
         *slot = acc;
     }
     Ok(out)
+}
+
+/// `cos(pi × n × (k + 0.5) / s)` at `[k × s + n]` for a power-of-two
+/// `s <= 256`, computed once per size (the transform used to evaluate
+/// the cosine for every term of every vector). The values and the
+/// order of operations in [`idct_1d`] are unchanged, so its results
+/// are bit-identical.
+fn cos_table(s: usize) -> &'static [f32] {
+    static TABLES: [std::sync::OnceLock<Vec<f32>>; 9] = [const { std::sync::OnceLock::new() }; 9];
+    TABLES[s.trailing_zeros() as usize].get_or_init(|| {
+        let s_f = s as f32;
+        let mut t = vec![0.0f32; s * s];
+        for k in 0..s {
+            for n in 0..s {
+                let angle = std::f32::consts::PI * (n as f32) * (k as f32 + 0.5) / s_f;
+                t[k * s + n] = angle.cos();
+            }
+        }
+        t
+    })
 }
 
 /// Spec-conformant 2-D inverse DCT per Annex I.2.2 Listing I.4.

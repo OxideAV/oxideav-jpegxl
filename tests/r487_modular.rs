@@ -269,6 +269,25 @@ fn sparse_sample_values_use_a_channel_palette_and_round_trip() {
     round_trip(&img16, &EncodeOptions::new(), "sparse rgba64");
 }
 
+#[test]
+fn the_decode_worker_budget_never_changes_the_pixels() {
+    use oxideav_jpegxl::{DecodeOptions, decode_with};
+    // 3×2 groups of 128: the per-group decode runs on the budget.
+    let img = structured(300, 200, PixelFormat::Rgba, 8, 41);
+    let opts = EncodeOptions::new()
+        .with_group_size_shift(0)
+        .with_effort(Effort::Fast);
+    let bytes = encode(&img, &opts).unwrap();
+    for threads in [1usize, 2, 5, 64] {
+        let back = decode_with(&bytes, &DecodeOptions::default().with_threads(threads)).unwrap();
+        assert_eq!(
+            back.as_bytes().unwrap(),
+            img.as_bytes().unwrap(),
+            "{threads} workers"
+        );
+    }
+}
+
 fn djxl_available() -> bool {
     Command::new("djxl").arg("--version").output().is_ok()
 }

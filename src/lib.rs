@@ -625,8 +625,8 @@ pub mod vardct_reconstruct;
 #[doc(hidden)] // internal: Annex L colour transforms (XYB / YCbCr)
 pub mod xyb;
 
-#[doc(hidden)] // internal: Modular codestream writer plumbing
 mod enc_transforms;
+#[doc(hidden)] // internal: Modular codestream writer plumbing
 pub mod encoder;
 #[doc(hidden)] // internal: prefix-code entropy writer plumbing
 pub mod entropy_write;
@@ -1649,18 +1649,36 @@ fn decode_frame_body(
     //     decode each per-pass per-group modular sub-bitstream and
     //     copy samples back into `lf_global.global_modular.image`.
     if !lf_global.global_modular.fully_decoded || num_groups > 1 || fh.passes.num_passes > 1 {
+        // Groups of a pass only read the shared global state: decode
+        // them on the caller's worker budget, paste in group order.
+        let workers = crate::par::decode_threads();
         for pass_idx in 0..fh.passes.num_passes {
+            let mut group_bytes = Vec::with_capacity(num_groups as usize);
             for group_idx in 0..(num_groups as u32) {
-                let slot = pass_group_slot(pass_idx, group_idx);
-                let pg_bytes = section_byte_range(slot)?;
-                let mut pg_br = BitReader::new_section(pg_bytes);
-                crate::pass_group::decode_modular_group_into(
-                    &mut pg_br,
-                    &fh,
-                    &mut lf_global,
-                    pass_idx,
-                    group_idx,
-                )?;
+                group_bytes.push(section_byte_range(pass_group_slot(pass_idx, group_idx))?);
+            }
+            // A batch of groups at a time, so only that many decoded
+            // groups are held next to the frame's image.
+            let batch = workers.max(1) * 2;
+            let fh_ref = &fh;
+            for (b, chunk) in group_bytes.chunks(batch).enumerate() {
+                let shared = &lf_global;
+                let first = b * batch;
+                let decoded = crate::par::par_map(workers, chunk.to_vec(), |k, bytes| {
+                    let mut pg_br = BitReader::new_section(bytes);
+                    crate::pass_group::decode_modular_group(
+                        &mut pg_br,
+                        fh_ref,
+                        shared,
+                        pass_idx,
+                        (first + k) as u32,
+                    )
+                });
+                for pixels in decoded {
+                    if let Some(pixels) = pixels? {
+                        crate::pass_group::paste_modular_group(&pixels, &mut lf_global)?;
+                    }
+                }
             }
         }
         // After all PassGroups complete, apply inverse transforms over
