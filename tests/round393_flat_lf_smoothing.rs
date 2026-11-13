@@ -126,11 +126,12 @@ fn flat_content_decode_tracks_reference() {
     }
 }
 
-/// §F.2 ramp arbitration (erratum candidate 4): decode under both
-/// readings and compare each against the reference. The corrected ramp
-/// `clamp(4·gap − 3, 0, 1)` must beat the literal `max(0, 3 − 4·gap)`
-/// on every channel AND on the exact-match count over the pixels where
-/// the two ramps disagree.
+/// LF smoothing arbitration: decode under the 2024 expression
+/// (`(wa − s) × max(0, 3 − 4·gap) + s`, the default since round 488)
+/// and under the 2021 FDIS's (`s` and `wa` exchanged) and compare each
+/// against the reference. The 2024 reading must beat the 2021 one on
+/// every channel AND on the exact-match count over the pixels where
+/// the two disagree.
 #[test]
 fn f2_ramp_arbitration_corrected_ramp_matches_reference() {
     let (rw, rh, refpx) = ref_rgb();
@@ -149,8 +150,8 @@ fn f2_ramp_arbitration_corrected_ramp_matches_reference() {
 
     let mad_corrected = mad(&corrected, &refpx);
     let mad_literal = mad(&literal, &refpx);
-    eprintln!("corrected ramp clamp(4g-3,0,1) MAD = {mad_corrected:?}");
-    eprintln!("literal   ramp max(0,3-4g)    MAD = {mad_literal:?}");
+    eprintln!("2024 expression MAD = {mad_corrected:?}");
+    eprintln!("2021 expression MAD = {mad_literal:?}");
     for k in 0..3 {
         assert!(
             mad_corrected[k] < mad_literal[k],

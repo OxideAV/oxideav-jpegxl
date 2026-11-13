@@ -556,9 +556,9 @@ VarDCT baseline: `vardct-256x256-d1` per-channel sRGB MAD
 0.66 / 0.47 / 0.61 (was ≈ 3.4 — the round-385 "d1 HF accuracy tail"
 is closed), `vardct-256x256-d3` 0.76 / 0.51 / 0.81, `large-1024x768-d2`
 (12-group) 0.44 / 0.37 / 0.32, flat-content 0.20 / 0.20 / 0.20. The
-same fixture resolved **§F.2 erratum candidate 4**: the corrected
-`clamp(4·gap − 3, 0, 1)` smoothing ramp is the conformant reading
-(CI-gated arbitration). Single-LfGroup frames of any group count
+same fixture arbitrates the **LF smoothing expression** (the 2024
+edition's `(wa − s) × max(0, 3 − 4·gap) + s`, see round 488 below;
+CI-gated). Single-LfGroup frames of any group count
 decode; §C.5 multi-LfGroup (> 2048 px) framing + LZ77 TOC permutations
 landed round 393 and are pinned on `large-3072x2048-multigroup`.
 Round 437 resolved the §C.7.1 `used_orders != 0` boundary for
@@ -739,7 +739,8 @@ What is implemented and tested today:
   (`round362…` 4.5 → 1.0/255; new flat-content 0.35/255 bound). The
   earlier round-385 corrections (Listing C.1 multipliers, Annex G CfL
   branch split + `-128` bias, Listing I.16 LLF normalisation) stand.
-- **§F.2 erratum candidate 4 RESOLVED.** On the flat fixture (674/900
+- **§F.2 erratum candidate 4** (superseded in round 488 by the 2024
+  expression, which this fixture also prefers). On the flat fixture (674/900
   interior LF samples at the `gap = 0.5` floor, where the two candidate
   ramps take opposite values) the corrected `clamp(4·gap − 3, 0, 1)`
   ramp beats the literal `max(0, 3 − 4·gap)` on every channel and
@@ -1229,12 +1230,13 @@ restoration filters, which turns an installed black-box decoder into
 a pixel oracle for decoder paths no staged fixture reached with one:
 a stream is encoded, decoded by both decoders, and any difference
 above the rounding band is a decoder defect to resolve from the 2024
-text. Six were found and fixed, each pinned by
+text. Seven were found and fixed, each pinned by
 `tests/r488_decoder_fixtures.rs` (a 384×256 stream whose 64×64 tiles
 each use one of the 21 transform types up to DCT64×64, and three
 streams with the Gabor-like transform and one, two and three
 iterations of the edge-preserving filter over a varying quantisation
-field — the black-box decode committed next to each; this decoder is
+field, and one with the adaptive LF smoothing on — the black-box
+decode committed next to each; this decoder is
 within one 8-bit code of it on every sample):
 
 - **LLF placement of blocks taller than wide** (I.8 / I.3.2): the LLF
@@ -1263,6 +1265,20 @@ within one 8-bit code of it on every sample):
   of I.5.3, `(1 << 16) / (global_scale × HfMul)` — the open
   cross-reference question of the errata (a larger `HfMul` is a finer
   step and now filters less, as the name says).
+
+- **Adaptive LF smoothing** (I.5.2, 2024): "the smoothed value is
+  `(wa − s) × max(0, 3 − 4 × gap) + s`", applied "after dequantizing
+  LF coefficients and applying chroma from luma". The decoder applied
+  it before the LF chroma-from-luma step, with the round-393 ramp
+  `clamp(4·gap − 3, 0, 1)` standing in for the 2021 FDIS's expression
+  (which has `s` and `wa` exchanged); the three readings agree at both
+  ends of the gap range and differ between. On a stream of this
+  crate's encoder with the smoothing on (`r488_lf_smoothing`, large
+  distance, signalled LF weights) only the 2024 expression in the 2024
+  order matches the black-box decode — within one code, against up to
+  41 for the others. This supersedes the round-393 "erratum candidate
+  4" resolution below; the staged flat-content fixture agrees (MAD
+  0.198 → 0.192, and 0.226 for the 2021 expression).
 
 With them the staged black-box-encoder fixtures moved as well (sRGB
 MAD per channel against the black-box decode, before → after):

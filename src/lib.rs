@@ -3552,10 +3552,19 @@ pub fn decode_vardct_frame_with_refs(
         height_blocks: fbh as u32,
     };
 
-    // F.2 adaptive LF smoothing (gated by kSkipAdaptiveLFSmoothing flag
-    // + no channel subsampled) — on the assembled frame-level LF image.
+    // I.5.2 adaptive LF smoothing (gated by kSkipAdaptiveLFSmoothing
+    // flag + no channel subsampled) — on the assembled frame-level LF
+    // image, after the LF chroma-from-luma step as the 2024 text has
+    // it.
     if crate::lf_dequant::should_apply_adaptive_lf_smoothing(fh) {
-        crate::lf_dequant::apply_adaptive_lf_smoothing(&mut dequant, &multipliers);
+        match lf_global.lf_channel_correlation.as_ref() {
+            Some(cfl) => crate::lf_dequant::apply_adaptive_lf_smoothing_after_cfl(
+                &mut dequant,
+                &multipliers,
+                cfl,
+            )?,
+            None => crate::lf_dequant::apply_adaptive_lf_smoothing(&mut dequant, &multipliers),
+        }
     }
 
     // Integrated finish: per-(pass, group) §C.8.3 HF decode + F.3

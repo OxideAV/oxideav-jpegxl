@@ -21,6 +21,11 @@
 //!   edge-preserving filter over a varying quantisation field (the
 //!   filter strength follows the quantisation width of each block).
 
+//! * `r488_lf_smoothing` — the adaptive LF smoothing of I.5.2 enabled
+//!   (the encoder normally signals it off) at a large distance with
+//!   signalled LF weights: the 2024 expression of the smoothed value,
+//!   applied after the LF chroma-from-luma step.
+
 mod common;
 
 use common::png::decode_png;
@@ -67,4 +72,9 @@ fn gabor_and_two_epf_iterations_match_the_black_box_decode() {
 #[test]
 fn three_epf_iterations_match_the_black_box_decode() {
     check("epf3");
+}
+
+#[test]
+fn adaptive_lf_smoothing_matches_the_black_box_decode() {
+    check("lf_smoothing");
 }

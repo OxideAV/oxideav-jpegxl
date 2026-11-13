@@ -285,6 +285,36 @@ pub fn apply_lf_chroma_from_luma(
     Ok(())
 }
 
+/// The adaptive LF smoothing of I.5.2 in its place in the pipeline
+/// (2024 edition): "After dequantizing LF coefficients and applying
+/// chroma from luma (I.6), the decoder applies the following adaptive
+/// smoothing algorithm". `out` holds the dequantised LF *before*
+/// chroma from luma, which the reconstruction applies later; so the
+/// correlation is added here, the image smoothed, and the correlation
+/// taken out again with the smoothed Y — what the later step then
+/// restores is exactly the smoothed, correlated image. The order
+/// matters because the smoothing weight of a sample depends on the
+/// deviation of each channel in units of its own step.
+pub fn apply_adaptive_lf_smoothing_after_cfl(
+    out: &mut LfDequantOutput,
+    multipliers: &LfMultipliers,
+    cfl: &crate::lf_global::LfChannelCorrelation,
+) -> crate::error::Result<()> {
+    let (kx, kb) = crate::chroma_from_luma::kx_kb_lf(cfl)?;
+    let [x, y, b] = &mut out.samples;
+    for ((x, b), &y) in x.iter_mut().zip(b.iter_mut()).zip(y.iter()) {
+        *x += kx * y;
+        *b += kb * y;
+    }
+    apply_adaptive_lf_smoothing(out, multipliers);
+    let [x, y, b] = &mut out.samples;
+    for ((x, b), &y) in x.iter_mut().zip(b.iter_mut()).zip(y.iter()) {
+        *x -= kx * y;
+        *b -= kb * y;
+    }
+    Ok(())
+}
+
 /// FDIS Annex F.2 weights for the 3×3 weighted-average kernel used in
 /// adaptive LF smoothing. Order: center, horizontal/vertical adjacent,
 /// diagonal adjacent — verbatim from the spec text.
@@ -396,34 +426,33 @@ pub fn apply_adaptive_lf_smoothing(out: &mut LfDequantOutput, multipliers: &LfMu
                 .max((wa_x - s_x).abs() * inv_m[0])
                 .max((wa_y - s_y).abs() * inv_m[1])
                 .max((wa_b - s_b).abs() * inv_m[2]);
-            // FDIS: smoothed = (s - wa) × max(0, 3 - 4 × gap) + wa —
-            // with a CORRECTED factor ramp (FDIS erratum candidate 4,
-            // proposed round 385, RESOLVED round 393). The literal
-            // `max(0, 3 - 4 × gap)` reading yields factor 1 (keep the
-            // sample) only at the gap = 0.5 floor and factor 0
-            // (replace with the weighted average) for every gap ≥
-            // 0.75 — i.e. it smooths REAL CONTENT the hardest while
-            // preserving only quantisation noise. The
-            // internally-consistent denoiser semantics — smooth only
-            // deviations within quantisation noise, keep real content
-            // — is the sign-flipped, clamped ramp
-            //   factor = clamp(4 × gap - 3, 0, 1)
-            // Round 393 pinned this externally on the purpose-built
-            // `flat-content-lf-smoothing` fixture (674/900 interior LF
-            // samples at the gap = 0.5 floor, where the two readings
-            // take opposite values): the corrected ramp beats the
-            // literal reading on every channel (sRGB MAD
-            // 0.2045/0.2044/0.2036 vs 0.2290/0.2287/0.2276) and
-            // matches ~740 more reference pixels exactly. CI-gated by
-            // `round393_flat_lf_smoothing`; the literal ramp stays
-            // reachable only through the per-thread
-            // `set_lf_smoothing_literal_ramp` arbitration hook.
+            // 2024 edition, I.5.2: "The smoothed value is
+            // (wa - s) * max(0, 3 - 4 * gap) + s" — the sample moves
+            // to the weighted average in full at the gap = 0.5 floor
+            // (a deviation within quantisation noise) and not at all
+            // from gap = 0.75 (real content). `factor` here is the
+            // share of the SAMPLE that is kept,
+            //   factor = 1 - max(0, 3 - 4 × gap) = clamp(4 × gap - 2, 0, 1).
+            //
+            // History: the 2021 FDIS prints the same expression with
+            // `s` and `wa` exchanged — `(s - wa) × max(0, 3 - 4 × gap)
+            // + wa`, which keeps the sample at the floor and smooths
+            // real content hardest. Round 393 replaced that by a
+            // sign-flipped ramp `clamp(4 × gap - 3, 0, 1)`, which
+            // agrees with the 2024 text at both ends of the range but
+            // reaches "keep" only at gap = 1. Round 488 arbitrated the
+            // three against a black-box decoder on streams of this
+            // crate's encoder with the smoothing on: only the 2024
+            // expression, applied after the LF chroma-from-luma step
+            // (see `apply_adaptive_lf_smoothing_after_cfl`), agrees —
+            // to within one 8-bit code, against up to 41 codes for the
+            // others. The 2021 reading stays reachable through the
+            // per-thread `set_lf_smoothing_literal_ramp` hook for the
+            // arbitration test on the staged flat-content fixture.
             let factor = if literal_ramp {
-                // Literal FDIS reading — kept selectable ONLY for the
-                // erratum-candidate-4 arbitration test.
                 (3.0 - 4.0 * gap).max(0.0)
             } else {
-                (4.0 * gap - 3.0).clamp(0.0, 1.0)
+                (4.0 * gap - 2.0).clamp(0.0, 1.0)
             };
 
             if trace_armed {

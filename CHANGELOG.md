@@ -137,6 +137,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - the **default DCT8×8 dequantisation weights of the B channel**
     had a transcription error in the last three band multipliers
     (`0.0, 0.0, −1.0` for Table I.6's `0.0, −1.0, −2.0`).
+- Decoder: **adaptive LF smoothing follows the 2024 edition**
+  (I.5.2): the smoothed value is `(wa − s) × max(0, 3 − 4 × gap) + s`
+  and the smoothing runs after the LF chroma-from-luma step. It ran
+  before that step with the ramp `clamp(4·gap − 3, 0, 1)`; on a stream
+  with the smoothing on at a large distance that was up to 41 codes
+  from a black-box decode, now within one (pinned by
+  `r488_lf_smoothing`). The staged flat-content fixture moves from MAD
+  0.198 to 0.192; every other fixture ratchet holds unchanged.
 - Decoder: the **edge-preserving filter follows the 2024 edition**
   (J.4.3) — `Weight()` is linear in the scaled distance (no square, no
   `zeroflush` cut-off), `step_multiplier` carries the factor `1.65`,
