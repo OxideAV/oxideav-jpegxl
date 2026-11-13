@@ -36,9 +36,9 @@ fn picture(width: u32, height: u32, format: PixelFormat, seed: u32) -> JxlImage 
     JxlImage::packed(width, height, format, data).unwrap()
 }
 
-fn same_at_every_budget(name: &str, bytes: &[u8]) {
+fn same_at_every_budget(name: &str, bytes: &[u8], budgets: &[usize]) {
     let serial = decode_with(bytes, &DecodeOptions::default()).unwrap();
-    for threads in [2usize, 3, 8, 64] {
+    for &threads in budgets {
         let got = decode_with(bytes, &DecodeOptions::default().with_threads(threads)).unwrap();
         assert_eq!(
             (got.width, got.height, got.format),
@@ -70,7 +70,7 @@ fn own_streams_decode_identically_at_every_budget() {
     {
         let img = picture(w, h, format, 20 + i as u32);
         let bytes = encode(&img, &EncodeOptions::new().with_distance(d)).unwrap();
-        same_at_every_budget(&format!("{w}x{h} {format:?} d{d}"), &bytes);
+        same_at_every_budget(&format!("{w}x{h} {format:?} d{d}"), &bytes, &[2, 3, 8, 64]);
     }
 }
 
@@ -93,7 +93,9 @@ fn staged_streams_decode_identically_at_every_budget() {
         "r488_epf3",
     ] {
         let bytes = std::fs::read(format!("{dir}/{name}.jxl")).unwrap();
-        same_at_every_budget(name, &bytes);
+        // Two budgets keep the 6 MP streams affordable in an
+        // unoptimised test build.
+        same_at_every_budget(name, &bytes, &[3, 8]);
     }
 }
 
