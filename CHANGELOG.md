@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.16](https://github.com/OxideAV/oxideav-jpegxl/compare/v0.0.15...v0.0.16) - 2026-11-13
+
+### Other
+
+- staged VarDCT fixture ratchets at the rounding floor; README / CHANGELOG record the final accuracy
+- decoder — adaptive LF smoothing per the 2024 edition (expression and place in the pipeline)
+- VarDCT encoder — quantisation field keeps edges fine (calmest 4x4 cell in reach)
+- parallel-decode test tries two budgets on the large staged streams
+- lossless encoder memory — planes taken over, group rectangles cut on demand, symbols packed in 32 bits
+- decoder — Gabor-like transform in row bands, one channel at a time
+- decoder — VarDCT groups, edge-preserving filter, Gabor-like transform and colour conversion on the worker budget; indexed EPF interior
+- VarDCT encoder — transform search over all 21 types, rate-distortion quantisation, quantisation field, fitted chroma-from-luma, Gabor-like sharpening and edge-preserving filter
+- entropy-stream context clustering without per-pair allocation
+- range loops rewritten as iterators (clippy 1.100 needless_range_loop)
+- decoder — edge-preserving filter per the 2024 edition (linear Weight, 1.65 step multiplier, quantization_width = 65536 / (global_scale x HfMul))
+- decoder — tall-block LLF placement, DCT8x4 orientation, AFV DC terms (2024 edition), DCT8x8 B-channel default weights
+- rolling-row Modular decode, parallel groups and tree learning, tabulated IDCT cosines; Modular-XYB rescale follows the LF weight divisors
+- VarDCT lossy encoder (XYB, DCT8x8, chroma-from-luma, LF as Modular, I.4 context model), alpha on VarDCT frames, distance / threads options
+- Modular density — learned MA tree (property splits, 14 predictors incl. the self-correcting one), palettes, clustered contexts, prefix/ANS and RCT election
+- API hygiene: non_exhaustive colour-encoding enums and parsed header/container/jbrd records
+
 ### Added
 
 - **VarDCT encoder: rate–distortion tools** (round 488). The lossy
