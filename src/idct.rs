@@ -499,7 +499,10 @@ pub fn idct_afv(coefficients: &[f32], t: TransformType) -> Result<Vec<f32>> {
     //   samples((flip_x==1 ? 0 : 4) + ix, flip_y×4 + iy) =
     //       samples_4x4(ix, iy)
     let mut coeffs_4x4 = [0.0f32; 16]; // 4×4 row-major: index = iy*4 + ix
-    coeffs_4x4[0] = coef(0, 0) - coef(0, 1) + coef(1, 0);
+    // 2024 edition (I.9.8): `coefficients(0, 0) - coefficients(1, 0) +
+    // coefficients(0, 1)` — the 2021 FDIS printed the two differential
+    // terms the other way round; a black-box decoder follows 2024.
+    coeffs_4x4[0] = coef(0, 0) - coef(1, 0) + coef(0, 1);
     for iy in 0..4usize {
         let start = if iy == 0 { 1 } else { 0 };
         for ix in start..4 {
@@ -527,7 +530,8 @@ pub fn idct_afv(coefficients: &[f32], t: TransformType) -> Result<Vec<f32>> {
     // see the doc-comment above for the inversion proof. Applied
     // correction: read from samples_4x8.)
     let mut coeffs_4x8 = [0.0f32; 32]; // 4 rows × 8 cols: index = iy*8 + ix
-    coeffs_4x8[0] = coef(0, 0) - coef(1, 0);
+    // 2024 edition: `coefficients(0, 0) - coefficients(0, 1)`.
+    coeffs_4x8[0] = coef(0, 0) - coef(0, 1);
     for iy in 0..4usize {
         let start = if iy == 0 { 1 } else { 0 };
         for ix in start..8 {
@@ -731,25 +735,18 @@ pub fn idct_hornuss(coefficients: &[f32]) -> Result<Vec<f32>> {
 
 /// `IDCT_DCT8×4(coefficients)` per Annex I.9.6.
 ///
-/// The first two coefficient columns are split into a Hadamard-style
-/// pair `dcs = (c00 + c01, c00 - c01)` providing the DC for each of two
-/// 4×8 (rows × cols) **vertical** halves. For half `x ∈ {0, 1}`, an
-/// internal 4×8 block is filled with `coefficients(ix, x + iy*2)` for
-/// `(iy, ix) ∈ [0..4) × [0..8)` (with `(0, 0)` patched to `dcs[x]`),
-/// then `IDCT_2D`'d to a 4×8 sample matrix.
+/// The first two coefficient rows at column 0 hold a Hadamard-style
+/// pair `dcs = (c00 + c01, c00 - c01)`: the DC of each of the "two 8x4
+/// vertical blocks" — 8 rows × 4 columns each, side by side. For half
+/// `x ∈ {0, 1}` a 4 × 8 coefficient matrix is filled with
+/// `coefficients(ix, x + iy*2)` (`ix < 8` along the long, vertical
+/// axis; `(0, 0)` patched to `dcs[x]`) and `IDCT_2D` gives the 8 × 4
+/// samples of columns `[x*4 .. x*4 + 4)`.
 ///
-/// The two 4×8 halves are tiled into the 8×4 (rows × cols) output as
-/// `result(x*4 + 0..4, 0..8)` — i.e. the result is in the spec's
-/// `(short × long) = (4 × 8)` natural-ordering layout, suitable for
-/// re-shaping into 8 rows × 4 cols by the caller. Per the closing
-/// table entry of Listing I.9.6 the output **pixel block** is 8×8
-/// (the spec stores 8×4 as the half-width-half-height of an 8×8 cell);
-/// here the helper returns the 8×8 reshape with each 4×8 half
-/// occupying the top/bottom 4 rows of the result.
-///
-/// Concretely the output shape is `8 × 8` row-major: rows
-/// `[0..4)` ← `samples_8x4[0]` (the `x=0` half, 4 rows × 8 cols),
-/// rows `[4..8)` ← `samples_8x4[1]` (the `x=1` half).
+/// DCT4×8 (I.9.7) reads the same coefficients and differs only in the
+/// orientation: its halves are 4 rows × 8 columns, stacked. (Rounds
+/// before 488 tiled both the DCT4×8 way; a black-box decoder agrees
+/// with this orientation on streams the encoder in this crate writes.)
 pub fn idct_dct8x4(coefficients: &[f32]) -> Result<Vec<f32>> {
     if coefficients.len() != 64 {
         return Err(Error::InvalidData(format!(
@@ -772,12 +769,13 @@ pub fn idct_dct8x4(coefficients: &[f32]) -> Result<Vec<f32>> {
                 coeffs_4x8[iy * 8 + ix] = coef(ix, x + iy * 2);
             }
         }
-        let samples = idct_2d(&coeffs_4x8, 4, 8)?;
-        // Tile the 4×8 sample half into rows [x*4 .. x*4 + 4) of the
-        // 8×8 output.
-        for iy in 0..4usize {
-            for ix in 0..8usize {
-                result[(x * 4 + iy) * 8 + ix] = samples[iy * 8 + ix];
+        // "Two 8x4 vertical blocks": each half is 8 rows × 4 columns,
+        // the long (8-coefficient) axis of `coeffs_4x8` being the
+        // vertical one, and half `x` covers columns [x*4 .. x*4 + 4).
+        let samples = idct_2d(&coeffs_4x8, 8, 4)?;
+        for r in 0..8usize {
+            for c in 0..4usize {
+                result[r * 8 + x * 4 + c] = samples[r * 4 + c];
             }
         }
     }
@@ -1545,28 +1543,19 @@ mod tests {
     #[test]
     fn idct_dct8x4_dc_only_constant() {
         // c(0,0) = 1, c(0,1) = 1 → dcs = (2, 0). Half x=0 has DC=2 and
-        // all other cells 0 → 4×8 IDCT yields 2 everywhere; half x=1
-        // has DC=0 → 0 everywhere. Since DC=2 and other cells are 0
-        // for half 0, IDCT_2D(coeffs_4x8 with first-cell=2, rest=0) =
-        // 2 in every cell. So result rows 0..4 ≈ 2 and rows 4..8 ≈ 0.
+        // every other cell 0, so its 8×4 block is 2 everywhere; half
+        // x=1 has DC=0 and is 0 everywhere. The halves are the two
+        // "8x4 vertical blocks": columns 0..4 and columns 4..8.
         let mut coeffs = vec![0.0f32; 64];
         coeffs[0] = 1.0; // (0, 0)
         coeffs[8] = 1.0; // (0, 1)
         let out = idct_dct8x4(&coeffs).unwrap();
-        for iy in 0..4 {
+        for iy in 0..8 {
             for ix in 0..8 {
+                let want = if ix < 4 { 2.0 } else { 0.0 };
                 assert!(
-                    approx_eq(out[iy * 8 + ix], 2.0, 1e-4),
-                    "row<4 ({ix},{iy}): {}",
-                    out[iy * 8 + ix]
-                );
-            }
-        }
-        for iy in 4..8 {
-            for ix in 0..8 {
-                assert!(
-                    approx_eq(out[iy * 8 + ix], 0.0, 1e-4),
-                    "row>=4 ({ix},{iy}): {}",
+                    approx_eq(out[iy * 8 + ix], want, 1e-4),
+                    "({ix},{iy}): {} vs {want}",
                     out[iy * 8 + ix]
                 );
             }
@@ -1657,8 +1646,8 @@ mod tests {
     fn idct_afv_dc_only_sub_block_corner_sums() {
         // Per Listing I.13 the three DC patches are derived as:
         //   coeffs_afv(0,0)   = (c(0,0) + c(0,1) + c(1,0)) × 4
-        //   coeffs_4x4(0,0)   = c(0,0) - c(0,1) + c(1,0)
-        //   coeffs_4x8(0,0)   = c(0,0) - c(1,0)
+        //   coeffs_4x4(0,0)   = c(0,0) - c(1,0) + c(0,1)
+        //   coeffs_4x8(0,0)   = c(0,0) - c(0,1)
         //
         // With only c(0,0) = 1.0 nonzero, those become
         //   afv DC = 4.0, 4x4 DC = 1.0, 4x8 DC = 1.0
@@ -1692,6 +1681,47 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The three DC terms of the 2024 edition (I.9.8): the 4×8 half
+    /// takes `c(0,0) − c(0,1)`, the 4×4 quarter `c(0,0) − c(1,0) +
+    /// c(0,1)`, the AFV quarter the sum of the three. The 2021 FDIS
+    /// had `c(0,1)` and `c(1,0)` the other way round in the first two.
+    #[test]
+    fn idct_afv_dc_terms_follow_the_2024_edition() {
+        let mut c = vec![0.0f32; 64];
+        c[0] = 1.0; // c(0, 0)
+        c[8] = 0.25; // c(0, 1)
+        c[1] = 0.5; // c(1, 0)
+        let s = idct_afv(&c, TransformType::Afv0).unwrap();
+        let mean = |x0: usize, y0: usize, w: usize, h: usize| -> f32 {
+            let mut sum = 0.0f32;
+            for y in y0..y0 + h {
+                for x in x0..x0 + w {
+                    sum += s[y * 8 + x];
+                }
+            }
+            sum / (w * h) as f32
+        };
+        // AFV0: the AFV quarter top-left, the 4×4 top-right, the 4×8
+        // half below.
+        assert!(
+            approx_eq(mean(0, 0, 4, 4), 1.75, 1e-4),
+            "{}",
+            mean(0, 0, 4, 4)
+        );
+        assert!(
+            approx_eq(mean(4, 0, 4, 4), 0.75, 1e-4),
+            "{}",
+            mean(4, 0, 4, 4)
+        );
+        assert!(
+            approx_eq(mean(0, 4, 8, 4), 0.75, 1e-4),
+            "{}",
+            mean(0, 4, 8, 4)
+        );
+        // And coefficient (0, 0) stays the block mean.
+        assert!(approx_eq(mean(0, 0, 8, 8), 1.0, 1e-4));
     }
 
     #[test]

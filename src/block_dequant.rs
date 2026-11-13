@@ -333,7 +333,13 @@ pub fn decode_block_to_residual(
 ///   `cx · cy`.
 ///
 /// The write is an **overwrite** of the `cy × cx` top-left cells:
-/// `block[y · bwidth + x] = llf[y · cx + x]` for `x < cx`, `y < cy`. The
+/// `block[y · bwidth + x] = llf[y · cx + x]` for `x < cx`, `y < cy` —
+/// read transposed (`llf[x · cy + y]`) for a block taller than wide,
+/// whose `llf` is in image order while the grid's long axis is the
+/// vertical one (round 488: DCT32×16, DCT64×32 and the larger tall
+/// types were placed untransposed before; a black-box decoder agrees
+/// with the transposed placement on streams the encoder in this crate
+/// writes). The
 /// overwrite is equivalent to an add because every LLF cell of `block` is
 /// zero by construction of [`DecodedHfBlock`], but the overwrite is the
 /// spec-literal placement and is robust against a future change that
@@ -370,9 +376,19 @@ pub fn merge_llf_into_block(block: &mut [f32], t: TransformType, llf: &[f32]) ->
             cx * cy
         )));
     }
+    // `llf` is in image order (`rows × cols` of the varblock's 8×8
+    // cells); the coefficient grid is `short × long`. For a block
+    // taller than wide the long axis of the grid is the vertical one,
+    // so the LLF block is read transposed.
+    let (cols, rows) = t.block_dims();
+    let tall = rows > cols;
     for y in 0..cy {
         for x in 0..cx {
-            block[y * bwidth + x] = llf[y * cx + x];
+            block[y * bwidth + x] = if tall {
+                llf[x * cy + y]
+            } else {
+                llf[y * cx + x]
+            };
         }
     }
     Ok(())
@@ -978,6 +994,35 @@ mod tests {
         for (i, &v) in blk.iter().enumerate() {
             if i > 1 {
                 assert_eq!(v, 0.0, "cell {i} must stay zero");
+            }
+        }
+    }
+
+    /// A block taller than wide: `llf` arrives in image order (rows ×
+    /// columns of 8×8 cells) while the coefficient grid's long axis is
+    /// the vertical one, so the LLF block lands transposed.
+    #[test]
+    fn merge_llf_tall_blocks_are_placed_transposed() {
+        // DCT32×16: 4 rows × 2 columns of cells; grid 32 wide, 16 tall.
+        let llf: Vec<f32> = (0..8).map(|i| (10 * (i / 2) + i % 2) as f32).collect();
+        let mut blk = vec![0.0f32; 512];
+        merge_llf_into_block(&mut blk, TransformType::Dct32x16, &llf).unwrap();
+        for vertical in 0..4 {
+            for horizontal in 0..2 {
+                assert_eq!(
+                    blk[horizontal * 32 + vertical],
+                    (10 * vertical + horizontal) as f32,
+                    "vertical {vertical}, horizontal {horizontal}"
+                );
+            }
+        }
+        // The wide sibling keeps image order.
+        let mut blk = vec![0.0f32; 512];
+        let llf: Vec<f32> = (0..8).map(|i| i as f32).collect();
+        merge_llf_into_block(&mut blk, TransformType::Dct16x32, &llf).unwrap();
+        for y in 0..2 {
+            for x in 0..4 {
+                assert_eq!(blk[y * 32 + x], (y * 4 + x) as f32);
             }
         }
     }

@@ -63,6 +63,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Decoder, four VarDCT corrections found by decoding this crate's own
+  streams with a black-box decoder (round 488; pinned by
+  `tests/r488_decoder_fixtures.rs`, a stream using all 21 transform
+  types up to DCT64×64 with the black-box decode as reference — this
+  decoder is within one 8-bit code of it everywhere):
+  - the LLF block of a varblock **taller than wide** (DCT32×16,
+    DCT64×32 and larger) was placed untransposed into the coefficient
+    grid;
+  - **DCT8×4** was reconstructed as two stacked 4 × 8 halves (the
+    DCT4×8 layout) instead of two 8 × 4 halves side by side;
+  - **AFV0..3** used the 2021 FDIS's DC terms; the 2024 edition swaps
+    the two differential coefficients between the 4×8 half and the
+    4×4 quarter;
+  - the **default DCT8×8 dequantisation weights of the B channel**
+    had a transcription error in the last three band multipliers
+    (`0.0, 0.0, −1.0` for Table I.6's `0.0, −1.0, −2.0`).
 - Decoder: signalled (non-default) `LfChannelDequantization` weights
   were used as read instead of as the `128 / m` divisors the LF
   dequantiser works with — any VarDCT stream with custom LF weights

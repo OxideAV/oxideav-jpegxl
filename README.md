@@ -1156,6 +1156,36 @@ generated `cjxl` transcode pairs:
   `decode` + `to_rgb8` on its inputs, seeded with every subsampled
   fixture.
 
+#### Round 488 — transform and dequantisation corrections arbitrated through the encoder
+
+The VarDCT encoder now writes every transform type, which turns an
+installed black-box decoder into a pixel oracle for decoder paths no
+staged fixture reached with one: a stream is encoded, decoded by both
+decoders, and any difference above the rounding band is a decoder
+defect to resolve from the 2024 text. Four were found and fixed, each
+pinned by `tests/r488_decoder_fixtures.rs` (a 384×256 stream whose
+64×64 tiles each use one of the 21 transform types up to DCT64×64,
+with the black-box decode committed next to it; this decoder is
+within one 8-bit code of it on every sample):
+
+- **LLF placement of blocks taller than wide** (I.8 / I.3.2): the LLF
+  block computed from the LF image is in image order, the coefficient
+  grid is `short × long`, so for DCT32×16, DCT64×32 and the larger
+  tall types it has to be placed transposed. (DCT16×8 and DCT32×8,
+  one cell wide, were unaffected.)
+- **DCT8×4** (I.9.6) is "two 8x4 vertical blocks": 8 rows × 4 columns
+  each, side by side. Both DCT8×4 and DCT4×8 were tiled as two 4 × 8
+  halves stacked.
+- **AFV** (I.9.8): the 2024 edition takes `coefficients(0, 0) −
+  coefficients(0, 1)` for the 4×8 half and `coefficients(0, 0) −
+  coefficients(1, 0) + coefficients(0, 1)` for the 4×4 quarter; the
+  2021 FDIS has the two differential terms the other way round.
+- **Default DCT8×8 weights of the B channel** (Table I.6):
+  `{512.0, −2.0, −1.0, 0.0, −1.0, −2.0}` — the last three band
+  multipliers had been transcribed as `0.0, 0.0, −1.0`, which
+  mis-scaled every B coefficient beyond the third band (visible as
+  blue errors in saturated detail at small distances).
+
 #### Not yet implemented
 
 - **A rare self-consistent §C.8.3 chroma mis-parse** (round 451):
@@ -1180,8 +1210,6 @@ generated `cjxl` transcode pairs:
 - ColorEncoding / ToneMapping fuller decode, preview / animation /
   intrinsic-size sub-bundles (parsing stops cleanly at the `have_*`
   flags).
-- The AFV non-DCT IDCT variants (parsed and dispatched; accuracy
-  unvalidated — no staged fixture reaches them with a pixel oracle).
 - Floating-point samples and `bps > 16`; high-bit-depth XYB / YCbCr.
 - Applying an embedded ICC profile's transfer curve to the decoded
   samples (the `grayscale` stream's image output currently uses the

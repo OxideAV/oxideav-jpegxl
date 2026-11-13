@@ -939,7 +939,7 @@ fn default_bundle_for_slot(slot_index: u32) -> Result<DequantMatrixParams> {
             dct_params: vec![
                 3150.0, 0.0, -0.4, -0.4, -0.4, -2.0, //
                 560.0, 0.0, -0.3, -0.3, -0.3, -0.3, //
-                512.0, -2.0, -1.0, 0.0, 0.0, -1.0,
+                512.0, -2.0, -1.0, 0.0, -1.0, -2.0,
             ]
             .into_iter()
             .map(|v: f64| v as f32)
