@@ -250,39 +250,81 @@ layouts — the same table in both directions, the output label is what
   `1.0` is visually lossless, `quality` maps to `(100 − q) / 10` down
   to 50 and steeper below). 8-bit sRGB input (`Gray8` / `Ya8` /
   `Rgb24` / `Rgba`, no ICC profile) is coded as **VarDCT in XYB**:
-  forward XYB from linear light (the inverse of L.2.2), an 8×8 DCT per
-  block, quantisation against the default dequantisation matrices
-  through `global_scale` × `HfMul`, chroma-from-luma with the default
-  correlation taken from the dequantised luma, the LF image as a
-  Modular sub-bitstream (learned MA tree, signalled LF weights), HF
-  coefficients in natural order under the I.4 context model with
-  clustered histograms, one `PassGroup` per 256×256 group; restoration
-  filters, noise, patches and splines off. Alpha is carried losslessly
-  next to the lossy colour. Anything else (16-bit, non-sRGB transfer or
-  primaries, ICC) — or everything with `EncodeOptions::modular` —
-  quantises the Modular residuals instead: the MA-tree leaf
-  `multiplier` is `round(2^((100 − q) / 12))` at 8 bits, scaled by
-  `2^(bits − 8)`, closed-loop, so the error per sample is bounded by
-  the step.
-* **Rate–distortion, VarDCT** (bytes / PSNR in dB through this
-  crate's decoder; a black-box encoder at its default effort for
-  reference — its distances are not on the same scale, compare at
-  matched sizes):
+  forward XYB from linear light (the inverse of L.2.2), then per
+  256×256 group
+  * the picture **sharpened by the inverse of the Gabor-like
+    smoothing** the frame signals (J.2; a fixed-point inversion of the
+    3×3 kernel), so the decoder's smoothing lands on the source;
+  * a **quantisation field**: `HfMul` of every block from the variance
+    of its luma and of its neighbours — busy blocks take a coarser
+    step, calm ones a finer one;
+  * a **transform per varblock chosen by cost** among all 21 types up
+    to DCT64×64 — DCT8×8, 16×16, 32×32, 64×64, the rectangular DCTs in
+    both orientations, DCT4×4, DCT4×8, DCT8×4, DCT2×2, IDENTITY and
+    AFV0..3 — each 64×64 tile covered bottom-up, every aligned area
+    keeping the cheapest of its sub-coverings and of the transforms
+    spanning it;
+  * **rate–distortion quantisation**: each coefficient takes the level
+    with the lowest Lagrangian cost and the scan is cut where coding
+    the tail stops paying;
+  * **chroma from luma fitted per 64×64 tile** (least squares of the X
+    and B coefficients on the dequantised Y, signalled in `XFromY` /
+    `BFromY`);
+  * the **edge-preserving filter** signalled from distance 2.5 (one
+    iteration) and 6 (two), its strength following each block's
+    quantisation width.
 
-  | distance | 1280×960 grey photo | 1280×960 RGB photo-like |
+  The cost is `D + lambda × R` with `D` the squared error in the pixel
+  domain of XYB (weighted by what the decoder's smoothing leaves of
+  each basis function, and by the field) and `R` an estimate of the
+  coefficient bits fitted to what the entropy coder produces — see
+  `src/vardct_enc.rs` for every constant and the measurement behind
+  it. The LF image is a Modular sub-bitstream (learned MA tree,
+  signalled LF weights), HF coefficients go in natural order under
+  the I.4 context model with clustered histograms, one `PassGroup`
+  per group; noise, patches and splines off. `EncodeOptions::effort`
+  sets the search: `Fast` is DCT8×8 only (field, fitted chroma and
+  filters stay on), `Balanced` searches squares up to 32×32, the
+  16×8 rectangles and the 8×8 family, `Thorough` everything up to
+  64×64. Alpha is carried losslessly next to the lossy colour.
+  Anything else (16-bit, non-sRGB transfer or primaries, ICC) — or
+  everything with `EncodeOptions::modular` — quantises the Modular
+  residuals instead: the MA-tree leaf `multiplier` is
+  `round(2^((100 − q) / 12))` at 8 bits, scaled by `2^(bits − 8)`,
+  closed-loop, so the error per sample is bounded by the step.
+* **Rate–distortion, VarDCT** (bytes / PSNR in dB / luma SSIM, every
+  stream through this crate's decoder; "black box" is a black-box
+  encoder at its default effort — its distances are not on the same
+  scale, compare at matched sizes):
+
+  | distance | 1280×960 grey photo, round 487 | now | 1280×960 RGB photo-like, round 487 | now |
+  |---|---|---|---|---|
+  | 0.5 | 129 138 / 45.37 / 0.9920 | 141 217 / 49.00 / 0.9961 | 187 174 / 37.21 / 0.9703 | 316 019 / 38.21 / 0.9867 |
+  | 1 | 82 548 / 41.50 / 0.9828 | 89 953 / 45.38 / 0.9926 | 104 626 / 35.76 / 0.9570 | 122 578 / 37.05 / 0.9680 |
+  | 2 | 50 937 / 37.85 / 0.9644 | 57 443 / 41.53 / 0.9845 | 62 252 / 33.97 / 0.9378 | 68 935 / 35.73 / 0.9572 |
+  | 4 | 30 566 / 34.53 / 0.9296 | 35 997 / 37.26 / 0.9649 | 37 866 / 31.92 / 0.9042 | 43 122 / 33.73 / 0.9369 |
+  | 8 | 18 081 / 31.25 / 0.8630 | 21 464 / 32.85 / 0.9156 | 23 197 / 29.28 / 0.8395 | 26 371 / 30.43 / 0.8873 |
+  | black box 0.5 | | 232 908 / 51.16 / 0.9972 | | 435 189 / 38.67 / 0.9886 |
+  | black box 1 | | 139 950 / 48.60 / 0.9958 | | 214 968 / 37.63 / 0.9765 |
+  | black box 2 | | 93 001 / 45.13 / 0.9925 | | 110 171 / 36.73 / 0.9651 |
+  | black box 4 | | 60 426 / 41.15 / 0.9848 | | 67 916 / 35.51 / 0.9535 |
+  | black box 8 | | 35 731 / 35.97 / 0.9583 | | 41 530 / 33.03 / 0.9229 |
+
+  At matched sizes (the other curve interpolated in the logarithm of
+  the size, averaged over the points that overlap; SSIM as
+  `−10 log10(1 − SSIM)` in dB):
+
+  | picture | against round 487, PSNR / SSIM | against the black-box encoder, PSNR / SSIM |
   |---|---|---|
-  | 0.5 | 129 138 / 45.37 | 187 174 / 37.21 |
-  | 1 | 82 548 / 41.50 | 104 626 / 35.76 |
-  | 2 | 50 937 / 37.85 | 62 252 / 33.97 |
-  | 4 | 30 566 / 34.53 | 37 866 / 31.92 |
-  | 8 | 18 081 / 31.25 | 23 197 / 29.28 |
-  | black-box 0.5 / 1 | 232 908 / 50.55, 139 950 / 48.27 | 435 189 / 38.64, 214 968 / 37.61 |
-  | black-box 2 / 4 / 8 | 93 001 / 44.99, 60 426 / 41.12, 35 731 / 36.01 | 110 171 / 36.72, 67 916 / 35.53, 41 530 / 33.08 |
+  | grey photo | +2.19 dB / +2.31 dB | +0.75 dB / +0.40 dB |
+  | RGB photo-like | +1.01 dB / +1.11 dB | +0.22 dB / +0.47 dB |
+  | two natural photographs, 960×540 and 1280×960 (not redistributable, used for tuning next to the corpus) | +2.03 / +0.62, +0.76 / +0.80 | +0.15 / +0.30, −0.10 / +0.27 |
 
-  At matched sizes the black-box encoder is ahead by about 3 dB on the
-  grey photo and 1–2 dB on the colour one: variable block sizes,
-  adaptive quantisation and the restoration filters are not written
-  yet.
+  The fastest effort (DCT8×8 only) is up to 1.6 dB of PSNR behind the
+  default at matched sizes (nothing on one of the natural photographs,
+  1.6 dB on the grey corpus photo) for a fifth of the encoding time. Every
+  one of these streams decodes in the black-box decoder to within one
+  8-bit code of this crate's decode (two on one stream at distance 8).
 * **Structure**: one global MA tree **learned from the picture** — a
   sample of it is scanned with the decoder's own property vector
   (Table H.4, previous-channel properties included) and every node
@@ -367,10 +409,10 @@ layouts — the same table in both directions, the output label is what
   encoder takes the framework's `ExecutionContext`). VarDCT decode is
   still serial, and the lossless encoder still holds every residual
   symbol (about 24 bytes per pixel) until the histograms are built.
-* Not written: transforms other than DCT8×8, an adaptive
-  quantisation field, per-tile chroma-from-luma factors, Gaborish /
-  EPF, custom coefficient orders, progressive passes; delta palettes,
-  the Squeeze transform, LZ77, patches, splines, noise,
+* Not written: transforms above 64×64, custom dequantisation
+  matrices, custom coefficient orders and block-context maps,
+  progressive passes, VarDCT for 16-bit / non-sRGB input; delta
+  palettes, the Squeeze transform, LZ77, patches, splines, noise,
   upsampling, crops, previews, extra channels beyond one alpha, float
   samples, `bits_per_sample > 16`.
 
@@ -399,7 +441,7 @@ still image that is the finished picture, not the bare first layer.
 | `quality` | `0..=100`; `100` = lossless Modular; below it lossy — VarDCT at distance `(100 − q) / 10` (steeper under 50) for 8-bit sRGB input, the Modular residual quantiser otherwise (see *Encoding*) |
 | `distance` | lossy target as a distance instead (`Some(0.0)` = lossless, about `1.0` visually lossless); overrides `quality` |
 | `modular` | keep lossy requests on the Modular coder |
-| `effort` | `Fast` / `Balanced` / `Thorough`: how much the Modular coder learns; never changes the pixels |
+| `effort` | `Fast` / `Balanced` / `Thorough`: how much the Modular coder learns (never changes the pixels of a lossless file) and how far the VarDCT coder searches transforms |
 | `threads` | worker budget for per-group work; the bytes are the same at every budget |
 | `container` | always write the 18181-2 box file |
 | `group_size_shift` | `group_dim = 128 << shift`, `0..=3` (Modular frames) |
@@ -1252,9 +1294,8 @@ source picture by the variance of such a perturbation).
   pipeline would be wrong for them).
 - The LfFrame (`lf_level > 0`) dimension scaling `progressive-dc`
   needs.
-- On the encoder: VarDCT beyond DCT8×8 with a uniform quantisation
-  field (variable block sizes, adaptive quantisation, per-tile
-  chroma-from-luma, restoration filters, progressive passes), VarDCT
+- On the encoder: custom dequantisation matrices / coefficient orders
+  / block-context maps, progressive passes, noise synthesis, VarDCT
   for 16-bit / non-sRGB input, delta palettes, Squeeze, LZ77, extra
   channels beyond one alpha, float samples.
 

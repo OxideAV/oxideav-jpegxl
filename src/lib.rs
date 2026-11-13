@@ -625,6 +625,7 @@ pub mod vardct_reconstruct;
 #[doc(hidden)] // internal: Annex L colour transforms (XYB / YCbCr)
 pub mod xyb;
 
+mod enc_dct;
 mod enc_transforms;
 #[doc(hidden)] // internal: Modular codestream writer plumbing
 pub mod encoder;

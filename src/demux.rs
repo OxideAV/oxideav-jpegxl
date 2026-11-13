@@ -270,7 +270,7 @@ impl Muxer for JxlMuxer {
 struct StillParts {
     spec: EncodeSpec,
     /// `Some((x_qm_scale, b_qm_scale))` for a VarDCT still.
-    vardct: Option<(u32, u32)>,
+    vardct: Option<crate::encoder::VarDctShape>,
     group_size_shift: u32,
     toc: Vec<u32>,
     sections: Vec<u8>,
@@ -344,15 +344,18 @@ fn parse_still(bytes: &[u8]) -> Result<StillParts> {
             .all(|b| b.mode == BlendMode::Replace)
         && fh.is_last
         && fh.name.is_empty()
-        && !rf.gab
-        && rf.epf_iters == 0
+        && (vardct || (!rf.gab && rf.epf_iters == 0))
+        && !rf.gab_custom
+        && !rf.epf_sharp_custom
+        && !rf.epf_weight_custom
+        && !rf.epf_sigma_custom
         && rf.extensions.mask == 0
         && fh.extensions.mask == 0
         && !toc.permuted;
     if !canonical {
         return Err(Error::Unsupported(
             "jpegxl muxer: the frame is not a plain Modular or XYB VarDCT still (kReplace, no \
-             crop / upsampling / image features / restoration filter / TOC permutation) and \
+             crop / upsampling / image features / custom restoration filter / TOC permutation) and \
              cannot be re-timed"
                 .into(),
         ));
@@ -380,8 +383,14 @@ fn parse_still(bytes: &[u8]) -> Result<StillParts> {
             // Only "is this an XYB codestream" matters to the prelude.
             vardct_distance: vardct.then_some(1.0),
             threads: 1,
+            vardct_transform: None,
         },
-        vardct: vardct.then_some((fh.x_qm_scale, fh.b_qm_scale)),
+        vardct: vardct.then_some(crate::encoder::VarDctShape {
+            x_qm_scale: fh.x_qm_scale,
+            b_qm_scale: fh.b_qm_scale,
+            gab: rf.gab,
+            epf_iters: rf.epf_iters,
+        }),
         group_size_shift: fh.group_size_shift,
         toc: toc.entries.clone(),
         sections,

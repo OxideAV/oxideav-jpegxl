@@ -93,7 +93,14 @@ fn lossy_requests_write_vardct_and_reach_a_sane_quality() {
             decode(&lossless).unwrap().as_bytes().unwrap(),
             img.as_bytes().unwrap()
         );
-        assert!(bytes.len() < lossless.len() / 2);
+        // The test picture is half noise: "visually lossless" keeps a
+        // good part of it.
+        assert!(
+            bytes.len() < lossless.len() * 2 / 3,
+            "{format:?}: {} bytes at quality 90, {} lossless",
+            bytes.len(),
+            lossless.len()
+        );
         // `modular` keeps a lossy request off VarDCT.
         let modular = encode(
             &img,
@@ -318,7 +325,7 @@ fn black_box_decoder_reconstructs_the_same_picture() {
         }
         let mean = sum as f64 / want.len() as f64;
         assert!(
-            worst <= 3 && mean < 0.5,
+            worst <= 2 && mean < 0.4,
             "case {i}: decoders differ (worst {worst}, mean {mean:.3})"
         );
     }

@@ -140,6 +140,9 @@ pub struct EncodeSpec {
     /// Worker budget for the per-group work (`0` and `1` are serial).
     /// The output does not depend on it.
     pub threads: usize,
+    /// Testing: a VarDCT frame uses this transform type wherever it
+    /// fits (`None`: the encoder's own choice).
+    pub vardct_transform: Option<crate::dct_select::TransformType>,
 }
 
 impl EncodeSpec {
@@ -644,12 +647,24 @@ fn code_frame(spec: &EncodeSpec, frame: &FrameInput) -> Result<CodedFrame> {
 
 // ---- frame serialisation ----------------------------------------------------
 
-/// The frame-header fields this writer emits (F.2, `kModular`).
+/// The frame-header fields of a VarDCT frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VarDctShape {
+    pub x_qm_scale: u32,
+    pub b_qm_scale: u32,
+    /// The Gabor-like transform (J.2) with its default weights.
+    pub gab: bool,
+    /// Iterations of the edge-preserving filter (J.3) with its
+    /// default parameters, `0..=3`.
+    pub epf_iters: u32,
+}
+
+/// The frame-header fields this writer emits (F.2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FrameShape {
-    /// `Some((x_qm_scale, b_qm_scale))` for a VarDCT frame (XYB,
-    /// adaptive LF smoothing off), `None` for a Modular one.
-    pub vardct: Option<(u32, u32)>,
+    /// The VarDCT fields of the header (XYB, adaptive LF smoothing
+    /// off), `None` for a Modular frame.
+    pub vardct: Option<VarDctShape>,
     pub group_size_shift: u32,
     pub num_extra: u32,
     pub have_animation: bool,
@@ -680,9 +695,9 @@ pub fn write_frame_header_and_toc(
     for _ in 0..shape.num_extra {
         w.write_bits(2, 0); // ec_upsampling = 1
     }
-    if let Some((x_qm_scale, b_qm_scale)) = shape.vardct {
-        w.write_bits(3, x_qm_scale);
-        w.write_bits(3, b_qm_scale);
+    if let Some(v) = shape.vardct {
+        w.write_bits(3, v.x_qm_scale);
+        w.write_bits(3, v.b_qm_scale);
     } else {
         w.write_bits(2, shape.group_size_shift);
     }
@@ -714,10 +729,20 @@ pub fn write_frame_header_and_toc(
         }
     }
     w.write_bits(2, 0); // name_len = 0
-    // RestorationFilter (Table J.1): no Gabor, no EPF.
+    // RestorationFilter (Table J.1): the filters a VarDCT frame asks
+    // for with their default parameters, none on a Modular frame.
+    let (gab, epf_iters) = shape.vardct.map_or((false, 0), |v| (v.gab, v.epf_iters));
     w.write_bool(false); // all_default
-    w.write_bool(false); // gab
-    w.write_bits(2, 0); // epf_iters
+    w.write_bool(gab);
+    if gab {
+        w.write_bool(false); // gab_custom
+    }
+    w.write_bits(2, epf_iters);
+    if epf_iters > 0 {
+        w.write_bool(false); // epf_sharp_custom
+        w.write_bool(false); // epf_weight_custom
+        w.write_bool(false); // epf_sigma_custom
+    }
     w.write_u64(0); // rf extensions
     w.write_u64(0); // frame extensions
     // TOC.
@@ -911,7 +936,13 @@ fn write_vardct_frame(
         threads: spec.threads,
         ..learn_params_for(spec.effort)
     };
-    let (sections, rate) = crate::vardct_enc::encode_frame(&input, distance, &learn, spec.threads)?;
+    let opts = crate::vardct_enc::VarDctOptions {
+        distance,
+        effort: spec.effort,
+        threads: spec.threads,
+        forced: spec.vardct_transform,
+    };
+    let (sections, rate) = crate::vardct_enc::encode_frame(&input, &opts, &learn)?;
     let mut toc = Vec::with_capacity(sections.len());
     for s in &sections {
         if s.len() > MAX_SECTION_BYTES {
@@ -922,7 +953,12 @@ fn write_vardct_frame(
         toc.push(s.len() as u32);
     }
     let shape = FrameShape {
-        vardct: Some((rate.x_qm_scale, rate.b_qm_scale)),
+        vardct: Some(VarDctShape {
+            x_qm_scale: rate.x_qm_scale,
+            b_qm_scale: rate.b_qm_scale,
+            gab: rate.gab,
+            epf_iters: rate.epf_iters,
+        }),
         group_size_shift: 1,
         num_extra: u32::from(spec.alpha),
         have_animation: spec.animation.is_some(),

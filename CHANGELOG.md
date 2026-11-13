@@ -9,6 +9,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **VarDCT encoder: rate–distortion tools** (round 488). The lossy
+  coder now chooses, per varblock, among **all 21 transform types up
+  to DCT64×64** (the square and rectangular DCTs, DCT4×4, DCT4×8,
+  DCT8×4, DCT2×2, IDENTITY, AFV0..3) by Lagrangian cost; quantises
+  each coefficient to its cheapest level and cuts the scan where the
+  tail stops paying; drives `HfMul` per block from a **quantisation
+  field** (luma variance of the block and its neighbours); fits the
+  **chroma-from-luma factors of every 64×64 tile**; signals the
+  **Gabor-like transform** and codes the picture sharpened by its
+  inverse; and signals the **edge-preserving filter** from distance
+  2.5 up, its strength following each block's quantisation width.
+  `Effort::Fast` keeps DCT8×8 only, `Thorough` searches everything.
+  On the corpus, at matched size and through this crate's decoder:
+  +2.2 dB PSNR / +2.3 dB SSIM (grey photo) and +1.0 / +1.1 dB (RGB)
+  over round 487, and +0.75 / +0.40 dB and +0.22 / +0.47 dB over a
+  black-box encoder at its default effort (it was 3 dB and 1 – 2 dB
+  ahead). Every stream decodes in a black-box decoder to within one
+  or two 8-bit codes of this crate's decode (pinned for each
+  transform type, each effort and the distance range).
+- `tests/r488_rd.rs`: a rate–distortion harness (PSNR, luma SSIM,
+  optional black-box decoder agreement and black-box encoder
+  reference) over a directory of pictures.
+
 - **VarDCT lossy encoder** (round 487). Any lossy request
   (`quality < 100` or `EncodeOptions::distance > 0`) on 8-bit sRGB
   input now writes `kVarDCT` frames in XYB: sRGB → linear → XYB (the

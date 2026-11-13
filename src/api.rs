@@ -669,6 +669,7 @@ fn encode_spec(
         effort: opts.effort,
         vardct_distance,
         threads: opts.threads,
+        vardct_transform: None,
     }
 }
 
