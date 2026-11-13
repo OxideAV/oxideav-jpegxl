@@ -975,7 +975,25 @@ impl Learner {
 
 /// Learn an MA tree for `sections` (left untouched).
 pub(crate) fn learn_tree(sections: &[Section], params: &LearnParams) -> Tree {
-    let total: usize = sections.iter().map(Section::num_samples).sum();
+    learn_tree_from(
+        sections.len(),
+        &|i| sections[i].num_samples(),
+        &|i| sections[i].clone(),
+        params,
+    )
+}
+
+/// [`learn_tree`] over sections produced on demand: `samples_of(i)` is
+/// the sample count of section `i`, `section(i)` builds it. Only the
+/// sections the learner scans are ever built, one per worker at a
+/// time, so the caller need not hold every section of a large picture.
+pub(crate) fn learn_tree_from(
+    count: usize,
+    samples_of: &(dyn Fn(usize) -> usize + Sync),
+    section: &(dyn Fn(usize) -> Section + Sync),
+    params: &LearnParams,
+) -> Tree {
+    let total: usize = (0..count).map(samples_of).sum();
     let multiplier = params.multiplier.max(1);
     if total == 0 {
         return Tree::single(0, multiplier);
@@ -987,8 +1005,8 @@ pub(crate) fn learn_tree(sections: &[Section], params: &LearnParams) -> Tree {
     } else {
         1
     };
-    let picked: Vec<usize> = (0..sections.len()).step_by(stride).collect();
-    let scanned: usize = picked.iter().map(|&s| sections[s].num_samples()).sum();
+    let picked: Vec<usize> = (0..count).step_by(stride).collect();
+    let scanned: usize = picked.iter().map(|&s| samples_of(s)).sum();
     // Probability as a 32-bit threshold.
     let keep = if scanned <= target {
         u64::from(u32::MAX) + 1
@@ -1005,7 +1023,7 @@ pub(crate) fn learn_tree(sections: &[Section], params: &LearnParams) -> Tree {
         let mut tok: Vec<u8> = Vec::new();
         let mut nprops: Vec<u8> = Vec::new();
         let mut rng = 0x9E37_79B9_7F4A_7C15u64 ^ (si as u64).wrapping_mul(0xD6E8_FEB8_6659_FD93);
-        let mut section = sections[si].clone();
+        let mut section = section(si);
         for i in 0..section.chans.len() {
             scan_channel(&mut section.chans, i, section.stream_index, use_wp, |s| {
                 rng = rng

@@ -31,9 +31,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Decoder: **VarDCT frames decode on the `DecodeOptions::threads`
   budget** — the PassGroup sections of a frame (entropy decode,
   dequantisation, inverse transforms) in parallel, each worker on its
-  own copy of the entropy state; the edge-preserving filter in row
-  bands; the Gabor-like transform per channel; the colour conversion
-  in row bands. Serial by default, the samples identical at every
+  own copy of the entropy state; the edge-preserving filter, the
+  Gabor-like transform and the colour conversion in row bands. Serial by default, the samples identical at every
   budget (pinned on this crate's streams and on the staged black-box
   streams, 96-group and multi-pass ones included), the stream
   diagnostics the workers count handed back to the caller. A 12 MP
@@ -80,6 +79,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Encoder memory, lossless: the coder takes the caller's channel
+  planes over instead of copying them, cuts a group's rectangle out
+  of the picture when a worker codes it (it used to cut every group
+  up front — a second copy of the picture — and clone the scanned
+  ones again for tree learning), and keeps the coded symbols packed
+  in one 32-bit word each (`PackedSymbols`; they were pairs of `u32`)
+  until the histograms are final. Peak resident set of a 12 MP RGB
+  encode: 846 MiB → 527 MiB on one worker, 846 MiB → 557 MiB on
+  eight; the files are byte-identical. What remains is accounted for
+  in the README (*Time and memory*).
 - Decoder: the edge-preserving filter reads the neighbourhood of a
   sample at least three pixels inside the frame by index instead of
   through the mirrored accessors (same terms in the same order,

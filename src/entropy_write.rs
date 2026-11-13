@@ -892,6 +892,57 @@ pub fn cluster_histograms(hists: &[Vec<u64>], max_clusters: usize) -> (Vec<u32>,
     (map, next as usize)
 }
 
+/// The `(context, value)` symbols of a stream held compactly: one
+/// 32-bit word when the context is below `2^12 − 1` and the value
+/// below `2^20` (every residual of ordinary content), three words
+/// otherwise. A lossless encode keeps one symbol per sample until the
+/// histograms are final; as pairs of `u32` that was eight bytes each.
+#[derive(Debug, Clone, Default)]
+pub struct PackedSymbols {
+    words: Vec<u32>,
+}
+
+impl PackedSymbols {
+    const ESCAPE: u32 = u32::MAX;
+    const VALUE_BITS: u32 = 20;
+
+    /// Pack `pairs` in order.
+    pub fn from_pairs(pairs: &[(u32, u32)]) -> Self {
+        let mut words = Vec::with_capacity(pairs.len());
+        for &(ctx, value) in pairs {
+            if ctx < (1 << (32 - Self::VALUE_BITS)) - 1 && value < (1 << Self::VALUE_BITS) {
+                words.push((ctx << Self::VALUE_BITS) | value);
+            } else {
+                words.extend_from_slice(&[Self::ESCAPE, ctx, value]);
+            }
+        }
+        Self { words }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.words.is_empty()
+    }
+
+    /// The symbols, in order.
+    pub fn iter(&self) -> impl Iterator<Item = (u32, u32)> + '_ {
+        let mut at = 0usize;
+        std::iter::from_fn(move || {
+            let &word = self.words.get(at)?;
+            if word == Self::ESCAPE {
+                let pair = (*self.words.get(at + 1)?, *self.words.get(at + 2)?);
+                at += 3;
+                Some(pair)
+            } else {
+                at += 1;
+                Some((
+                    word >> Self::VALUE_BITS,
+                    word & ((1 << Self::VALUE_BITS) - 1),
+                ))
+            }
+        })
+    }
+}
+
 /// Per-context value statistics of a stream whose clustering and
 /// hybrid configurations the encoder elects itself
 /// ([`EntropyCodes::build_clustered`]).
@@ -1301,6 +1352,27 @@ impl EntropyCodes {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn packed_symbols_round_trip_including_escapes() {
+        let pairs = vec![
+            (0u32, 0u32),
+            (17, 5),
+            (4094, (1 << 20) - 1),
+            (4095, 3),
+            (3, 1 << 20),
+            (u32::MAX, u32::MAX),
+            (100_000, 7),
+            (1, 1),
+        ];
+        let packed = PackedSymbols::from_pairs(&pairs);
+        assert_eq!(packed.iter().collect::<Vec<_>>(), pairs);
+        assert!(!packed.is_empty());
+        assert!(PackedSymbols::from_pairs(&[]).is_empty());
+        // Ordinary symbols take one word each.
+        let plain: Vec<(u32, u32)> = (0..1000).map(|i| (i % 300, i * 7)).collect();
+        assert_eq!(PackedSymbols::from_pairs(&plain).words.len(), 1000);
+    }
+
     use super::*;
     use crate::ans::hybrid::HybridUintState;
     use crate::bitreader::BitReader;

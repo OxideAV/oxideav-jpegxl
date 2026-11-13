@@ -384,31 +384,46 @@ layouts — the same table in both directions, the output label is what
 * **Time and memory** (`benches/codec.rs`, a synthesised photo-like
   RGB picture; median of three, one process per measurement, peak
   resident set of that process; an 18-core machine shared with other
-  builds, so read the ratios rather than the digits). "Before" is this
-  round's first VarDCT commit — for decoding, the round-477 decoder:
+  builds, so read the ratios rather than the digits). "Before" is the
+  round-487 state, measured in the same session:
 
   | 1 worker → 8 workers | 1 MP before | 1 MP now | 12 MP before | 12 MP now |
   |---|---|---|---|---|
-  | lossless encode, ms | 960 → 1184 | 652 → 372 | 4240 → 1443 | 2258 → 772 |
-  | lossless decode, ms | 771 → 659 | 268 → 44 | 8411 → 4517 | 2289 → 575 |
-  | lossy (d 1) encode, ms | 244 → 180 | 118 → 81 | 1074 → 913 | 861 → 495 |
-  | lossy (d 1) decode, ms | 298 → 278 | 170 → 133 | 2307 → 2295 | 1264 → 1231 |
-  | lossless encode, peak MiB | 242 → 252 | 210 → 249 | 1048 → 1002 | 856 → 1053 |
-  | lossless decode, peak MiB | 47 → 49 | 45 → 67 | 384 → 384 | 374 → 435 |
-  | lossy encode, peak MiB | 77 → 78 | 75 → 94 | 418 → 418 | 394 → 424 |
-  | lossy decode, peak MiB | 52 → 52 | 51 → 51 | 388 → 379 | 388 → 389 |
+  | lossless encode, ms | 552 → 314 | 458 → 206 | 2027 → 685 | 1959 → 536 |
+  | lossless decode, ms | 140 → 30 | 148 → 30 | 1795 → 342 | 1816 → 350 |
+  | lossy (d 1) encode, ms | 96 → 60 | 258 → 135 | 730 → 441 | 1722 → 430 |
+  | lossy (d 1) decode, ms | 88 → 89 | 109 → 37 | 1065 → 1052 | 1214 → 285 |
+  | lossless encode, peak MiB | 198 → 231 | 181 → 225 | 846 → 842 | 524 → 547 |
+  | lossless decode, peak MiB | 37 → 66 | 37 → 65 | 371 → 417 | 371 → 415 |
+  | lossy encode, peak MiB | 75 → 89 | 49 → 97 | 386 → 407 | 287 → 326 |
+  | lossy decode, peak MiB | 45 → 45 | 50 → 109 | 374 → 374 | 421 → 506 |
 
-  What changed: Modular channel decode on rolling row state (no
-  per-sample allocation, no history planes), Modular groups decoded
-  and encoded on the worker budget, MA-tree learning sampled and
-  searched on the worker budget, the IDCT's cosines tabulated once per
-  size instead of evaluated per term, VarDCT groups colour-converted /
-  transformed / quantised / tokenised per group on the budget. The
-  bytes written and the pixels decoded are the same at every budget
-  (`EncodeOptions::threads`, `DecodeOptions::threads`; the registry
-  encoder takes the framework's `ExecutionContext`). VarDCT decode is
-  still serial, and the lossless encoder still holds every residual
-  symbol (about 24 bytes per pixel) until the histograms are built.
+  What changed in round 488. **Lossy decode runs on the worker
+  budget**: PassGroup sections (entropy decode, dequantisation,
+  inverse transforms) in parallel, the edge-preserving filter and the
+  Gabor-like transform in row bands, XYB → RGB in row bands — 3.7×
+  to 4.3× on eight workers where it was serial. (On one worker the
+  lossy rows are not like for like: the encoder now signals the
+  Gabor-like transform and uses large transforms, which the decoder
+  pays for, and writes a third more bytes at the same distance for a
+  better picture — see the rate–distortion table.) **Lossy encode**
+  searches transforms and quantises by rate–distortion: 2.4× to 2.7×
+  the time of the DCT8×8-only coder on one worker, the same time on
+  eight at 12 MP; `Effort::Fast` is that coder's speed. **Lossless
+  encode memory** is down 38 % at 12 MP: the coder takes the
+  caller's planes over, cuts group rectangles on demand and keeps
+  coded symbols in 32 bits each. The 524 MiB that remain for a 12 MP
+  RGB picture (36 M samples) are, in MiB: the bench's packed picture
+  34, the channel planes as `i32` 137, the packed symbols 137, the
+  tree learner's sample and tables about 150 (fixed by the effort,
+  the same at 1 MP), the output and its section buffers about 45,
+  and one group in flight per worker. The planes and the symbols are
+  the floor of this design — a streaming coder that converts and
+  codes a group at a time from the caller's pixels would remove the
+  first, and two-pass coding (histograms first, bytes second) the
+  second. The bytes written and the pixels decoded are the same at
+  every budget (`EncodeOptions::threads`, `DecodeOptions::threads`;
+  the registry encoder takes the framework's `ExecutionContext`).
 * Not written: transforms above 64×64, custom dequantisation
   matrices, custom coefficient orders and block-context maps,
   progressive passes, VarDCT for 16-bit / non-sRGB input; delta
@@ -426,7 +441,7 @@ dimension, `2^30` max pixels, `strict = false`, `coalesce = true`):
 | `max_width`, `max_height`, `max_pixels`, `max_bytes` | checked against the headers **before** any pixel buffer is allocated; `None` = unlimited; a hit is `Error::LimitExceeded`. `max_bytes` bounds the native output size (`width × height × channels × bytes_per_sample`) — the decoder's working set is about four bytes per sample per channel on top |
 | `strict` | reject trailing bytes after the `is_last` frame of a raw codestream (a box file's structure is always validated) |
 | `coalesce` | `decode_all` composes frames onto the canvas per §C.2 and returns only presented frames (`true`), or returns every frame of the array as decoded — frame-rectangle geometry, un-blended, un-oriented, `Frame::x` / `y` offsets, zero-duration layers included (`false`) |
-| `threads` | worker budget (default `1`): Modular groups, VarDCT groups (entropy decode and reconstruction), the edge-preserving filter (row bands), the Gabor-like transform (per channel) and the XYB → RGB conversion (row bands) run on that many workers; the pixels never depend on it |
+| `threads` | worker budget (default `1`): Modular groups, VarDCT groups (entropy decode and reconstruction), the edge-preserving filter, the Gabor-like transform and the XYB → RGB conversion (row bands) run on that many workers; the pixels never depend on it |
 
 `decode` is always the first **presented** frame, §C.2-composed over
 any preceding layers and oriented (Table A.17) — for a multi-layer

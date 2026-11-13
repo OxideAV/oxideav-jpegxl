@@ -30,11 +30,13 @@
 use crate::bitreader::U32Dist;
 use crate::bitwriter::BitWriter;
 use crate::enc_transforms::{Transform, plan_transforms};
-use crate::entropy_write::{Coding, EntropyCodes, HybridConfig, SymbolStats, ValueStats};
+use crate::entropy_write::{
+    Coding, EntropyCodes, HybridConfig, PackedSymbols, SymbolStats, ValueStats,
+};
 use crate::error::{Error, Result};
 use crate::icc::icc_context;
 use crate::image::ColorInfo;
-use crate::modular_enc::{Chan, LearnParams, Section, encode_section, learn_tree};
+use crate::modular_enc::{Chan, LearnParams, Section, encode_section, learn_tree_from};
 pub use crate::options::Effort;
 
 /// `U32(1 + u(9), 1 + u(13), 1 + u(18), 1 + u(30))` — SizeHeader dims.
@@ -506,24 +508,32 @@ struct CodedFrame {
     transforms: Vec<Transform>,
     /// Symbols of the channels carried by `GlobalModular` (empty when
     /// it carries none).
-    global: Vec<(u32, u32)>,
+    global: PackedSymbols,
     /// One entry per group in raster order (empty for a one-group
     /// picture).
-    groups: Vec<Vec<(u32, u32)>>,
+    groups: Vec<PackedSymbols>,
 }
 
-fn code_frame(spec: &EncodeSpec, frame: &FrameInput) -> Result<CodedFrame> {
+/// Code one Modular frame from its channel planes (consumed: the
+/// transforms run in place and nothing of picture size is copied).
+///
+/// Working set, for a picture of `N` samples (pixels × channels):
+/// the planes (`4 N` bytes), the symbols of the sections coded so far
+/// (`4 N` bytes in the end, see [`PackedSymbols`]), the learner's
+/// sample (bounded by the effort, not by the picture), and per worker
+/// one group's planes and symbols at a time.
+fn code_frame(spec: &EncodeSpec, channels: Vec<Vec<i32>>) -> Result<CodedFrame> {
     let width = spec.width as usize;
     let height = spec.height as usize;
     let n_ch = spec.num_channels();
-    if frame.channels.len() != n_ch {
+    if channels.len() != n_ch {
         return Err(Error::invalid(format!(
             "JXL encoder: frame carries {} channel(s), {n_ch} expected",
-            frame.channels.len()
+            channels.len()
         )));
     }
     let max = (1i64 << spec.bits) - 1;
-    for (c, ch) in frame.channels.iter().enumerate() {
+    for (c, ch) in channels.iter().enumerate() {
         if ch.len() != width * height {
             return Err(Error::invalid(format!(
                 "JXL encoder: channel {c} has {} samples, {} expected",
@@ -537,10 +547,9 @@ fn code_frame(spec: &EncodeSpec, frame: &FrameInput) -> Result<CodedFrame> {
             )));
         }
     }
-    let chans: Vec<Chan> = frame
-        .channels
-        .iter()
-        .map(|c| Chan::new(width, height, c.clone()))
+    let chans: Vec<Chan> = channels
+        .into_iter()
+        .map(|c| Chan::new(width, height, c))
         .collect();
     let multiplier = quantizer_for_quality(spec.quality, spec.bits);
     let planned = plan_transforms(
@@ -553,52 +562,69 @@ fn code_frame(spec: &EncodeSpec, frame: &FrameInput) -> Result<CodedFrame> {
     let n_meta = planned.n_meta;
     let mut chans = planned.chans;
 
-    // Split into independently decoded sections: the meta channels
-    // and — when the picture fits one group — everything else go into
-    // GlobalModular; otherwise each group carries its rectangle of
-    // every non-meta channel.
+    // Independently decoded sections: the meta channels and — when the
+    // picture fits one group — everything else go into GlobalModular
+    // (section 0); otherwise each group carries its rectangle of every
+    // non-meta channel. A group's section is cut out of the picture
+    // when a worker asks for it, never all of them at once.
     let group_dim = spec.group_dim() as usize;
     let single = width <= group_dim && height <= group_dim;
-    let mut sections: Vec<Section> = Vec::new();
-    if single {
-        sections.push(Section {
-            stream_index: 0,
-            chans,
-        });
+    let image: Vec<Chan> = if single {
+        Vec::new()
     } else {
-        let image: Vec<Chan> = chans.split_off(n_meta);
-        sections.push(Section {
-            stream_index: 0,
-            chans,
-        });
-        let gx = width.div_ceil(group_dim);
-        let gy = height.div_ceil(group_dim);
-        let base = 1 + 3 * spec.num_lf_groups() as i64 + 17;
-        for j in 0..gy {
-            for i in 0..gx {
-                let x0 = i * group_dim;
-                let y0 = j * group_dim;
-                let rw = group_dim.min(width - x0);
-                let rh = group_dim.min(height - y0);
-                let stream_index = i32::try_from(base + (j * gx + i) as i64).map_err(|_| {
-                    Error::unsupported("JXL encoder: too many groups for a stream index")
-                })?;
-                sections.push(Section {
-                    stream_index,
-                    chans: image.iter().map(|c| c.rect(x0, y0, rw, rh)).collect(),
-                });
-            }
-        }
-        // The whole-picture planes are not needed past this point.
-        drop(image);
+        chans.split_off(n_meta)
+    };
+    let global = Section {
+        stream_index: 0,
+        chans,
+    };
+    let gx = width.div_ceil(group_dim);
+    let n_groups = if single {
+        0
+    } else {
+        gx * height.div_ceil(group_dim)
+    };
+    let base = 1 + 3 * spec.num_lf_groups() as i64 + 17;
+    if i32::try_from(base + n_groups as i64).is_err() {
+        return Err(Error::unsupported(
+            "JXL encoder: too many groups for a stream index",
+        ));
     }
+    let group_rect = |g: usize| -> (usize, usize, usize, usize) {
+        let (x0, y0) = ((g % gx) * group_dim, (g / gx) * group_dim);
+        (
+            x0,
+            y0,
+            group_dim.min(width - x0),
+            group_dim.min(height - y0),
+        )
+    };
+    let section_at = |i: usize| -> Section {
+        if i == 0 {
+            return global.clone();
+        }
+        let (x0, y0, rw, rh) = group_rect(i - 1);
+        Section {
+            stream_index: (base + (i - 1) as i64) as i32,
+            chans: image.iter().map(|c| c.rect(x0, y0, rw, rh)).collect(),
+        }
+    };
+    let samples_of = |i: usize| -> usize {
+        if i == 0 {
+            global.num_samples()
+        } else {
+            let (_, _, rw, rh) = group_rect(i - 1);
+            rw * rh * image.len()
+        }
+    };
+    let count = 1 + n_groups;
 
     let params = LearnParams {
         multiplier,
         threads: spec.threads,
         ..learn_params_for(spec.effort)
     };
-    let tree = learn_tree(&sections, &params);
+    let tree = learn_tree_from(count, &samples_of, &section_at, &params);
     let tree_syms = tree.symbols();
     let mut tree_stats = ValueStats::new(6);
     for &(c, v) in &tree_syms {
@@ -607,29 +633,27 @@ fn code_frame(spec: &EncodeSpec, frame: &FrameInput) -> Result<CodedFrame> {
     let tree_codes = EntropyCodes::build_clustered(&tree_stats, 1, 6)?;
 
     // Sections are independent given the tree: one worker each, the
-    // statistics merged in section order.
+    // statistics merged in section order. A batch at a time, so only
+    // a few sections and per-section histograms exist at once.
     let mut leaf_stats = ValueStats::new(tree.num_ctx);
-    let mut coded: Vec<Vec<(u32, u32)>> = Vec::with_capacity(sections.len());
-    // A batch at a time, so only a few per-section histograms exist
-    // next to the merged one.
+    let mut coded: Vec<PackedSymbols> = Vec::with_capacity(count);
     let batch = spec.threads.max(1) * 2;
-    let mut pending = sections.into_iter();
-    loop {
-        let chunk: Vec<Section> = pending.by_ref().take(batch).collect();
-        if chunk.is_empty() {
-            break;
-        }
-        for (syms, stats) in crate::par::par_map(spec.threads, chunk, |_, mut section| {
+    let mut first = 0usize;
+    while first < count {
+        let ids: Vec<usize> = (first..count.min(first + batch)).collect();
+        for (syms, stats) in crate::par::par_map(spec.threads, ids, |_, i| {
+            let mut section = section_at(i);
             let syms = encode_section(&mut section, &tree);
             let mut stats = ValueStats::new(tree.num_ctx);
             for &(c, v) in &syms {
                 stats.add(c, v);
             }
-            (syms, stats)
+            (PackedSymbols::from_pairs(&syms), stats)
         }) {
             leaf_stats.merge(&stats);
             coded.push(syms);
         }
+        first += batch;
     }
     let n_streams = coded.iter().filter(|s| !s.is_empty()).count().max(1);
     let leaf_codes = EntropyCodes::build_clustered(&leaf_stats, n_streams, 256)?;
@@ -833,22 +857,26 @@ fn write_global_modular_header(w: &mut BitWriter, coded: &CodedFrame) -> Result<
 fn write_frame(
     w: &mut BitWriter,
     spec: &EncodeSpec,
-    frame: &FrameInput,
+    frame: FrameInput,
     is_last: bool,
 ) -> Result<()> {
     if let Some(distance) = spec.vardct_distance {
-        return write_vardct_frame(w, spec, frame, is_last, distance);
+        return write_vardct_frame(w, spec, &frame, is_last, distance);
     }
-    let coded = code_frame(spec, frame)?;
+    let duration = frame.duration;
+    let coded = code_frame(spec, frame.channels)?;
     let single = coded.groups.is_empty();
     let mut sections: Vec<Vec<u8>> = Vec::new();
     {
         let mut lf = BitWriter::new();
         write_global_modular_header(&mut lf, &coded)?;
         if !coded.global.is_empty() {
+            // One section's symbols are unpacked at a time (the ANS
+            // writer walks them backwards).
+            let pairs: Vec<(u32, u32)> = coded.global.iter().collect();
             coded
                 .leaf_codes
-                .write_symbols(&mut lf, coded.global.iter().copied());
+                .write_symbols(&mut lf, pairs.iter().copied());
         }
         lf.zero_pad_to_byte();
         sections.push(lf.into_bytes());
@@ -858,15 +886,16 @@ fn write_frame(
             sections.push(Vec::new()); // ModularLfGroup: nothing to code
         }
         sections.push(Vec::new()); // HfGlobal: absent for kModular
-        let groups: Vec<&Vec<(u32, u32)>> = coded.groups.iter().collect();
+        let groups: Vec<&PackedSymbols> = coded.groups.iter().collect();
         sections.extend(crate::par::par_map(spec.threads, groups, |_, group| {
             let mut gw = BitWriter::new();
             gw.write_bool(true); // use_global_tree
             gw.write_bool(true); // default_wp
             gw.write_bits(2, 0); // nb_transforms = 0
+            let pairs: Vec<(u32, u32)> = group.iter().collect();
             coded
                 .leaf_codes
-                .write_symbols(&mut gw, group.iter().copied());
+                .write_symbols(&mut gw, pairs.iter().copied());
             gw.into_bytes()
         }));
     }
@@ -884,7 +913,7 @@ fn write_frame(
         group_size_shift: spec.group_size_shift,
         num_extra: u32::from(spec.alpha),
         have_animation: spec.animation.is_some(),
-        duration: frame.duration,
+        duration,
         is_last,
     };
     write_frame_header_and_toc(w, &shape, &toc)?;
@@ -984,7 +1013,21 @@ pub fn vardct_applies(bits: u32, colour: &ColourSpec) -> bool {
 /// without an [`AnimationSpec`] is a still; several frames require
 /// one.
 pub fn encode_codestream(spec: &EncodeSpec, frames: &[FrameInput]) -> Result<Vec<u8>> {
-    if frames.is_empty() {
+    // One frame is copied at a time.
+    encode_frames(spec, frames.iter().cloned())
+}
+
+/// [`encode_codestream`] taking the frames by value: their channel
+/// planes become the coder's working planes instead of being copied.
+pub fn encode_codestream_owned(spec: &EncodeSpec, frames: Vec<FrameInput>) -> Result<Vec<u8>> {
+    encode_frames(spec, frames.into_iter())
+}
+
+fn encode_frames(
+    spec: &EncodeSpec,
+    frames: impl ExactSizeIterator<Item = FrameInput>,
+) -> Result<Vec<u8>> {
+    if frames.len() == 0 {
         return Err(Error::invalid("JXL encoder: no frame to encode"));
     }
     if frames.len() > 1 && spec.animation.is_none() {
@@ -995,7 +1038,7 @@ pub fn encode_codestream(spec: &EncodeSpec, frames: &[FrameInput]) -> Result<Vec
     let mut w = BitWriter::new();
     write_prelude(&mut w, spec)?;
     let last = frames.len() - 1;
-    for (i, f) in frames.iter().enumerate() {
+    for (i, f) in frames.enumerate() {
         write_frame(&mut w, spec, f, i == last)?;
     }
     Ok(w.into_bytes())

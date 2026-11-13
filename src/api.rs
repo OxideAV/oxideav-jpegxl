@@ -699,7 +699,7 @@ pub fn encode(image: &JxlImage, opts: &EncodeOptions) -> Result<Vec<u8>> {
         channels: input.channels,
         duration: 0,
     };
-    let cs = crate::encoder::encode_codestream(&spec, std::slice::from_ref(&frame))?;
+    let cs = crate::encoder::encode_codestream_owned(&spec, vec![frame])?;
     finish_file(cs, &image.metadata, opts)
 }
 
@@ -795,7 +795,7 @@ pub fn encode_all(frames: &[Frame], opts: &EncodeOptions) -> Result<Vec<u8>> {
             duration: ticks[i],
         });
     }
-    let cs = crate::encoder::encode_codestream(&spec, &inputs)?;
+    let cs = crate::encoder::encode_codestream_owned(&spec, inputs)?;
     finish_file(cs, &first.image.metadata, opts)
 }
 
