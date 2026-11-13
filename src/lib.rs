@@ -2435,8 +2435,7 @@ fn apply_modular_restoration_filters(
     }
     let w = img.descs[0].width as usize;
     let h = img.descs[0].height as usize;
-    for k in 0..n_colour {
-        let d = img.descs[k];
+    for d in &img.descs[..n_colour] {
         if d.width as usize != w || d.height as usize != h {
             return Err(Error::Unsupported(
                 "jxl decoder (round 420): restoration filters on subsampled colour channels \

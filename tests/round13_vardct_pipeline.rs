@@ -108,8 +108,8 @@ fn derive_dct_select_dct32x32_in_4x4_grid() {
     // Top-left only at (0,0).
     assert_eq!(g.cells[0], DctSelectCell::TopLeft(TransformType::Dct32x32));
     // The other 15 cells must all be Continuation.
-    for i in 1..16 {
-        assert_eq!(g.cells[i], DctSelectCell::Continuation, "cell {i}");
+    for (i, cell) in g.cells.iter().enumerate().take(16).skip(1) {
+        assert_eq!(*cell, DctSelectCell::Continuation, "cell {i}");
     }
     assert_eq!(g.hf_mul[0], 1);
 }

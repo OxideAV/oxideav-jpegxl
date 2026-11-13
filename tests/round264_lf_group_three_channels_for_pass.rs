@@ -153,8 +153,8 @@ fn r264_integration_3x3_uniform_dct8x8_raster_order() {
     for (i, e) in expected.iter().enumerate() {
         assert_eq!(out[i].0.x, e.0);
         assert_eq!(out[i].0.y, e.1);
-        for c in 0..3 {
-            assert_eq!(out[i].1[c].coeffs.len(), 64);
+        for channel in out[i].1.iter().take(3) {
+            assert_eq!(channel.coeffs.len(), 64);
         }
     }
 }

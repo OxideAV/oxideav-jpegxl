@@ -1455,8 +1455,8 @@ mod tests {
         // documented in materialise_dct2 — verify we don't emit
         // NaN / Inf for it.
         let set = materialise_default_dequant_set().unwrap();
-        for channel in 0..3 {
-            for v in &set.matrices[2][channel] {
+        for (channel, matrix) in set.matrices[2].iter().enumerate() {
+            for v in matrix {
                 assert!(
                     v.is_finite() && *v > 0.0,
                     "DCT2 channel {channel} cell {v} is bad"
@@ -1472,8 +1472,7 @@ mod tests {
         // dequant reciprocal would be Inf and our positivity gate
         // would have errored. Re-confirm here.
         let set = materialise_default_dequant_set().unwrap();
-        for channel in 0..3 {
-            let dq = &set.matrices[10][channel];
+        for (channel, dq) in set.matrices[10].iter().enumerate() {
             assert_eq!(dq.len(), 64);
             for (i, &v) in dq.iter().enumerate() {
                 assert!(

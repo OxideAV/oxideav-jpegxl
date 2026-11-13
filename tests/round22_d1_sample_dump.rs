@@ -165,8 +165,8 @@ fn d1_lfcoefficients_sample_dump_and_wp_rounding_toggle_round_22() {
         // ceil(256/8) = 32 wide × 32 tall = 1024 samples per channel.
         // 3 channels × 1024 = 3072 samples → 3072 ANS calls is a
         // possible but not exact match; round-19 confirmed.
-        for c in 0..lfc.lf_quant.len() {
-            dump_first_n("lf_quant", c, &lfc.lf_quant[c], 256);
+        for (c, plane) in lfc.lf_quant.iter().enumerate() {
+            dump_first_n("lf_quant", c, plane, 256);
         }
     } else {
         eprintln!("[r22]   LfCoefficients::read FAILED under WP +3 — no samples to dump");

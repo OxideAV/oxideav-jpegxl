@@ -532,8 +532,8 @@ mod tests {
         let widths = [2, 2, 2];
         let heights = [2, 2, 2];
         let out = dequant_lf(&lf_quant, widths, heights, 0, &m);
-        for c in 0..3 {
-            for &v in &out.samples[c] {
+        for plane in &out.samples {
+            for &v in plane {
                 assert_eq!(v, 0.0);
             }
         }
@@ -612,13 +612,8 @@ mod tests {
             heights: [3, 3, 3],
         };
         apply_adaptive_lf_smoothing(&mut out, &m);
-        for c_idx in 0..3 {
-            let expected = match c_idx {
-                0 => 3.0,
-                1 => 5.0,
-                _ => 7.0,
-            };
-            for &v in &out.samples[c_idx] {
+        for (c_idx, (plane, expected)) in out.samples.iter().zip([3.0f32, 5.0, 7.0]).enumerate() {
+            for &v in plane {
                 assert!(
                     (v - expected).abs() < 1e-5,
                     "channel {c_idx}: got {v} expected {expected}"
@@ -642,8 +637,8 @@ mod tests {
             heights: [2, 2, 2],
         };
         apply_adaptive_lf_smoothing(&mut out, &m);
-        for c in 0..3 {
-            assert_eq!(out.samples[c], before);
+        for plane in &out.samples {
+            assert_eq!(plane, &before);
         }
     }
 
@@ -734,11 +729,11 @@ mod tests {
         apply_adaptive_lf_smoothing(&mut out, &m);
         let wa = 11.0 * ADAPTIVE_LF_WEIGHT_CENTER
             + 10.0 * (4.0 * ADAPTIVE_LF_WEIGHT_HV + 4.0 * ADAPTIVE_LF_WEIGHT_DIAG);
-        for c in 0..3 {
+        for (c, plane) in out.samples.iter().enumerate() {
             assert!(
-                (out.samples[c][4] - wa).abs() < 1e-5,
+                (plane[4] - wa).abs() < 1e-5,
                 "channel {c}: got {} expected wa {wa}",
-                out.samples[c][4]
+                plane[4]
             );
         }
     }
