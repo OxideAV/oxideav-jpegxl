@@ -46,6 +46,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Encoder: the context clustering of an entropy stream no longer
+  allocates a merged histogram per candidate pair and tabulates
+  `c × log2(c)` for small counts (same sums in the same order, so the
+  clusters and the bytes are unchanged); on a 12 MP lossy encode,
+  whose coefficient stream has 7 425 contexts, it was a seventh of the
+  time.
 - Modular channel decode runs on rolling row state (the neighbours,
   Table H.4 properties and the self-correcting predictor's history
   are kept for two rows instead of being re-derived, with an

@@ -706,6 +706,30 @@ const CONFIG_CANDIDATES: [(u32, u32); 12] = [
 const HEADER_BASE_BITS: f64 = 12.0;
 const HEADER_SYMBOL_BITS: f64 = 7.0;
 
+/// `c × log2(c)` (0 for `c = 0`), tabulated for small counts: the
+/// clustering below evaluates it per histogram bin of every candidate
+/// pair.
+#[inline]
+fn count_log2(c: u64) -> f64 {
+    const TABLE_LEN: usize = 4096;
+    static TABLE: std::sync::OnceLock<Vec<f64>> = std::sync::OnceLock::new();
+    let table = TABLE.get_or_init(|| {
+        (0..TABLE_LEN)
+            .map(|c| {
+                if c == 0 {
+                    0.0
+                } else {
+                    c as f64 * (c as f64).log2()
+                }
+            })
+            .collect()
+    });
+    match table.get(c as usize) {
+        Some(&v) => v,
+        None => c as f64 * (c as f64).log2(),
+    }
+}
+
 /// Shannon cost in bits of coding the histogram with its own ideal
 /// code.
 fn entropy_bits(h: &[u64]) -> f64 {
@@ -714,7 +738,7 @@ fn entropy_bits(h: &[u64]) -> f64 {
     for &c in h {
         if c > 0 {
             n += c;
-            s += c as f64 * (c as f64).log2();
+            s += count_log2(c);
         }
     }
     if n == 0 {
@@ -736,12 +760,32 @@ fn header_bits(h: &[u64]) -> f64 {
 /// Cost increase (bits, may be negative) of coding `a` and `b` with
 /// one shared histogram instead of two.
 fn merge_delta(a: &[u64], b: &[u64], cost_a: f64, cost_b: f64) -> f64 {
-    let n = a.len().max(b.len());
-    let mut m = vec![0u64; n];
-    for (i, slot) in m.iter_mut().enumerate() {
-        *slot = a.get(i).copied().unwrap_or(0) + b.get(i).copied().unwrap_or(0);
+    // The entropy and header cost of the bin-wise sum, without
+    // materialising it (same terms in the same order as
+    // `entropy_bits` / `header_bits` on the summed histogram).
+    let (long, short) = if a.len() >= b.len() { (a, b) } else { (b, a) };
+    let mut n = 0u64;
+    let mut s = 0.0f64;
+    let mut nz = 0usize;
+    for (i, &x) in long.iter().enumerate() {
+        let c = x + short.get(i).copied().unwrap_or(0);
+        if c > 0 {
+            n += c;
+            s += count_log2(c);
+            nz += 1;
+        }
     }
-    entropy_bits(&m) + header_bits(&m) - cost_a - cost_b
+    let entropy = if n == 0 {
+        0.0
+    } else {
+        n as f64 * (n as f64).log2() - s
+    };
+    let header = if nz <= 1 {
+        4.0
+    } else {
+        HEADER_BASE_BITS + HEADER_SYMBOL_BITS * nz as f64
+    };
+    entropy + header - cost_a - cost_b
 }
 
 /// Greedy agglomerative clustering of token histograms: repeatedly
