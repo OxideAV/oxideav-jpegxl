@@ -43,10 +43,10 @@ fn png_rgb(bytes: &[u8]) -> (usize, usize, Vec<u8>) {
 /// pixel ratchet, with zero §C.8.3 loudness diagnostics.
 ///
 /// Ratchet: measured at MAD 1.97 / 1.36 / 0.68 on landing (round
-/// 454) — the first multi-pass decode; the residual (vs the sub-1
-/// single-pass band) is cross-pass accumulation accuracy, a
-/// follow-up, bounded here at 3.0 so a regression to the old
-/// misparse (MAD ≈ tens) can never pass.
+/// 454) and at 0.13 / 0.10 / 0.16 since round 488 — the "cross-pass
+/// accumulation tail" was the transform and restoration-filter
+/// defects fixed there (tall-block LLF placement, the 2024 EPF
+/// weight). Bounded at 0.4.
 #[test]
 fn multipass_fixture_decodes_within_ratchet() {
     oxideav_jpegxl::hf_coefficient_histograms::reset_section_closure_failures();
@@ -79,8 +79,8 @@ fn multipass_fixture_decodes_within_ratchet() {
         }
         let mad = sum as f64 / (w * h) as f64;
         assert!(
-            mad < 3.0,
-            "channel {c}: MAD {mad:.3} exceeds the round-454 landing ratchet 3.0"
+            mad < 0.4,
+            "channel {c}: MAD {mad:.3} exceeds the round-488 ratchet 0.4"
         );
     }
 }

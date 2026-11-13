@@ -2889,7 +2889,12 @@ fn finish_vardct_decode(
         let rf = &fh.restoration_filter;
         if rf.gab || rf.epf_iters > 0 {
             let sigma_grid = if rf.epf_iters > 0 {
-                Some(crate::epf::derive_vardct_sigma_grid(&grid, sharpness, rf)?)
+                Some(crate::epf::derive_vardct_sigma_grid(
+                    &grid,
+                    sharpness,
+                    rf,
+                    global_scale,
+                )?)
             } else {
                 None
             };

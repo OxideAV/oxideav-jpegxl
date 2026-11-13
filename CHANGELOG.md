@@ -79,6 +79,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - the **default DCT8×8 dequantisation weights of the B channel**
     had a transcription error in the last three band multipliers
     (`0.0, 0.0, −1.0` for Table I.6's `0.0, −1.0, −2.0`).
+- Decoder: the **edge-preserving filter follows the 2024 edition**
+  (J.4.3) — `Weight()` is linear in the scaled distance (no square, no
+  `zeroflush` cut-off), `step_multiplier` carries the factor `1.65`,
+  and `quantization_width` is `(1 << 16) / (global_scale × HfMul)`
+  instead of `HfMul` itself. Pinned by three committed streams (one,
+  two and three iterations, with and without the Gabor-like
+  transform, over a varying quantisation field) against the black-box
+  decode. Together with the transform corrections the staged
+  black-box-encoder fixtures improve too — the multi-pass stream from
+  MAD 1.97 / 1.36 / 0.68 to 0.13 / 0.10 / 0.16, the multi-LfGroup
+  stream from 0.60 / 0.41 / 0.47 to 0.14 / 0.10 / 0.16 — and their
+  ratchets are tightened.
 - Decoder: signalled (non-default) `LfChannelDequantization` weights
   were used as read instead of as the `128 / m` divisors the LF
   dequantiser works with — any VarDCT stream with custom LF weights

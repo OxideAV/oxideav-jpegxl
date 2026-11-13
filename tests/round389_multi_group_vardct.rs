@@ -254,8 +254,9 @@ fn multi_group_decode_matches_reference_srgb_bytes() {
         }
         let mad = sum as f64 / n as f64;
         assert!(
-            mad < 1.5,
-            "channel {c} sRGB MAD {mad:.3} exceeds 1.5 (measured 0.55/0.49/0.33 at landing)"
+            mad < 0.6,
+            "channel {c} sRGB MAD {mad:.3} exceeds 0.6 (measured 0.55/0.49/0.33 at landing, \
+             0.39/0.33/0.30 since round 488)"
         );
         assert!(
             maxd <= 16,
@@ -310,8 +311,9 @@ fn d3_header_parses_and_decodes_to_reference() {
         }
         let mad = sum as f64 / n as f64;
         assert!(
-            mad < 2.0,
-            "d3 channel {c} sRGB MAD {mad:.3} exceeds 2.0 (measured 0.89/0.70/0.95)"
+            mad < 0.8,
+            "d3 channel {c} sRGB MAD {mad:.3} exceeds 0.8 (measured 0.89/0.70/0.95 at landing, \
+             0.47/0.31/0.55 since round 488)"
         );
         assert!(maxd <= 20, "d3 channel {c} max diff {maxd} exceeds 20");
     }

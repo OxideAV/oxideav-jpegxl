@@ -178,8 +178,9 @@ fn full_decode_within_pixel_ratchet() {
         }
         let mad = sum as f64 / (w * h) as f64;
         assert!(
-            mad < 1.0,
-            "channel {c}: MAD {mad:.3} exceeds the sub-1/255 photo band ratchet"
+            mad < 0.4,
+            "channel {c}: MAD {mad:.3} exceeds the round-488 ratchet 0.4 \
+             (measured 0.14/0.10/0.16)"
         );
     }
 }

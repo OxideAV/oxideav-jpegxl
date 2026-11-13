@@ -79,8 +79,9 @@ fn custom_orders_stream_decodes_end_to_end() {
         "the round-451 §C.8.3 errata closed this stream's desync (closure \
          {closure_failures}, underruns {underruns} must both be 0)"
     );
-    // Regression ratchet at the round-451 clean-decode level.
-    let bounds = [1.0, 1.0, 1.0];
+    // Regression ratchet: 0.08 / 0.11 / 0.15 measured since the
+    // round-488 transform and restoration-filter corrections.
+    let bounds = [0.4, 0.4, 0.4];
     for (c, mad_max) in bounds.iter().enumerate() {
         let plane = &frame.planes[c];
         let mut sum = 0u64;

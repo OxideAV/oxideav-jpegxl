@@ -1,5 +1,27 @@
 //! Edge-preserving restoration filter — ISO/IEC FDIS 18181-1:2021
-//! Annex J.3 ("Edge-preserving filter", pages 85–87).
+//! Annex J.3 ("Edge-preserving filter", pages 85–87), as revised by
+//! ISO/IEC 18181-1:2024 J.4.
+//!
+//! ## What the code applies (2024 edition, round 488)
+//!
+//! The sections below were written against the 2021 FDIS and keep its
+//! clause numbers and its history of readings. Three points of the
+//! 2024 text supersede them, each arbitrated against a black-box
+//! decoder on streams the encoder in this crate writes with the
+//! filter on (one, two and three iterations; the two decoders agree
+//! to within one 8-bit code):
+//!
+//! * `Weight()` is **linear**: `v = 1 − scaled_distance × inv_sigma;
+//!   if (v <= 0) return 0; return v;` — the FDIS squared `v` and cut
+//!   it at a per-pass `zeroflush`. [`weight`] keeps its `zeroflush`
+//!   argument; the drivers pass `0`.
+//! * `step_multiplier = 1.65 × {rf.epf_pass0_sigma_scale, 1,
+//!   rf.epf_pass2_sigma_scale}` ([`step_schedule`]) — the FDIS had no
+//!   `1.65`.
+//! * `quantization_width` is the per-block multiplier `mul` of I.5.3,
+//!   `(1 << 16) / (global_scale × HfMul)`
+//!   ([`derive_vardct_sigma_grid`]) — the FDIS said "the values in
+//!   HfMul", which makes a finer step filter *more*.
 //!
 //! ## Scope (round 144)
 //!
@@ -411,7 +433,12 @@ pub fn distance_step_2(
 /// zeroflush and the wiring round should pass `0.0`, the minimum
 /// cutoff).
 ///
-/// Returns `0.0` when the computed `v <= zeroflush`, else `v * v`.
+/// Returns `0.0` when the computed `v <= zeroflush`, else `v` — the
+/// 2024 edition's `Weight()` (J.4.3): `if (v <= 0) return 0; return
+/// v;`, so the drivers pass `zeroflush = 0`. (The 2021 FDIS squared
+/// `v` and cut it at a per-pass `zeroflush`; a black-box decoder
+/// follows the 2024 text, to within one 8-bit code on every stream
+/// the encoder in this crate writes with the filter on.)
 /// Per §J.2 `v = 1.0 - scaled_distance * inv_sigma`; for `sigma`
 /// derived via Listing J.3 and `distance >= 0`, `inv_sigma` is
 /// negative when `sigma > 0` (because `sqrt(0.5) - 1 < 0`) — so the
@@ -420,7 +447,7 @@ pub fn distance_step_2(
 pub fn weight(distance: f32, inv_sigma: f32, position_multiplier: f32, zeroflush: f32) -> f32 {
     let scaled_distance = position_multiplier * distance;
     let v = 1.0_f32 - scaled_distance * inv_sigma;
-    if v <= zeroflush { 0.0 } else { v * v }
+    if v <= zeroflush { 0.0 } else { v }
 }
 
 /// Compute Listing J.2's `inv_sigma = step_multiplier × 4 ×
@@ -463,6 +490,28 @@ pub fn inv_sigma_for_pass(step_multiplier: f32, sigma: f32) -> Result<f32> {
     // matches the reference decode of that stream to MAD 0.012.
     let factor = 1.0_f32 - 0.5_f32.sqrt();
     Ok(step_multiplier * 4.0_f32 * factor / sigma)
+}
+
+/// `step_multiplier` of J.4.3 (2024 edition): `1.65 ×
+/// {rf.epf_pass0_sigma_scale, 1, rf.epf_pass2_sigma_scale}` — the
+/// 2021 FDIS omitted the `1.65`.
+pub const STEP_MULTIPLIER_BASE: f32 = 1.65;
+
+/// The steps `rf.epf_iters` selects (J.4.1), in execution order, each
+/// with its `step_multiplier`: the first step only for three
+/// iterations, the second always, the third from two iterations up.
+pub fn step_schedule(rf: &RestorationFilter) -> Vec<(Pass, f32)> {
+    let mut schedule = Vec::with_capacity(3);
+    if rf.epf_iters == 3 {
+        schedule.push((Pass::Pass0, STEP_MULTIPLIER_BASE * rf.epf_pass0_sigma_scale));
+    }
+    if rf.epf_iters >= 1 {
+        schedule.push((Pass::Pass1, STEP_MULTIPLIER_BASE));
+    }
+    if rf.epf_iters >= 2 {
+        schedule.push((Pass::Pass2, STEP_MULTIPLIER_BASE * rf.epf_pass2_sigma_scale));
+    }
+    schedule
 }
 
 /// Listing J.3 — `sigma = max(1e-4, quantization_width ×
@@ -521,7 +570,13 @@ pub fn derive_vardct_sigma_grid(
     grid: &crate::dct_select::DctSelectGrid,
     sharpness: &[i32],
     rf: &RestorationFilter,
+    global_scale: u32,
 ) -> Result<SigmaGrid> {
+    if global_scale == 0 {
+        return Err(Error::InvalidData(
+            "JXL EPF: global_scale must be >= 1".into(),
+        ));
+    }
     let bw = grid.width_blocks as usize;
     let bh = grid.height_blocks as usize;
     if sharpness.len() != bw * bh {
@@ -552,7 +607,14 @@ pub fn derive_vardct_sigma_grid(
                         "JXL EPF: negative Sharpness {sh} at block ({bx},{by})"
                     )));
                 }
-                sigma[idx] = vardct_sigma_from_listing_j3(vb.hf_mul as f32, sh as usize, rf)?;
+                // 2024 edition, J.4.3: `quantization_width` is the
+                // per-block multiplier `mul` of I.5.3,
+                // `(1 << 16) / (global_scale × HfMul)` — the width of
+                // the quantisation step, so a finer step filters less.
+                // (The 2021 FDIS said "the values in HfMul"; a
+                // black-box decoder follows the 2024 definition.)
+                let quantization_width = 65536.0_f32 / (global_scale as f32 * vb.hf_mul as f32);
+                sigma[idx] = vardct_sigma_from_listing_j3(quantization_width, sh as usize, rf)?;
                 filled[idx] = true;
             }
         }
@@ -1033,23 +1095,8 @@ pub fn apply_epf_iterations(
     // The ordered list of (Pass, step_multiplier, zeroflush) the
     // §J.3.1 epf_iters value selects, in execution order.
     let mut schedule: Vec<(Pass, f32, f32)> = Vec::with_capacity(3);
-    if rf.epf_iters == 3 {
-        // Step 0 — 13-tap, compressed step 0 zeroflush.
-        schedule.push((
-            Pass::Pass0,
-            rf.epf_pass0_sigma_scale,
-            rf.epf_pass1_zeroflush,
-        ));
-    }
-    // Step 1 — always done when epf_iters >= 1.
-    schedule.push((Pass::Pass1, 1.0, rf.epf_pass1_zeroflush));
-    if rf.epf_iters >= 2 {
-        // Step 2 — compressed step 1 zeroflush.
-        schedule.push((
-            Pass::Pass2,
-            rf.epf_pass2_sigma_scale,
-            rf.epf_pass2_zeroflush,
-        ));
+    for (pass, step_multiplier) in step_schedule(rf) {
+        schedule.push((pass, step_multiplier, 0.0));
     }
 
     let n = width * height;
@@ -1166,20 +1213,8 @@ pub fn apply_epf_iterations_per_block_sigma(
 
     // The §J.3.1 schedule, identical to apply_epf_iterations.
     let mut schedule: Vec<(Pass, f32, f32)> = Vec::with_capacity(3);
-    if rf.epf_iters == 3 {
-        schedule.push((
-            Pass::Pass0,
-            rf.epf_pass0_sigma_scale,
-            rf.epf_pass1_zeroflush,
-        ));
-    }
-    schedule.push((Pass::Pass1, 1.0, rf.epf_pass1_zeroflush));
-    if rf.epf_iters >= 2 {
-        schedule.push((
-            Pass::Pass2,
-            rf.epf_pass2_sigma_scale,
-            rf.epf_pass2_zeroflush,
-        ));
+    for (pass, step_multiplier) in step_schedule(rf) {
+        schedule.push((pass, step_multiplier, 0.0));
     }
 
     let n = width * height;
@@ -1489,11 +1524,11 @@ mod tests {
         // inv_sigma = -1, pm = 1, zeroflush = 5.0:
         // v(d=0) = 1 → 1 > 5 false → returns 0.
         // v(d=4) = 1 - 1×4×(-1) = 5 → 5 > 5 false → returns 0.
-        // v(d=5) = 1 - 1×5×(-1) = 6 → 6 > 5 true → returns 36.
+        // v(d=5) = 1 - 1×5×(-1) = 6 → 6 > 5 true → returns 6.
         assert_eq!(weight(0.0, -1.0, 1.0, 5.0), 0.0);
         assert_eq!(weight(4.0, -1.0, 1.0, 5.0), 0.0);
         let w = weight(5.0, -1.0, 1.0, 5.0);
-        assert!((w - 36.0).abs() < 1e-5, "w({}) != 36", w);
+        assert!((w - 6.0).abs() < 1e-5, "w({}) != 6", w);
     }
 
     /// `position_multiplier` is applied to `distance` before the
@@ -1501,9 +1536,9 @@ mod tests {
     #[test]
     fn weight_position_multiplier_scales_distance() {
         // d = 1, inv_sigma = -1, pm = 2:
-        // v = 1 - 2×1×(-1) = 3 → returns 9.
+        // v = 1 - 2×1×(-1) = 3 → returns 3.
         let w = weight(1.0, -1.0, 2.0, 0.0);
-        assert!((w - 9.0).abs() < 1e-5);
+        assert!((w - 3.0).abs() < 1e-5);
     }
 
     // ---- inv_sigma_for_pass ----
@@ -2176,8 +2211,8 @@ mod tests {
         // 2×1 blocks across a 16×8 frame: left block skipped (0.1),
         // right block filtered. The filtered sigma must be large
         // enough that Weight() — a DECREASING function of distance
-        // per the round-420 sign erratum — stays above the pass-1
-        // zeroflush for this pattern's cross-tap distances
+        // per the round-420 sign erratum — stays above zero for
+        // this pattern's cross-tap distances
         // (|Δ| = 3 × Σ channel_scale × 5 taps ≈ 7e2), else the
         // kernel degenerates to the identity and the "changed"
         // probe below is vacuous.
@@ -2207,8 +2242,8 @@ mod tests {
             w,
             h,
             &grid,
-            1.0,
-            rf.epf_pass1_zeroflush,
+            STEP_MULTIPLIER_BASE,
+            0.0,
             rf.epf_border_sad_mul,
             rf.epf_channel_scale,
         )

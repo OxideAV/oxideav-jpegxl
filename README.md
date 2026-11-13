@@ -1156,16 +1156,19 @@ generated `cjxl` transcode pairs:
   `decode` + `to_rgb8` on its inputs, seeded with every subsampled
   fixture.
 
-#### Round 488 — transform and dequantisation corrections arbitrated through the encoder
+#### Round 488 — transform, dequantisation and restoration-filter corrections arbitrated through the encoder
 
-The VarDCT encoder now writes every transform type, which turns an
-installed black-box decoder into a pixel oracle for decoder paths no
-staged fixture reached with one: a stream is encoded, decoded by both
-decoders, and any difference above the rounding band is a decoder
-defect to resolve from the 2024 text. Four were found and fixed, each
-pinned by `tests/r488_decoder_fixtures.rs` (a 384×256 stream whose
-64×64 tiles each use one of the 21 transform types up to DCT64×64,
-with the black-box decode committed next to it; this decoder is
+The VarDCT encoder now writes every transform type and both
+restoration filters, which turns an installed black-box decoder into
+a pixel oracle for decoder paths no staged fixture reached with one:
+a stream is encoded, decoded by both decoders, and any difference
+above the rounding band is a decoder defect to resolve from the 2024
+text. Six were found and fixed, each pinned by
+`tests/r488_decoder_fixtures.rs` (a 384×256 stream whose 64×64 tiles
+each use one of the 21 transform types up to DCT64×64, and three
+streams with the Gabor-like transform and one, two and three
+iterations of the edge-preserving filter over a varying quantisation
+field — the black-box decode committed next to each; this decoder is
 within one 8-bit code of it on every sample):
 
 - **LLF placement of blocks taller than wide** (I.8 / I.3.2): the LLF
@@ -1185,6 +1188,29 @@ within one 8-bit code of it on every sample):
   multipliers had been transcribed as `0.0, 0.0, −1.0`, which
   mis-scaled every B coefficient beyond the third band (visible as
   blue errors in saturated detail at small distances).
+- **EPF `Weight()`** (J.4.3, 2024): `v = 1 − scaled_distance ×
+  inv_sigma`, zero when not positive, returned as is — linear, with
+  `step_multiplier = 1.65 × {epf_pass0_sigma_scale, 1,
+  epf_pass2_sigma_scale}`. The 2021 FDIS squared `v`, cut it at a
+  per-pass `zeroflush` and had no `1.65`.
+- **EPF `quantization_width`** (J.4.3, 2024) is the multiplier `mul`
+  of I.5.3, `(1 << 16) / (global_scale × HfMul)` — the open
+  cross-reference question of the errata (a larger `HfMul` is a finer
+  step and now filters less, as the name says).
+
+With them the staged black-box-encoder fixtures moved as well (sRGB
+MAD per channel against the black-box decode, before → after):
+`progressive-ac-multipass` 1.97 / 1.36 / 0.68 → 0.13 / 0.10 / 0.16,
+`large-3072x2048-multigroup` 0.60 / 0.41 / 0.47 → 0.14 / 0.10 / 0.16,
+`vardct-256x256-d3` 0.89 / 0.70 / 0.95 → 0.47 / 0.31 / 0.55,
+`large-1024x768-d2` 0.55 / 0.49 / 0.33 → 0.39 / 0.33 / 0.30, the
+custom-orders stream to 0.08 / 0.11 / 0.15 — the ratchets are
+tightened to match. What remains is a quarter of a code of
+uncorrelated difference: this decoder rounds the float result to
+nearest, and the black-box decoder's 8-bit output differs from that
+on about a quarter of the samples by one code with no bias (on this
+crate's own streams its output is the further of the two from the
+source picture by the variance of such a perturbation).
 
 #### Not yet implemented
 
@@ -1201,12 +1227,7 @@ within one 8-bit code of it on every sample):
   deviate identically (the model is stream-independent). Pinned
   loudly (`cfl_near_half_corner_still_open`) until a reproducer
   isolates the input.
-- The residual sub-1/255 VarDCT accuracy tail (float rounding + §J
-  filter differences) and `save_before_ct` pre-CT reference recording
-  in the §C.2 composer. The first multi-pass decode (round 454,
-  `progressive-ac-multipass`) sits above that band (MAD
-  1.97/1.36/0.68, ratcheted at 3.0) — the cross-pass accumulation
-  accuracy tail is follow-up material.
+- `save_before_ct` pre-CT reference recording in the §C.2 composer.
 - ColorEncoding / ToneMapping fuller decode, preview / animation /
   intrinsic-size sub-bundles (parsing stops cleanly at the `have_*`
   flags).

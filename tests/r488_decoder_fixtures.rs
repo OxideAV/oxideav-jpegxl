@@ -1,5 +1,5 @@
-//! Round 488 — decoder regression fixtures for the transform
-//! corrections of this round.
+//! Round 488 — decoder regression fixtures for the transform and
+//! restoration-filter corrections of this round.
 //!
 //! Provenance: each `r488_*.jxl` was written by this crate's VarDCT
 //! encoder (a round-488 development build forcing particular coding
@@ -16,6 +16,10 @@
 //!   present). Before round 488 the tall rectangular types above
 //!   16×8 (LLF placement), DCT8×4 (orientation), AFV (DC terms) and the
 //!   DCT8×8 B-channel weights were decoded differently.
+//! * `r488_epf1_gab`, `r488_epf2_gab`, `r488_epf3` — the Gabor-like
+//!   transform and one, two and three iterations of the
+//!   edge-preserving filter over a varying quantisation field (the
+//!   filter strength follows the quantisation width of each block).
 
 mod common;
 
@@ -48,4 +52,19 @@ fn check(name: &str) {
 #[test]
 fn every_transform_type_matches_the_black_box_decode() {
     check("transforms");
+}
+
+#[test]
+fn gabor_and_one_epf_iteration_match_the_black_box_decode() {
+    check("epf1_gab");
+}
+
+#[test]
+fn gabor_and_two_epf_iterations_match_the_black_box_decode() {
+    check("epf2_gab");
+}
+
+#[test]
+fn three_epf_iterations_match_the_black_box_decode() {
+    check("epf3");
 }
