@@ -143,8 +143,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   before that step with the ramp `clamp(4·gap − 3, 0, 1)`; on a stream
   with the smoothing on at a large distance that was up to 41 codes
   from a black-box decode, now within one (pinned by
-  `r488_lf_smoothing`). The staged flat-content fixture moves from MAD
-  0.198 to 0.192; every other fixture ratchet holds unchanged.
+  `r488_lf_smoothing`). The black-box encoder turns this smoothing on
+  by default, so the staged fixtures move too: `vardct-256x256-d3`
+  from MAD 0.47 / 0.31 / 0.55 to 0.25 / 0.25 / 0.25 and
+  `large-1024x768-d2` from 0.39 / 0.33 / 0.30 to 0.25 / 0.25 / 0.25 —
+  the rounding floor between the two decoders; their ratchets are
+  tightened to 0.35.
 - Decoder: the **edge-preserving filter follows the 2024 edition**
   (J.4.3) — `Weight()` is linear in the scaled distance (no square, no
   `zeroflush` cut-off), `step_multiplier` carries the factor `1.65`,

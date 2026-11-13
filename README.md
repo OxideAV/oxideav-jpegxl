@@ -1282,17 +1282,18 @@ within one 8-bit code of it on every sample):
 
 With them the staged black-box-encoder fixtures moved as well (sRGB
 MAD per channel against the black-box decode, before → after):
-`progressive-ac-multipass` 1.97 / 1.36 / 0.68 → 0.13 / 0.10 / 0.16,
-`large-3072x2048-multigroup` 0.60 / 0.41 / 0.47 → 0.14 / 0.10 / 0.16,
-`vardct-256x256-d3` 0.89 / 0.70 / 0.95 → 0.47 / 0.31 / 0.55,
-`large-1024x768-d2` 0.55 / 0.49 / 0.33 → 0.39 / 0.33 / 0.30, the
-custom-orders stream to 0.08 / 0.11 / 0.15 — the ratchets are
-tightened to match. What remains is a quarter of a code of
-uncorrelated difference: this decoder rounds the float result to
-nearest, and the black-box decoder's 8-bit output differs from that
-on about a quarter of the samples by one code with no bias (on this
-crate's own streams its output is the further of the two from the
-source picture by the variance of such a perturbation).
+`vardct-256x256-d3` 0.89 / 0.70 / 0.95 → 0.25 / 0.25 / 0.25,
+`large-1024x768-d2` 0.55 / 0.49 / 0.33 → 0.25 / 0.25 / 0.25,
+`progressive-ac-multipass` 1.97 / 1.36 / 0.68 → 0.12 / 0.10 / 0.15,
+`large-3072x2048-multigroup` 0.60 / 0.41 / 0.47 → 0.12 / 0.10 / 0.15,
+the custom-orders stream to 0.08 / 0.11 / 0.13 — the ratchets are
+tightened to match. A quarter of a code is the floor: this decoder
+rounds the float result to nearest, and the black-box decoder's 8-bit
+output differs from that on about a quarter of the samples by one
+code with no bias (on this crate's own streams its output is the
+further of the two from the source picture by the variance of such a
+perturbation). Every staged photographic VarDCT fixture now sits on
+that floor or under it.
 
 #### Not yet implemented
 
