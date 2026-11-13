@@ -255,7 +255,33 @@ pub fn apply_channel(
     // bounds — avoids the mirror lookup per sample. Edge pixels
     // (first/last row, first/last column) fall back to the
     // mirroring path.
-    for y in 0..height {
+    // Rows are independent: under a worker budget the plane is
+    // convolved in bands.
+    let band = 64usize;
+    let bands: Vec<(usize, &mut [f32])> = output
+        .chunks_mut(band * width)
+        .enumerate()
+        .map(|(i, rows)| (i * band, rows))
+        .collect();
+    for done in crate::par::par_map(crate::par::decode_threads(), bands, |_, (y0, rows)| {
+        convolve_rows(input, rows, width, height, y0, &k)
+    }) {
+        done?;
+    }
+    Ok(())
+}
+
+/// The rows `y0 ..` of the convolution of `input` (a whole plane) into
+/// `rows`.
+fn convolve_rows(
+    input: &[f32],
+    rows: &mut [f32],
+    width: usize,
+    height: usize,
+    y0: usize,
+    k: &[f32; 9],
+) -> Result<()> {
+    for y in y0..y0 + rows.len() / width {
         for x in 0..width {
             let s = if x >= 1 && x + 1 < width && y >= 1 && y + 1 < height {
                 // Interior pixel — direct row-major fetch.
@@ -298,7 +324,7 @@ pub fn apply_channel(
                 }
                 acc
             };
-            output[y * width + x] = s;
+            rows[(y - y0) * width + x] = s;
         }
     }
     Ok(())
@@ -350,21 +376,9 @@ pub fn apply_xyb_planes_in_place(
     height: usize,
     rf: &crate::frame_header::RestorationFilter,
 ) -> Result<()> {
-    // The channels are independent: one worker each under a budget.
-    let channels = vec![
-        (x_plane, rf.gab_x_weight1, rf.gab_x_weight2),
-        (y_plane, rf.gab_y_weight1, rf.gab_y_weight2),
-        (b_plane, rf.gab_b_weight1, rf.gab_b_weight2),
-    ];
-    for done in crate::par::par_map(
-        crate::par::decode_threads(),
-        channels,
-        |_, (plane, weight1, weight2)| {
-            apply_channel_in_place(plane, width, height, weight1, weight2)
-        },
-    ) {
-        done?;
-    }
+    apply_channel_in_place(x_plane, width, height, rf.gab_x_weight1, rf.gab_x_weight2)?;
+    apply_channel_in_place(y_plane, width, height, rf.gab_y_weight1, rf.gab_y_weight2)?;
+    apply_channel_in_place(b_plane, width, height, rf.gab_b_weight1, rf.gab_b_weight2)?;
     Ok(())
 }
 
