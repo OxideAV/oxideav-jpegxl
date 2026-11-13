@@ -747,6 +747,12 @@ pub fn note_walk_underrun() {
     WALK_UNDERRUN_COUNT.with(|c| c.set(c.get() + 1));
 }
 
+/// Add `n` to this thread's count (a worker's share handed back to
+/// the thread that asked for the decode).
+pub(crate) fn add_walk_underruns(n: u64) {
+    WALK_UNDERRUN_COUNT.with(|c| c.set(c.get() + n));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

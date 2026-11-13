@@ -350,9 +350,21 @@ pub fn apply_xyb_planes_in_place(
     height: usize,
     rf: &crate::frame_header::RestorationFilter,
 ) -> Result<()> {
-    apply_channel_in_place(x_plane, width, height, rf.gab_x_weight1, rf.gab_x_weight2)?;
-    apply_channel_in_place(y_plane, width, height, rf.gab_y_weight1, rf.gab_y_weight2)?;
-    apply_channel_in_place(b_plane, width, height, rf.gab_b_weight1, rf.gab_b_weight2)?;
+    // The channels are independent: one worker each under a budget.
+    let channels = vec![
+        (x_plane, rf.gab_x_weight1, rf.gab_x_weight2),
+        (y_plane, rf.gab_y_weight1, rf.gab_y_weight2),
+        (b_plane, rf.gab_b_weight1, rf.gab_b_weight2),
+    ];
+    for done in crate::par::par_map(
+        crate::par::decode_threads(),
+        channels,
+        |_, (plane, weight1, weight2)| {
+            apply_channel_in_place(plane, width, height, weight1, weight2)
+        },
+    ) {
+        done?;
+    }
     Ok(())
 }
 

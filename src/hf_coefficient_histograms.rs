@@ -496,3 +496,9 @@ pub fn section_closure_failures() -> u64 {
 pub fn reset_section_closure_failures() {
     SECTION_CLOSURE_FAILURES.with(|c| c.set(0));
 }
+
+/// Add `n` to this thread's count (a worker's share handed back to
+/// the thread that asked for the decode).
+pub(crate) fn add_section_closure_failures(n: u64) {
+    SECTION_CLOSURE_FAILURES.with(|c| c.set(c.get() + n));
+}

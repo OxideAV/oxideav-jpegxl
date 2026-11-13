@@ -924,24 +924,101 @@ pub fn apply_step_per_block_sigma(
         return Ok(());
     }
 
-    // Kernel + metric per pass, mirroring the constant-sigma appliers.
+    // Rows are independent within a step (every output sample reads
+    // the step's input planes only): with a worker budget the frame is
+    // filtered in bands.
+    let threads = crate::par::decode_threads();
+    let band = PARALLEL_BAND_ROWS;
+    if threads <= 1 || height <= band {
+        return step_rows(
+            pass,
+            [x_in, y_in, b_in],
+            [x_out, y_out, b_out],
+            width,
+            height,
+            0,
+            sigma_grid,
+            step_multiplier,
+            zeroflush,
+            position_multiplier_border,
+            channel_scale,
+        );
+    }
+    let bands: Vec<(usize, [&mut [f32]; 3])> = x_out
+        .chunks_mut(band * width)
+        .zip(y_out.chunks_mut(band * width))
+        .zip(b_out.chunks_mut(band * width))
+        .enumerate()
+        .map(|(k, ((x, y), b))| (k * band, [x, y, b]))
+        .collect();
+    for done in crate::par::par_map(threads, bands, |_, (y0, out)| {
+        step_rows(
+            pass,
+            [x_in, y_in, b_in],
+            out,
+            width,
+            height,
+            y0,
+            sigma_grid,
+            step_multiplier,
+            zeroflush,
+            position_multiplier_border,
+            channel_scale,
+        )
+    }) {
+        done?;
+    }
+    Ok(())
+}
+
+/// Rows per work unit of a parallel filter step.
+const PARALLEL_BAND_ROWS: usize = 64;
+
+/// The rows `y0 .. y0 + out[0].len() / width` of one per-block-sigma
+/// step: `input` are the step's whole input planes, `out` the output
+/// rows. A sample at least three pixels inside the frame reads its
+/// neighbourhood by index; the others go through the mirrored
+/// accessors. Both paths add the same terms in the same order.
+#[allow(clippy::too_many_arguments)]
+fn step_rows(
+    pass: Pass,
+    input: [&[f32]; 3],
+    out: [&mut [f32]; 3],
+    width: usize,
+    height: usize,
+    y0: usize,
+    sigma_grid: &SigmaGrid,
+    step_multiplier: f32,
+    zeroflush: f32,
+    position_multiplier_border: f32,
+    channel_scale: [f32; 3],
+) -> Result<()> {
+    // Kernel + distance selector for this pass.
     let (kernel, use_step_2): (&[(i64, i64)], bool) = match pass {
         Pass::Pass0 => (&KERNEL_13TAP, false),
         Pass::Pass1 => (&KERNEL_5TAP, false),
         Pass::Pass2 => (&KERNEL_5TAP, true),
     };
+    let [x_in, y_in, b_in] = input;
+    let [x_out, y_out, b_out] = out;
+    let rows = x_out.len() / width;
+    let stride = width as isize;
+    // Margin a sample needs on every side for the indexed path: the
+    // kernel reaches two pixels, the distance cross one more.
+    const MARGIN: usize = 3;
 
-    for y in 0..height {
+    for y in y0..y0 + rows {
         for x in 0..width {
             let idx = y * width + x;
+            let o = (y - y0) * width + x;
             let block_sigma = sigma_grid.at_pixel(x, y);
 
-            // §J.3.3 block-skip: sigma < 0.3 → output == input for
-            // every step on this block's pixels.
+            // Listing J.3 tail: `sigma < 0.3` → skip all steps for the
+            // block (output == input).
             if block_sigma < EPF_SKIP_SIGMA {
-                x_out[idx] = x_in[idx];
-                y_out[idx] = y_in[idx];
-                b_out[idx] = b_in[idx];
+                x_out[o] = x_in[idx];
+                y_out[o] = y_in[idx];
+                b_out[o] = b_in[idx];
                 continue;
             }
 
@@ -951,46 +1028,73 @@ pub fn apply_step_per_block_sigma(
             } else {
                 1.0_f32
             };
-            let (xi, yi) = (x as i64, y as i64);
 
             let mut sum_w = 0.0_f32;
             let mut acc = [0.0_f32; 3];
-            for (ix, iy) in kernel.iter() {
-                let distance = if use_step_2 {
-                    distance_step_2(
-                        x_in,
-                        y_in,
-                        b_in,
-                        width,
-                        height,
-                        xi,
-                        yi,
-                        *ix,
-                        *iy,
-                        channel_scale,
-                    )?
-                } else {
-                    distance_step_0_and_1(
-                        x_in,
-                        y_in,
-                        b_in,
-                        width,
-                        height,
-                        xi,
-                        yi,
-                        *ix,
-                        *iy,
-                        channel_scale,
-                    )?
-                };
-                let w = weight(distance, inv_sigma, pm, zeroflush);
-                sum_w += w;
-                let sx = fetch_mirror(x_in, width, height, xi + ix, yi + iy)?;
-                let sy = fetch_mirror(y_in, width, height, xi + ix, yi + iy)?;
-                let sb = fetch_mirror(b_in, width, height, xi + ix, yi + iy)?;
-                acc[0] += sx * w;
-                acc[1] += sy * w;
-                acc[2] += sb * w;
+            let interior = x >= MARGIN && x + MARGIN < width && y >= MARGIN && y + MARGIN < height;
+            if interior {
+                for &(ix, iy) in kernel.iter() {
+                    let n = (idx as isize + iy as isize * stride + ix as isize) as usize;
+                    let mut distance = 0.0_f32;
+                    if use_step_2 {
+                        for (plane, scale) in input.iter().zip(channel_scale) {
+                            distance += (plane[idx] - plane[n]).abs() * scale;
+                        }
+                    } else {
+                        for (plane, scale) in input.iter().zip(channel_scale) {
+                            for &(dx, dy) in KERNEL_5TAP.iter() {
+                                let d = dy as isize * stride + dx as isize;
+                                let s_ref = plane[(idx as isize + d) as usize];
+                                let s_nbr = plane[(n as isize + d) as usize];
+                                distance += (s_ref - s_nbr).abs() * scale;
+                            }
+                        }
+                    }
+                    let w = weight(distance, inv_sigma, pm, zeroflush);
+                    sum_w += w;
+                    acc[0] += x_in[n] * w;
+                    acc[1] += y_in[n] * w;
+                    acc[2] += b_in[n] * w;
+                }
+            } else {
+                let (xi, yi) = (x as i64, y as i64);
+                for (ix, iy) in kernel.iter() {
+                    let distance = if use_step_2 {
+                        distance_step_2(
+                            x_in,
+                            y_in,
+                            b_in,
+                            width,
+                            height,
+                            xi,
+                            yi,
+                            *ix,
+                            *iy,
+                            channel_scale,
+                        )?
+                    } else {
+                        distance_step_0_and_1(
+                            x_in,
+                            y_in,
+                            b_in,
+                            width,
+                            height,
+                            xi,
+                            yi,
+                            *ix,
+                            *iy,
+                            channel_scale,
+                        )?
+                    };
+                    let w = weight(distance, inv_sigma, pm, zeroflush);
+                    sum_w += w;
+                    let sx = fetch_mirror(x_in, width, height, xi + ix, yi + iy)?;
+                    let sy = fetch_mirror(y_in, width, height, xi + ix, yi + iy)?;
+                    let sb = fetch_mirror(b_in, width, height, xi + ix, yi + iy)?;
+                    acc[0] += sx * w;
+                    acc[1] += sy * w;
+                    acc[2] += sb * w;
+                }
             }
             if !sum_w.is_finite() || sum_w <= 0.0 {
                 return Err(Error::InvalidData(format!(
@@ -999,9 +1103,9 @@ pub fn apply_step_per_block_sigma(
                 )));
             }
             let inv = 1.0_f32 / sum_w;
-            x_out[idx] = acc[0] * inv;
-            y_out[idx] = acc[1] * inv;
-            b_out[idx] = acc[2] * inv;
+            x_out[o] = acc[0] * inv;
+            y_out[o] = acc[1] * inv;
+            b_out[o] = acc[2] * inv;
         }
     }
     Ok(())
@@ -2198,6 +2302,101 @@ mod tests {
             assert_eq!(x, base, "iters={iters}: skipped blocks must pass through");
             assert_eq!(y, base);
             assert_eq!(b, base);
+        }
+    }
+
+    /// The indexed interior path of a step gives exactly what the
+    /// mirrored accessors give: every sample of a noisy frame, for
+    /// each of the three steps, against a per-sample evaluation
+    /// through `distance_step_*` / `weight` / `fetch_mirror`.
+    #[test]
+    fn indexed_interior_path_matches_the_mirrored_accessors() {
+        let rf = RestorationFilter::default();
+        let (w, h) = (24usize, 19usize);
+        let mut s = 77u32;
+        let mut plane = |scale: f32| -> Vec<f32> {
+            (0..w * h)
+                .map(|i| {
+                    s = s.wrapping_mul(1664525).wrapping_add(1013904223);
+                    ((i % w) as f32 * 0.4).sin() * scale
+                        + (s >> 8) as f32 / (1 << 24) as f32 * scale
+                })
+                .collect()
+        };
+        let (x, y, b) = (plane(0.01), plane(0.3), plane(0.2));
+        let grid = SigmaGrid::new(vec![1.5; 3 * 3], 3, 3).unwrap();
+        for (pass, kernel, step2) in [
+            (Pass::Pass0, &KERNEL_13TAP[..], false),
+            (Pass::Pass1, &KERNEL_5TAP[..], false),
+            (Pass::Pass2, &KERNEL_5TAP[..], true),
+        ] {
+            let mut out = [
+                vec![0.0f32; w * h],
+                vec![0.0f32; w * h],
+                vec![0.0f32; w * h],
+            ];
+            let [xo, yo, bo] = &mut out;
+            apply_step_per_block_sigma(
+                pass,
+                &x,
+                &y,
+                &b,
+                xo,
+                yo,
+                bo,
+                w,
+                h,
+                &grid,
+                STEP_MULTIPLIER_BASE,
+                0.0,
+                rf.epf_border_sad_mul,
+                rf.epf_channel_scale,
+            )
+            .unwrap();
+            let inv_sigma = inv_sigma_for_pass(STEP_MULTIPLIER_BASE, 1.5).unwrap();
+            for py in 0..h {
+                for px in 0..w {
+                    let pm = if is_border_position(px, py) {
+                        rf.epf_border_sad_mul
+                    } else {
+                        1.0
+                    };
+                    let (xi, yi) = (px as i64, py as i64);
+                    let mut sum = 0.0f32;
+                    let mut acc = [0.0f32; 3];
+                    for &(ix, iy) in kernel {
+                        let d = if step2 {
+                            distance_step_2(&x, &y, &b, w, h, xi, yi, ix, iy, rf.epf_channel_scale)
+                        } else {
+                            distance_step_0_and_1(
+                                &x,
+                                &y,
+                                &b,
+                                w,
+                                h,
+                                xi,
+                                yi,
+                                ix,
+                                iy,
+                                rf.epf_channel_scale,
+                            )
+                        }
+                        .unwrap();
+                        let wgt = weight(d, inv_sigma, pm, 0.0);
+                        sum += wgt;
+                        for (slot, p) in acc.iter_mut().zip([&x, &y, &b]) {
+                            *slot += fetch_mirror(p, w, h, xi + ix, yi + iy).unwrap() * wgt;
+                        }
+                    }
+                    for (c, plane) in out.iter().enumerate() {
+                        assert_eq!(
+                            plane[py * w + px],
+                            acc[c] * (1.0 / sum),
+                            "{pass:?} channel {c} at ({px}, {py})"
+                        );
+                    }
+                }
+            }
         }
     }
 

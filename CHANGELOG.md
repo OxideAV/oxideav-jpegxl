@@ -28,6 +28,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ahead). Every stream decodes in a black-box decoder to within one
   or two 8-bit codes of this crate's decode (pinned for each
   transform type, each effort and the distance range).
+- Decoder: **VarDCT frames decode on the `DecodeOptions::threads`
+  budget** — the PassGroup sections of a frame (entropy decode,
+  dequantisation, inverse transforms) in parallel, each worker on its
+  own copy of the entropy state; the edge-preserving filter in row
+  bands; the Gabor-like transform per channel; the colour conversion
+  in row bands. Serial by default, the samples identical at every
+  budget (pinned on this crate's streams and on the staged black-box
+  streams, 96-group and multi-pass ones included), the stream
+  diagnostics the workers count handed back to the caller. A 12 MP
+  lossy decode goes from 1.26 s on one worker to 0.30 s on eight
+  (0.115 s → 0.037 s at 1 MP).
 - `tests/r488_rd.rs`: a rate–distortion harness (PSNR, luma SSIM,
   optional black-box decoder agreement and black-box encoder
   reference) over a directory of pictures.
@@ -69,6 +80,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Decoder: the edge-preserving filter reads the neighbourhood of a
+  sample at least three pixels inside the frame by index instead of
+  through the mirrored accessors (same terms in the same order,
+  pinned sample for sample); a 1.2 MP frame with one iteration of the
+  filter decodes in 157 ms instead of 481 ms on one worker.
 - Encoder: the context clustering of an entropy stream no longer
   allocates a merged histogram per candidate pair and tabulates
   `c × log2(c)` for small counts (same sums in the same order, so the

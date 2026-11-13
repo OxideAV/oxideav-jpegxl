@@ -79,7 +79,7 @@ use crate::multi_pass_hf_histogram_decoder::HfHistogramDecodeContext;
 /// followed by that pass's §C.7.2 / I.3.3 HF-coefficient histogram
 /// block (`495 × num_hf_presets × nb_block_ctx` clustered
 /// distributions).
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct HfPassData {
     /// The pass's §C.7.1 / I.3.1 coefficient-order bundle
     /// (`order[p][b][c]` — every preset of this pass shares it; the
@@ -131,7 +131,7 @@ impl HfPassData {
 ///
 /// Construct with [`Self::read`], which performs every read on a
 /// single contiguous bit cursor in spec order.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct HfGlobalSection {
     /// §I.2.4 dequant-matrix bundle + §I.2.6 `num_hf_presets`.
     pub hf_global: HfGlobal,

@@ -426,7 +426,7 @@ dimension, `2^30` max pixels, `strict = false`, `coalesce = true`):
 | `max_width`, `max_height`, `max_pixels`, `max_bytes` | checked against the headers **before** any pixel buffer is allocated; `None` = unlimited; a hit is `Error::LimitExceeded`. `max_bytes` bounds the native output size (`width × height × channels × bytes_per_sample`) — the decoder's working set is about four bytes per sample per channel on top |
 | `strict` | reject trailing bytes after the `is_last` frame of a raw codestream (a box file's structure is always validated) |
 | `coalesce` | `decode_all` composes frames onto the canvas per §C.2 and returns only presented frames (`true`), or returns every frame of the array as decoded — frame-rectangle geometry, un-blended, un-oriented, `Frame::x` / `y` offsets, zero-duration layers included (`false`) |
-| `threads` | worker budget (default `1`): Modular groups decode on that many workers; the pixels never depend on it |
+| `threads` | worker budget (default `1`): Modular groups, VarDCT groups (entropy decode and reconstruction), the edge-preserving filter (row bands), the Gabor-like transform (per channel) and the XYB → RGB conversion (row bands) run on that many workers; the pixels never depend on it |
 
 `decode` is always the first **presented** frame, §C.2-composed over
 any preceding layers and oriented (Table A.17) — for a multi-layer

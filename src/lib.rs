@@ -2662,10 +2662,10 @@ struct VarDctFinishInputs<'a> {
 /// at the group's pixel offset. The assembled planes are then cropped
 /// to the logical frame extent (§6.2), restoration-filtered (§J), and
 /// converted XYB → 8-bit RGB (§L.2.2).
-fn finish_vardct_decode(
+fn finish_vardct_decode<'r>(
     inputs: VarDctFinishInputs<'_>,
     hf_section: &mut crate::hf_global_section::HfGlobalSection,
-    group_readers: Vec<(crate::group_rect::GroupRect, Vec<BitReader<'_>>)>,
+    group_readers: Vec<(crate::group_rect::GroupRect, Vec<BitReader<'r>>)>,
     pts: Option<i64>,
     after_hf: &mut dyn FnMut(u32, u32, &mut BitReader<'_>) -> Result<()>,
 ) -> Result<(RawFrame, Option<crate::patches::PreCtFrame>)> {
@@ -2746,22 +2746,35 @@ fn finish_vardct_decode(
         ],
     };
 
-    for (rect, per_pass_readers) in group_readers {
+    let capture = VARDCT_HF_COEFF_CAPTURE_ARMED.with(|c| c.get());
+    // One group: its PassGroup sections entropy-decoded and
+    // reconstructed to the group's padded XYB planes. Returns them
+    // with the decoded coefficient stacks and, per pass, the reader
+    // positioned after the HF coefficients.
+    type GroupDecode<'r> = (
+        ChannelResidualPlanes,
+        Vec<BitReader<'r>>,
+        crate::multi_pass_decode::MultiPassThreeChannelOutput,
+    );
+    let decode_group = |hf_section: &mut crate::hf_global_section::HfGlobalSection,
+                        rect: &crate::group_rect::GroupRect,
+                        per_pass_readers: Vec<BitReader<'r>>|
+     -> Result<GroupDecode<'r>> {
         // Group-local views (§C.8.1: all PassGroup coordinates are
         // relative to the group's top-left corner).
-        let sub_grid = crate::group_rect::slice_dct_select_rect(&grid, &rect)?;
-        let sub_lf = crate::group_rect::slice_lf_rect(&lf, &rect)?;
+        let sub_grid = crate::group_rect::slice_dct_select_rect(&grid, rect)?;
+        let sub_lf = crate::group_rect::slice_lf_rect(&lf, rect)?;
         let sub_xfy = crate::group_rect::slice_tiles_rect(
             x_from_y,
             grid.width_blocks,
             grid.height_blocks,
-            &rect,
+            rect,
         )?;
         let sub_bfy = crate::group_rect::slice_tiles_rect(
             b_from_y,
             grid.width_blocks,
             grid.height_blocks,
-            &rect,
+            rect,
         )?;
 
         if per_pass_readers.len() != fh.passes.num_passes as usize {
@@ -2803,6 +2816,7 @@ fn finish_vardct_decode(
         // coefficients to previously-decoded ones").
         let mut stacks: crate::multi_pass_decode::MultiPassThreeChannelOutput =
             Vec::with_capacity(per_pass_readers.len());
+        let mut readers: Vec<BitReader<'r>> = Vec::with_capacity(per_pass_readers.len());
         for (p, mut gbr) in per_pass_readers.into_iter().enumerate() {
             let headers = PerPassHfHeaders::read(&mut gbr, 1, num_hf_presets, nb_block_ctx)?;
             let pass_data = hf_section.pass_data_mut(p as u32)?;
@@ -2831,43 +2845,103 @@ fn finish_vardct_decode(
                 .pass_data_mut(p as u32)?
                 .histograms
                 .finish_section()?;
-            // G.4: the group's Modular data (extra channels) follows
-            // its HF coefficients on the same bit cursor.
-            after_hf(rect.index, p as u32, &mut gbr)?;
             stacks.push(out.pop().ok_or_else(|| {
                 Error::InvalidData(
                     "jxl VarDCT integrated decode: empty per-pass decode output".into(),
                 )
             })?);
-        }
-
-        // Diagnostic capture: when armed, snapshot this group's decoded
-        // quantised HF-coefficient stacks (the crate-side per-varblock
-        // HF trace of #168) before reconstruction consumes them.
-        if VARDCT_HF_COEFF_CAPTURE_ARMED.with(|c| c.get()) {
-            VARDCT_HF_COEFF_CAPTURE.with(|s| {
-                s.borrow_mut()
-                    .get_or_insert_with(Vec::new)
-                    .push((rect.index, stacks.clone()));
-            });
+            // G.4: the group's Modular data (extra channels) follows
+            // its HF coefficients on the same bit cursor; the caller
+            // reads it from here.
+            readers.push(gbr);
         }
 
         let group_planes = reconstruct_lf_group_cross_pass(
             &fh.passes, &sub_grid, &sub_lf, &dq, &sub_xfy, &sub_bfy, &cfl, &stacks,
         )?;
+        // The coefficient stacks are only kept for the diagnostic
+        // capture.
+        Ok((
+            group_planes,
+            readers,
+            if capture { stacks } else { Vec::new() },
+        ))
+    };
 
-        // Paste the group's padded planes into the frame-level planes
-        // at the group's pixel offset.
-        let px0 = (rect.bx0 as usize) * 8;
-        let py0 = (rect.by0 as usize) * 8;
-        for c in 0..3 {
-            let src = &group_planes.planes[c];
-            let dst = &mut planes_xyb.planes[c];
-            for sy in 0..src.height {
-                let src_row = sy * src.width;
-                let dst_row = (py0 + sy) * dst.width + px0;
-                dst.samples[dst_row..dst_row + src.width]
-                    .copy_from_slice(&src.samples[src_row..src_row + src.width]);
+    // Groups are independent given the frame-level tables. With a
+    // worker budget they decode in parallel, each worker on its own
+    // copy of the entropy state; the Modular tails, the diagnostics
+    // and the assembly stay on this thread, in group order, so the
+    // result does not depend on the budget.
+    let threads = crate::par::decode_threads();
+    // The workers' copies of the entropy state, reused from batch to
+    // batch (at most one per worker is ever made).
+    let pool: std::sync::Mutex<Vec<crate::hf_global_section::HfGlobalSection>> =
+        std::sync::Mutex::new(Vec::new());
+    let mut pending = group_readers.into_iter();
+    loop {
+        let batch: Vec<_> = pending.by_ref().take(threads.max(1) * 2).collect();
+        if batch.is_empty() {
+            break;
+        }
+        let decoded: Vec<Result<(crate::group_rect::GroupRect, GroupDecode<'r>, [u64; 2])>> =
+            if threads > 1 && batch.len() > 1 {
+                let shared: &crate::hf_global_section::HfGlobalSection = hf_section;
+                crate::par::par_map(threads, batch, |_, (rect, readers)| {
+                    let spare = pool.lock().ok().and_then(|mut p| p.pop());
+                    let mut section = spare.unwrap_or_else(|| shared.clone());
+                    // The loudness counters are per thread: hand the
+                    // worker's share back to the caller.
+                    let before = [
+                        crate::pass_group_hf::walk_underruns(),
+                        crate::hf_coefficient_histograms::section_closure_failures(),
+                    ];
+                    let out = decode_group(&mut section, &rect, readers);
+                    let noted = [
+                        crate::pass_group_hf::walk_underruns() - before[0],
+                        crate::hf_coefficient_histograms::section_closure_failures() - before[1],
+                    ];
+                    if let Ok(mut p) = pool.lock() {
+                        p.push(section);
+                    }
+                    out.map(|d| (rect, d, noted))
+                })
+            } else {
+                batch
+                    .into_iter()
+                    .map(|(rect, readers)| {
+                        decode_group(hf_section, &rect, readers).map(|d| (rect, d, [0, 0]))
+                    })
+                    .collect()
+            };
+        for item in decoded {
+            let (rect, (group_planes, readers, stacks), noted) = item?;
+            crate::pass_group_hf::add_walk_underruns(noted[0]);
+            crate::hf_coefficient_histograms::add_section_closure_failures(noted[1]);
+            for (p, mut gbr) in readers.into_iter().enumerate() {
+                after_hf(rect.index, p as u32, &mut gbr)?;
+            }
+            // Diagnostic capture: when armed, snapshot this group's
+            // decoded quantised HF-coefficient stacks (the crate-side
+            // per-varblock HF trace of #168).
+            if capture {
+                VARDCT_HF_COEFF_CAPTURE.with(|s| {
+                    s.borrow_mut()
+                        .get_or_insert_with(Vec::new)
+                        .push((rect.index, stacks));
+                });
+            }
+            // Paste the group's padded planes into the frame-level
+            // planes at the group's pixel offset.
+            let px0 = (rect.bx0 as usize) * 8;
+            let py0 = (rect.by0 as usize) * 8;
+            for (src, dst) in group_planes.planes.iter().zip(planes_xyb.planes.iter_mut()) {
+                for sy in 0..src.height {
+                    let src_row = sy * src.width;
+                    let dst_row = (py0 + sy) * dst.width + px0;
+                    dst.samples[dst_row..dst_row + src.width]
+                        .copy_from_slice(&src.samples[src_row..src_row + src.width]);
+                }
             }
         }
     }
@@ -3031,20 +3105,40 @@ fn finish_vardct_decode(
     let x_plane = &cropped.planes[0];
     let y_plane = &cropped.planes[1];
     let b_plane = &cropped.planes[2];
-    let mut r_bytes = Vec::with_capacity(w * h);
-    let mut g_bytes = Vec::with_capacity(w * h);
-    let mut b_bytes = Vec::with_capacity(w * h);
-    for i in 0..(w * h) {
-        let (r, g, bb) = crate::xyb::inverse_xyb_to_rgb(
-            x_plane.samples[i],
-            y_plane.samples[i],
-            b_plane.samples[i],
-            oim,
-            tone,
+    let mut r_bytes = vec![0u8; w * h];
+    let mut g_bytes = vec![0u8; w * h];
+    let mut b_bytes = vec![0u8; w * h];
+    {
+        // Sample-wise, so the rows convert in bands on the worker
+        // budget.
+        let band = w * 64;
+        let bands: Vec<(usize, [&mut [u8]; 3])> = r_bytes
+            .chunks_mut(band.max(1))
+            .zip(g_bytes.chunks_mut(band.max(1)))
+            .zip(b_bytes.chunks_mut(band.max(1)))
+            .enumerate()
+            .map(|(k, ((r, g), b))| (k * band, [r, g, b]))
+            .collect();
+        crate::par::par_map(
+            crate::par::decode_threads(),
+            bands,
+            |_, (start, [r, g, b])| {
+                for (k, ((r, g), b)) in r.iter_mut().zip(g.iter_mut()).zip(b.iter_mut()).enumerate()
+                {
+                    let i = start + k;
+                    let (lr, lg, lb) = crate::xyb::inverse_xyb_to_rgb(
+                        x_plane.samples[i],
+                        y_plane.samples[i],
+                        b_plane.samples[i],
+                        oim,
+                        tone,
+                    );
+                    *r = enc.encode_u8(lr);
+                    *g = enc.encode_u8(lg);
+                    *b = enc.encode_u8(lb);
+                }
+            },
         );
-        r_bytes.push(enc.encode_u8(r));
-        g_bytes.push(enc.encode_u8(g));
-        b_bytes.push(enc.encode_u8(bb));
     }
     Ok((
         RawFrame {
