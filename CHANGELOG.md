@@ -22,10 +22,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   2.5 up, its strength following each block's quantisation width.
   `Effort::Fast` keeps DCT8×8 only, `Thorough` searches everything.
   On the corpus, at matched size and through this crate's decoder:
-  +2.2 dB PSNR / +2.3 dB SSIM (grey photo) and +1.0 / +1.1 dB (RGB)
-  over round 487, and +0.75 / +0.40 dB and +0.22 / +0.47 dB over a
+  +2.4 dB PSNR / +2.3 dB SSIM (grey photo) and +1.1 / +1.1 dB (RGB)
+  over round 487, and +0.94 / +0.38 dB and +0.30 / +0.46 dB over a
   black-box encoder at its default effort (it was 3 dB and 1 – 2 dB
-  ahead). Every stream decodes in a black-box decoder to within one
+  ahead). The quantisation field looks for the calmest 4×4 cell in
+  reach of a block, so edges and glyphs beside flat patches are not
+  mistaken for texture (+1.2 dB at matched size on the corpus
+  screenshot; screen content otherwise remains 5 – 10 dB behind the
+  black-box encoder, which has patches and palettes for it). Every stream decodes in a black-box decoder to within one
   or two 8-bit codes of this crate's decode (pinned for each
   transform type, each effort and the distance range).
 - Decoder: **VarDCT frames decode on the `DecodeOptions::threads`

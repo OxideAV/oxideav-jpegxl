@@ -256,8 +256,9 @@ layouts — the same table in both directions, the output label is what
     smoothing** the frame signals (J.2; a fixed-point inversion of the
     3×3 kernel), so the decoder's smoothing lands on the source;
   * a **quantisation field**: `HfMul` of every block from the variance
-    of its luma and of its neighbours — busy blocks take a coarser
-    step, calm ones a finer one;
+    of its luma and the calmest 4×4 cell in reach — texture takes a
+    coarser step, an edge or a glyph beside a flat patch keeps a fine
+    one;
   * a **transform per varblock chosen by cost** among all 21 types up
     to DCT64×64 — DCT8×8, 16×16, 32×32, 64×64, the rectangular DCTs in
     both orientations, DCT4×4, DCT4×8, DCT8×4, DCT2×2, IDENTITY and
@@ -299,11 +300,11 @@ layouts — the same table in both directions, the output label is what
 
   | distance | 1280×960 grey photo, round 487 | now | 1280×960 RGB photo-like, round 487 | now |
   |---|---|---|---|---|
-  | 0.5 | 129 138 / 45.37 / 0.9920 | 141 217 / 49.00 / 0.9961 | 187 174 / 37.21 / 0.9703 | 316 019 / 38.21 / 0.9867 |
-  | 1 | 82 548 / 41.50 / 0.9828 | 89 953 / 45.38 / 0.9926 | 104 626 / 35.76 / 0.9570 | 122 578 / 37.05 / 0.9680 |
-  | 2 | 50 937 / 37.85 / 0.9644 | 57 443 / 41.53 / 0.9845 | 62 252 / 33.97 / 0.9378 | 68 935 / 35.73 / 0.9572 |
-  | 4 | 30 566 / 34.53 / 0.9296 | 35 997 / 37.26 / 0.9649 | 37 866 / 31.92 / 0.9042 | 43 122 / 33.73 / 0.9369 |
-  | 8 | 18 081 / 31.25 / 0.8630 | 21 464 / 32.85 / 0.9156 | 23 197 / 29.28 / 0.8395 | 26 371 / 30.43 / 0.8873 |
+  | 0.5 | 129 138 / 45.37 / 0.9920 | 146 145 / 49.38 / 0.9962 | 187 174 / 37.21 / 0.9703 | 325 345 / 38.29 / 0.9869 |
+  | 1 | 82 548 / 41.50 / 0.9828 | 92 947 / 45.78 / 0.9929 | 104 626 / 35.76 / 0.9570 | 127 776 / 37.17 / 0.9684 |
+  | 2 | 50 937 / 37.85 / 0.9644 | 59 045 / 42.01 / 0.9852 | 62 252 / 33.97 / 0.9378 | 70 661 / 35.87 / 0.9579 |
+  | 4 | 30 566 / 34.53 / 0.9296 | 37 045 / 37.80 / 0.9668 | 37 866 / 31.92 / 0.9042 | 43 991 / 33.97 / 0.9389 |
+  | 8 | 18 081 / 31.25 / 0.8630 | 22 152 / 33.40 / 0.9202 | 23 197 / 29.28 / 0.8395 | 26 997 / 30.71 / 0.8916 |
   | black box 0.5 | | 232 908 / 51.16 / 0.9972 | | 435 189 / 38.67 / 0.9886 |
   | black box 1 | | 139 950 / 48.60 / 0.9958 | | 214 968 / 37.63 / 0.9765 |
   | black box 2 | | 93 001 / 45.13 / 0.9925 | | 110 171 / 36.73 / 0.9651 |
@@ -316,15 +317,23 @@ layouts — the same table in both directions, the output label is what
 
   | picture | against round 487, PSNR / SSIM | against the black-box encoder, PSNR / SSIM |
   |---|---|---|
-  | grey photo | +2.19 dB / +2.31 dB | +0.75 dB / +0.40 dB |
-  | RGB photo-like | +1.01 dB / +1.11 dB | +0.22 dB / +0.47 dB |
-  | two natural photographs, 960×540 and 1280×960 (not redistributable, used for tuning next to the corpus) | +2.03 / +0.62, +0.76 / +0.80 | +0.15 / +0.30, −0.10 / +0.27 |
+  | grey photo | +2.43 dB / +2.30 dB | +0.94 dB / +0.38 dB |
+  | RGB photo-like | +1.10 dB / +1.12 dB | +0.30 dB / +0.46 dB |
+  | two natural photographs, 960×540 and 1280×960 (not redistributable, used for tuning next to the corpus) | +2.08 / +0.60, +0.96 / +0.47 | +0.19 / +0.27, −0.06 / +0.20 |
 
   The fastest effort (DCT8×8 only) is up to 1.6 dB of PSNR behind the
   default at matched sizes (nothing on one of the natural photographs,
-  1.6 dB on the grey corpus photo) for a fifth of the encoding time. Every
-  one of these streams decodes in the black-box decoder to within one
-  8-bit code of this crate's decode (two on one stream at distance 8).
+  1.6 dB on the grey corpus photo) for a fifth of the encoding time.
+  Every one of these streams decodes in the black-box decoder to
+  within one 8-bit code of this crate's decode.
+
+  **Screen content is where the gap remains.** On the corpus
+  screenshot and the pixel art the black-box encoder is 5 – 10 dB
+  ahead at matched sizes (screenshot at distance 1: 95 760 bytes /
+  45.71 dB here against 111 294 / 48.63; pixel art: 13 559 / 43.69
+  against 22 480 / 45.24, and 10 902 bytes / 56.91 dB at its distance
+  0.5): repeated glyphs and flat colour want patches, palettes and a
+  Modular coder for the residue, none of which the lossy path writes.
 * **Structure**: one global MA tree **learned from the picture** — a
   sample of it is scanned with the decoder's own property vector
   (Table H.4, previous-channel properties included) and every node

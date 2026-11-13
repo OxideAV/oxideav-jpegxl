@@ -40,9 +40,9 @@
 //!   the growth per doubling, the block's `non_zeros` symbol) fitted
 //!   to the sizes the entropy coder actually produces.
 //! * **Quantisation field** — `HfMul` of a block follows the variance
-//!   of its luma (in the cube-root domain of XYB) and of its
-//!   neighbours: busy blocks mask their own error and take a coarser
-//!   step, calm ones a finer one.
+//!   of its luma (in the cube-root domain of XYB) and the calmest 4×4
+//!   cell in reach: texture masks its own error and takes a coarser
+//!   step, an edge or a glyph beside a flat patch keeps a fine one.
 //! * **Transform choice** — each 64×64 tile is covered bottom-up:
 //!   every aligned 8×8, 16×16, 32×32 and 64×64 area keeps the cheapest
 //!   of its sub-coverings and of the transforms that span it, all
@@ -1217,17 +1217,23 @@ fn sharpen(plane: &[f32], pw: usize, ph: usize, kernel: [f32; 3]) -> Vec<f32> {
 }
 
 /// The quantisation field: a block's multiplier is
-/// `((reference + floor) / (activity + floor)) ^ exponent`, the
-/// activity being the variance of the block's luma (in the
-/// cube-root domain of XYB, so already relative to brightness), half
-/// its own and half the smallest of its 3×3 neighbourhood — a busy
-/// block next to a flat one must not spill its coarser step into
-/// where it shows. Swept on the corpus: an exponent of 0.2 moves
-/// about 0.2 dB of PSNR into 0.3 – 0.5 dB of SSIM at equal size
-/// (0.5, the textbook equaliser of SSIM, costs three times the PSNR
-/// for little more); the floor is where the activity stops mattering
-/// (about four 8-bit codes of standard deviation) and doubles as the
-/// reference, the level that keeps the frame's base step.
+/// `((reference + floor) / (activity + floor)) ^ exponent`. The
+/// activity is the geometric mean (after adding the floor) of the
+/// variance of the block's luma — in the cube-root domain of XYB, so
+/// already relative to brightness — and of the smallest variance among
+/// the 4×4 cells of the block and of the ring of cells around it.
+/// Texture is busy everywhere, so the two agree and the block takes a
+/// coarser step; an edge or a glyph next to a flat patch has a calm
+/// cell in reach, its activity collapses and it keeps a fine step —
+/// error there is not masked. Swept on the corpus: an exponent of 0.2
+/// moves about 0.2 dB of PSNR into 0.3 – 0.5 dB of SSIM at equal size
+/// on photographs (0.5, the textbook equaliser of SSIM, costs three
+/// times the PSNR for little more); the calm-cell term is neutral on
+/// photographs against a block-level minimum (±0.1 dB) and worth
+/// 1.2 dB at equal size on the screenshot. The floor is where the
+/// activity stops mattering (about four 8-bit codes of standard
+/// deviation) and doubles as the reference, the level that keeps the
+/// frame's base step.
 const AQ_EXPONENT: f32 = 0.2;
 const AQ_FLOOR: f32 = 1.0e-3;
 const AQ_REFERENCE: f32 = 1.0e-3;
@@ -1239,18 +1245,29 @@ const AQ_RANGE: (f32, f32) = (0.4, 2.5);
 /// luma plane (with its margin): blocks busier than the reference take
 /// a coarser step, calmer ones a finer step.
 fn quant_field(y_plane: &[f32], pw: usize, gw: usize, gh: usize) -> Vec<f32> {
-    // Variance of the blocks -1..=gw × -1..=gh.
+    // Variance of the 4×4 cells of the blocks -1..=gw × -1..=gh, and
+    // of those blocks.
     let (aw, ah) = (gw + 2, gh + 2);
+    let cw = aw * 2;
+    let mut cell = vec![0.0f32; cw * ah * 2];
     let mut act = vec![0.0f32; aw * ah];
     for by in 0..ah {
         for bx in 0..aw {
             let (mut sum, mut sq) = (0.0f32, 0.0f32);
-            for r in 0..8 {
-                let o = (by * 8 + r) * pw + bx * 8;
-                for &v in &y_plane[o..o + 8] {
-                    sum += v;
-                    sq += v * v;
+            for q in 0..4 {
+                let (qx, qy) = (q % 2, q / 2);
+                let (mut s4, mut q4) = (0.0f32, 0.0f32);
+                for r in 0..4 {
+                    let o = (by * 8 + qy * 4 + r) * pw + bx * 8 + qx * 4;
+                    for &v in &y_plane[o..o + 4] {
+                        s4 += v;
+                        q4 += v * v;
+                    }
                 }
+                let m4 = s4 / 16.0;
+                cell[(by * 2 + qy) * cw + bx * 2 + qx] = (q4 / 16.0 - m4 * m4).max(0.0);
+                sum += s4;
+                sq += q4;
             }
             let mean = sum / 64.0;
             act[by * aw + bx] = (sq / 64.0 - mean * mean).max(0.0);
@@ -1260,13 +1277,16 @@ fn quant_field(y_plane: &[f32], pw: usize, gw: usize, gh: usize) -> Vec<f32> {
     for by in 0..gh {
         for bx in 0..gw {
             let own = act[(by + 1) * aw + bx + 1];
-            let mut low = own;
-            for j in 0..3 {
-                for i in 0..3 {
-                    low = low.min(act[(by + j) * aw + bx + i]);
+            // The calmest 4×4 cell of the block and of the ring of
+            // cells around it.
+            let mut low = f32::INFINITY;
+            for j in 0..4 {
+                for i in 0..4 {
+                    low = low.min(cell[((by + 1) * 2 - 1 + j) * cw + (bx + 1) * 2 - 1 + i]);
                 }
             }
-            let a = AQ_OWN_SHARE * own + (1.0 - AQ_OWN_SHARE) * low;
+            let a = (own + AQ_FLOOR).powf(AQ_OWN_SHARE) * (low + AQ_FLOOR).powf(1.0 - AQ_OWN_SHARE)
+                - AQ_FLOOR;
             let f = ((AQ_REFERENCE + AQ_FLOOR) / (a + AQ_FLOOR)).powf(AQ_EXPONENT);
             field[by * gw + bx] = f.clamp(AQ_RANGE.0, AQ_RANGE.1);
         }
