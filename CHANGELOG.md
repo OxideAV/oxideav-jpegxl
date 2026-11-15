@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.16](https://github.com/OxideAV/oxideav-jpegxl/compare/v0.0.15...v0.0.16) - 2026-11-15
+
+### Other
+
+- decoder refuses delta palette entries instead of mis-decoding them; README — round 490 time / memory / screen-content tables
+- encode speed (lane-batched forward DCT, per-worker statistics), and the lossless codestream for lossy screen content when it is no larger
+- decoder — two fuzz findings: UnpackSigned at the top of the range, the weighted predictor's modulo-2^32 error sum
+- decoder — a Modular frame of an XYB image may carry extra channels (lossy Modular with alpha, patch reference frames)
+- patches on lossy VarDCT frames — glyphs stored once as XYB differences, added back after the filters
+- patches and LZ77 for lossless screen content; decoder reads patch position deltas in context 6
+- lossy VarDCT at 10 / 12 / 16 bits; decoder presents VarDCT and XYB frames at the declared depth; floating-point sample output
+- encoder reads the picture where the caller keeps it — groups fetched and transformed on demand, symbols in three bytes, learner sample appended in batches
+- staged VarDCT fixture ratchets at the rounding floor; README / CHANGELOG record the final accuracy
+- decoder — adaptive LF smoothing per the 2024 edition (expression and place in the pipeline)
+- VarDCT encoder — quantisation field keeps edges fine (calmest 4x4 cell in reach)
+- parallel-decode test tries two budgets on the large staged streams
+- lossless encoder memory — planes taken over, group rectangles cut on demand, symbols packed in 32 bits
+- decoder — Gabor-like transform in row bands, one channel at a time
+- decoder — VarDCT groups, edge-preserving filter, Gabor-like transform and colour conversion on the worker budget; indexed EPF interior
+- VarDCT encoder — transform search over all 21 types, rate-distortion quantisation, quantisation field, fitted chroma-from-luma, Gabor-like sharpening and edge-preserving filter
+- entropy-stream context clustering without per-pair allocation
+- range loops rewritten as iterators (clippy 1.100 needless_range_loop)
+- decoder — edge-preserving filter per the 2024 edition (linear Weight, 1.65 step multiplier, quantization_width = 65536 / (global_scale x HfMul))
+- decoder — tall-block LLF placement, DCT8x4 orientation, AFV DC terms (2024 edition), DCT8x8 B-channel default weights
+- rolling-row Modular decode, parallel groups and tree learning, tabulated IDCT cosines; Modular-XYB rescale follows the LF weight divisors
+- VarDCT lossy encoder (XYB, DCT8x8, chroma-from-luma, LF as Modular, I.4 context model), alpha on VarDCT frames, distance / threads options
+- Modular density — learned MA tree (property splits, 14 predictors incl. the self-correcting one), palettes, clustered contexts, prefix/ANS and RCT election
+- API hygiene: non_exhaustive colour-encoding enums and parsed header/container/jbrd records
+
 ### Added
 
 - **A lossy request on screen content is answered with the lossless
