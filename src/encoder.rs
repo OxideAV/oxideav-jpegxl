@@ -146,11 +146,21 @@ pub struct EncodeSpec {
     /// Testing: a VarDCT frame uses this transform type wherever it
     /// fits (`None`: the encoder's own choice).
     pub vardct_transform: Option<crate::dct_select::TransformType>,
+    /// Look for repeated glyph-like regions and code them once, in a
+    /// reference frame placed in front of the picture's own frame
+    /// (K.2). Stills only.
+    pub patches: bool,
+    /// Let the Modular symbol streams copy earlier symbols (LZ77,
+    /// C.3.3) where that is estimated smaller.
+    pub lz77: bool,
 }
 
 impl EncodeSpec {
+    fn num_colour(&self) -> usize {
+        if self.grey { 1 } else { 3 }
+    }
     fn num_channels(&self) -> usize {
-        (if self.grey { 1 } else { 3 }) + usize::from(self.alpha)
+        self.num_colour() + usize::from(self.alpha)
     }
     fn group_dim(&self) -> u32 {
         128 << self.group_size_shift
@@ -634,6 +644,28 @@ fn code_frame(spec: &EncodeSpec, src: &Pixels<'_>) -> Result<CodedFrame> {
     }
     let n_streams = coded.iter().filter(|s| !s.is_empty()).count().max(1);
     let leaf_codes = EntropyCodes::build_clustered(&leaf_stats, n_streams, 256)?;
+    let (leaf_codes, coded) = if spec.lz77 {
+        // The row length the two-dimensional distance codes of each
+        // section refer to: its widest channel (H.3).
+        let global_width = global.chans.iter().map(|c| c.w).max().unwrap_or(0);
+        let row_length = |i: usize| -> u32 {
+            if i == 0 {
+                global_width as u32
+            } else {
+                group_rect(i - 1).2 as u32
+            }
+        };
+        elect_lz77(
+            leaf_codes,
+            &leaf_stats,
+            coded,
+            &row_length,
+            n_streams,
+            spec.threads,
+        )?
+    } else {
+        (leaf_codes, coded)
+    };
     let mut it = coded.into_iter();
     let global = it.next().unwrap_or_default();
     Ok(CodedFrame {
@@ -644,6 +676,87 @@ fn code_frame(spec: &EncodeSpec, src: &Pixels<'_>) -> Result<CodedFrame> {
         global,
         groups: it.collect(),
     })
+}
+
+/// Parse the sections' symbol streams into literals and LZ77 copies
+/// (C.3.3) and keep the parse when, with codes rebuilt for it, the
+/// frame is estimated smaller. A sample of the sections is parsed
+/// first: content without repeats (photographs) stops there.
+fn elect_lz77(
+    plain: EntropyCodes,
+    plain_stats: &ValueStats,
+    coded: Vec<PackedSymbols>,
+    row_length: &(dyn Fn(usize) -> u32 + Sync),
+    n_streams: usize,
+    threads: usize,
+) -> Result<(EntropyCodes, Vec<PackedSymbols>)> {
+    /// Sections parsed before deciding to parse them all.
+    const PROBE_SECTIONS: usize = 8;
+    /// Share of the probed bits the copies have to save.
+    const PROBE_GAIN: f64 = 0.01;
+    /// Share of the estimated frame the rebuilt codes have to save.
+    const KEEP_GAIN: f64 = 0.005;
+    let num_ctx = plain_stats.num_dist();
+    let cost = plain.literal_cost();
+    let parse = |i: usize| -> (Option<Vec<(u32, u32)>>, f64, f64) {
+        let pairs: Vec<(u32, u32)> = coded[i].iter().collect();
+        let literal_bits: f64 = pairs.iter().map(|&(c, v)| f64::from(cost.bits(c, v))).sum();
+        match crate::entropy_write::lz77_parse(&pairs, row_length(i), &cost) {
+            Some((parsed, saved)) => (Some(parsed), saved, literal_bits),
+            None => (None, 0.0, literal_bits),
+        }
+    };
+    let count = coded.len();
+    let step = count.div_ceil(PROBE_SECTIONS).max(1);
+    let probe: Vec<usize> = (0..count).step_by(step).collect();
+    let (mut saved, mut total) = (0.0f64, 0.0f64);
+    for (_, s, t) in crate::par::par_map(threads, probe, |_, i| parse(i)) {
+        saved += s;
+        total += t;
+    }
+    if saved <= total * PROBE_GAIN {
+        drop(cost);
+        return Ok((plain, coded));
+    }
+    // Every section, a batch at a time: the parsed stream packed and
+    // counted by the worker that made it.
+    let mut stats = crate::entropy_write::Lz77Stats::new(num_ctx);
+    let mut parsed: Vec<PackedSymbols> = Vec::with_capacity(count);
+    let batch = threads.max(1) * 2;
+    let mut first = 0usize;
+    while first < count {
+        let ids: Vec<usize> = (first..count.min(first + batch)).collect();
+        for (packed, section_stats) in crate::par::par_map(threads, ids, |_, i| {
+            let mut section_stats = crate::entropy_write::Lz77Stats::new(num_ctx);
+            let packed = match parse(i).0 {
+                Some(ops) => {
+                    for &(c, v) in &ops {
+                        section_stats.add(c, v);
+                    }
+                    PackedSymbols::from_pairs(&ops)
+                }
+                None => {
+                    for (c, v) in coded[i].iter() {
+                        section_stats.add(c, v);
+                    }
+                    coded[i].clone()
+                }
+            };
+            (packed, section_stats)
+        }) {
+            stats.merge(&section_stats);
+            parsed.push(packed);
+        }
+        first += batch;
+    }
+    let (codes, bits) = EntropyCodes::build_clustered_lz77(&stats, n_streams, 256)?;
+    let plain_bits = plain.estimated_size(plain_stats, n_streams);
+    drop(cost);
+    if bits < plain_bits * (1.0 - KEEP_GAIN) {
+        Ok((codes, parsed))
+    } else {
+        Ok((plain, coded))
+    }
 }
 
 // ---- frame serialisation ----------------------------------------------------
@@ -666,12 +779,34 @@ pub struct FrameShape {
     /// The VarDCT fields of the header (XYB, adaptive LF smoothing
     /// off), `None` for a Modular frame.
     pub vardct: Option<VarDctShape>,
+    /// The image is `xyb_encoded` (a Modular frame of such an image
+    /// has no `do_YCbCr` field).
+    pub xyb: bool,
     pub group_size_shift: u32,
     pub num_extra: u32,
     pub have_animation: bool,
     pub duration: u32,
     pub is_last: bool,
+    /// `Some((width, height))` writes a `kReferenceOnly` frame of that
+    /// size, recorded before the colour transform in
+    /// `Reference[`[`PATCH_REFERENCE_SLOT`]`]`: the source of a patch
+    /// dictionary. The animation and `is_last` fields do not apply.
+    pub reference: Option<(u32, u32)>,
+    /// The frame carries a patch dictionary (`kPatches`).
+    pub patches: bool,
 }
+
+/// The `Reference[]` slot the encoder's patch sources are saved in.
+pub const PATCH_REFERENCE_SLOT: u32 = 1;
+
+/// `U32(u(8), 256 + u(11), 2304 + u(14), 18688 + u(30))` — frame
+/// crop fields.
+const CROP_DIST: [U32Dist; 4] = [
+    U32Dist::Bits(8),
+    U32Dist::BitsOffset(11, 256),
+    U32Dist::BitsOffset(14, 2304),
+    U32Dist::BitsOffset(30, 18688),
+];
 
 /// `FrameHeader` (Table F.2) + TOC (F.3) for a plain Modular frame;
 /// `toc` holds the section sizes in bytes. Leaves the writer
@@ -681,16 +816,21 @@ pub fn write_frame_header_and_toc(
     shape: &FrameShape,
     toc: &[u32],
 ) -> Result<()> {
+    // kPatches (Table F.3).
+    let feature_flags = if shape.patches { 0x02 } else { 0 };
     w.write_bool(false); // all_default
-    w.write_bits(2, 0); // frame_type kRegularFrame
+    // frame_type: kRegularFrame, or kReferenceOnly.
+    w.write_bits(2, if shape.reference.is_some() { 2 } else { 0 });
     if shape.vardct.is_some() {
         w.write_bits(1, 0); // encoding kVarDCT
-        w.write_u64(0x80); // flags: kSkipAdaptiveLFSmoothing
+        w.write_u64(0x80 | feature_flags); // kSkipAdaptiveLFSmoothing
     // do_YCbCr is absent: the image is xyb_encoded.
     } else {
         w.write_bits(1, 1); // encoding kModular
-        w.write_u64(0); // flags
-        w.write_bool(false); // do_YCbCr
+        w.write_u64(feature_flags);
+        if !shape.xyb {
+            w.write_bool(false); // do_YCbCr
+        }
     }
     w.write_bits(2, 0); // upsampling = 1
     for _ in 0..shape.num_extra {
@@ -701,6 +841,16 @@ pub fn write_frame_header_and_toc(
         w.write_bits(3, v.b_qm_scale);
     } else {
         w.write_bits(2, shape.group_size_shift);
+    }
+    if let Some((width, height)) = shape.reference {
+        // No passes, blending, duration or is_last on a
+        // kReferenceOnly frame; its crop has a size and no origin.
+        w.write_bool(true); // have_crop
+        w.write_u32(CROP_DIST, width)?;
+        w.write_u32(CROP_DIST, height)?;
+        w.write_bits(2, PATCH_REFERENCE_SLOT); // save_as_reference
+        w.write_bool(true); // save_before_ct
+        return write_frame_header_tail(w, shape, toc);
     }
     w.write_bits(2, 0); // passes.num_passes = 1
     w.write_bool(false); // have_crop
@@ -729,6 +879,12 @@ pub fn write_frame_header_and_toc(
             w.write_bool(false); // save_before_ct
         }
     }
+    write_frame_header_tail(w, shape, toc)
+}
+
+/// The end of a `FrameHeader` (name, restoration filter, extensions)
+/// and the TOC.
+fn write_frame_header_tail(w: &mut BitWriter, shape: &FrameShape, toc: &[u32]) -> Result<()> {
     w.write_bits(2, 0); // name_len = 0
     // RestorationFilter (Table J.1): the filters a VarDCT frame asks
     // for with their default parameters, none on a Modular frame.
@@ -830,7 +986,36 @@ fn write_global_modular_header(w: &mut BitWriter, coded: &CodedFrame) -> Result<
     write_transforms(w, &coded.transforms)
 }
 
-/// Append one frame (header, TOC, sections) to a byte-aligned writer.
+/// What a frame is in the codestream.
+#[derive(Clone, Copy)]
+enum FrameRole<'a> {
+    /// A frame of the picture; `patches` are the symbols of its patch
+    /// dictionary when it has one.
+    Regular {
+        duration: u32,
+        is_last: bool,
+        patches: Option<&'a [(u32, u32)]>,
+    },
+    /// A `kReferenceOnly` frame: the source of a later frame's
+    /// patches, never shown.
+    Reference,
+}
+
+/// The patch dictionary of LfGlobal: a ten-context entropy stream.
+fn write_patch_dictionary(w: &mut BitWriter, symbols: &[(u32, u32)]) -> Result<()> {
+    let mut stats = ValueStats::new(crate::patches::PATCH_NUM_CONTEXTS);
+    for &(c, v) in symbols {
+        stats.add(c, v);
+    }
+    let codes = EntropyCodes::build_clustered(&stats, 1, crate::patches::PATCH_NUM_CONTEXTS)?;
+    codes.write_prelude(w);
+    codes.write_symbols(w, symbols.iter().copied());
+    Ok(())
+}
+
+/// Append one frame of the picture (header, TOC, sections) to a
+/// byte-aligned writer — preceded by a reference frame when a patch
+/// dictionary makes the pair smaller.
 fn write_frame(
     w: &mut BitWriter,
     spec: &EncodeSpec,
@@ -841,11 +1026,104 @@ fn write_frame(
     if let Some(distance) = spec.vardct_distance {
         return write_vardct_frame(w, spec, &pixels, duration, is_last, distance);
     }
-    let coded = code_frame(spec, &pixels)?;
+    let role = FrameRole::Regular {
+        duration,
+        is_last,
+        patches: None,
+    };
+    let lossless = quantizer_for_quality(spec.quality, spec.bits) == 1;
+    let plan = if spec.patches && spec.animation.is_none() && lossless {
+        pixels.validate(
+            spec.width as usize,
+            spec.height as usize,
+            spec.num_channels(),
+            (1i64 << spec.bits) - 1,
+        )?;
+        crate::enc_patches::find_patches(
+            &pixels,
+            spec.width as usize,
+            spec.height as usize,
+            spec.num_colour(),
+        )
+    } else {
+        None
+    };
+    let plain = modular_frame(spec, &pixels, role)?;
+    if let Some(plan) = plan {
+        // Coded both ways: the dictionary stays only when the
+        // reference frame and the emptied picture are smaller
+        // together than the picture as it is.
+        let pair = patched_modular_frames(spec, &pixels, &plan, duration, is_last)?;
+        if pair.len() < plain.len() {
+            w.write_bytes(&pair);
+            return Ok(());
+        }
+    }
+    w.write_bytes(&plain);
+    Ok(())
+}
+
+/// A reference frame holding the patches of `plan`, then the picture
+/// coded without them and with their dictionary.
+fn patched_modular_frames(
+    spec: &EncodeSpec,
+    pixels: &Pixels<'_>,
+    plan: &crate::enc_patches::PatchPlan,
+    duration: u32,
+    is_last: bool,
+) -> Result<Vec<u8>> {
+    let atlas_spec = EncodeSpec {
+        width: plan.atlas_width as u32,
+        height: plan.atlas_height as u32,
+        patches: false,
+        ..spec.clone()
+    };
+    // The reference frame carries every channel of the image: the
+    // extra ones are not patched and stay empty.
+    let mut planes = plan.atlas.clone();
+    while planes.len() < spec.num_channels() {
+        planes.push(vec![0i32; plan.atlas_width * plan.atlas_height]);
+    }
+    let atlas = Pixels::Planes {
+        planes: &planes,
+        width: plan.atlas_width,
+    };
+    let mut out = modular_frame(&atlas_spec, &atlas, FrameRole::Reference)?;
+    let symbols = crate::enc_patches::dictionary_symbols(
+        &plan.entries,
+        PATCH_REFERENCE_SLOT,
+        usize::from(spec.alpha),
+    );
+    let emptied = Pixels::Filled {
+        base: pixels,
+        fills: &plan.fills,
+    };
+    out.extend(modular_frame(
+        spec,
+        &emptied,
+        FrameRole::Regular {
+            duration,
+            is_last,
+            patches: Some(&symbols),
+        },
+    )?);
+    Ok(out)
+}
+
+/// One Modular frame (header, TOC, sections) as bytes.
+fn modular_frame(spec: &EncodeSpec, pixels: &Pixels<'_>, role: FrameRole<'_>) -> Result<Vec<u8>> {
+    let coded = code_frame(spec, pixels)?;
     let single = coded.groups.is_empty();
     let mut sections: Vec<Vec<u8>> = Vec::new();
     {
         let mut lf = BitWriter::new();
+        if let FrameRole::Regular {
+            patches: Some(symbols),
+            ..
+        } = role
+        {
+            write_patch_dictionary(&mut lf, symbols)?;
+        }
         write_global_modular_header(&mut lf, &coded)?;
         if !coded.global.is_empty() {
             // One section's symbols are unpacked at a time (the ANS
@@ -894,19 +1172,31 @@ fn write_frame(
         }
         toc.push(s.len() as u32);
     }
+    let (duration, is_last, patches) = match role {
+        FrameRole::Regular {
+            duration,
+            is_last,
+            patches,
+        } => (duration, is_last, patches.is_some()),
+        FrameRole::Reference => (0, false, false),
+    };
     let shape = FrameShape {
         vardct: None,
+        xyb: spec.vardct_distance.is_some(),
         group_size_shift: spec.group_size_shift,
         num_extra: u32::from(spec.alpha),
         have_animation: spec.animation.is_some(),
         duration,
         is_last,
+        reference: matches!(role, FrameRole::Reference).then_some((spec.width, spec.height)),
+        patches,
     };
-    write_frame_header_and_toc(w, &shape, &toc)?;
+    let mut w = BitWriter::new();
+    write_frame_header_and_toc(&mut w, &shape, &toc)?;
     for s in &sections {
         w.write_bytes(s);
     }
-    Ok(())
+    Ok(w.into_bytes())
 }
 
 /// Append one VarDCT frame.
@@ -959,11 +1249,14 @@ fn write_vardct_frame(
             gab: rate.gab,
             epf_iters: rate.epf_iters,
         }),
+        xyb: true,
         group_size_shift: 1,
         num_extra: u32::from(spec.alpha),
         have_animation: spec.animation.is_some(),
         duration,
         is_last,
+        reference: None,
+        patches: false,
     };
     write_frame_header_and_toc(w, &shape, &toc)?;
     for s in &sections {

@@ -314,13 +314,9 @@ impl HybridUintState {
                     // eagerly, which is the only consistent reading.
                     let dx = entry[0];
                     let dy = entry[1];
+                    // C.3.3: `if (distance < 1) distance = 1`.
                     let signed: i64 = dx as i64 + (dist_multiplier as i64) * (dy as i64);
-                    if signed < 1 {
-                        return Err(Error::InvalidData(
-                            "JXL LZ77: special-distance result < 1".into(),
-                        ));
-                    }
-                    distance = signed.min(MAX_DISTANCE as i64) as u32;
+                    distance = signed.clamp(1, MAX_DISTANCE as i64) as u32;
                 } else {
                     distance = distance
                         .checked_sub(119)

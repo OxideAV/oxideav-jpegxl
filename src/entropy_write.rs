@@ -1033,11 +1033,53 @@ fn tokens_of(keys: &[u64], cfg: HybridConfig) -> (Vec<u64>, f64) {
 /// symbols.
 #[derive(Debug, Clone)]
 pub struct EntropyCodes {
+    /// One entry per context, plus the LZ77 distance context when the
+    /// stream copies.
     cluster_map: Vec<u32>,
     configs: Vec<HybridConfig>,
     codes: Vec<PrefixCodeWriter>,
     /// `Some((log_alphabet_size, clusters))` for an ANS stream.
     ans: Option<(u32, Vec<AnsCluster>)>,
+    /// `Some(min_symbol)` when the stream uses LZ77 copies (C.3.3):
+    /// tokens from there up are copy lengths.
+    lz_min_symbol: Option<u32>,
+}
+
+/// Marks, in the context of a `(context, value)` symbol, the head of
+/// an LZ77 copy: the value is the copy length less
+/// [`LZ77_MIN_LENGTH`], coded in the context of the first copied
+/// symbol; the copied symbols themselves are not in the stream. A
+/// [`LZ77_DISTANCE`] symbol follows.
+pub const LZ77_COPY: u32 = 1 << 31;
+/// The context of the distance code that follows a copy head.
+pub const LZ77_DISTANCE: u32 = u32::MAX;
+/// `min_length` of every LZ77 stream written here.
+pub const LZ77_MIN_LENGTH: u32 = 3;
+/// How copy lengths are split into tokens and raw bits (`lz_len_conf`):
+/// at most 37 tokens for any 32-bit length.
+const LZ77_LENGTH_CONFIG: HybridConfig = HybridConfig {
+    split_exponent: 3,
+    msb_in_token: 0,
+    lsb_in_token: 0,
+};
+/// The furthest back a copy can reach (C.3.3: the window).
+pub const LZ77_WINDOW: usize = 1 << 20;
+
+/// The distance code of a copy `distance` symbols back (C.3.3): one of
+/// the 120 two-dimensional codes when `dist_multiplier` (the row
+/// length of the picture being coded) makes one of them land there,
+/// the plain distance otherwise.
+pub fn lz77_distance_code(distance: usize, dist_multiplier: u32) -> u32 {
+    if dist_multiplier == 0 {
+        return distance as u32 - 1;
+    }
+    let w = i64::from(dist_multiplier);
+    for (code, [dx, dy]) in crate::ans::hybrid::K_SPECIAL_DISTANCES.iter().enumerate() {
+        if i64::from(*dx) + w * i64::from(*dy) == distance as i64 {
+            return code as u32;
+        }
+    }
+    distance as u32 + 119
 }
 
 impl EntropyCodes {
@@ -1059,6 +1101,7 @@ impl EntropyCodes {
             configs: stats.configs.clone(),
             codes,
             ans: None,
+            lz_min_symbol: None,
         }
     }
 
@@ -1233,7 +1276,25 @@ impl EntropyCodes {
     /// flag, the configurations, then the prefix counts + codes or the
     /// ANS alphabet size + distributions.
     pub fn write_prelude(&self, w: &mut BitWriter) {
-        w.write_bool(false); // lz77.enabled
+        match self.lz_min_symbol {
+            None => w.write_bool(false), // lz77.enabled
+            Some(min_symbol) => {
+                w.write_bool(true);
+                // U32(224, 512, 4096, 8 + u(15)).
+                match min_symbol {
+                    224 => w.write_bits(2, 0),
+                    512 => w.write_bits(2, 1),
+                    4096 => w.write_bits(2, 2),
+                    other => {
+                        w.write_bits(2, 3);
+                        w.write_bits(15, other - 8);
+                    }
+                }
+                // min_length: U32(3, 4, 5 + u(2), 9 + u(8)) → 3.
+                w.write_bits(2, 0);
+                LZ77_LENGTH_CONFIG.write(w, 8);
+            }
+        }
         self.write_cluster_map(w);
         match &self.ans {
             None => {
@@ -1315,10 +1376,62 @@ impl EntropyCodes {
     /// an ANS stream goes through [`write_symbols`](Self::write_symbols)).
     pub fn write(&self, w: &mut BitWriter, ctx: u32, value: u32) {
         debug_assert!(self.ans.is_none(), "ANS streams are written as a whole");
-        let cluster = self.cluster_map[ctx as usize] as usize;
-        let (token, nbits, extra) = self.configs[cluster].tokenize(value);
+        let (cluster, token, nbits, extra) = self.token_of(ctx, value);
         self.codes[cluster].write_symbol(w, token);
         w.write_bits(nbits, extra);
+    }
+
+    /// Cluster, token, extra-bit count and extra bits of one symbol —
+    /// a literal, a copy head ([`LZ77_COPY`]) or a copy distance
+    /// ([`LZ77_DISTANCE`]).
+    #[inline]
+    fn token_of(&self, ctx: u32, value: u32) -> (usize, u32, u32, u32) {
+        if let Some(min_symbol) = self.lz_min_symbol {
+            if ctx == LZ77_DISTANCE {
+                let cluster = self.cluster_map[self.cluster_map.len() - 1] as usize;
+                let (token, nbits, extra) = self.configs[cluster].tokenize(value);
+                return (cluster, token, nbits, extra);
+            }
+            if ctx & LZ77_COPY != 0 {
+                let cluster = self.cluster_map[(ctx & !LZ77_COPY) as usize] as usize;
+                let (token, nbits, extra) = LZ77_LENGTH_CONFIG.tokenize(value);
+                return (cluster, min_symbol + token, nbits, extra);
+            }
+        }
+        let cluster = self.cluster_map[ctx as usize] as usize;
+        let (token, nbits, extra) = self.configs[cluster].tokenize(value);
+        (cluster, token, nbits, extra)
+    }
+
+    /// Bits a literal `(context, value)` takes under these codes: its
+    /// token under the cluster's code, plus its raw bits.
+    pub fn literal_cost(&self) -> LiteralCost<'_> {
+        let token_bits = match &self.ans {
+            None => self
+                .codes
+                .iter()
+                .map(|c| c.lengths.iter().map(|&l| f32::from(l)).collect())
+                .collect(),
+            Some((_, clusters)) => clusters
+                .iter()
+                .map(|c| {
+                    c.dist
+                        .iter()
+                        .map(|&d| {
+                            if d == 0 {
+                                24.0
+                            } else {
+                                12.0 - f32::from(d).log2()
+                            }
+                        })
+                        .collect()
+                })
+                .collect(),
+        };
+        LiteralCost {
+            codes: self,
+            token_bits,
+        }
     }
 
     /// Write a whole symbol stream `(context, value)` in order. For an
@@ -1341,8 +1454,7 @@ impl EntropyCodes {
         let mut state: u32 = ANS_FINAL_STATE;
         let mut words: Vec<Option<u16>> = Vec::new();
         for (ctx, v) in symbols.clone().rev() {
-            let cluster = self.cluster_map[ctx as usize] as usize;
-            let (token, _, _) = self.configs[cluster].tokenize(v);
+            let (cluster, token, _, _) = self.token_of(ctx, v);
             let c = &clusters[cluster];
             let f = u32::from(c.dist[token as usize]);
             debug_assert!(f > 0, "token {token} has probability 0");
@@ -1360,14 +1472,362 @@ impl EntropyCodes {
         words.reverse();
         w.write_bits(32, state);
         for ((ctx, v), word) in symbols.zip(words) {
-            let cluster = self.cluster_map[ctx as usize] as usize;
-            let (_, nbits, extra) = self.configs[cluster].tokenize(v);
+            let (_, _, nbits, extra) = self.token_of(ctx, v);
             if let Some(word) = word {
                 w.write_bits(16, u32::from(word));
             }
             w.write_bits(nbits, extra);
         }
     }
+}
+
+/// Per-symbol cost of literals under a set of codes (see
+/// [`EntropyCodes::literal_cost`]).
+pub struct LiteralCost<'a> {
+    codes: &'a EntropyCodes,
+    token_bits: Vec<Vec<f32>>,
+}
+
+impl LiteralCost<'_> {
+    /// Estimated bits of the literal `value` in `ctx`.
+    #[inline]
+    pub fn bits(&self, ctx: u32, value: u32) -> f32 {
+        let cluster = self.codes.cluster_map[ctx as usize] as usize;
+        let (token, nbits, _) = self.codes.configs[cluster].tokenize(value);
+        self.token_bits[cluster]
+            .get(token as usize)
+            .copied()
+            .unwrap_or(24.0)
+            + nbits as f32
+    }
+}
+
+/// Statistics of a stream that may copy: per context the literal
+/// values and the copy lengths coded there, and the distance codes.
+#[derive(Debug, Clone)]
+pub struct Lz77Stats {
+    num_dist: usize,
+    /// Contexts `0..num_dist`: literals; `num_dist..2 × num_dist`: copy
+    /// lengths (less [`LZ77_MIN_LENGTH`]); the last one: distance
+    /// codes.
+    values: ValueStats,
+}
+
+impl Lz77Stats {
+    /// Statistics for a stream of `num_dist` contexts.
+    pub fn new(num_dist: usize) -> Self {
+        Self {
+            num_dist,
+            values: ValueStats::new(2 * num_dist + 1),
+        }
+    }
+
+    /// Record one symbol of a parsed stream.
+    #[inline]
+    pub fn add(&mut self, ctx: u32, value: u32) {
+        let slot = if ctx == LZ77_DISTANCE {
+            2 * self.num_dist
+        } else if ctx & LZ77_COPY != 0 {
+            self.num_dist + (ctx & !LZ77_COPY) as usize
+        } else {
+            ctx as usize
+        };
+        self.values.add(slot as u32, value);
+    }
+
+    /// Add every count of `other`.
+    pub fn merge(&mut self, other: &Lz77Stats) {
+        self.values.merge(&other.values);
+    }
+}
+
+impl EntropyCodes {
+    /// [`build_clustered`](Self::build_clustered) for a stream parsed
+    /// into literals and LZ77 copies: the distance codes get a context
+    /// of their own (`lz_dist_ctx`), every cluster's alphabet is its
+    /// literal tokens followed, from `min_symbol` up, by its copy
+    /// length tokens. Returns the codes and their estimated size in
+    /// bits for `n_streams` symbol streams.
+    pub fn build_clustered_lz77(
+        stats: &Lz77Stats,
+        n_streams: usize,
+        max_clusters: usize,
+    ) -> Result<(Self, f64)> {
+        let n = stats.num_dist;
+        let cfg_of = |(s, m): (u32, u32)| HybridConfig {
+            split_exponent: s,
+            msb_in_token: m,
+            lsb_in_token: 0,
+        };
+        let keys: Vec<Vec<u64>> = stats
+            .values
+            .hists
+            .iter()
+            .map(|h| h.iter().map(|&c| u64::from(c)).collect())
+            .collect();
+        // Literal and distance contexts, in stream context order.
+        let value_ctx = |ctx: usize| if ctx == n { &keys[2 * n] } else { &keys[ctx] };
+        let cost_under = |k: &[u64], cfg: HybridConfig| {
+            let (t, extra) = tokens_of(k, cfg);
+            entropy_bits(&t) + header_bits(&t) + extra
+        };
+        let mut provisional = cfg_of(CONFIG_CANDIDATES[0]);
+        let mut best = f64::INFINITY;
+        for &cand in &CONFIG_CANDIDATES {
+            let cfg = cfg_of(cand);
+            let total: f64 = (0..=n).map(|c| cost_under(value_ctx(c), cfg)).sum();
+            if total < best {
+                best = total;
+                provisional = cfg;
+            }
+        }
+        // Copy lengths as tokens, per context.
+        let length_tokens: Vec<(Vec<u64>, f64)> = (0..n)
+            .map(|c| tokens_of(&keys[n + c], LZ77_LENGTH_CONFIG))
+            .collect();
+        // Cluster on the literal tokens with the length tokens behind
+        // them (at a provisional offset no literal token reaches).
+        const PROVISIONAL_OFFSET: usize = 192;
+        let shapes: Vec<Vec<u64>> = (0..=n)
+            .map(|c| {
+                let mut h = tokens_of(value_ctx(c), provisional).0;
+                if c < n && !length_tokens[c].0.is_empty() {
+                    h.resize(h.len().max(PROVISIONAL_OFFSET), 0);
+                    h.truncate(PROVISIONAL_OFFSET);
+                    h.extend_from_slice(&length_tokens[c].0);
+                }
+                h
+            })
+            .collect();
+        // Every cluster index must be named: a stream whose distance
+        // context is empty never copies and has no use for this build.
+        let (cluster_map, n_clusters) =
+            cluster_histograms(&shapes, max_clusters.clamp(1, MAX_CLUSTERS));
+        let mut merged = vec![vec![0u64; VALUE_KEYS]; n_clusters];
+        let mut merged_lengths: Vec<Vec<u64>> = vec![Vec::new(); n_clusters];
+        let mut extra_bits = 0.0f64;
+        for ctx in 0..=n {
+            let cluster = cluster_map[ctx] as usize;
+            for (slot, &c) in merged[cluster].iter_mut().zip(value_ctx(ctx)) {
+                *slot += c;
+            }
+            if ctx < n {
+                let (tokens, extra) = &length_tokens[ctx];
+                extra_bits += extra;
+                let dst = &mut merged_lengths[cluster];
+                if dst.len() < tokens.len() {
+                    dst.resize(tokens.len(), 0);
+                }
+                for (slot, &c) in dst.iter_mut().zip(tokens) {
+                    *slot += c;
+                }
+            }
+        }
+        let mut configs = Vec::with_capacity(n_clusters);
+        let mut literal_counts = Vec::with_capacity(n_clusters);
+        for k in &merged {
+            let mut pick = provisional;
+            let mut best = cost_under(k, provisional);
+            for &cand in &CONFIG_CANDIDATES {
+                let cfg = cfg_of(cand);
+                let c = cost_under(k, cfg);
+                if c < best {
+                    best = c;
+                    pick = cfg;
+                }
+            }
+            configs.push(pick);
+            let (tokens, extra) = tokens_of(k, pick);
+            extra_bits += extra;
+            literal_counts.push(tokens);
+        }
+        // `min_symbol`: past every literal token of every cluster.
+        let min_symbol = literal_counts
+            .iter()
+            .map(|c| c.len())
+            .max()
+            .unwrap_or(0)
+            .max(8);
+        let counts: Vec<Vec<u64>> = literal_counts
+            .into_iter()
+            .zip(&merged_lengths)
+            .map(|(mut c, lengths)| {
+                if !lengths.is_empty() {
+                    c.resize(min_symbol, 0);
+                    c.extend_from_slice(lengths);
+                }
+                c
+            })
+            .collect();
+        let stats = SymbolStats {
+            cluster_map,
+            configs,
+            counts,
+        };
+        let mut codes = Self::build_cheapest(&stats, n_streams)?;
+        codes.lz_min_symbol = Some(min_symbol as u32);
+        let bits = codes.estimated_bits(&stats, n_streams) + extra_bits;
+        Ok((codes, bits))
+    }
+
+    /// Estimated size in bits of everything the statistics hold under
+    /// these codes (a stream without copies), prelude included.
+    pub fn estimated_size(&self, stats: &ValueStats, n_streams: usize) -> f64 {
+        let mut counts: Vec<Vec<u64>> = vec![Vec::new(); self.configs.len()];
+        let mut extra_bits = 0.0f64;
+        for (ctx, h) in stats.hists.iter().enumerate() {
+            if h.is_empty() {
+                continue;
+            }
+            let cluster = self.cluster_map[ctx] as usize;
+            let keys: Vec<u64> = h.iter().map(|&c| u64::from(c)).collect();
+            let (tokens, extra) = tokens_of(&keys, self.configs[cluster]);
+            extra_bits += extra;
+            let dst = &mut counts[cluster];
+            if dst.len() < tokens.len() {
+                dst.resize(tokens.len(), 0);
+            }
+            for (slot, &c) in dst.iter_mut().zip(&tokens) {
+                *slot += c;
+            }
+        }
+        let stats = SymbolStats {
+            cluster_map: self.cluster_map.clone(),
+            configs: self.configs.clone(),
+            counts,
+        };
+        self.estimated_bits(&stats, n_streams) + extra_bits
+    }
+}
+
+/// Estimated bits of a copy head of `length` symbols.
+#[inline]
+fn copy_length_bits(length: usize) -> f32 {
+    let payload = (length as u32).saturating_sub(LZ77_MIN_LENGTH);
+    let (_, nbits, _) = LZ77_LENGTH_CONFIG.tokenize(payload);
+    5.0 + nbits as f32
+}
+
+/// Estimated bits of a distance code.
+#[inline]
+fn distance_code_bits(code: u32) -> f32 {
+    if code < 8 {
+        3.0
+    } else {
+        5.0 + (32 - code.leading_zeros()) as f32
+    }
+}
+
+/// Parse a symbol stream into literals and LZ77 copies (C.3.3).
+///
+/// A copy repeats the *values* found `distance` symbols back, so the
+/// search runs on the values alone: at every position the candidates
+/// are the previous symbol (a run), the symbols one row up and around
+/// it (`dist_multiplier` is the row length; those distances have short
+/// codes), and the last place the next three values were seen. The
+/// longest candidate is taken when the literals it replaces cost more
+/// than the copy under `cost`.
+///
+/// Returns the parsed stream — copy heads marked with [`LZ77_COPY`]
+/// and followed by a [`LZ77_DISTANCE`] symbol — and the estimated bits
+/// saved, or `None` when nothing was worth copying.
+pub fn lz77_parse(
+    symbols: &[(u32, u32)],
+    dist_multiplier: u32,
+    cost: &LiteralCost<'_>,
+) -> Option<(Vec<(u32, u32)>, f64)> {
+    const HASH_BITS: u32 = 15;
+    /// Positions of a copy entered into the table (its start and the
+    /// symbols right after it; a long run needs no more).
+    const INSERT_CAP: usize = 16;
+    let n = symbols.len();
+    if n < 8 {
+        return None;
+    }
+    let w = dist_multiplier as usize;
+    // Near candidates with their codes, cheapest first.
+    let mut near: Vec<(usize, u32)> = Vec::new();
+    for d in [1, w, w + 1, w.wrapping_sub(1), 2, 2 * w] {
+        if (1..=LZ77_WINDOW).contains(&d) && !near.iter().any(|&(x, _)| x == d) && (w > 0 || d <= 2)
+        {
+            near.push((d, lz77_distance_code(d, dist_multiplier)));
+        }
+    }
+    let hash = |i: usize| -> usize {
+        let h = symbols[i].1.wrapping_mul(0x9E37_79B1)
+            ^ symbols[i + 1].1.wrapping_mul(0x85EB_CA6B).rotate_left(11)
+            ^ symbols[i + 2].1.wrapping_mul(0xC2B2_AE35).rotate_left(21);
+        (h.wrapping_mul(0x9E37_79B1) >> (32 - HASH_BITS)) as usize
+    };
+    let mut head = vec![u32::MAX; 1 << HASH_BITS];
+    let match_len = |i: usize, d: usize| -> usize {
+        let mut l = 0usize;
+        while i + l < n && symbols[i + l].1 == symbols[i + l - d].1 {
+            l += 1;
+        }
+        l
+    };
+    let mut out: Vec<(u32, u32)> = Vec::with_capacity(n);
+    let mut saved = 0.0f64;
+    let mut copies = 0usize;
+    let mut i = 0usize;
+    while i < n {
+        let mut best = (0usize, 0usize, 0u32); // (length, distance, code)
+        for &(d, code) in &near {
+            if d <= i && symbols[i].1 == symbols[i - d].1 {
+                let l = match_len(i, d);
+                if l > best.0 {
+                    best = (l, d, code);
+                }
+            }
+        }
+        if i + 3 <= n {
+            let h = hash(i);
+            let cand = head[h];
+            if cand != u32::MAX {
+                let d = i - cand as usize;
+                if d <= LZ77_WINDOW {
+                    let l = match_len(i, d);
+                    // A far copy has to be clearly longer to be
+                    // preferred to a near one.
+                    if l > best.0 + 2 {
+                        best = (l, d, lz77_distance_code(d, dist_multiplier));
+                    }
+                }
+            }
+            head[h] = i as u32;
+        }
+        let (length, _, code) = best;
+        if length >= LZ77_MIN_LENGTH as usize {
+            let literal_bits: f32 = symbols[i..i + length]
+                .iter()
+                .map(|&(c, v)| cost.bits(c, v))
+                .sum();
+            let copy_bits = copy_length_bits(length) + distance_code_bits(code);
+            if literal_bits > copy_bits + 1.0 {
+                out.push((symbols[i].0 | LZ77_COPY, length as u32 - LZ77_MIN_LENGTH));
+                out.push((LZ77_DISTANCE, code));
+                saved += f64::from(literal_bits - copy_bits);
+                copies += 1;
+                for k in i + 1..(i + length).min(i + INSERT_CAP) {
+                    if k + 3 <= n {
+                        head[hash(k)] = k as u32;
+                    }
+                }
+                i += length;
+                continue;
+            }
+            // Not worth a copy: the whole span costs less than one,
+            // so neither would any part of it. Passing over it keeps
+            // the parse linear on long cheap runs (a flat picture).
+            out.extend_from_slice(&symbols[i..i + length]);
+            i += length;
+            continue;
+        }
+        out.push(symbols[i]);
+        i += 1;
+    }
+    (copies > 0).then_some((out, saved))
 }
 
 #[cfg(test)]
@@ -1445,6 +1905,95 @@ mod tests {
                 "{coding:?}: bit position after the stream"
             );
         }
+    }
+
+    /// A stream with runs, row repeats and far repeats is parsed into
+    /// copies, written with LZ77 codes and read back by the decoder —
+    /// under both codings and with and without a row length.
+    #[test]
+    fn lz77_streams_round_trip_through_the_reader() {
+        let row = 37usize;
+        let mut s = 12345u32;
+        let mut next = || {
+            s = s.wrapping_mul(1664525).wrapping_add(1013904223);
+            s >> 16
+        };
+        let mut symbols: Vec<(u32, u32)> = Vec::new();
+        // A noisy row, the same row twice more (a copy one row up), a
+        // long run, a far repeat of the first row, large values.
+        let first: Vec<(u32, u32)> = (0..row).map(|i| ((i % 5) as u32, next() % 40)).collect();
+        for _ in 0..3 {
+            symbols.extend_from_slice(&first);
+        }
+        symbols.extend((0..200).map(|i| ((i % 5) as u32, 7)));
+        symbols.extend((0..300).map(|i| ((i % 5) as u32, next() % 3000)));
+        symbols.extend_from_slice(&first);
+        symbols.extend((0..50).map(|_| (2, 70_000 + next() % 9)));
+        symbols.extend((0..90).map(|_| (4, 0)));
+        let num_dist = 5usize;
+        for dist_multiplier in [0u32, row as u32] {
+            let mut stats = ValueStats::new(num_dist);
+            for &(c, v) in &symbols {
+                stats.add(c, v);
+            }
+            let plain = EntropyCodes::build_clustered(&stats, 1, 8).unwrap();
+            let cost = plain.literal_cost();
+            let (parsed, saved) =
+                lz77_parse(&symbols, dist_multiplier, &cost).expect("the stream repeats");
+            assert!(saved > 500.0, "{saved} bits saved");
+            assert!(parsed.len() < symbols.len() / 2, "{} ops", parsed.len());
+            let mut lz_stats = Lz77Stats::new(num_dist);
+            for &(c, v) in &parsed {
+                lz_stats.add(c, v);
+            }
+            let (codes, bits) = EntropyCodes::build_clustered_lz77(&lz_stats, 1, 8).unwrap();
+            assert!(bits < plain.estimated_size(&stats, 1));
+            let mut w = BitWriter::new();
+            codes.write_prelude(&mut w);
+            w.write_bits(5, 0b10110);
+            codes.write_symbols(&mut w, parsed.iter().copied());
+            w.write_bits(3, 0b101);
+            let bytes = w.into_bytes();
+            assert!((bytes.len() * 8) as f64 <= bits * 1.1 + 64.0);
+            let mut br = BitReader::new(&bytes);
+            let mut es = EntropyStream::read(&mut br, num_dist).expect("prelude");
+            assert!(es.lz77.enabled);
+            assert_eq!(br.read_bits(5).unwrap(), 0b10110);
+            es.read_ans_state_init(&mut br).unwrap();
+            let mut hy = HybridUintState::new(es.lz77, es.lz_len_conf);
+            for (i, &(c, v)) in symbols.iter().enumerate() {
+                let got =
+                    decode_uint_in_with_dist_pub(&mut hy, &mut es, &mut br, c, dist_multiplier)
+                        .unwrap();
+                assert_eq!(got, v, "symbol {i} (row length {dist_multiplier})");
+            }
+            if let Some(ans) = &es.ans_state {
+                assert!(ans.final_state());
+            }
+            assert_eq!(br.read_bits(3).unwrap(), 0b101);
+        }
+        // Nothing to copy: no parse.
+        let noise: Vec<(u32, u32)> = (0..500).map(|i| ((i % 5) as u32, next())).collect();
+        let mut stats = ValueStats::new(num_dist);
+        for &(c, v) in &noise {
+            stats.add(c, v);
+        }
+        let plain = EntropyCodes::build_clustered(&stats, 1, 8).unwrap();
+        assert!(lz77_parse(&noise, 0, &plain.literal_cost()).is_none());
+    }
+
+    #[test]
+    fn distance_codes_name_the_neighbours_of_a_picture() {
+        // Without a row length: the distance less one.
+        assert_eq!(lz77_distance_code(1, 0), 0);
+        assert_eq!(lz77_distance_code(500, 0), 499);
+        // With one: the sample above is code 0, the previous one code
+        // 1, anything else past the 120 two-dimensional codes.
+        assert_eq!(lz77_distance_code(100, 100), 0);
+        assert_eq!(lz77_distance_code(1, 100), 1);
+        assert_eq!(lz77_distance_code(101, 100), 2);
+        assert_eq!(lz77_distance_code(99, 100), 3);
+        assert_eq!(lz77_distance_code(5000, 100), 5119);
     }
 
     #[test]

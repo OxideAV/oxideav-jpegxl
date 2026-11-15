@@ -24,6 +24,12 @@ pub(crate) enum Pixels<'a> {
         channels: usize,
         bytes: usize,
     },
+    /// Another view with rectangles of its colour channels repainted:
+    /// the frame a patch dictionary is coded without.
+    Filled {
+        base: &'a Pixels<'a>,
+        fills: &'a crate::enc_patches::Fills,
+    },
 }
 
 impl Pixels<'_> {
@@ -32,6 +38,7 @@ impl Pixels<'_> {
         match *self {
             Pixels::Planes { planes, .. } => planes.len(),
             Pixels::Packed { channels, .. } => channels,
+            Pixels::Filled { base, .. } => base.num_channels(),
         }
     }
 
@@ -62,6 +69,10 @@ impl Pixels<'_> {
                     }
                 }
             }
+            Pixels::Filled { base, fills } => {
+                base.row(c, y, x0, out);
+                fills.apply(c, y, x0, out);
+            }
         }
     }
 
@@ -91,6 +102,8 @@ impl Pixels<'_> {
             )));
         }
         match *self {
+            // The repainted colours are colours of the picture.
+            Pixels::Filled { base, .. } => return base.validate(width, height, n_ch, max),
             Pixels::Planes { planes, .. } => {
                 for (c, ch) in planes.iter().enumerate() {
                     if ch.len() != width * height {

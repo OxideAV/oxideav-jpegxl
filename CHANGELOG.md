@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Patches for lossless screen content** (round 490,
+  `EncodeOptions::patches`, default on, stills). Repeated glyph-like
+  regions — found by cutting rows into runs, taking regions larger
+  than a glyph as background, grouping the rest into boxes and hashing
+  their pixels — are coded once in a `kReferenceOnly` frame and placed
+  by a patch dictionary (`kReplace`); the picture is coded with them
+  painted over. Kept only when the pair of frames is smaller than the
+  picture alone. On the synthesised screenshot corpus of
+  `tests/r490_screen.rs`: 243 046 → 50 659 bytes (−79 %), every
+  stream bit-exact here and in a black-box decoder (a black-box
+  encoder at its efforts 7 / 9 writes 307 875 / 271 778 bytes for the
+  corpus). The corpus repeats its glyphs exactly, as text on a pixel
+  grid does; sub-pixel positioned text repeats less.
+- **LZ77 in the Modular entropy coder** (`EncodeOptions::lz77`,
+  default on): section symbol streams parsed into literals and copies
+  with the two-dimensional distance codes of C.3.3, elected per frame
+  on estimated size. −16 % on the same corpus without patches
+  (−11 % and −24 % on the two window pictures, nothing on pure text).
 - **Lossy VarDCT encoding at every integer depth** (round 490): 10-,
   12- and 16-bit input (and anything from 1 to 16 bits), grey or
   colour, with or without alpha, is coded as VarDCT in XYB like 8-bit
@@ -36,6 +54,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Decoder: **patch position deltas are read in context 6** (K.3.1 of
+  the 2024 edition; the 2021 listing read them in context 5, with the
+  blend mode). Streams of the black-box encoder join the two contexts
+  in one cluster and decoded either way; a dictionary whose clusters
+  separate them — which this crate's encoder now writes — is read by
+  a black-box decoder only with the deltas in 6 and the mode in 5.
+- Decoder: an LZ77 two-dimensional distance code that lands before
+  the start of the stream is clamped to 1 (C.3.3) instead of being
+  refused.
 - Decoder: **Modular arithmetic is exact for samples that use all 32
   bits** (lossless binary32 pictures). The reconstructed sample is the
   32 low bits of `diff × multiplier + offset + prediction` (a stream

@@ -384,6 +384,8 @@ fn parse_still(bytes: &[u8]) -> Result<StillParts> {
             vardct_distance: vardct.then_some(1.0),
             threads: 1,
             vardct_transform: None,
+            patches: false,
+            lz77: false,
         },
         vardct: vardct.then_some(crate::encoder::VarDctShape {
             x_qm_scale: fh.x_qm_scale,
@@ -465,11 +467,14 @@ fn splice_animation(packets: &[Packet], time_base: TimeBase) -> Result<Vec<u8>> 
         }
         let shape = FrameShape {
             vardct: parts.vardct,
+            xyb: parts.vardct.is_some(),
             group_size_shift: parts.group_size_shift,
             num_extra: u32::from(spec.alpha),
             have_animation: true,
             duration: ticks[i],
             is_last: i == last,
+            reference: None,
+            patches: false,
         };
         crate::encoder::write_frame_header_and_toc(&mut w, &shape, &parts.toc)?;
         w.write_bytes(&parts.sections);

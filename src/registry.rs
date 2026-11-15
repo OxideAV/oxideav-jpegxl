@@ -463,7 +463,11 @@ impl JxlEncoderOptions {
             .with_group_size_shift(self.group_size_shift as u8)
             .with_distance((self.distance > 0.0).then_some(self.distance))
             .with_modular(self.modular)
-            .with_effort(effort))
+            .with_effort(effort)
+            // One frame per packet: the container re-times packets
+            // frame by frame, which a reference frame in front of the
+            // picture would defeat.
+            .with_patches(false))
     }
 }
 

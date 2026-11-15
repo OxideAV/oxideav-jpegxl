@@ -9,35 +9,33 @@
 //! (§K.4), in the colour space **before** the inverse colour transforms
 //! of Annex L but after upsampling (§K.2).
 //!
-//! ## Wire structure (§C.4.5)
+//! ## Wire structure (§C.4.5; K.3.1 in the 2024 edition)
 //!
 //! The bundle is a single §D.3 entropy stream with **10 clustered
 //! distributions**; `ReadHybridVarLenUint(x)` reads one hybrid var-len
 //! integer with distribution `D[x]`. `num_patches` comes first
-//! (context 0), then Listing C.2 per patch: `ref` (1), `x0` / `y0` (3),
+//! (context 0), then per patch: `ref` (1), `x0` / `y0` (3),
 //! `width` / `height` (2, biased by +1), `count` (7, biased by +1), the
 //! first position (4), subsequent positions as `UnpackSigned` deltas
-//! (5), and per position one blend-info per (colour, extra-channel)
-//! plane group: `mode`, `alpha_channel` (8, only when the image has
-//! more than one alpha channel and the mode consumes alpha), `clamp`
-//! (9, only for the modes Table K.1 defines clamping for).
+//! (6), and per position one blend-info per (colour, extra-channel)
+//! plane group: `mode` (5), `alpha_channel` (8, only when the image
+//! has more than one alpha channel and the mode consumes alpha),
+//! `clamp` (9, only for the modes Table K.1 defines clamping for).
 //!
-//! ### Listing C.2 `mode` context — open question (round 441)
+//! ### The delta and `mode` contexts (rounds 441, 490)
 //!
-//! The printed listing reads `mode = ReadHybridVarLenUint(5)` — the same
-//! context as the position deltas — which leaves context 6 of the
-//! declared 10 distributions entirely unused; the natural suspicion is
-//! a typo for context 6. The question is **unarbitrable on the
-//! available wire evidence**: every locally generated patches
-//! codestream (several sizes and dictionary shapes, all from an
-//! independent encoder invoked black-box) carries the §D.3.5 cluster
-//! map `[0, 1, 2, 3, 0, 2, 2, 4, 2, 2]`, which assigns contexts 5 and 6
-//! to the *same* cluster — the two readings decode identically, and
-//! both close the §D.3.3 ANS final-state invariant. The printed reading
-//! (context 5) is therefore followed; [`set_patch_mode_ctx_override`]
-//! keeps the alternative reachable and a CI test pins the equivalence
-//! on the committed fixture so a future specimen that separates the
-//! clusters arbitrates immediately.
+//! The 2021 listing reads both the position deltas and `mode` in
+//! context 5 and leaves context 6 of the ten unused; the 2024 edition
+//! (K.3.1) reads the **deltas in context 6** and `mode` in context 5.
+//! Streams of an independent encoder never told the readings apart —
+//! every one carries the cluster map `[0, 1, 2, 3, 0, 2, 2, 4, 2, 2]`,
+//! which puts contexts 5 and 6 in one cluster. This crate's encoder
+//! (round 490) writes dictionaries whose clusters do separate them,
+//! and a black-box decoder reads those only with the 2024 assignment:
+//! deltas in 6, `mode` in 5. That is what [`decode_patches_with`]
+//! follows; [`set_patch_mode_ctx_override`] keeps the other `mode`
+//! reading reachable for the equivalence test on the committed
+//! fixture.
 //!
 //! ## Rendering (§K.2)
 //!
@@ -152,22 +150,24 @@ pub struct Patch {
 }
 
 thread_local! {
-    /// Arbitration hook for the Listing C.2 `mode` context (see the
-    /// module-level open-question note). `None` → the printed default
+    /// Test hook for the `mode` context (see the module-level note
+    /// on the delta and `mode` contexts). `None` → the printed default
     /// (context 5).
     static PATCH_MODE_CTX_OVERRIDE: Cell<Option<u32>> = const { Cell::new(None) };
 }
 
-/// The Listing C.2 `mode` context as printed: context **5**. See the
-/// module-level open-question note — every available specimen clusters
-/// contexts 5 and 6 together, so the printed reading stands until a
-/// stream separates them.
+/// The `mode` context: **5** (both editions; see the module-level
+/// note).
 pub const PATCH_MODE_CTX_DEFAULT: u32 = 5;
 
-/// Force the Listing C.2 `mode` context for the current thread
-/// (`None` restores the printed default). Arbitration hook for the
-/// module-level open question; CI pins the 5-vs-6 equivalence on the
-/// committed fixture.
+/// The context of the position deltas after a patch's first position:
+/// **6** (2024 edition, K.3.1; arbitrated against a black-box decoder
+/// — see the module-level note).
+pub const PATCH_DELTA_CTX: u32 = 6;
+
+/// Force the `mode` context for the current thread (`None` restores
+/// the printed default). A test hook: CI pins that contexts 5 and 6
+/// read the committed fixture alike (its cluster map joins them).
 #[doc(hidden)] // internal: per-thread arbitration hook for the round-441 mode-context question
 pub fn set_patch_mode_ctx_override(ctx: Option<u32>) {
     PATCH_MODE_CTX_OVERRIDE.with(|c| c.set(ctx));
@@ -228,8 +228,8 @@ where
                 (read_uint(4)? as i64, read_uint(4)? as i64)
             } else {
                 (
-                    unpack_signed(read_uint(5)?) as i64 + last_x,
-                    unpack_signed(read_uint(5)?) as i64 + last_y,
+                    unpack_signed(read_uint(PATCH_DELTA_CTX)?) as i64 + last_x,
+                    unpack_signed(read_uint(PATCH_DELTA_CTX)?) as i64 + last_y,
                 )
             };
             // §C.4.5: "the width × height rectangle with top-left
@@ -478,8 +478,10 @@ mod tests {
             (4, 1),
             (4, 1),
             (5, 1),
-            (5, 2),
-            (5, 4),
+            // The second position: deltas in context 6 (K.3.1 of the
+            // 2024 edition), its mode in context 5.
+            (6, 2),
+            (6, 4),
             (5, 3),
             (9, 0),
         ];

@@ -657,6 +657,8 @@ fn encode_spec(
         vardct_distance,
         threads: opts.threads,
         vardct_transform: None,
+        patches: opts.patches,
+        lz77: opts.lz77,
     }
 }
 

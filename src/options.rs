@@ -175,6 +175,17 @@ pub struct EncodeOptions {
     /// `ExecutionContext`; this crate never asks the host for its
     /// core count.
     pub threads: usize,
+    /// Look for repeated glyph-like regions (text, icons) and code
+    /// each once, in a reference frame in front of the picture's own
+    /// frame, placed by a patch dictionary — kept only when the file
+    /// comes out smaller. Default `true`; stills only. The output then
+    /// holds two frames, so turn it off for a stream that is to be
+    /// re-timed frame by frame (the registry encoder does).
+    pub patches: bool,
+    /// Let the lossless symbol streams copy earlier symbols (LZ77
+    /// with the two-dimensional distance codes) — elected per frame,
+    /// kept only where it is estimated smaller. Default `true`.
+    pub lz77: bool,
 }
 
 impl EncodeOptions {
@@ -193,6 +204,18 @@ impl EncodeOptions {
     /// Builder: set `threads` (`0` is treated as `1`).
     pub fn with_threads(mut self, threads: usize) -> Self {
         self.threads = threads.max(1);
+        self
+    }
+
+    /// Builder: set `patches`.
+    pub fn with_patches(mut self, patches: bool) -> Self {
+        self.patches = patches;
+        self
+    }
+
+    /// Builder: set `lz77`.
+    pub fn with_lz77(mut self, lz77: bool) -> Self {
+        self.lz77 = lz77;
         self
     }
 
@@ -252,6 +275,8 @@ impl PartialEq for EncodeOptions {
             && self.distance.map(f32::to_bits) == other.distance.map(f32::to_bits)
             && self.modular == other.modular
             && self.threads == other.threads
+            && self.patches == other.patches
+            && self.lz77 == other.lz77
     }
 }
 
@@ -268,6 +293,8 @@ impl Default for EncodeOptions {
             distance: None,
             modular: false,
             threads: 1,
+            patches: true,
+            lz77: true,
         }
     }
 }

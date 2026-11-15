@@ -71,6 +71,8 @@ fn spec(width: usize, height: usize, distance: f32, effort: Effort) -> EncodeSpe
         vardct_distance: Some(distance),
         threads: 1,
         vardct_transform: None,
+        patches: false,
+        lz77: false,
     }
 }
 

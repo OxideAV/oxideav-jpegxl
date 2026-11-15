@@ -383,6 +383,46 @@ layouts — the same table in both directions, the output label is what
   sharing the global tree. `EncodeOptions::effort` (`Fast` /
   `Balanced` / `Thorough`) trades learning time for density and never
   changes the pixels.
+* **Screen content, lossless** (round 490). Two tools are elected per
+  picture, each kept only when the file comes out smaller:
+  * **Patches** (`EncodeOptions::patches`, on by default, stills):
+    rows are cut into runs of one colour, regions of one colour larger
+    than a glyph are background, and what is left — grouped with its
+    neighbours in eight directions into glyph-sized boxes: a letter
+    with its anti-aliased rim, an icon, a bullet — is hashed; boxes
+    with identical pixels become one dictionary entry. The entries are
+    packed on shelves into a `kReferenceOnly` frame coded in front of
+    the picture, the picture itself is coded with every occurrence
+    painted over in the colour around it, and the patch dictionary
+    (K.3.1) puts them back with `kReplace`. Photographs fail the
+    first test (too many runs) after one pass over the rows.
+  * **LZ77** (`EncodeOptions::lz77`, on by default): the symbol
+    stream of each section is parsed into literals and copies — the
+    previous symbol, the symbols one row up and beside it (the
+    two-dimensional distance codes of C.3.3, `dist_multiplier` being
+    the row length), and the last place the next three values were
+    seen — a copy being taken when the literals it replaces cost more
+    under the frame's codes. Eight sections are parsed first; content
+    that saves under 1 % there is not parsed further.
+
+  Bytes on a synthesised screenshot corpus (`tests/r490_screen.rs`:
+  text in a procedural anti-aliased font on flat panels, a gradient
+  bar, a noise thumbnail; every stream decodes bit-exactly here and
+  in the black-box decoder):
+
+  | picture | neither | LZ77 | patches + LZ77 | black-box encoder e7 / e9 |
+  |---|---|---|---|---|
+  | window 800×600 | 76 191 | 68 001 | **17 645** | 98 485 / 85 506 |
+  | page 640×480 | 23 411 | 23 411 | **4 767** | 6 618 / 6 648 |
+  | terminal 720×400 | 31 210 | 31 210 | **6 120** | 9 364 / 9 161 |
+  | window 1280×800 | 157 645 | 120 424 | **22 127** | 193 408 / 170 463 |
+  | corpus | 288 457 | 243 046 (−16 %) | **50 659** (−82 %) | 307 875 / 271 778 |
+
+  LZ77 earns its bytes on flat panels and gradients (the two windows)
+  and nothing on pure text, which the patches take; once the patches
+  are out, what is left is flat enough that LZ77 adds under 1 %. The
+  corpus repeats its glyphs exactly, as text on a pixel grid does;
+  sub-pixel positioned text repeats less and gains less.
 * **Metadata**: an ICC profile is embedded in the codestream (E.4,
   written as a header residual stream plus one verbatim main-content
   command, so any profile round-trips byte for byte); Exif / XMP
@@ -464,7 +504,8 @@ layouts — the same table in both directions, the output label is what
 * Not written: transforms above 64×64, custom dequantisation
   matrices, custom coefficient orders and block-context maps,
   progressive passes, VarDCT for non-sRGB input; delta
-  palettes, the Squeeze transform, LZ77, patches, splines, noise,
+  palettes, the Squeeze transform, patches on lossy or animated
+  frames, splines, noise,
   upsampling, crops, previews, extra channels beyond one alpha, float
   samples, `bits_per_sample > 16`.
 
@@ -486,7 +527,8 @@ still image that is the finished picture, not the bare first layer.
 
 `EncodeOptions` (`Default`: `quality = 100`, `container = false`,
 `group_size_shift = 1`, `animation = None`, `effort = Balanced`,
-`distance = None`, `modular = false`, `threads = 1`):
+`distance = None`, `modular = false`, `threads = 1`, `patches = true`,
+`lz77 = true`):
 
 | Field | Meaning |
 |---|---|
@@ -498,6 +540,8 @@ still image that is the finished picture, not the bare first layer.
 | `container` | always write the 18181-2 box file |
 | `group_size_shift` | `group_dim = 128 << shift`, `0..=3` (Modular frames) |
 | `animation` | tick rate and loop count for `encode_all` |
+| `patches` | lossless stills: code repeated glyph-like regions once, in a reference frame in front of the picture (default `true`; the file then holds two frames) |
+| `lz77` | lossless: let the symbol streams copy earlier symbols where that is smaller (default `true`) |
 
 The registry schema (`registry::JxlEncoderOptions`) carries `quality`
 / `container` / `group_size_shift` / `distance` / `modular` / `effort`
