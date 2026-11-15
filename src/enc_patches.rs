@@ -65,6 +65,9 @@ pub(crate) struct PatchEntry {
     pub w: usize,
     pub h: usize,
     pub positions: Vec<(usize, usize)>,
+    /// The colour its first occurrence is painted over with (that of
+    /// every occurrence when the search keeps entries apart by it).
+    pub fill: [i32; 3],
 }
 
 /// A rectangle of the frame repainted in one colour.
@@ -248,11 +251,16 @@ fn hash_keys(w: usize, h: usize, keys: &[u64]) -> u64 {
 /// Search `src` (its first `n_colour` channels are the colour) for
 /// repeated glyph-like rectangles. `None` when the picture is not
 /// screen content or nothing repeats enough to pay.
+///
+/// With `same_fill` two occurrences are one entry only when they are
+/// also painted over with the same colour: what a patch that is added
+/// to the frame (the difference to that colour) needs.
 pub(crate) fn find_patches(
     src: &Pixels<'_>,
     width: usize,
     height: usize,
     n_colour: usize,
+    same_fill: bool,
 ) -> Option<PatchPlan> {
     if width < 16 || height < 16 || n_colour == 0 || n_colour > 3 {
         return None;
@@ -389,8 +397,33 @@ pub(crate) fn find_patches(
         h: usize,
         keys: Vec<u64>,
         foreground: u32,
-        positions: Vec<(usize, usize)>,
+        /// Each occurrence with the colour key it is painted over with.
+        positions: Vec<(usize, usize, u64)>,
     }
+    // The colour around a box: the commonest of the ring of pixels
+    // just outside it, the smallest key on a tie; a box that fills the
+    // frame keeps its own first pixel.
+    let mut ring: HashMap<u64, u32> = HashMap::new();
+    let mut span = vec![0u64; MAX_GLYPH + 2];
+    let mut fill_of = |px: usize, py: usize, w: usize, h: usize, own: u64| -> u64 {
+        ring.clear();
+        let x_lo = px.saturating_sub(1);
+        let x_hi = (px + w + 1).min(width);
+        let span = &mut span[..x_hi - x_lo];
+        for y in py.saturating_sub(1)..(py + h + 1).min(height) {
+            row_keys(src, n_colour, y, x_lo, span);
+            let inside_rows = y >= py && y < py + h;
+            for (i, &k) in span.iter().enumerate() {
+                let x = x_lo + i;
+                if !(inside_rows && x >= px && x < px + w) {
+                    *ring.entry(k).or_insert(0) += 1;
+                }
+            }
+        }
+        ring.iter()
+            .max_by_key(|&(&k, &n)| (n, std::cmp::Reverse(k)))
+            .map_or(own, |(&k, _)| k)
+    };
     let mut found: Vec<Found> = Vec::new();
     let mut by_hash: HashMap<u64, Vec<u32>> = HashMap::new();
     let mut content: Vec<u64> = Vec::new();
@@ -401,18 +434,22 @@ pub(crate) fn find_patches(
         for (row, line) in content.chunks_exact_mut(w).enumerate() {
             row_keys(src, n_colour, b.y0 as usize + row, b.x0 as usize, line);
         }
-        let hash = hash_keys(w, h, &content);
+        let (px, py) = (b.x0 as usize, b.y0 as usize);
+        let fill = fill_of(px, py, w, h, content[0]);
+        let hash = hash_keys(w, h, &content) ^ if same_fill { fill.rotate_left(17) } else { 0 };
         let slot = by_hash.entry(hash).or_default();
-        let at = (b.x0 as usize, b.y0 as usize);
         match slot
             .iter()
             .find(|&&i| {
                 let f = &found[i as usize];
-                f.w == w && f.h == h && f.keys == content
+                f.w == w
+                    && f.h == h
+                    && f.keys == content
+                    && (!same_fill || f.positions[0].2 == fill)
             })
             .copied()
         {
-            Some(i) => found[i as usize].positions.push(at),
+            Some(i) => found[i as usize].positions.push((px, py, fill)),
             None => {
                 slot.push(found.len() as u32);
                 found.push(Found {
@@ -420,7 +457,7 @@ pub(crate) fn find_patches(
                     h,
                     keys: content.clone(),
                     foreground: b.area,
-                    positions: vec![at],
+                    positions: vec![(px, py, fill)],
                 });
             }
         }
@@ -480,42 +517,23 @@ pub(crate) fn find_patches(
     }
 
     // 5. The frame without them: each occurrence repainted with the
-    // commonest colour of the ring around it.
+    // colour around it.
+    let colour_of = |key: u64| -> [i32; 3] {
+        let mut colour = [0i32; 3];
+        for (c, slot) in colour.iter_mut().enumerate().take(n_colour) {
+            *slot = ((key >> (16 * (n_colour - 1 - c))) & 0xFFFF) as i32;
+        }
+        colour
+    };
     let mut fills = Vec::new();
-    let mut ring: HashMap<u64, u32> = HashMap::new();
-    let mut span = vec![0u64; MAX_GLYPH + 2];
     for f in &found {
-        for &(px, py) in &f.positions {
-            ring.clear();
-            let x_lo = px.saturating_sub(1);
-            let x_hi = (px + f.w + 1).min(width);
-            let span = &mut span[..x_hi - x_lo];
-            for y in py.saturating_sub(1)..(py + f.h + 1).min(height) {
-                row_keys(src, n_colour, y, x_lo, span);
-                let inside_rows = y >= py && y < py + f.h;
-                for (i, &k) in span.iter().enumerate() {
-                    let x = x_lo + i;
-                    if !(inside_rows && x >= px && x < px + f.w) {
-                        *ring.entry(k).or_insert(0) += 1;
-                    }
-                }
-            }
-            // The commonest ring colour, the smallest key on a tie; a
-            // box that fills the frame keeps its own first pixel.
-            let key = ring
-                .iter()
-                .max_by_key(|&(&k, &n)| (n, std::cmp::Reverse(k)))
-                .map_or(f.keys[0], |(&k, _)| k);
-            let mut colour = [0i32; 3];
-            for (c, slot) in colour.iter_mut().enumerate().take(n_colour) {
-                *slot = ((key >> (16 * (n_colour - 1 - c))) & 0xFFFF) as i32;
-            }
+        for &(px, py, key) in &f.positions {
             fills.push(Fill {
                 x: px,
                 y: py,
                 w: f.w,
                 h: f.h,
-                colour,
+                colour: colour_of(key),
             });
         }
     }
@@ -527,7 +545,8 @@ pub(crate) fn find_patches(
             ay,
             w: f.w,
             h: f.h,
-            positions: f.positions,
+            fill: colour_of(f.positions[0].2),
+            positions: f.positions.iter().map(|&(x, y, _)| (x, y)).collect(),
         })
         .collect();
     Some(PatchPlan {
@@ -539,19 +558,24 @@ pub(crate) fn find_patches(
     })
 }
 
+/// `PatchBlendMode` values (Table K.1) the encoder writes: neither
+/// carries an alpha channel or a clamp field.
+pub(crate) const BLEND_NONE: u32 = 0;
+pub(crate) const BLEND_REPLACE: u32 = 1;
+pub(crate) const BLEND_ADD: u32 = 2;
+
 /// The patch dictionary as the `(context, value)` symbols of its
 /// ten-context entropy stream (the patch-reading listing of the
-/// LfGlobal section): every entry reads `reference` slot, is copied
-/// with `kReplace` over the colour channels and leaves the
-/// `num_extra` extra channels alone (`kNone`).
+/// LfGlobal section): every entry reads `reference` slot, is blended
+/// with `mode` ([`BLEND_REPLACE`] or [`BLEND_ADD`]) into the colour
+/// channels and leaves the `num_extra` extra channels alone.
 pub(crate) fn dictionary_symbols(
     entries: &[PatchEntry],
     reference: u32,
     num_extra: usize,
+    mode: u32,
 ) -> Vec<(u32, u32)> {
     use crate::bitwriter::pack_signed;
-    const REPLACE: u32 = 1;
-    const NONE: u32 = 0;
     let mut out = vec![(0u32, entries.len() as u32)];
     for e in entries {
         out.push((1, reference));
@@ -571,9 +595,9 @@ pub(crate) fn dictionary_symbols(
                 out.push((6, pack_signed((y - last.1) as i32)));
             }
             last = (x, y);
-            out.push((5, REPLACE));
+            out.push((5, mode));
             for _ in 0..num_extra {
-                out.push((5, NONE));
+                out.push((5, BLEND_NONE));
             }
         }
     }
@@ -629,7 +653,7 @@ mod tests {
             planes: &planes,
             width: w,
         };
-        let plan = find_patches(&src, w, h, 1).expect("a page of text has patches");
+        let plan = find_patches(&src, w, h, 1, false).expect("a page of text has patches");
         assert!(plan.entries.len() <= 12, "{} entries", plan.entries.len());
         assert!(
             plan.num_positions() > 50,
@@ -658,7 +682,7 @@ mod tests {
         plan.fills.apply(0, py, 0, &mut line);
         assert_eq!((line[px - 1], line[px]), (7, 255));
         // The dictionary symbols start with the entry count.
-        let syms = dictionary_symbols(&plan.entries, 1, 0);
+        let syms = dictionary_symbols(&plan.entries, 1, 0, BLEND_REPLACE);
         assert_eq!(syms[0], (0, plan.entries.len() as u32));
         assert_eq!(syms[1], (1, 1));
     }
@@ -678,13 +702,13 @@ mod tests {
             planes: &planes,
             width: w,
         };
-        assert!(find_patches(&src, w, h, 1).is_none());
+        assert!(find_patches(&src, w, h, 1, false).is_none());
         // A flat picture has background and nothing on it.
         let planes = vec![vec![9i32; w * h]];
         let src = Pixels::Planes {
             planes: &planes,
             width: w,
         };
-        assert!(find_patches(&src, w, h, 1).is_none());
+        assert!(find_patches(&src, w, h, 1, false).is_none());
     }
 }

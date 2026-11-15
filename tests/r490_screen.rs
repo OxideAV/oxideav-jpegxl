@@ -372,6 +372,112 @@ fn lz77_saves_bytes_where_symbols_repeat() {
     assert!(total.1 < total.0, "{} -> {}", total.0, total.1);
 }
 
+fn psnr(a: &[u8], b: &[u8]) -> f64 {
+    assert_eq!(a.len(), b.len());
+    let sse: f64 = a
+        .iter()
+        .zip(b)
+        .map(|(&x, &y)| {
+            let d = f64::from(x) - f64::from(y);
+            d * d
+        })
+        .sum();
+    if sse == 0.0 {
+        return 99.0;
+    }
+    10.0 * (255.0 * 255.0 * a.len() as f64 / sse).log10()
+}
+
+/// The black-box encoder's lossy stream at `distance`, decoded by this
+/// crate: `(bytes, PSNR)`.
+fn black_box_lossy(c: &Canvas, distance: f32) -> Option<(usize, f64)> {
+    if !tool("cjxl") {
+        return None;
+    }
+    let (src, dst) = (scratch("lossy-ref.ppm"), scratch("lossy-ref.jxl"));
+    std::fs::write(&src, ppm(c)).unwrap();
+    let out = Command::new("cjxl")
+        .arg(&src)
+        .arg(&dst)
+        .args(["-d", &distance.to_string()])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let bytes = std::fs::read(&dst).unwrap();
+    let _ = std::fs::remove_file(&src);
+    let _ = std::fs::remove_file(&dst);
+    let back = decode(&bytes).ok()?;
+    Some((bytes.len(), psnr(&back.to_rgb8(), &c.rgb)))
+}
+
+#[test]
+fn patches_sharpen_lossy_screen_content() {
+    for distance in [1.0f32, 3.0] {
+        let mut total = [(0usize, 0.0f64); 2];
+        for (name, canvas) in corpus() {
+            let img = canvas.image();
+            let opts = EncodeOptions::new().with_distance(distance);
+            let plain = encode(&img, &opts.clone().with_patches(false)).unwrap();
+            let patched = encode(&img, &opts).unwrap();
+            let mut quality = [0.0f64; 2];
+            for (k, (label, bytes)) in [("plain", &plain), ("patches", &patched)]
+                .into_iter()
+                .enumerate()
+            {
+                let back = decode(bytes).unwrap();
+                assert_eq!(back.format, PixelFormat::Rgb24, "{name} {label}");
+                let ours = back.as_bytes().unwrap();
+                quality[k] = psnr(ours, &canvas.rgb);
+                total[k].0 += bytes.len();
+                total[k].1 += quality[k];
+                let tag = format!("lossy-{label}-{}-{distance}", canvas.w);
+                if let Some(theirs) = black_box_rgb(bytes, &tag) {
+                    let worst = ours
+                        .iter()
+                        .zip(&theirs)
+                        .map(|(&a, &b)| a.abs_diff(b))
+                        .max()
+                        .unwrap_or(0);
+                    assert!(
+                        worst <= 2,
+                        "{name} {label} d{distance}: the black-box decoder differs by {worst}"
+                    );
+                }
+            }
+            // Kept only when no larger; the glyphs are then near exact.
+            assert!(patched.len() <= plain.len(), "{name} d{distance}");
+            assert!(
+                quality[1] >= quality[0] - 0.1,
+                "{name} d{distance}: {:.2} dB with patches, {:.2} without",
+                quality[1],
+                quality[0]
+            );
+            let reference = black_box_lossy(&canvas, distance)
+                .map(|(n, q)| format!("; black-box encoder {n} bytes / {q:.2} dB"))
+                .unwrap_or_default();
+            println!(
+                "{name} d{distance}: {} bytes / {:.2} dB without patches, {} / {:.2} with{reference}",
+                plain.len(),
+                quality[0],
+                patched.len(),
+                quality[1]
+            );
+        }
+        let n = corpus().len() as f64;
+        println!(
+            "corpus d{distance}: {} bytes / {:.2} dB -> {} bytes / {:.2} dB",
+            total[0].0,
+            total[0].1 / n,
+            total[1].0,
+            total[1].1 / n
+        );
+        // Text is where the lossy coder spends its bits: the
+        // dictionary has to pay in both size and quality.
+        assert!(total[1].0 * 100 < total[0].0 * 85, "d{distance}: {total:?}");
+        assert!(total[1].1 > total[0].1 + 2.0 * n, "d{distance}: {total:?}");
+    }
+}
+
 #[test]
 fn patches_leave_alpha_and_photographs_alone() {
     // RGBA: the colour is patched, the alpha plane is coded as it is.

@@ -355,13 +355,36 @@ layouts — the same table in both directions, the output label is what
   Every one of these streams decodes in the black-box decoder to
   within one 8-bit code of this crate's decode.
 
-  **Screen content is where the gap remains.** On the corpus
-  screenshot and the pixel art the black-box encoder is 5 – 10 dB
-  ahead at matched sizes (screenshot at distance 1: 95 760 bytes /
-  45.71 dB here against 111 294 / 48.63; pixel art: 13 559 / 43.69
-  against 22 480 / 45.24, and 10 902 bytes / 56.91 dB at its distance
-  0.5): repeated glyphs and flat colour want patches, palettes and a
-  Modular coder for the residue, none of which the lossy path writes.
+  **Screen content: patches** (round 490, `EncodeOptions::patches`,
+  stills). The glyph search of the lossless coder (below) also runs
+  on lossy input. Each repeated glyph is stored once, in a
+  `kReferenceOnly` Modular frame, as its XYB difference to the colour
+  it stands on (in steps of about a third of an 8-bit code of luma at
+  distance 1, coarser with the distance); the VarDCT frame is coded
+  with the glyphs painted over — flat ground, nearly free — and a
+  patch dictionary adds them back (`kAdd`) after the restoration
+  filters. The pair is kept when it is no larger than the plain
+  frame. On the synthesised screenshot corpus of
+  `tests/r490_screen.rs` (bytes / PSNR in dB through this crate's
+  decoder; a black-box decoder agrees within two 8-bit codes on every
+  stream; the black-box encoder at its default effort and the same
+  nominal distance):
+
+  | picture, distance | without patches | with patches | black-box encoder |
+  |---|---|---|---|
+  | window 800×600, 1 | 118 313 / 40.69 | **19 026 / 44.83** | 144 954 / 42.45 |
+  | page 640×480, 1 | 89 742 / 42.72 | **5 131 / 69.04** | 17 215 / 52.73 |
+  | terminal 720×400, 1 | 87 482 / 38.87 | **8 348 / 57.80** | 22 881 / 54.06 |
+  | window 1280×800, 1 | 255 651 / 41.96 | **24 688 / 48.98** | 316 958 / 44.24 |
+  | window 800×600, 3 | 73 058 / 33.81 | **13 257 / 39.27** | 22 980 / 39.32 |
+  | page 640×480, 3 | 56 671 / 34.19 | **4 766 / 48.10** | 11 848 / 44.34 |
+  | terminal 720×400, 3 | 53 362 / 33.21 | **6 630 / 42.03** | 15 176 / 46.55 |
+  | window 1280×800, 3 | 155 821 / 34.19 | **18 478 / 42.15** | 43 112 / 41.46 |
+
+  A tenth of the bytes and 9 to 14 dB more on the corpus as a whole.
+  The corpus repeats its glyphs exactly (text on a pixel grid);
+  sub-pixel positioned text repeats less, and what does not repeat is
+  still coded by the DCT.
 * **Structure**: one global MA tree **learned from the picture** — a
   sample of it is scanned with the decoder's own property vector
   (Table H.4, previous-channel properties included) and every node
@@ -504,8 +527,8 @@ layouts — the same table in both directions, the output label is what
 * Not written: transforms above 64×64, custom dequantisation
   matrices, custom coefficient orders and block-context maps,
   progressive passes, VarDCT for non-sRGB input; delta
-  palettes, the Squeeze transform, patches on lossy or animated
-  frames, splines, noise,
+  palettes, the Squeeze transform, patches on animated frames,
+  splines, noise,
   upsampling, crops, previews, extra channels beyond one alpha, float
   samples, `bits_per_sample > 16`.
 
@@ -540,7 +563,7 @@ still image that is the finished picture, not the bare first layer.
 | `container` | always write the 18181-2 box file |
 | `group_size_shift` | `group_dim = 128 << shift`, `0..=3` (Modular frames) |
 | `animation` | tick rate and loop count for `encode_all` |
-| `patches` | lossless stills: code repeated glyph-like regions once, in a reference frame in front of the picture (default `true`; the file then holds two frames) |
+| `patches` | stills, lossless and lossy: code repeated glyph-like regions once, in a reference frame in front of the picture (default `true`; the file then holds two frames) |
 | `lz77` | lossless: let the symbol streams copy earlier symbols where that is smaller (default `true`) |
 
 The registry schema (`registry::JxlEncoderOptions`) carries `quality`

@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Patches for lossy screen content** (round 490). The VarDCT coder
+  stores each repeated glyph once — its XYB difference to the colour
+  it stands on, in a `kReferenceOnly` Modular frame — codes the frame
+  with the glyphs painted over, and adds them back with a patch
+  dictionary (`kAdd`). On the screenshot corpus at distance 1:
+  551 188 bytes / 41.06 dB → 57 193 bytes / 55.16 dB; at distance 3:
+  338 912 / 33.85 → 43 131 / 42.89 (the black-box encoder at its
+  default effort: 502 008 / 48.37 and 93 116 / 42.92). A black-box
+  decoder agrees within two 8-bit codes on every stream.
 - **Patches for lossless screen content** (round 490,
   `EncodeOptions::patches`, default on, stills). Repeated glyph-like
   regions — found by cutting rows into runs, taking regions larger

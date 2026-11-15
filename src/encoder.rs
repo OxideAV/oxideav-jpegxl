@@ -533,20 +533,40 @@ struct CodedFrame {
 /// not by the picture), and per worker one group's planes and symbols
 /// at a time — the picture itself stays where the caller keeps it and
 /// each group is fetched and transformed when a worker codes it.
-fn code_frame(spec: &EncodeSpec, src: &Pixels<'_>) -> Result<CodedFrame> {
+///
+/// With `raw` the channels are coded as they are, whatever their
+/// range: no transform is elected and nothing is quantised (the
+/// reference frame of a lossy picture's patches holds signed XYB
+/// differences).
+fn code_frame(spec: &EncodeSpec, src: &Pixels<'_>, raw: bool) -> Result<CodedFrame> {
     let width = spec.width as usize;
     let height = spec.height as usize;
     let n_ch = spec.num_channels();
-    src.validate(width, height, n_ch, (1i64 << spec.bits) - 1)?;
-    let multiplier = quantizer_for_quality(spec.quality, spec.bits);
-    let planned = plan_transforms(
-        src,
-        width,
-        height,
-        if spec.grey { 1 } else { 3 },
-        spec.bits,
-        multiplier == 1,
-    );
+    let (multiplier, planned) = if raw {
+        if src.num_channels() != n_ch {
+            return Err(Error::invalid("JXL encoder: reference frame channel count"));
+        }
+        (
+            1,
+            crate::enc_transforms::Planned {
+                transforms: Vec::new(),
+                metas: Vec::new(),
+                map: crate::enc_transforms::PixelMap::identity(n_ch),
+            },
+        )
+    } else {
+        src.validate(width, height, n_ch, (1i64 << spec.bits) - 1)?;
+        let multiplier = quantizer_for_quality(spec.quality, spec.bits);
+        let planned = plan_transforms(
+            src,
+            width,
+            height,
+            if spec.grey { 1 } else { 3 },
+            spec.bits,
+            multiplier == 1,
+        );
+        (multiplier, planned)
+    };
     let transforms = planned.transforms;
     let map = planned.map;
 
@@ -970,9 +990,24 @@ fn write_transforms(w: &mut BitWriter, transforms: &[Transform]) -> Result<()> {
     Ok(())
 }
 
-fn write_global_modular_header(w: &mut BitWriter, coded: &CodedFrame) -> Result<()> {
-    // LfChannelDequantization: all_default.
-    w.write_bool(true);
+/// `lf_weights`: the LF dequantisation weights `m_x_lf`, `m_y_lf`,
+/// `m_b_lf` when they are not the defaults (they scale the integers
+/// of a Modular frame of an XYB image, L.2.2).
+fn write_global_modular_header(
+    w: &mut BitWriter,
+    coded: &CodedFrame,
+    lf_weights: Option<[f32; 3]>,
+) -> Result<()> {
+    // LfChannelDequantization.
+    match lf_weights {
+        None => w.write_bool(true), // all_default
+        Some(weights) => {
+            w.write_bool(false);
+            for m in weights {
+                w.write_f16(m)?;
+            }
+        }
+    }
     // GlobalModular: the global tree.
     w.write_bool(true); // use_global_tree
     coded.tree_codes.write_prelude(w);
@@ -997,8 +1032,9 @@ enum FrameRole<'a> {
         patches: Option<&'a [(u32, u32)]>,
     },
     /// A `kReferenceOnly` frame: the source of a later frame's
-    /// patches, never shown.
-    Reference,
+    /// patches, never shown. With `xyb_weights` its channels are XYB
+    /// integers under those LF weights, coded as they are.
+    Reference { xyb_weights: Option<[f32; 3]> },
 }
 
 /// The patch dictionary of LfGlobal: a ten-context entropy stream.
@@ -1044,6 +1080,7 @@ fn write_frame(
             spec.width as usize,
             spec.height as usize,
             spec.num_colour(),
+            false,
         )
     } else {
         None
@@ -1088,11 +1125,16 @@ fn patched_modular_frames(
         planes: &planes,
         width: plan.atlas_width,
     };
-    let mut out = modular_frame(&atlas_spec, &atlas, FrameRole::Reference)?;
+    let mut out = modular_frame(
+        &atlas_spec,
+        &atlas,
+        FrameRole::Reference { xyb_weights: None },
+    )?;
     let symbols = crate::enc_patches::dictionary_symbols(
         &plan.entries,
         PATCH_REFERENCE_SLOT,
         usize::from(spec.alpha),
+        crate::enc_patches::BLEND_REPLACE,
     );
     let emptied = Pixels::Filled {
         base: pixels,
@@ -1112,7 +1154,11 @@ fn patched_modular_frames(
 
 /// One Modular frame (header, TOC, sections) as bytes.
 fn modular_frame(spec: &EncodeSpec, pixels: &Pixels<'_>, role: FrameRole<'_>) -> Result<Vec<u8>> {
-    let coded = code_frame(spec, pixels)?;
+    let xyb_weights = match role {
+        FrameRole::Reference { xyb_weights } => xyb_weights,
+        FrameRole::Regular { .. } => None,
+    };
+    let coded = code_frame(spec, pixels, xyb_weights.is_some())?;
     let single = coded.groups.is_empty();
     let mut sections: Vec<Vec<u8>> = Vec::new();
     {
@@ -1124,7 +1170,7 @@ fn modular_frame(spec: &EncodeSpec, pixels: &Pixels<'_>, role: FrameRole<'_>) ->
         {
             write_patch_dictionary(&mut lf, symbols)?;
         }
-        write_global_modular_header(&mut lf, &coded)?;
+        write_global_modular_header(&mut lf, &coded, xyb_weights)?;
         if !coded.global.is_empty() {
             // One section's symbols are unpacked at a time (the ANS
             // writer walks them backwards).
@@ -1178,7 +1224,7 @@ fn modular_frame(spec: &EncodeSpec, pixels: &Pixels<'_>, role: FrameRole<'_>) ->
             is_last,
             patches,
         } => (duration, is_last, patches.is_some()),
-        FrameRole::Reference => (0, false, false),
+        FrameRole::Reference { .. } => (0, false, false),
     };
     let shape = FrameShape {
         vardct: None,
@@ -1188,7 +1234,7 @@ fn modular_frame(spec: &EncodeSpec, pixels: &Pixels<'_>, role: FrameRole<'_>) ->
         have_animation: spec.animation.is_some(),
         duration,
         is_last,
-        reference: matches!(role, FrameRole::Reference).then_some((spec.width, spec.height)),
+        reference: matches!(role, FrameRole::Reference { .. }).then_some((spec.width, spec.height)),
         patches,
     };
     let mut w = BitWriter::new();
@@ -1199,7 +1245,60 @@ fn modular_frame(spec: &EncodeSpec, pixels: &Pixels<'_>, role: FrameRole<'_>) ->
     Ok(w.into_bytes())
 }
 
-/// Append one VarDCT frame.
+/// LF weights of the reference frame of a lossy picture's patches:
+/// its integers are XYB differences in steps of `m / 128` (L.2.2) —
+/// about a third of an 8-bit code of luma at distance 1, coarser in
+/// proportion to the distance (the weights are powers of two, exact
+/// in the half floats they are written as).
+fn patch_weights(distance: f32) -> [f32; 3] {
+    let coarser = 2f32.powi(distance.clamp(1.0, 8.0).log2().round() as i32);
+    [coarser / 64.0, coarser / 8.0, coarser / 8.0]
+}
+
+/// The reference picture of `plan` for an XYB image: per entry the
+/// XYB difference between its pixels and the colour its occurrences
+/// are painted over with, as the integers (Y', X', B' − Y') a Modular
+/// frame of an XYB image carries, followed by empty extra channels.
+fn xyb_patch_planes(
+    spec: &EncodeSpec,
+    plan: &crate::enc_patches::PatchPlan,
+    weights: [f32; 3],
+) -> Vec<Vec<i32>> {
+    let opsin = crate::vardct_enc::Opsin::new(spec.bits);
+    let n = plan.atlas_width * plan.atlas_height;
+    let mut planes = vec![vec![0i32; n]; 3 + usize::from(spec.alpha)];
+    let xyb_of = |rgb: [i32; 3]| -> [f32; 3] {
+        if spec.grey {
+            opsin.xyb(rgb[0], rgb[0], rgb[0])
+        } else {
+            opsin.xyb(rgb[0], rgb[1], rgb[2])
+        }
+    };
+    let scale = weights.map(|m| 128.0 / m);
+    for e in &plan.entries {
+        let ground = xyb_of(e.fill);
+        for y in 0..e.h {
+            for x in 0..e.w {
+                let i = (e.ay + y) * plan.atlas_width + e.ax + x;
+                let mut rgb = [0i32; 3];
+                for (slot, plane) in rgb.iter_mut().zip(&plan.atlas) {
+                    *slot = plane[i];
+                }
+                let v = xyb_of(rgb);
+                let x_q = ((v[0] - ground[0]) * scale[0]).round() as i32;
+                let y_q = ((v[1] - ground[1]) * scale[1]).round() as i32;
+                let b_q = ((v[2] - ground[2]) * scale[2]).round() as i32;
+                planes[0][i] = y_q;
+                planes[1][i] = x_q;
+                planes[2][i] = b_q - y_q;
+            }
+        }
+    }
+    planes
+}
+
+/// Append one VarDCT frame of the picture — preceded by a reference
+/// frame when the picture has patches and the pair is no larger.
 fn write_vardct_frame(
     w: &mut BitWriter,
     spec: &EncodeSpec,
@@ -1208,13 +1307,91 @@ fn write_vardct_frame(
     is_last: bool,
     distance: f32,
 ) -> Result<()> {
-    let n_colour = if spec.grey { 1 } else { 3 };
     pixels.validate(
         spec.width as usize,
         spec.height as usize,
         spec.num_channels(),
         (1i64 << spec.bits) - 1,
     )?;
+    let plain = vardct_frame(spec, pixels, duration, is_last, distance, None)?;
+    let plan = if spec.patches && spec.animation.is_none() {
+        // Added to the frame, a patch is the difference to the colour
+        // under it: one entry per glyph and ground.
+        crate::enc_patches::find_patches(
+            pixels,
+            spec.width as usize,
+            spec.height as usize,
+            spec.num_colour(),
+            true,
+        )
+    } else {
+        None
+    };
+    if let Some(plan) = plan {
+        let weights = patch_weights(distance);
+        let planes = xyb_patch_planes(spec, &plan, weights);
+        let atlas_spec = EncodeSpec {
+            width: plan.atlas_width as u32,
+            height: plan.atlas_height as u32,
+            grey: false,
+            quality: 100,
+            patches: false,
+            ..spec.clone()
+        };
+        let atlas = Pixels::Planes {
+            planes: &planes,
+            width: plan.atlas_width,
+        };
+        let mut pair = modular_frame(
+            &atlas_spec,
+            &atlas,
+            FrameRole::Reference {
+                xyb_weights: Some(weights),
+            },
+        )?;
+        let symbols = crate::enc_patches::dictionary_symbols(
+            &plan.entries,
+            PATCH_REFERENCE_SLOT,
+            usize::from(spec.alpha),
+            crate::enc_patches::BLEND_ADD,
+        );
+        let mut dictionary = BitWriter::new();
+        write_patch_dictionary(&mut dictionary, &symbols)?;
+        let emptied = Pixels::Filled {
+            base: pixels,
+            fills: &plan.fills,
+        };
+        pair.extend(vardct_frame(
+            spec,
+            &emptied,
+            duration,
+            is_last,
+            distance,
+            Some(&dictionary),
+        )?);
+        // The glyphs of the pair are exact to a fraction of a code
+        // where the plain frame quantises them: the pair is taken
+        // whenever it is not also larger.
+        if pair.len() <= plain.len() {
+            w.write_bytes(&pair);
+            return Ok(());
+        }
+    }
+    w.write_bytes(&plain);
+    Ok(())
+}
+
+/// One VarDCT frame (header, TOC, sections) as bytes; `dictionary` is
+/// its serialised patch dictionary when it has one.
+fn vardct_frame(
+    spec: &EncodeSpec,
+    pixels: &Pixels<'_>,
+    duration: u32,
+    is_last: bool,
+    distance: f32,
+    dictionary: Option<&BitWriter>,
+) -> Result<Vec<u8>> {
+    let n_colour = spec.num_colour();
     let input = crate::vardct_enc::VarDctInput {
         width: spec.width as usize,
         height: spec.height as usize,
@@ -1232,7 +1409,7 @@ fn write_vardct_frame(
         threads: spec.threads,
         forced: spec.vardct_transform,
     };
-    let (sections, rate) = crate::vardct_enc::encode_frame(&input, &opts, &learn)?;
+    let (sections, rate) = crate::vardct_enc::encode_frame(&input, &opts, &learn, dictionary)?;
     let mut toc = Vec::with_capacity(sections.len());
     for s in &sections {
         if s.len() > MAX_SECTION_BYTES {
@@ -1256,13 +1433,14 @@ fn write_vardct_frame(
         duration,
         is_last,
         reference: None,
-        patches: false,
+        patches: dictionary.is_some(),
     };
-    write_frame_header_and_toc(w, &shape, &toc)?;
+    let mut w = BitWriter::new();
+    write_frame_header_and_toc(&mut w, &shape, &toc)?;
     for s in &sections {
         w.write_bytes(s);
     }
-    Ok(())
+    Ok(w.into_bytes())
 }
 
 /// Whether the VarDCT coder takes this picture: integer samples of

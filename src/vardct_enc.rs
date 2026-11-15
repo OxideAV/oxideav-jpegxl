@@ -244,7 +244,7 @@ fn invert3(m: [[f64; 3]; 3]) -> [[f64; 3]; 3] {
 
 /// Forward XYB: the inverse of L.2.2 with the default
 /// `OpsinInverseMatrix` and `intensity_target = 255`.
-struct Opsin {
+pub(crate) struct Opsin {
     fwd: [[f32; 3]; 3],
     bias: [f32; 3],
     cbrt_bias: [f32; 3],
@@ -253,7 +253,7 @@ struct Opsin {
 }
 
 impl Opsin {
-    fn new(bits: u32) -> Self {
+    pub(crate) fn new(bits: u32) -> Self {
         let oim = OpsinInverseMatrix::default();
         let inv = oim.inv_mat.map(|r| r.map(f64::from));
         let bias = oim.opsin_bias.map(f64::from);
@@ -269,7 +269,7 @@ impl Opsin {
     }
 
     #[inline]
-    fn xyb(&self, r: i32, g: i32, b: i32) -> [f32; 3] {
+    pub(crate) fn xyb(&self, r: i32, g: i32, b: i32) -> [f32; 3] {
         let rgb = [
             self.lut[r as usize],
             self.lut[g as usize],
@@ -1971,10 +1971,13 @@ fn write_pass_group(w: &mut BitWriter, coded: &Coded, hf: &Symbols, extra: &Symb
 
 /// Encode one VarDCT frame: the TOC sections in order (one entry when
 /// the frame has a single group, each of the others byte-aligned).
+/// `lf_global_prefix` is what LfGlobal starts with ahead of the
+/// fields written here: the frame's patch dictionary.
 pub(crate) fn encode_frame(
     input: &VarDctInput<'_>,
     opts: &VarDctOptions,
     learn: &LearnParams,
+    lf_global_prefix: Option<&BitWriter>,
 ) -> Result<(Vec<Vec<u8>>, RateParams)> {
     if input.width == 0 || input.height == 0 {
         return Err(Error::invalid("JXL encoder: zero image dimension"));
@@ -1992,6 +1995,9 @@ pub(crate) fn encode_frame(
     };
 
     // LfGlobal.
+    if let Some(prefix) = lf_global_prefix {
+        w.append(prefix);
+    }
     if coded.rate.lf_weights == [1.0 / 32.0, 0.25, 0.5] {
         w.write_bool(true); // LfChannelDequantization.all_default
     } else {

@@ -296,6 +296,17 @@ pub(crate) struct PixelMap {
 }
 
 impl PixelMap {
+    /// The map that changes nothing: `n_src` channels coded as they
+    /// are.
+    pub(crate) fn identity(n_src: usize) -> Self {
+        Self {
+            palette: None,
+            rct_type: 0,
+            ranks: vec![None; n_src],
+            n_src,
+        }
+    }
+
     /// Channels the coder sees per pixel.
     pub(crate) fn num_coded(&self) -> usize {
         if self.palette.is_some() {
