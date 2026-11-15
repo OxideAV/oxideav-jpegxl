@@ -492,3 +492,39 @@ fn deep_lossy_size_against_a_black_box_encoder() {
     }
     let _ = std::fs::remove_file(&ppm);
 }
+
+/// A delta-palette stream (H.6.4, `nb_deltas = 9`, `d_pred = 13`) of
+/// a black-box encoder (`cjxl -d 0 --modular_lossy_palette
+/// --modular_palette_colors=64` on a 300×80 ramp), with the black-box
+/// decoder's output next to it. This crate's reading of the listing
+/// decodes it to other pixels (71 501 of 72 000 samples differed), so
+/// the decoder refuses delta entries until a trace settles the
+/// reading; the expected picture is committed for that day.
+#[test]
+fn a_delta_palette_stream_is_refused_not_misdecoded() {
+    let bytes = fixture("delta_palette_black_box.jxl");
+    let (w, h, c, maxval, want) = parse_pnm(&fixture("delta_palette_black_box_expected.ppm"));
+    assert_eq!((w, h, c, maxval), (300, 80, 3, 255));
+    let meta = info(&bytes).unwrap();
+    assert_eq!((meta.width, meta.height), (300, 80));
+    match decode(&bytes) {
+        Err(oxideav_jpegxl::Error::Unsupported(msg)) => {
+            assert!(msg.contains("delta palette"), "{msg}");
+        }
+        // The day the reading is settled, the pixels have to be the
+        // black-box decoder's.
+        Ok(img) => {
+            let got: Vec<u32> = img
+                .as_bytes()
+                .unwrap()
+                .iter()
+                .map(|&b| u32::from(b))
+                .collect();
+            assert_eq!(
+                got, want,
+                "delta palette decode differs from the black-box decoder"
+            );
+        }
+        Err(other) => panic!("unexpected error: {other}"),
+    }
+}

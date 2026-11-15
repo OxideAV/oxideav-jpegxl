@@ -115,6 +115,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Decoder: **a stream that uses a delta palette entry (H.6.4) is
+  refused** (`Error::Unsupported`) instead of decoded. On the one
+  specimen at hand — a stream of a black-box encoder with
+  `nb_deltas = 9`, `d_pred = 13` — this crate's reading of the
+  listing decoded without error to other pixels than the black-box
+  decoder (71 501 of 72 000 samples), and a black-box decoder refuses
+  streams written from the same reading. The specimen and the
+  black-box decoder's output are committed for the round that settles
+  it; plain palettes are unaffected.
 - **Encode speed** (round 490, output unchanged byte for byte). The
   forward DCT runs every one-dimensional transform of a block side by
   side — the same operations in the same order per transform, across

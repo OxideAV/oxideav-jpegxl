@@ -2672,6 +2672,25 @@ pub fn inverse_palette(
     let h = idx_desc.height;
     let _ = idx_desc;
 
+    // Delta entries (an index below `nb_deltas`, the implicit negative
+    // ones included) are refused rather than guessed at. This crate's
+    // reading of the H.6.4 listing decodes the one delta-palette
+    // specimen at hand — a stream of a black-box encoder — without
+    // error but to other pixels than the black-box decoder, and that
+    // decoder refuses streams written from the same reading; the
+    // listing does not settle which is right (round 490, see the
+    // README). A wrong picture is worse than no picture.
+    if img.channels[first]
+        .iter()
+        .any(|&index| index < nb_deltas as i32)
+    {
+        return Err(Error::Unsupported(
+            "jxl decoder: delta palette entries (H.6.4, an index below nb_deltas) are not \
+             decoded — the listing's reading is not arbitrated against a black-box decoder"
+                .into(),
+        ));
+    }
+
     // Insert num_c-1 copies of channel[first] at positions [first+1..=last].
     for i in (first + 1)..=last {
         let copy = img.channels[first].clone();

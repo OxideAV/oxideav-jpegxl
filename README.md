@@ -258,6 +258,7 @@ layouts — the same table in both directions, the output label is what
 | `Rgb48Le` | RGB, 9..=16 | `bits_per_sample = 12` writes a 12-bit codestream |
 | `Rgba64Le` | RGB + alpha, 9..=16 | |
 | `YuvJ444P` / `YuvJ422P` / `YuvJ420P` / `Yuv440P` | — | `Error::Unsupported` (planar transcode layouts are decode-only; never converted) |
+| `GrayF32Le` / `RgbF32Le` / `RgbaF32Le` | — | `Error::Unsupported` (float samples are decode-only) |
 
 * **Lossless at quality 100** (the default): every layout above
   round-trips bit-exactly, on one-group and multi-group geometries
@@ -515,49 +516,85 @@ layouts — the same table in both directions, the output label is what
   encode time; `Effort::Fast` gives 414 416 / 1 623 756 on the two
   grey photographs and 44 828 on the screenshot in about a tenth of
   it.
-* **Time and memory** (`benches/codec.rs`, a synthesised photo-like
-  RGB picture; median of three, one process per measurement, peak
-  resident set of that process; an 18-core machine shared with other
-  builds, so read the ratios rather than the digits). "Before" is the
-  round-487 state, measured in the same session:
+* **Time and memory** (`benches/codec.rs`: a synthesised photo-like
+  RGB picture, default effort, one process per measurement). The
+  machine is an 18-core one shared with fourteen other builds and
+  runs in two speed regimes a factor 1.5 apart, so "before" (the
+  state at the start of round 490) and "now" were run interleaved
+  and the figures are medians of five to twelve runs — read the
+  ratios, not the digits:
 
-  | 1 worker → 8 workers | 1 MP before | 1 MP now | 12 MP before | 12 MP now |
-  |---|---|---|---|---|
-  | lossless encode, ms | 552 → 314 | 458 → 206 | 2027 → 685 | 1959 → 536 |
-  | lossless decode, ms | 140 → 30 | 148 → 30 | 1795 → 342 | 1816 → 350 |
-  | lossy (d 1) encode, ms | 96 → 60 | 258 → 135 | 730 → 441 | 1722 → 430 |
-  | lossy (d 1) decode, ms | 88 → 89 | 109 → 37 | 1065 → 1052 | 1214 → 285 |
-  | lossless encode, peak MiB | 198 → 231 | 181 → 225 | 846 → 842 | 524 → 547 |
-  | lossless decode, peak MiB | 37 → 66 | 37 → 65 | 371 → 417 | 371 → 415 |
-  | lossy encode, peak MiB | 75 → 89 | 49 → 97 | 386 → 407 | 287 → 326 |
-  | lossy decode, peak MiB | 45 → 45 | 50 → 109 | 374 → 374 | 421 → 506 |
+  | 12 MP, 1 worker → 8 workers | before | now |
+  |---|---|---|
+  | lossless encode, ms | 2390 → 734 | 2540 → 685 |
+  | lossless encode, megapixels / s | 5.0 → 16.3 | 4.7 → 17.5 |
+  | lossy (d 1) encode, ms | 3360 → 589 | 2980 → 481 |
+  | lossy (d 1) encode, megapixels / s | 3.6 → 20.4 | 4.0 → 24.9 |
+  | lossless encode, peak resident MiB, three encodes in the process | 540 → 548 | 301 → 389 |
+  | lossless encode, peak resident MiB, one encode | 433 → — | **243** → 313 |
+  | lossless encode, peak live heap MiB (34 of it the picture) | 313 → — | 151 → 161 |
+  | lossy encode, peak resident MiB, three encodes | 300 → 328 | 141 → 182 |
+  | lossy encode, peak resident / live heap MiB, one encode | — | 115 / 90 → 170 / 112 |
 
-  What changed in round 488. **Lossy decode runs on the worker
-  budget**: PassGroup sections (entropy decode, dequantisation,
-  inverse transforms) in parallel, the edge-preserving filter and the
-  Gabor-like transform in row bands, XYB → RGB in row bands — 3.7×
-  to 4.3× on eight workers where it was serial. (On one worker the
-  lossy rows are not like for like: the encoder now signals the
-  Gabor-like transform and uses large transforms, which the decoder
-  pays for, and writes a third more bytes at the same distance for a
-  better picture — see the rate–distortion table.) **Lossy encode**
-  searches transforms and quantises by rate–distortion: 2.4× to 2.7×
-  the time of the DCT8×8-only coder on one worker, the same time on
-  eight at 12 MP; `Effort::Fast` is that coder's speed. **Lossless
-  encode memory** is down 38 % at 12 MP: the coder takes the
-  caller's planes over, cuts group rectangles on demand and keeps
-  coded symbols in 32 bits each. The 524 MiB that remain for a 12 MP
-  RGB picture (36 M samples) are, in MiB: the bench's packed picture
-  34, the channel planes as `i32` 137, the packed symbols 137, the
-  tree learner's sample and tables about 150 (fixed by the effort,
-  the same at 1 MP), the output and its section buffers about 45,
-  and one group in flight per worker. The planes and the symbols are
-  the floor of this design — a streaming coder that converts and
-  codes a group at a time from the caller's pixels would remove the
-  first, and two-pass coding (histograms first, bytes second) the
-  second. The bytes written and the pixels decoded are the same at
-  every budget (`EncodeOptions::threads`, `DecodeOptions::threads`;
-  the registry encoder takes the framework's `ExecutionContext`).
+  At 1 MP: lossless 603 → 350 ms before, 609 → 343 now; lossy 414 →
+  217 before, 387 → 201 now; lossless peak resident (three encodes)
+  203 → 233 MiB before, 93 → 146 now. Decoding is untouched (12 MP
+  lossless on one worker: 2.72 s before, 2.53 s now, the same within
+  the noise).
+
+  **Where the encoder's time goes** (sampling profiler, 12 MP, one
+  worker, before this round's changes). *Lossless*: coding the
+  sections 75 % — the raster scan with its property vector and tree
+  walk 52 %, the self-correcting predictor 23 % — tree learning 8 %,
+  writing the symbols 6 %, clustering the contexts 3 %, everything
+  else (packing, statistics, fetching the picture, electing
+  transforms) 6 %. *Lossy*: the forward DCT 27 %, the transform
+  wrapper and the nine small 8×8 transforms 20 %, rate–distortion
+  quantisation 27 %, group bookkeeping 5 %, the cube roots of XYB
+  4 %, sharpening 3 %, the entropy coder and the tree of the LF image
+  10 %. *Lossless on eight workers*, the main thread: waiting for the
+  section workers 53 %, tree learning 19 %, context clustering 18 %,
+  the rest 10 %.
+
+  **What changed in round 490** (the bytes written are the same as
+  before on this picture, at every budget):
+
+  * *Memory.* The coders read each group from the caller's packed
+    picture when a worker codes it and apply the elected transforms
+    to that rectangle; no `i32` plane copy of the picture exists
+    (137 MiB at 12 MP). Coded symbols take three bytes (16-bit
+    context, 8-bit value, a side list for the rest) instead of four
+    (103 MiB instead of 137), a group's symbols are freed when its
+    section is written, and the tree learner appends its sample a
+    batch of sections at a time. One lossless 12 MP encode at the
+    default effort and budget peaks at 243 MiB resident — the picture
+    34, the symbols 103, the output about 15, one group in flight,
+    and what the allocator keeps of the learner's 50 MiB. There is
+    no slower low-memory mode to choose: the one path costs a few
+    per cent of single-worker time at most (below).
+  * *Lossy speed.* The forward DCT runs every one-dimensional
+    transform of a block side by side — per transform the operations
+    of the scalar recursion in the same order (the coefficients are
+    bit-identical, pinned for every block shape), across lanes the
+    compiler vectorises; its share of the profile went from 27 % to
+    11 %. About 10 % on one worker in either regime of the machine.
+  * *Under a budget.* Workers keep one set of entropy statistics
+    each for all the groups they code, added up at the end, instead
+    of one per group merged batch by batch: groups are handed out
+    once, no thread is started per batch and none waits at a batch
+    boundary. Eight workers: lossless 7 %, lossy 18 % less time.
+  * *Not gained.* Lossless on one worker is where it was (a few per
+    cent slower in these runs: the picture is now converted group by
+    group, eight sections are parsed for LZ77 before it is turned
+    down, and the predictor's arithmetic is 64-bit). Its time is the
+    per-sample scan, which the decoder shares; no change that keeps
+    the bytes was found there beyond computing only the
+    previous-channel properties the tree reads.
+
+  The worker budget is the caller's (`EncodeOptions::threads`,
+  `DecodeOptions::threads`; the registry encoder takes the
+  framework's `ExecutionContext`); the bytes written and the pixels
+  decoded are the same at every budget.
 * Not written: transforms above 64×64, custom dequantisation
   matrices, custom coefficient orders and block-context maps,
   progressive passes, VarDCT for non-sRGB input; the Squeeze
@@ -566,16 +603,21 @@ layouts — the same table in both directions, the output label is what
   that only nearly repeat, splines, noise, upsampling, crops,
   previews, extra channels beyond one alpha, float samples,
   `bits_per_sample > 16`.
-* **Delta palettes are not written, and not trusted on decode.** An
+* **Delta palettes are not written, and refused on decode.** An
   encoder for H.6.4 delta entries was built this round and withdrawn:
   a black-box decoder refuses every stream with `nb_deltas ≥ 1` and a
   non-zero palette entry that this crate's reading of the listing
-  produces, and this crate's decoder reads a delta-palette stream of
-  a black-box encoder (`nb_colours = 64`, `nb_deltas = 9`,
+  produces, and that reading decodes a delta-palette stream of a
+  black-box encoder (`nb_colours = 64`, `nb_deltas = 9`,
   `d_pred = 13`) without error but to other pixels than the
   black-box decoder (71 501 of 72 000 samples). The listing as
-  printed does not settle which reading is right; no staged stream
-  exercises it.
+  printed does not settle which reading is right and no staged stream
+  exercises it, so the decoder now answers a stream that uses a delta
+  entry (an index below `nb_deltas`, the implicit negative ones
+  included) with `Error::Unsupported` instead of a picture known to
+  be wrong; the specimen and the black-box decoder's output are
+  committed (`tests/fixtures/delta_palette_black_box*`) for the day
+  the reading is settled. Plain palettes are unaffected.
 
 ## Options
 
@@ -1456,7 +1498,7 @@ that floor or under it.
   flags).
 - Integer `bps > 16` on Modular frames without a colour transform;
   high-bit-depth YCbCr Modular frames; a float layout for grey +
-  alpha.
+  alpha; delta palette entries (refused, see *Encoding*).
 - Applying an embedded ICC profile's transfer curve to the decoded
   samples (the `grayscale` stream's image output currently uses the
   signalled/default transfer, sRGB, rather than the profile's

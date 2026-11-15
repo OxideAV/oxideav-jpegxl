@@ -79,20 +79,24 @@ fuzz_target!(|data: &[u8]| {
         .with_metadata(meta)
         .with_color(ColorInfo::srgb().with_primaries(if flags & 8 != 0 { 9 } else { 1 }));
     // Bits 6..8 pick the effort; bit 5 keeps lossy requests on the
-    // Modular coder (VarDCT otherwise takes sRGB input of any depth;
-    // stills also go through the screen-content tools — patches, the
-    // lossless codestream when it is smaller).
+    // Modular coder (VarDCT otherwise takes sRGB input of any depth).
     let effort = match flags >> 6 {
         0 => Effort::Fast,
         1 | 2 => Effort::Balanced,
         _ => Effort::Thorough,
     };
+    // The top two bits of the frame-count byte switch the
+    // screen-content tools (patches and the lossless codestream for a
+    // lossy request; LZ77), so both the single-pass coder and the
+    // elected paths are driven.
     let opts = EncodeOptions::new()
         .with_quality(quality)
         .with_group_size_shift(shift)
         .with_container(flags & 16 != 0)
         .with_modular(flags & 32 != 0)
-        .with_effort(effort);
+        .with_effort(effort)
+        .with_patches(data[6] & 0x80 != 0)
+        .with_lz77(data[6] & 0x40 != 0);
     let out = encode(&image, &opts).expect("encode accepts every valid packed image");
     assert!(probe(&out));
     let i = info(&out).expect("own output parses");
