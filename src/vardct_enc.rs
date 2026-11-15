@@ -65,6 +65,7 @@ use crate::coeff_order::{natural_coeff_order, order_id_for_transform};
 use crate::dct_quant_weights::{materialise_default_dequant_set_for_quantizer, slot_for_transform};
 use crate::dct_select::TransformType;
 use crate::enc_dct::{LfLink, SmallTransform, fdct, forward_small, lf_link, small_transform};
+use crate::enc_source::Pixels;
 use crate::entropy_write::{EntropyCodes, ValueStats};
 use crate::error::{Error, Result};
 use crate::lf_dequant::LfMultipliers;
@@ -436,10 +437,16 @@ pub(crate) struct VarDctInput<'a> {
     pub width: usize,
     pub height: usize,
     pub bits: u32,
-    /// One (grey) or three (R, G, B) channels.
-    pub colour: &'a [Vec<i32>],
-    /// Extra channels coded losslessly (alpha).
-    pub extra: &'a [Vec<i32>],
+    /// The picture: `n_colour` colour channels (one grey, or R, G, B)
+    /// followed by the extra channels, which are coded losslessly.
+    pub pixels: &'a Pixels<'a>,
+    pub n_colour: usize,
+}
+
+impl VarDctInput<'_> {
+    fn num_extra(&self) -> usize {
+        self.pixels.num_channels() - self.n_colour
+    }
 }
 
 /// `(context, value)` symbols of one entropy-coded stream.
@@ -1157,26 +1164,28 @@ struct Placed {
 fn group_planes(ctx: &FrameCtx<'_>, bx0: usize, by0: usize, gw: usize, gh: usize) -> [Vec<f32>; 3] {
     let (width, height) = (ctx.input.width, ctx.input.height);
     let (pw, ph) = (gw * 8 + 2 * MARGIN, gh * 8 + 2 * MARGIN);
-    let grey = ctx.input.colour.len() == 1;
+    let grey = ctx.input.n_colour == 1;
     let xs: Vec<usize> = (0..pw)
         .map(|x| mirror((bx0 * 8 + x) as i64 - MARGIN as i64, width))
         .collect();
+    // The span of source columns the mirrored window touches.
+    let lo = xs.iter().copied().min().unwrap_or(0);
+    let hi = xs.iter().copied().max().unwrap_or(0);
+    let mut rows: [Vec<i32>; 3] = std::array::from_fn(|_| vec![0i32; hi - lo + 1]);
     let mut planes: [Vec<f32>; 3] = std::array::from_fn(|_| vec![0.0f32; pw * ph]);
     for y in 0..ph {
         let sy = mirror((by0 * 8 + y) as i64 - MARGIN as i64, height);
-        let row = sy * width;
+        for (c, row) in rows.iter_mut().enumerate().take(ctx.input.n_colour) {
+            ctx.input.pixels.row(c, sy, lo, row);
+        }
         let o = y * pw;
         for (x, &sx) in xs.iter().enumerate() {
-            let i = row + sx;
+            let i = sx - lo;
             let v = if grey {
-                let g = ctx.input.colour[0][i];
+                let g = rows[0][i];
                 ctx.opsin.xyb(g, g, g)
             } else {
-                ctx.opsin.xyb(
-                    ctx.input.colour[0][i],
-                    ctx.input.colour[1][i],
-                    ctx.input.colour[2][i],
-                )
+                ctx.opsin.xyb(rows[0][i], rows[1][i], rows[2][i])
             };
             planes[0][o + x] = v[0];
             planes[1][o + x] = v[1];
@@ -1844,7 +1853,13 @@ fn code(input: &VarDctInput<'_>, opts: &VarDctOptions, learn: &LearnParams) -> R
     }
     let extra_in_groups = width > GROUP_DIM || height > GROUP_DIM;
     let n_fixed = sections.len();
-    if !input.extra.is_empty() {
+    let n_extra = input.num_extra();
+    let extra_rect = |x0: usize, y0: usize, rw: usize, rh: usize| -> Vec<Chan> {
+        (input.n_colour..input.n_colour + n_extra)
+            .map(|c| Chan::new(rw, rh, input.pixels.rect(c, x0, y0, rw, rh)))
+            .collect()
+    };
+    if n_extra > 0 {
         if extra_in_groups {
             for gy in 0..gy_n {
                 for gx in 0..gx_n {
@@ -1853,22 +1868,14 @@ fn code(input: &VarDctInput<'_>, opts: &VarDctOptions, learn: &LearnParams) -> R
                     let rh = GROUP_DIM.min(height - y0);
                     sections.push(Section {
                         stream_index: (1 + 3 * num_lf_groups + 17 + gy * gx_n + gx) as i32,
-                        chans: input
-                            .extra
-                            .iter()
-                            .map(|c| Chan::new(width, height, c.clone()).rect(x0, y0, rw, rh))
-                            .collect(),
+                        chans: extra_rect(x0, y0, rw, rh),
                     });
                 }
             }
         } else {
             sections.push(Section {
                 stream_index: 0,
-                chans: input
-                    .extra
-                    .iter()
-                    .map(|c| Chan::new(width, height, c.clone()))
-                    .collect(),
+                chans: extra_rect(0, 0, width, height),
             });
         }
     }
@@ -1913,7 +1920,7 @@ fn code(input: &VarDctInput<'_>, opts: &VarDctOptions, learn: &LearnParams) -> R
         let meta = it.next().unwrap_or_default();
         lf_groups.push((lf, nb_blocks, nbits, meta));
     }
-    let global_extra = if input.extra.is_empty() {
+    let global_extra = if n_extra == 0 {
         None
     } else if extra_in_groups {
         Some(Vec::new())
@@ -1923,7 +1930,7 @@ fn code(input: &VarDctInput<'_>, opts: &VarDctOptions, learn: &LearnParams) -> R
     let mut groups = Vec::with_capacity(num_groups);
     let mut extra_it = extra_syms.into_iter();
     for hf in hf_syms {
-        let extra = if extra_in_groups && !input.extra.is_empty() {
+        let extra = if extra_in_groups && n_extra > 0 {
             extra_it.next().unwrap_or_default()
         } else {
             Vec::new()

@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Encoder memory: the picture is read where the caller keeps it**
+  (round 490). The Modular and VarDCT coders fetch each group's
+  rectangle from the caller's packed samples when a worker codes it
+  and apply the elected transforms (palette, RCT, channel palettes —
+  all pointwise) to that rectangle; no integer plane copy of the
+  picture exists any more. Coded symbols are kept in three bytes each
+  (16-bit context, 8-bit value, a side list for the rest) instead of
+  four, a group's symbols are freed as soon as its section is written,
+  and the tree learner appends its sample a batch of sections at a
+  time instead of holding it per section and again joined. A 12 MP
+  RGB picture: peak live heap of a lossless encode 313 → 142 MiB
+  (picture included), peak resident set of one encode 433 → 226 MiB;
+  lossy 295 → 133 MiB resident. The bytes written are the same as
+  before at every effort and worker budget. `benches/codec.rs` now
+  reports the peak of live heap bytes next to the time, and
+  `tests/r490_memory.rs` pins the budget.
+
 ### Added
 
 - **VarDCT encoder: rate–distortion tools** (round 488). The lossy

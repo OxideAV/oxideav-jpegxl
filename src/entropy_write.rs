@@ -892,52 +892,72 @@ pub fn cluster_histograms(hists: &[Vec<u64>], max_clusters: usize) -> (Vec<u32>,
     (map, next as usize)
 }
 
-/// The `(context, value)` symbols of a stream held compactly: one
-/// 32-bit word when the context is below `2^12 − 1` and the value
-/// below `2^20` (every residual of ordinary content), three words
-/// otherwise. A lossless encode keeps one symbol per sample until the
-/// histograms are final; as pairs of `u32` that was eight bytes each.
+/// The `(context, value)` symbols of a stream held compactly: three
+/// bytes when the context is below `2^16 − 1` and the value below 255
+/// (nearly every residual of ordinary content), with the full pair in
+/// a side list otherwise. A lossless encode keeps one symbol per
+/// sample until the histograms are final; as pairs of `u32` that was
+/// eight bytes each.
 #[derive(Debug, Clone, Default)]
 pub struct PackedSymbols {
-    words: Vec<u32>,
+    ctx: Vec<u16>,
+    value: Vec<u8>,
+    /// The symbols that do not fit, in order (marked by `ctx ==
+    /// u16::MAX` in the main arrays).
+    wide: Vec<(u32, u32)>,
 }
 
 impl PackedSymbols {
-    const ESCAPE: u32 = u32::MAX;
-    const VALUE_BITS: u32 = 20;
+    const WIDE: u16 = u16::MAX;
+
+    /// An empty list with room for `n` symbols.
+    pub fn with_capacity(n: usize) -> Self {
+        Self {
+            ctx: Vec::with_capacity(n),
+            value: Vec::with_capacity(n),
+            wide: Vec::new(),
+        }
+    }
+
+    /// Append one symbol.
+    #[inline]
+    pub fn push(&mut self, ctx: u32, value: u32) {
+        if ctx < u32::from(Self::WIDE) && value < 255 {
+            self.ctx.push(ctx as u16);
+            self.value.push(value as u8);
+        } else {
+            self.ctx.push(Self::WIDE);
+            self.value.push(0);
+            self.wide.push((ctx, value));
+        }
+    }
 
     /// Pack `pairs` in order.
     pub fn from_pairs(pairs: &[(u32, u32)]) -> Self {
-        let mut words = Vec::with_capacity(pairs.len());
+        let mut out = Self::with_capacity(pairs.len());
         for &(ctx, value) in pairs {
-            if ctx < (1 << (32 - Self::VALUE_BITS)) - 1 && value < (1 << Self::VALUE_BITS) {
-                words.push((ctx << Self::VALUE_BITS) | value);
-            } else {
-                words.extend_from_slice(&[Self::ESCAPE, ctx, value]);
-            }
+            out.push(ctx, value);
         }
-        Self { words }
+        out
     }
 
     pub fn is_empty(&self) -> bool {
-        self.words.is_empty()
+        self.ctx.is_empty()
+    }
+
+    /// Number of symbols.
+    pub fn len(&self) -> usize {
+        self.ctx.len()
     }
 
     /// The symbols, in order.
     pub fn iter(&self) -> impl Iterator<Item = (u32, u32)> + '_ {
-        let mut at = 0usize;
-        std::iter::from_fn(move || {
-            let &word = self.words.get(at)?;
-            if word == Self::ESCAPE {
-                let pair = (*self.words.get(at + 1)?, *self.words.get(at + 2)?);
-                at += 3;
-                Some(pair)
+        let mut wide = self.wide.iter();
+        self.ctx.iter().zip(&self.value).map(move |(&c, &v)| {
+            if c == Self::WIDE {
+                wide.next().copied().unwrap_or((0, 0))
             } else {
-                at += 1;
-                Some((
-                    word >> Self::VALUE_BITS,
-                    word & ((1 << Self::VALUE_BITS) - 1),
-                ))
+                (u32::from(c), u32::from(v))
             }
         })
     }
@@ -1358,7 +1378,9 @@ mod tests {
             (0u32, 0u32),
             (17, 5),
             (4094, (1 << 20) - 1),
-            (4095, 3),
+            (65534, 254),
+            (65535, 3),
+            (7, 255),
             (3, 1 << 20),
             (u32::MAX, u32::MAX),
             (100_000, 7),
@@ -1368,9 +1390,11 @@ mod tests {
         assert_eq!(packed.iter().collect::<Vec<_>>(), pairs);
         assert!(!packed.is_empty());
         assert!(PackedSymbols::from_pairs(&[]).is_empty());
-        // Ordinary symbols take one word each.
-        let plain: Vec<(u32, u32)> = (0..1000).map(|i| (i % 300, i * 7)).collect();
-        assert_eq!(PackedSymbols::from_pairs(&plain).words.len(), 1000);
+        // Ordinary symbols take three bytes each.
+        let plain: Vec<(u32, u32)> = (0..1000).map(|i| (i % 300, i % 251)).collect();
+        let packed = PackedSymbols::from_pairs(&plain);
+        assert_eq!((packed.len(), packed.wide.len()), (1000, 0));
+        assert_eq!(packed.iter().collect::<Vec<_>>(), plain);
     }
 
     use super::*;

@@ -48,22 +48,6 @@ impl Chan {
             data,
         }
     }
-
-    /// The `rw × rh` rectangle at `(x0, y0)` as a channel of its own.
-    pub(crate) fn rect(&self, x0: usize, y0: usize, rw: usize, rh: usize) -> Self {
-        let mut data = Vec::with_capacity(rw * rh);
-        for y in 0..rh {
-            let o = (y0 + y) * self.w + x0;
-            data.extend_from_slice(&self.data[o..o + rw]);
-        }
-        Self {
-            w: rw,
-            h: rh,
-            hshift: self.hshift,
-            vshift: self.vshift,
-            data,
-        }
-    }
 }
 
 /// One independently decoded sub-bitstream: its channels and the
@@ -1018,46 +1002,56 @@ pub(crate) fn learn_tree_from(
     let use_wp = params.use_wp;
     // One sample stream per scanned section, seeded by its index, so
     // the sample does not depend on how the sections are scheduled.
-    let sampled = crate::par::par_map(params.threads, picked, |_, si| {
-        let mut raw_props: Vec<i32> = Vec::new();
-        let mut tok: Vec<u8> = Vec::new();
-        let mut nprops: Vec<u8> = Vec::new();
-        let mut rng = 0x9E37_79B9_7F4A_7C15u64 ^ (si as u64).wrapping_mul(0xD6E8_FEB8_6659_FD93);
-        let mut section = section(si);
-        for i in 0..section.chans.len() {
-            scan_channel(&mut section.chans, i, section.stream_index, use_wp, |s| {
-                rng = rng
-                    .wrapping_mul(6364136223846793005)
-                    .wrapping_add(1442695040888963407);
-                if (rng >> 32) < keep {
-                    raw_props.extend_from_slice(&s.props[..MAX_PROPS]);
-                    nprops.push(s.nprops as u8);
-                    for p in 0..NUM_PREDICTORS as u32 {
-                        let r = i64::from(s.value) - i64::from(predict(p, &s.nb, s.wp));
-                        let q = quantise(r, m).clamp(i64::from(i32::MIN) + 1, i64::from(i32::MAX));
-                        tok.push(cost_token(pack_signed(q as i32)));
+    // The sections are scanned a batch at a time and appended in
+    // order: the sample exists once, not once per section and again
+    // joined.
+    let expected = (scanned as f64 * keep as f64 / (1u64 << 32) as f64) as usize + 1024;
+    let mut raw_props: Vec<i32> = Vec::with_capacity(expected * MAX_PROPS);
+    let mut tok: Vec<u8> = Vec::with_capacity(expected * NUM_PREDICTORS);
+    let mut nprops: Vec<u8> = Vec::with_capacity(expected);
+    let batch = params.threads.max(1) * 2;
+    for ids in picked.chunks(batch) {
+        let sampled = crate::par::par_map(params.threads, ids.to_vec(), |_, si| {
+            let mut raw_props: Vec<i32> = Vec::new();
+            let mut tok: Vec<u8> = Vec::new();
+            let mut nprops: Vec<u8> = Vec::new();
+            let mut rng =
+                0x9E37_79B9_7F4A_7C15u64 ^ (si as u64).wrapping_mul(0xD6E8_FEB8_6659_FD93);
+            let mut section = section(si);
+            for i in 0..section.chans.len() {
+                scan_channel(&mut section.chans, i, section.stream_index, use_wp, |s| {
+                    rng = rng
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+                    if (rng >> 32) < keep {
+                        raw_props.extend_from_slice(&s.props[..MAX_PROPS]);
+                        nprops.push(s.nprops as u8);
+                        for p in 0..NUM_PREDICTORS as u32 {
+                            let r = i64::from(s.value) - i64::from(predict(p, &s.nb, s.wp));
+                            let q =
+                                quantise(r, m).clamp(i64::from(i32::MIN) + 1, i64::from(i32::MAX));
+                            tok.push(cost_token(pack_signed(q as i32)));
+                        }
                     }
-                }
-                if m == 1 {
-                    s.value
-                } else {
-                    // Quantised coding is closed-loop: learn on the
-                    // kind of neighbourhood the decoder will see.
-                    let pred = predict(5, &s.nb, s.wp);
-                    let q = quantise(i64::from(s.value) - i64::from(pred), m);
-                    (i64::from(pred) + q * m).clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
-                }
-            });
+                    if m == 1 {
+                        s.value
+                    } else {
+                        // Quantised coding is closed-loop: learn on the
+                        // kind of neighbourhood the decoder will see.
+                        let pred = predict(5, &s.nb, s.wp);
+                        let q = quantise(i64::from(s.value) - i64::from(pred), m);
+                        (i64::from(pred) + q * m).clamp(i64::from(i32::MIN), i64::from(i32::MAX))
+                            as i32
+                    }
+                });
+            }
+            (raw_props, tok, nprops)
+        });
+        for (p, t, np) in sampled {
+            raw_props.extend_from_slice(&p);
+            tok.extend_from_slice(&t);
+            nprops.extend_from_slice(&np);
         }
-        (raw_props, tok, nprops)
-    });
-    let mut raw_props: Vec<i32> = Vec::new();
-    let mut tok: Vec<u8> = Vec::new();
-    let mut nprops: Vec<u8> = Vec::new();
-    for (p, t, np) in sampled {
-        raw_props.extend_from_slice(&p);
-        tok.extend_from_slice(&t);
-        nprops.extend_from_slice(&np);
     }
     let n = nprops.len();
     if n == 0 {

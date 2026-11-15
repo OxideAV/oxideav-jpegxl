@@ -8,7 +8,8 @@ use std::io::{Read, Write};
 use std::time::Duration;
 
 use crate::container::{self, MetadataKind, Signature};
-use crate::encoder::{AnimationSpec, ColourSpec, EncodeSpec, FrameInput};
+use crate::enc_source::Pixels;
+use crate::encoder::{AnimationSpec, ColourSpec, EncodeSpec};
 use crate::error::{Error, Result};
 use crate::image::{ColorInfo, ColorRange, JxlImage, Metadata, PixelFormat, Plane, RawFrame};
 use crate::metadata_fdis::{
@@ -554,21 +555,22 @@ pub fn decode_from<R: Read>(mut r: R) -> Result<JxlImage> {
     decode(&buf)
 }
 
-/// One picture as the encoder wants it: the channel planes (grey or
-/// R, G, B, then alpha), the sample depth and the codestream colour
-/// description.
-struct EncodeInput {
-    channels: Vec<Vec<i32>>,
+/// One picture as the encoder wants it: a view of its packed samples
+/// (grey or R, G, B, then alpha), the sample depth and the codestream
+/// colour description.
+struct EncodeInput<'a> {
+    pixels: Pixels<'a>,
     grey: bool,
     alpha: bool,
     bits: u32,
     colour: ColourSpec,
 }
 
-/// Unpack a [`JxlImage`] into Modular channels. Only the packed
-/// grey / RGB layouts (8- and 16-bit) are encoder inputs; the planar
-/// YCbCr transcode layouts are refused by type rather than converted.
-fn encode_input(image: &JxlImage) -> Result<EncodeInput> {
+/// Describe a [`JxlImage`] to the encoder. Only the packed grey / RGB
+/// layouts (8- and 16-bit) are encoder inputs; the planar YCbCr
+/// transcode layouts are refused by type rather than converted. The
+/// samples are read in place, a group at a time.
+fn encode_input(image: &JxlImage) -> Result<EncodeInput<'_>> {
     let fmt = image.format;
     let (grey, alpha) = match fmt {
         PixelFormat::Gray8 | PixelFormat::Gray16Le => (true, false),
@@ -597,34 +599,25 @@ fn encode_input(image: &JxlImage) -> Result<EncodeInput> {
         .first()
         .ok_or_else(|| Error::invalid("JPEG XL encoder: image has no plane"))?;
     let row = width * channels_n * bytes;
+    if width == 0 || height == 0 {
+        return Err(Error::invalid("JXL encoder: zero image dimension"));
+    }
     if plane.stride < row || plane.data.len() < plane.stride * (height - 1) + row {
         return Err(Error::invalid(
             "JPEG XL encoder: plane too short for the geometry",
         ));
-    }
-    let mut channels: Vec<Vec<i32>> = (0..channels_n)
-        .map(|_| Vec::with_capacity(width * height))
-        .collect();
-    for y in 0..height {
-        let src = &plane.data[y * plane.stride..y * plane.stride + row];
-        for x in 0..width {
-            for (c, ch) in channels.iter_mut().enumerate() {
-                let o = (x * channels_n + c) * bytes;
-                let v = if bytes == 1 {
-                    i32::from(src[o])
-                } else {
-                    i32::from(u16::from_le_bytes([src[o], src[o + 1]]))
-                };
-                ch.push(v);
-            }
-        }
     }
     let colour = match &image.metadata.icc {
         Some(icc) => ColourSpec::Icc(icc.clone()),
         None => ColourSpec::from_color_info(&image.color),
     };
     Ok(EncodeInput {
-        channels,
+        pixels: Pixels::Packed {
+            data: &plane.data,
+            stride: plane.stride,
+            channels: channels_n,
+            bytes,
+        },
         grey,
         alpha,
         bits,
@@ -633,7 +626,7 @@ fn encode_input(image: &JxlImage) -> Result<EncodeInput> {
 }
 
 fn encode_spec(
-    input: &EncodeInput,
+    input: &EncodeInput<'_>,
     image: &JxlImage,
     opts: &EncodeOptions,
     animation: Option<AnimationSpec>,
@@ -695,11 +688,7 @@ fn finish_file(codestream: Vec<u8>, meta: &Metadata, opts: &EncodeOptions) -> Re
 pub fn encode(image: &JxlImage, opts: &EncodeOptions) -> Result<Vec<u8>> {
     let input = encode_input(image)?;
     let spec = encode_spec(&input, image, opts, None);
-    let frame = FrameInput {
-        channels: input.channels,
-        duration: 0,
-    };
-    let cs = crate::encoder::encode_codestream_owned(&spec, vec![frame])?;
+    let cs = crate::encoder::encode_frames(&spec, std::iter::once((input.pixels, 0)))?;
     finish_file(cs, &image.metadata, opts)
 }
 
@@ -765,10 +754,7 @@ pub fn encode_all(frames: &[Frame], opts: &EncodeOptions) -> Result<Vec<u8>> {
     let first_input = encode_input(&first.image)?;
     let spec = encode_spec(&first_input, &first.image, opts, Some(anim));
     let mut inputs = Vec::with_capacity(frames.len());
-    inputs.push(FrameInput {
-        channels: first_input.channels,
-        duration: ticks[0],
-    });
+    inputs.push((first_input.pixels, ticks[0]));
     for (i, f) in frames.iter().enumerate().skip(1) {
         let img = &f.image;
         if img.width != first.image.width
@@ -790,12 +776,9 @@ pub fn encode_all(frames: &[Frame], opts: &EncodeOptions) -> Result<Vec<u8>> {
             )));
         }
         let input = encode_input(img)?;
-        inputs.push(FrameInput {
-            channels: input.channels,
-            duration: ticks[i],
-        });
+        inputs.push((input.pixels, ticks[i]));
     }
-    let cs = crate::encoder::encode_codestream_owned(&spec, inputs)?;
+    let cs = crate::encoder::encode_frames(&spec, inputs.into_iter())?;
     finish_file(cs, &first.image.metadata, opts)
 }
 

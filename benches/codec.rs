@@ -13,11 +13,55 @@
 //! one operation; `decode` reads the file a previous `encode` run left
 //! in the directory named by `JXL_BENCH_DIR` (the system temp
 //! directory by default). Prints one line per operation with the
-//! median of three runs.
+//! median of three runs, and the peak of live heap bytes during the
+//! operation (a counting allocator: the picture or file it works on is
+//! included, pages the allocator keeps after a free are not).
 
+use std::alloc::{GlobalAlloc, Layout, System};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 use oxideav_jpegxl::{DecodeOptions, EncodeOptions, JxlImage, decode_with, encode};
+
+/// The system allocator with a running total and its high-water mark,
+/// so a run can report the peak of live heap bytes whatever the host's
+/// resident-set accounting does with freed pages.
+struct Counting;
+
+static LIVE: AtomicUsize = AtomicUsize::new(0);
+static PEAK: AtomicUsize = AtomicUsize::new(0);
+
+fn note(grown: usize) {
+    let now = LIVE.fetch_add(grown, Ordering::Relaxed) + grown;
+    PEAK.fetch_max(now, Ordering::Relaxed);
+}
+
+// SAFETY: every call is forwarded unchanged to the system allocator;
+// the counters only observe sizes.
+unsafe impl GlobalAlloc for Counting {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        note(layout.size());
+        unsafe { System.alloc(layout) }
+    }
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        LIVE.fetch_sub(layout.size(), Ordering::Relaxed);
+        unsafe { System.dealloc(ptr, layout) }
+    }
+    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        note(layout.size());
+        unsafe { System.alloc_zeroed(layout) }
+    }
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        // A block that moves exists twice while it is copied.
+        note(new_size);
+        let moved = unsafe { System.realloc(ptr, layout, new_size) };
+        LIVE.fetch_sub(layout.size(), Ordering::Relaxed);
+        moved
+    }
+}
+
+#[global_allocator]
+static ALLOCATOR: Counting = Counting;
 
 fn lattice(x: i64, y: i64, seed: u64) -> f32 {
     let mut h = (x as u64)
@@ -108,28 +152,40 @@ fn main() {
         let img = photo(width, height);
         let mut times = Vec::new();
         let mut bytes = Vec::new();
+        let mut peaks = Vec::new();
         for _ in 0..runs {
+            drop(std::mem::take(&mut bytes));
+            PEAK.store(LIVE.load(Ordering::Relaxed), Ordering::Relaxed);
             let t = Instant::now();
             bytes = encode(&img, &opts).expect("encode");
             times.push(t.elapsed().as_secs_f64() * 1000.0);
+            peaks.push(PEAK.load(Ordering::Relaxed) as f64 / (1 << 20) as f64);
         }
         std::fs::write(&path, &bytes).expect("write");
         println!(
-            "{label} encode {:.0} ms {} bytes",
+            "{label} encode {:.0} ms {} bytes, peak heap {:.0} MiB (picture included)",
             median(times),
-            bytes.len()
+            bytes.len(),
+            median(peaks)
         );
     }
     if what != "encode" {
         let bytes = std::fs::read(&path).expect("run the encode step first");
         let dopts = DecodeOptions::default().with_threads(threads);
         let mut times = Vec::new();
+        let mut peaks = Vec::new();
         for _ in 0..runs {
+            PEAK.store(LIVE.load(Ordering::Relaxed), Ordering::Relaxed);
             let t = Instant::now();
             let img = decode_with(&bytes, &dopts).expect("decode");
             times.push(t.elapsed().as_secs_f64() * 1000.0);
+            peaks.push(PEAK.load(Ordering::Relaxed) as f64 / (1 << 20) as f64);
             assert_eq!((img.width, img.height), (width, height));
         }
-        println!("{label} decode {:.0} ms", median(times));
+        println!(
+            "{label} decode {:.0} ms, peak heap {:.0} MiB (file included)",
+            median(times),
+            median(peaks)
+        );
     }
 }

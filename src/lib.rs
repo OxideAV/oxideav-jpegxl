@@ -626,6 +626,7 @@ pub mod vardct_reconstruct;
 pub mod xyb;
 
 mod enc_dct;
+mod enc_source;
 mod enc_transforms;
 #[doc(hidden)] // internal: Modular codestream writer plumbing
 pub mod encoder;
