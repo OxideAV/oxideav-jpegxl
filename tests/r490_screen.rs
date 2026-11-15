@@ -478,6 +478,149 @@ fn patches_sharpen_lossy_screen_content() {
     }
 }
 
+/// Lossy patches next to an alpha channel, and on grey: the reference
+/// frame is a Modular frame of an XYB image that carries the extra
+/// channel too.
+#[test]
+fn lossy_patches_keep_alpha_exact() {
+    let canvas = page(320, 200, 5);
+    let (w, h) = (canvas.w as u32, canvas.h as u32);
+    let mut rgba = Vec::with_capacity(canvas.rgb.len() / 3 * 4);
+    for (i, px) in canvas.rgb.as_chunks::<3>().0.iter().enumerate() {
+        rgba.extend_from_slice(px);
+        rgba.push(((i % 320) * 255 / 319) as u8);
+    }
+    let ya: Vec<u8> = rgba
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .flat_map(|p| [p[1], p[3]])
+        .collect();
+    let grey: Vec<u8> = canvas.rgb.as_chunks::<3>().0.iter().map(|p| p[1]).collect();
+    let pictures = [
+        ("rgba", JxlImage::from_rgba8(w, h, rgba).unwrap()),
+        ("ya", JxlImage::packed(w, h, PixelFormat::Ya8, ya).unwrap()),
+        (
+            "grey",
+            JxlImage::packed(w, h, PixelFormat::Gray8, grey).unwrap(),
+        ),
+    ];
+    for (name, img) in &pictures {
+        let opts = EncodeOptions::new().with_distance(1.0);
+        let plain = encode(img, &opts.clone().with_patches(false)).unwrap();
+        let patched = encode(img, &opts).unwrap();
+        assert!(
+            patched.len() < plain.len() / 2,
+            "{name}: {} bytes",
+            patched.len()
+        );
+        let back = decode(&patched).unwrap();
+        assert_eq!(back.format, img.format, "{name}");
+        let (src, got) = (img.as_bytes().unwrap(), back.as_bytes().unwrap());
+        let channels = img.format.channels();
+        let alpha = img.format.has_alpha().then_some(channels - 1);
+        let (mut sse, mut n) = (0.0f64, 0usize);
+        for (i, (&a, &b)) in src.iter().zip(got).enumerate() {
+            if alpha == Some(i % channels) {
+                assert_eq!(a, b, "{name}: alpha sample {i}");
+            } else {
+                let d = f64::from(a) - f64::from(b);
+                sse += d * d;
+                n += 1;
+            }
+        }
+        let quality = 10.0 * (255.0 * 255.0 * n as f64 / sse.max(1e-9)).log10();
+        println!(
+            "{name} d1: {} -> {} bytes, {quality:.2} dB",
+            plain.len(),
+            patched.len()
+        );
+        assert!(quality > 45.0, "{name}: {quality:.2} dB");
+        // The black-box decoder reads the pair of frames too.
+        if tool("djxl") {
+            let (jxl, out) = (
+                scratch(&format!("pa-{name}.jxl")),
+                scratch(&format!("pa-{name}.pam")),
+            );
+            std::fs::write(&jxl, &patched).unwrap();
+            let run = Command::new("djxl").arg(&jxl).arg(&out).output().unwrap();
+            assert!(
+                run.status.success(),
+                "{name}: the black-box decoder refused the stream: {}",
+                String::from_utf8_lossy(&run.stderr)
+            );
+            let data = std::fs::read(&out).unwrap();
+            let theirs = &data[data.len() - got.len()..];
+            let worst = got
+                .iter()
+                .zip(theirs)
+                .map(|(&a, &b)| a.abs_diff(b))
+                .max()
+                .unwrap_or(0);
+            assert!(
+                worst <= 2,
+                "{name}: the black-box decoder differs by {worst}"
+            );
+            let _ = std::fs::remove_file(&jxl);
+            let _ = std::fs::remove_file(&out);
+        }
+    }
+}
+
+/// A lossy Modular stream of a black-box encoder with an alpha channel
+/// (an XYB image whose Modular frame carries the extra channel).
+#[test]
+fn a_black_box_lossy_modular_stream_with_alpha_decodes() {
+    if !tool("cjxl") || !tool("djxl") {
+        eprintln!("cjxl / djxl not installed: skipped");
+        return;
+    }
+    let canvas = screenshot(200, 160, 3);
+    let mut pam = format!(
+        "P7\nWIDTH {}\nHEIGHT {}\nDEPTH 4\nMAXVAL 255\nTUPLTYPE RGB_ALPHA\nENDHDR\n",
+        canvas.w, canvas.h
+    )
+    .into_bytes();
+    let mut alpha = Vec::new();
+    for (i, px) in canvas.rgb.as_chunks::<3>().0.iter().enumerate() {
+        pam.extend_from_slice(px);
+        let a = ((i / canvas.w) * 255 / (canvas.h - 1)) as u8;
+        pam.push(a);
+        alpha.push(a);
+    }
+    let (src, jxl, out) = (scratch("bb.pam"), scratch("bb.jxl"), scratch("bb-out.pam"));
+    std::fs::write(&src, &pam).unwrap();
+    let run = Command::new("cjxl")
+        .arg(&src)
+        .arg(&jxl)
+        .args(["-m", "1", "-d", "1"])
+        .output()
+        .unwrap();
+    assert!(run.status.success());
+    let bytes = std::fs::read(&jxl).unwrap();
+    let back = decode(&bytes).unwrap();
+    assert_eq!(back.format, PixelFormat::Rgba);
+    let got = back.as_bytes().unwrap();
+    let run = Command::new("djxl").arg(&jxl).arg(&out).output().unwrap();
+    assert!(run.status.success());
+    let data = std::fs::read(&out).unwrap();
+    let theirs = &data[data.len() - got.len()..];
+    let mut worst = 0u8;
+    for (i, (&a, &b)) in got.iter().zip(theirs).enumerate() {
+        if i % 4 == 3 {
+            assert_eq!(a, b, "alpha sample {}", i / 4);
+            assert_eq!(a, alpha[i / 4]);
+        } else {
+            worst = worst.max(a.abs_diff(b));
+        }
+    }
+    println!("black-box lossy Modular RGBA: colour within {worst} of the black-box decode");
+    assert!(worst <= 2, "colour differs by {worst}");
+    for f in [src, jxl, out] {
+        let _ = std::fs::remove_file(f);
+    }
+}
+
 #[test]
 fn patches_leave_alpha_and_photographs_alone() {
     // RGBA: the colour is patched, the alpha plane is coded as it is.

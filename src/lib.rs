@@ -1799,14 +1799,22 @@ fn decode_frame_body(
                 want_pre_ct,
             },
         )?;
-        if metadata.colour_encoding.colour_space == ColourSpace::Grey {
+        // Extra channels ride behind the three colour planes, in the
+        // same storage.
+        for (i, ch) in img.channels.iter().enumerate().skip(3) {
+            let (w, h) = (img.descs[i].width as usize, img.descs[i].height as usize);
+            planes.push(extra_channel_plane(ch, i - 3, metadata, store, w, h)?);
+        }
+        if metadata.colour_encoding.colour_space == ColourSpace::Grey && n_chans == 3 {
             // Grey output from an xyb_encoded frame: the §L.2.2
             // inverse XYB produces (R, G, B); for kGrey the single
             // output plane is the GREEN channel (the luminance-carrier
             // of the opsin matrix — R = G = B for genuinely grey
             // content up to quantisation), wire-arbitrated pixel-wise
             // against the black-box reference decode of the committed
-            // grey lossy-Modular fixture.
+            // grey lossy-Modular fixture. With extra channels the
+            // three planes stay, as on the VarDCT path: the packer
+            // picks the green one and finds the extras behind them.
             planes.truncate(2);
             planes.swap_remove(0);
         }
@@ -2149,7 +2157,9 @@ fn build_rgb_planes_from_xyb(
     rf: &crate::frame_header::RestorationFilter,
     features: ModularXybFeatures<'_>,
 ) -> Result<(Vec<Plane>, Option<crate::patches::PreCtFrame>)> {
-    if img.channels.len() != 3 {
+    // The first three channels are Y', X', B'; extra channels follow
+    // and are the caller's.
+    if img.channels.len() < 3 {
         return Err(Error::InvalidData(format!(
             "JXL XYB inverse: expected 3 channels (Y', X', B'), got {}",
             img.channels.len()
@@ -3228,6 +3238,62 @@ fn xyb_planes_to_output(
     ])
 }
 
+/// Extra channel `index` of a frame whose colour went through a
+/// colour transform, as a plane in the storage of the colour planes:
+/// an integer channel rescaled from its own depth (exactly when the
+/// depths match), a floating-point one read by its bit pattern.
+fn extra_channel_plane(
+    ch: &[i32],
+    index: usize,
+    metadata: &ImageMetadataFdis,
+    store: SampleStore,
+    w: usize,
+    h: usize,
+) -> Result<Plane> {
+    if ch.len() != w * h {
+        return Err(Error::InvalidData(format!(
+            "jxl decoder: extra channel {index} has {} samples, {} expected",
+            ch.len(),
+            w * h
+        )));
+    }
+    let depth = metadata
+        .extra_channel_info
+        .get(index)
+        .map(|ec| ec.bit_depth)
+        .unwrap_or(metadata.bit_depth);
+    let mut data = store.zeroed(w * h);
+    if depth.float_sample {
+        for (k, &v) in ch.iter().enumerate() {
+            let f = crate::sample_store::float_from_bits(v, depth.bits_per_sample, depth.exp_bits);
+            store.put(&mut data, k, f);
+        }
+    } else {
+        let max = (1i64 << depth.bits_per_sample.clamp(1, 31)) - 1;
+        let same = store
+            == SampleStore::Int {
+                bits: depth.bits_per_sample,
+            };
+        for (k, &v) in ch.iter().enumerate() {
+            let v = i64::from(v).clamp(0, max);
+            if same {
+                // Exact: no trip through a float.
+                if store.bytes() == 1 {
+                    data[k] = v as u8;
+                } else {
+                    data[2 * k..2 * k + 2].copy_from_slice(&(v as u16).to_le_bytes());
+                }
+            } else {
+                store.put(&mut data, k, (v as f64 / max as f64) as f32);
+            }
+        }
+    }
+    Ok(Plane {
+        stride: w * store.bytes(),
+        data,
+    })
+}
+
 /// Re-store 8-bit planes in the image's sample storage (a JPEG
 /// transcode frame decodes to the JPEG's 8-bit samples whatever depth
 /// the image declares).
@@ -3758,48 +3824,9 @@ pub fn decode_vardct_frame_with_refs(
                     w * h
                 )));
             }
-            // Bring the extra channel to the storage of the colour
-            // planes: an integer channel rescaled from its own depth,
-            // a floating-point one read by its bit pattern.
-            let depth = metadata
-                .extra_channel_info
-                .get(i)
-                .map(|ec| ec.bit_depth)
-                .unwrap_or(metadata.bit_depth);
-            let mut data = store.zeroed(w * h);
-            if depth.float_sample {
-                for (k, &v) in ch.iter().enumerate() {
-                    let f = crate::sample_store::float_from_bits(
-                        v,
-                        depth.bits_per_sample,
-                        depth.exp_bits,
-                    );
-                    store.put(&mut data, k, f);
-                }
-            } else {
-                let max = (1i64 << depth.bits_per_sample.clamp(1, 31)) - 1;
-                let same = store
-                    == SampleStore::Int {
-                        bits: depth.bits_per_sample,
-                    };
-                for (k, &v) in ch.iter().enumerate() {
-                    let v = i64::from(v).clamp(0, max);
-                    if same {
-                        // Exact: no trip through a float.
-                        if store.bytes() == 1 {
-                            data[k] = v as u8;
-                        } else {
-                            data[2 * k..2 * k + 2].copy_from_slice(&(v as u16).to_le_bytes());
-                        }
-                    } else {
-                        store.put(&mut data, k, (v as f64 / max as f64) as f32);
-                    }
-                }
-            }
-            frame.planes.push(Plane {
-                stride: w * store.bytes(),
-                data,
-            });
+            frame
+                .planes
+                .push(extra_channel_plane(ch, i, metadata, store, w, h)?);
         }
     }
     Ok((frame, pre_ct))

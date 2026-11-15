@@ -63,6 +63,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Decoder: **a Modular frame of an XYB image may carry extra
+  channels** (it was refused with "expected 3 channels"): lossy
+  Modular streams with alpha decode — one of a black-box encoder
+  (`-m 1 -d 1` on RGBA) now agrees with the black-box decoder within
+  one 8-bit code, alpha exact — and so does the reference frame this
+  crate's encoder writes for the patches of a lossy picture with
+  alpha (which this crate could write but not read back).
 - Decoder: **patch position deltas are read in context 6** (K.3.1 of
   the 2024 edition; the 2021 listing read them in context 5, with the
   blend mode). Streams of the black-box encoder join the two contexts
