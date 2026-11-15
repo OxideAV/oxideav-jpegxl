@@ -57,6 +57,13 @@ pub enum JxlPixelFormat {
     /// Full range like every JPEG transcode — `oxideav_core` has no
     /// `YuvJ440P` label, so the range rides on [`ColorInfo::range`].
     Yuv440P,
+    /// One grey sample per pixel as a little-endian IEEE binary32
+    /// (`1.0` is the nominal maximum; values outside `0..=1` are kept).
+    GrayF32Le,
+    /// R, G, B as little-endian binary32 (12 bytes per pixel).
+    RgbF32Le,
+    /// R, G, B, A as little-endian binary32 (16 bytes per pixel).
+    RgbaF32Le,
 }
 
 /// Contract alias of [`JxlPixelFormat`].
@@ -76,6 +83,9 @@ impl JxlPixelFormat {
             Self::Rgb48Le => 6,
             Self::Rgba64Le => 8,
             Self::YuvJ444P | Self::YuvJ422P | Self::YuvJ420P | Self::Yuv440P => 1,
+            Self::GrayF32Le => 4,
+            Self::RgbF32Le => 12,
+            Self::RgbaF32Le => 16,
         }
     }
 
@@ -83,21 +93,28 @@ impl JxlPixelFormat {
     /// layouts, one plane each for the planar ones.
     pub const fn channels(self) -> usize {
         match self {
-            Self::Gray8 | Self::Gray16Le => 1,
+            Self::Gray8 | Self::Gray16Le | Self::GrayF32Le => 1,
             Self::Ya8 | Self::Ya16Le => 2,
-            Self::Rgb24 | Self::Rgb48Le => 3,
-            Self::Rgba | Self::Rgba64Le => 4,
+            Self::Rgb24 | Self::Rgb48Le | Self::RgbF32Le => 3,
+            Self::Rgba | Self::Rgba64Le | Self::RgbaF32Le => 4,
             Self::YuvJ444P | Self::YuvJ422P | Self::YuvJ420P | Self::Yuv440P => 3,
         }
     }
 
-    /// Bytes per sample (1 for the 8-bit family, 2 for the 16-bit one).
+    /// Bytes per sample (1 for the 8-bit family, 2 for the 16-bit
+    /// one, 4 for the float one).
     pub const fn bytes_per_sample(self) -> usize {
         match self {
             Self::Gray8 | Self::Ya8 | Self::Rgb24 | Self::Rgba => 1,
             Self::Gray16Le | Self::Ya16Le | Self::Rgb48Le | Self::Rgba64Le => 2,
             Self::YuvJ444P | Self::YuvJ422P | Self::YuvJ420P | Self::Yuv440P => 1,
+            Self::GrayF32Le | Self::RgbF32Le | Self::RgbaF32Le => 4,
         }
+    }
+
+    /// Whether the samples are IEEE binary32 floats.
+    pub const fn is_float(self) -> bool {
+        matches!(self, Self::GrayF32Le | Self::RgbF32Le | Self::RgbaF32Le)
     }
 
     /// Whether the layout is planar YCbCr (three planes) rather than one
@@ -144,19 +161,23 @@ impl JxlPixelFormat {
 
     /// Whether the layout carries an alpha channel.
     pub const fn has_alpha(self) -> bool {
-        matches!(self, Self::Ya8 | Self::Ya16Le | Self::Rgba | Self::Rgba64Le)
+        matches!(
+            self,
+            Self::Ya8 | Self::Ya16Le | Self::Rgba | Self::Rgba64Le | Self::RgbaF32Le
+        )
     }
 
     /// Whether the layout is grey (one colour channel).
     pub const fn is_gray(self) -> bool {
         matches!(
             self,
-            Self::Gray8 | Self::Gray16Le | Self::Ya8 | Self::Ya16Le
+            Self::Gray8 | Self::Gray16Le | Self::Ya8 | Self::Ya16Le | Self::GrayF32Le
         )
     }
 
     /// The layout for `colour_channels` (1 or 3) colour channels, an
-    /// optional alpha channel and a storage width of 1 or 2 bytes.
+    /// optional alpha channel and a storage width of 1 or 2 bytes
+    /// (integers) or 4 (floats; grey with alpha has no float layout).
     pub(crate) fn for_layout(
         colour_channels: usize,
         alpha: bool,
@@ -171,6 +192,9 @@ impl JxlPixelFormat {
             (1, true, 2) => Self::Ya16Le,
             (3, false, 2) => Self::Rgb48Le,
             (3, true, 2) => Self::Rgba64Le,
+            (1, false, 4) => Self::GrayF32Le,
+            (3, false, 4) => Self::RgbF32Le,
+            (3, true, 4) => Self::RgbaF32Le,
             _ => {
                 return Err(Error::unsupported(format!(
                     "JPEG XL: no packed layout for {colour_channels} colour channel(s), \
@@ -619,20 +643,30 @@ impl JxlImage {
         }
     }
 
-    /// Maximum sample value, `2^bits_per_sample − 1`.
+    /// Maximum sample value, `2^bits_per_sample − 1` (the 16-bit
+    /// scale [`sample`](Self::sample) reads floats on).
     fn sample_max(&self) -> u32 {
+        if self.format.is_float() {
+            return 65535;
+        }
         (1u32 << self.bits_per_sample.clamp(1, 16)) - 1
     }
 
-    /// Read channel `c` of pixel `(x, y)` as a raw integer sample.
+    /// Read channel `c` of pixel `(x, y)` as a raw integer sample (a
+    /// float sample as its value clamped to `0..=1` on a 16-bit scale).
     #[inline]
     fn sample(&self, p: &Plane, x: usize, y: usize, c: usize) -> u32 {
         let bps = self.format.bytes_per_sample();
         let i = y * p.stride + (x * self.format.channels() + c) * bps;
-        if bps == 1 {
-            u32::from(p.data[i])
-        } else {
-            u32::from(u16::from_le_bytes([p.data[i], p.data[i + 1]]))
+        match bps {
+            1 => u32::from(p.data[i]),
+            2 => u32::from(u16::from_le_bytes([p.data[i], p.data[i + 1]])),
+            _ => {
+                let v =
+                    f32::from_le_bytes([p.data[i], p.data[i + 1], p.data[i + 2], p.data[i + 3]]);
+                // NaN maps to 0.
+                (v.clamp(0.0, 1.0) * 65535.0 + 0.5) as u32
+            }
         }
     }
 
@@ -774,6 +808,31 @@ mod tests {
         .unwrap();
         assert_eq!(r.to_rgba8(), vec![128, 255, 0, 128]);
         assert_eq!(r.to_rgb8(), vec![128, 255, 0]);
+    }
+
+    #[test]
+    fn float_layouts_convert_clamped() {
+        let f = |v: f32| v.to_le_bytes();
+        let grey: Vec<u8> = [0.0f32, 1.0, 0.5, -3.0, 9.0, f32::NAN]
+            .iter()
+            .flat_map(|&v| f(v))
+            .collect();
+        let g = JxlImage::packed(6, 1, PixelFormat::GrayF32Le, grey).unwrap();
+        assert!(g.format.is_gray() && g.format.is_float() && !g.format.has_alpha());
+        assert_eq!(g.bits_per_sample, 32);
+        let rgb = g.to_rgb8();
+        assert_eq!(rgb.len(), 18);
+        assert_eq!(
+            [rgb[0], rgb[3], rgb[6], rgb[9], rgb[12], rgb[15]],
+            [0, 255, 128, 0, 255, 0]
+        );
+        let rgba: Vec<u8> = [1.0f32, 0.0, 0.25, 0.5]
+            .iter()
+            .flat_map(|&v| f(v))
+            .collect();
+        let c = JxlImage::packed(1, 1, PixelFormat::RgbaF32Le, rgba).unwrap();
+        assert_eq!(c.to_rgba8(), vec![255, 0, 64, 128]);
+        assert_eq!(c.to_rgb8(), vec![255, 0, 64]);
     }
 
     #[test]

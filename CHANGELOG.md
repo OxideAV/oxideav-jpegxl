@@ -7,8 +7,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Lossy VarDCT encoding at every integer depth** (round 490): 10-,
+  12- and 16-bit input (and anything from 1 to 16 bits), grey or
+  colour, with or without alpha, is coded as VarDCT in XYB like 8-bit
+  input was; alpha stays lossless at its own depth. Pinned on eight
+  layouts at three distances against this crate's decoder and, where
+  installed, a black-box decoder (within one code at 10 / 12 bits and
+  for 16-bit colour).
+- Decoder: **VarDCT and XYB frames decode at the declared depth**
+  instead of 8 bits — `Gray16Le` / `Ya16Le` / `Rgb48Le` / `Rgba64Le`
+  for 9 to 16 bits (the Modular XYB path included, which refused
+  them). A 16-bit lossy stream of a black-box encoder decodes within
+  3 of 65 535 of the black-box decoder's output. Extra channels of a
+  VarDCT frame are brought to the colour depth exactly when the depths
+  match. `info` reports the same layout `decode` returns.
+- Decoder: **floating-point samples** (`float_sample`, binary32,
+  binary16 and the other D.3.5 widths) decode to the new
+  `GrayF32Le` / `RgbF32Le` / `RgbaF32Le` layouts
+  (`JxlPixelFormat::is_float`, mapped to the framework labels of the
+  same names): lossless Modular integers read as the bit patterns
+  D.3.5 defines, VarDCT / XYB frames converted without clamping
+  (`TransferEncoder::encode_extended`), §C.2 composition unclamped in
+  float. Lossless binary32 / binary16 streams of a black-box encoder
+  decode to the bit patterns the black-box decoder writes; lossy ones
+  agree to 7 × 10⁻⁵.
+
+### Fixed
+
+- Decoder: **Modular arithmetic is exact for samples that use all 32
+  bits** (lossless binary32 pictures). The reconstructed sample is the
+  32 low bits of `diff × multiplier + offset + prediction` (a stream
+  whose residual only exists modulo 2^32 was refused as out of range);
+  the gradient predictor and the previous-channel gradient are clamped
+  as exact 64-bit values instead of after a 32-bit wrap; the
+  self-correcting predictor works in 64 bits in its eight-times domain
+  and narrows only the stored `true_err` (H.5.1). Nothing changes for
+  content of 24 bits or fewer. The encoder shares the scan and is
+  unchanged in output.
+
 ### Changed
 
+- A VarDCT or XYB image that declares more than 8 bits now decodes to
+  the 16-bit layouts (it decoded to the 8-bit ones); a float image
+  decodes instead of reporting `Unsupported`.
 - **Encoder memory: the picture is read where the caller keeps it**
   (round 490). The Modular and VarDCT coders fetch each group's
   rectangle from the caller's packed samples when a worker codes it

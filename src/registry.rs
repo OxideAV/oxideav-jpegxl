@@ -68,6 +68,9 @@ pub fn to_core_pixel_format(pf: JxlPixelFormat) -> PixelFormat {
         JxlPixelFormat::YuvJ422P => PixelFormat::YuvJ422P,
         JxlPixelFormat::YuvJ420P => PixelFormat::YuvJ420P,
         JxlPixelFormat::Yuv440P => PixelFormat::Yuv440P,
+        JxlPixelFormat::GrayF32Le => PixelFormat::GrayF32Le,
+        JxlPixelFormat::RgbF32Le => PixelFormat::RgbF32Le,
+        JxlPixelFormat::RgbaF32Le => PixelFormat::RgbaF32Le,
     }
 }
 
@@ -87,6 +90,9 @@ pub fn from_core_pixel_format(pf: PixelFormat) -> Result<JxlPixelFormat> {
         PixelFormat::YuvJ422P => JxlPixelFormat::YuvJ422P,
         PixelFormat::YuvJ420P => JxlPixelFormat::YuvJ420P,
         PixelFormat::Yuv440P => JxlPixelFormat::Yuv440P,
+        PixelFormat::GrayF32Le => JxlPixelFormat::GrayF32Le,
+        PixelFormat::RgbF32Le => JxlPixelFormat::RgbF32Le,
+        PixelFormat::RgbaF32Le => JxlPixelFormat::RgbaF32Le,
         other => {
             return Err(JxlError::unsupported(format!(
                 "JPEG XL: pixel format {other:?} is not a JPEG XL output layout"
@@ -354,7 +360,7 @@ pub fn make_decoder(params: &CodecParameters) -> oxideav_core::Result<Box<dyn De
 ///
 /// | key | kind | default | meaning |
 /// |---|---|---|---|
-/// | `quality` | u32 `0..=100` | `100` | `100` = lossless Modular; below it lossy — VarDCT for 8-bit sRGB input, the residual quantiser of [`crate::encoder::quantizer_for_quality`] otherwise |
+/// | `quality` | u32 `0..=100` | `100` | `100` = lossless Modular; below it lossy — VarDCT for sRGB input of any integer depth, the residual quantiser of [`crate::encoder::quantizer_for_quality`] otherwise |
 /// | `container` | bool | `false` | always write the 18181-2 box file (a bare codestream otherwise, unless Exif / XMP blobs need boxes) |
 /// | `group_size_shift` | u32 `0..=3` | `1` | `group_dim = 128 << shift` |
 /// | `distance` | f32 | `0` | lossy target as a distance (`0` = use `quality`) |
@@ -467,7 +473,7 @@ impl CodecOptionsStruct for JxlEncoderOptions {
             name: "quality",
             kind: OptionKind::U32,
             default: OptionValue::U32(100),
-            help: "0..=100; 100 = lossless Modular, lower = lossy (VarDCT for 8-bit sRGB, quantised Modular otherwise)",
+            help: "0..=100; 100 = lossless Modular, lower = lossy (VarDCT for sRGB input, quantised Modular otherwise)",
         },
         OptionField {
             name: "container",

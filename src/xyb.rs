@@ -302,6 +302,35 @@ impl TransferEncoder {
         }
     }
 
+    /// [`Self::encode`] without the clamp, for floating-point output:
+    /// the curve continues above 1 and is mirrored through the origin
+    /// for negative light, so out-of-range values survive.
+    pub fn encode_extended(self, linear: f32) -> f32 {
+        if !linear.is_finite() {
+            return linear;
+        }
+        let l = linear.abs();
+        let v = match self {
+            Self::Linear => l,
+            Self::SRgb => {
+                if l <= 0.003_130_8 {
+                    12.92 * l
+                } else {
+                    1.055 * l.powf(1.0 / 2.4) - 0.055
+                }
+            }
+            Self::Bt709 => {
+                if l < 0.018 {
+                    4.5 * l
+                } else {
+                    1.099 * l.powf(0.45) - 0.099
+                }
+            }
+            Self::Gamma(g) => l.powf(g),
+        };
+        v.copysign(linear)
+    }
+
     /// [`Self::encode`] + 8-bit quantisation ([`linear_rgb_to_u8`] on
     /// the encoded value).
     pub fn encode_u8(self, linear: f32) -> u8 {

@@ -183,6 +183,9 @@ uses the same label):
 | recompressed JPEG, 4:2:2 | `YuvJ422P` | chroma `ceil(w / 2) × h` |
 | recompressed JPEG, 4:4:0 | `Yuv440P` | chroma `w × ceil(h / 2)`; full range on `ColorInfo` (core has no `YuvJ440P`) |
 | recompressed greyscale JPEG | `Gray8` | the luma plane |
+| grey, floating point | `GrayF32Le` | little-endian IEEE binary32; `1.0` is the nominal maximum, nothing is clamped |
+| RGB, floating point | `RgbF32Le` | 12 bytes per pixel |
+| RGB + alpha, floating point | `RgbaF32Le` | 16 bytes per pixel (grey + alpha has no float layout: `Error::Unsupported`) |
 
 * **A losslessly recompressed JPEG decodes to the JPEG's own samples**
   (round 473): a still whose single frame is `kVarDCT + do_YCbCr`
@@ -203,9 +206,22 @@ uses the same label):
   decoder); `info` / the registry stream publish the same label
   `decode` returns. 4:1:1 / 4:1:0 JPEGs cannot be recompressed at all
   (`jpeg_upsampling` describes {1,1}, {2,2}, {2,1}, {1,2} only).
-* **VarDCT frames reconstruct to 8 bits per sample** whatever the
-  declared depth (`info` reads the first frame header and reports the
-  8-bit label in that case); Modular frames keep the declared depth.
+* **Every frame decodes at the declared depth** (round 490): VarDCT
+  and XYB frames are converted from their float planes straight to
+  `bits_per_sample` (they used to stop at 8 bits), Modular frames keep
+  their integers. A 16-bit lossy file of a black-box encoder decodes
+  within 3 of 65 535 of the black-box decoder's output (mean 0.06).
+* **Floating-point samples** (`float_sample`, round 490) decode to the
+  `*F32Le` layouts with `bits_per_sample = 32`, whatever the coded
+  width: Modular integers are read as the bit patterns D.3.5 defines
+  (one sign bit, `exp_bits` exponent bits, the rest mantissa — binary32
+  passes through bit for bit, binary16 and the odd widths are widened
+  exactly, subnormals included), VarDCT / XYB frames are converted
+  without clamping (the transfer curve continued above 1 and mirrored
+  below 0). Lossless binary32 and binary16 streams of a black-box
+  encoder decode to the very bit patterns the black-box decoder
+  writes; lossy ones agree to 7 × 10⁻⁵. `to_rgb8` / `to_rgba8` clamp
+  to `0..=1`.
 * A kGrey image decoded through XYB or VarDCT arrives as three planes
   (R, G, B); the grey output is the **G** plane (the opsin luminance
   carrier; R = G = B for genuinely grey content up to quantisation).
@@ -213,8 +229,9 @@ uses the same label):
   colours, selection masks, CFA, thermal) are decoded but **not
   carried** in `JxlImage`; a sub-sampled (`dim_shift > 0`) alpha channel
   is `Error::Unsupported`.
-* Floating-point samples (`float_sample`) and `bits_per_sample > 16`
-  are `Error::Unsupported` — no `*F32Le` layout is produced yet.
+* Integer `bits_per_sample > 16` is `Error::Unsupported` on a Modular
+  frame without a colour transform (an `xyb_encoded` image, whose
+  depth is only a suggested presentation, is presented at 16 bits).
 * `to_rgb8` / `to_rgba8`: grey replicated to R = G = B, alpha dropped /
   set to 255, deeper samples scaled by `255 / (2^bits_per_sample − 1)`
   with round-to-nearest; the planar layouts as described above.
@@ -225,8 +242,8 @@ uses the same label):
 
 `encode` / `encode_rgb8` / `encode_rgba8` / `encode_to` /
 `encode_all` write a `kModular` codestream (Annex H) when lossless and
-— for 8-bit sRGB input — a `kVarDCT` codestream (Annex I, XYB) when
-lossy. Declared input
+— for sRGB input of any depth — a `kVarDCT` codestream (Annex I, XYB)
+when lossy. Declared input
 layouts — the same table in both directions, the output label is what
 `decode` returns:
 
@@ -248,8 +265,9 @@ layouts — the same table in both directions, the output label is what
   depth, and a black-box decoder agrees where one is installed).
 * **Lossy** (`quality < 100`, or `EncodeOptions::distance` — about
   `1.0` is visually lossless, `quality` maps to `(100 − q) / 10` down
-  to 50 and steeper below). 8-bit sRGB input (`Gray8` / `Ya8` /
-  `Rgb24` / `Rgba`, no ICC profile) is coded as **VarDCT in XYB**:
+  to 50 and steeper below). sRGB input without an ICC profile — every
+  layout of the table, at 1 to 16 bits per sample — is coded as
+  **VarDCT in XYB**:
   forward XYB from linear light (the inverse of L.2.2), then per
   256×256 group
   * the picture **sharpened by the inverse of the Gabor-like
@@ -288,7 +306,17 @@ layouts — the same table in both directions, the output label is what
   filters stay on), `Balanced` searches squares up to 32×32, the
   16×8 rectangles and the 8×8 family, `Thorough` everything up to
   64×64. Alpha is carried losslessly next to the lossy colour.
-  Anything else (16-bit, non-sRGB transfer or primaries, ICC) — or
+  **Deep input** (round 490): 10-, 12- and 16-bit pictures, grey or
+  colour, with or without alpha, take the same path — XYB is coded
+  identically whatever the depth, and the stream declares the depth
+  the decoder presents. On a 320×240 16-bit synthetic picture at
+  distance 1: 5 300 bytes / 42.22 dB here, 8 868 bytes / 43.20 dB
+  from the black-box encoder (3 014 / 39.35 against 6 260 / 41.51 at
+  distance 2; its distances are not on the same scale). The black-box
+  decoder reads every such stream to within one code of this crate's
+  decode at 10 and 12 bits and for 16-bit colour, and within 23 of
+  65 535 for 16-bit grey.
+  Anything else (non-sRGB transfer or primaries, ICC) — or
   everything with `EncodeOptions::modular` — quantises the Modular
   residuals instead: the MA-tree leaf `multiplier` is
   `round(2^((100 − q) / 12))` at 8 bits, scaled by `2^(bits − 8)`,
@@ -435,7 +463,7 @@ layouts — the same table in both directions, the output label is what
   the registry encoder takes the framework's `ExecutionContext`).
 * Not written: transforms above 64×64, custom dequantisation
   matrices, custom coefficient orders and block-context maps,
-  progressive passes, VarDCT for 16-bit / non-sRGB input; delta
+  progressive passes, VarDCT for non-sRGB input; delta
   palettes, the Squeeze transform, LZ77, patches, splines, noise,
   upsampling, crops, previews, extra channels beyond one alpha, float
   samples, `bits_per_sample > 16`.
@@ -462,7 +490,7 @@ still image that is the finished picture, not the bare first layer.
 
 | Field | Meaning |
 |---|---|
-| `quality` | `0..=100`; `100` = lossless Modular; below it lossy — VarDCT at distance `(100 − q) / 10` (steeper under 50) for 8-bit sRGB input, the Modular residual quantiser otherwise (see *Encoding*) |
+| `quality` | `0..=100`; `100` = lossless Modular; below it lossy — VarDCT at distance `(100 − q) / 10` (steeper under 50) for sRGB input of any depth, the Modular residual quantiser otherwise (see *Encoding*) |
 | `distance` | lossy target as a distance instead (`Some(0.0)` = lossless, about `1.0` visually lossless); overrides `quality` |
 | `modular` | keep lossy requests on the Modular coder |
 | `effort` | `Fast` / `Balanced` / `Thorough`: how much the Modular coder learns (never changes the pixels of a lossless file) and how far the VarDCT coder searches transforms |
@@ -1314,7 +1342,9 @@ that floor or under it.
 - ColorEncoding / ToneMapping fuller decode, preview / animation /
   intrinsic-size sub-bundles (parsing stops cleanly at the `have_*`
   flags).
-- Floating-point samples and `bps > 16`; high-bit-depth XYB / YCbCr.
+- Integer `bps > 16` on Modular frames without a colour transform;
+  high-bit-depth YCbCr Modular frames; a float layout for grey +
+  alpha.
 - Applying an embedded ICC profile's transfer curve to the decoded
   samples (the `grayscale` stream's image output currently uses the
   signalled/default transfer, sRGB, rather than the profile's
@@ -1337,7 +1367,7 @@ that floor or under it.
   needs.
 - On the encoder: custom dequantisation matrices / coefficient orders
   / block-context maps, progressive passes, noise synthesis, VarDCT
-  for 16-bit / non-sRGB input, delta palettes, Squeeze, LZ77, extra
+  for non-sRGB input, delta palettes, Squeeze, LZ77, extra
   channels beyond one alpha, float samples.
 
 Unsupported inputs surface as `Error::Unsupported` rather than a silent

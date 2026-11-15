@@ -634,6 +634,7 @@ pub mod encoder;
 pub mod entropy_write;
 mod modular_enc;
 mod par;
+mod sample_store;
 mod vardct_enc;
 
 mod api;
@@ -673,6 +674,7 @@ use crate::bitreader::BitReader;
 use crate::frame_header::{FrameDecodeParams, FrameHeader, RfEdition};
 use crate::lf_global::LfGlobal;
 use crate::metadata_fdis::{ColourSpace, ImageMetadataFdis, SizeHeaderFdis};
+use crate::sample_store::SampleStore;
 use crate::toc::Toc;
 
 /// Public codec id string. Matches the aggregator feature name `jpegxl`.
@@ -972,20 +974,17 @@ pub(crate) fn decode_sequence(
     // This guards against a malformed `is_last`-never-set stream.
     let max_frames = codestream.len().max(1);
     let mut frame_pts = pts;
-    let bytes = if metadata.bit_depth.bits_per_sample > 8 {
-        2
-    } else {
-        1
-    };
+    let store = sample_store(metadata)?;
+    let bytes = store.bytes();
     // §C.2 composition state: the Reference[…] slots + image-sized
     // canvas the per-frame BlendingInfo composes against (coalesced
     // mode only).
     let mut compose_state =
         if matches!(mode, SequenceMode::Coalesced | SequenceMode::FirstPresented) {
-            Some(frame_compose::ComposeState::new_with_depth(
+            Some(frame_compose::ComposeState::new_with_store(
                 size.width as usize,
                 size.height as usize,
-                metadata.bit_depth.bits_per_sample,
+                store,
             )?)
         } else {
             None
@@ -1453,9 +1452,10 @@ fn decode_frame_body(
         } else {
             planes.to_rgb_frame(pts)?
         };
+        let store = sample_store(metadata)?;
         return Ok(DecodedFrame {
-            bytes_per_sample: 1,
-            frame,
+            bytes_per_sample: store.bytes(),
+            frame: planes_from_8bit(frame, store),
             is_last,
             next_frame_offset,
             compose: compose_meta,
@@ -1495,7 +1495,7 @@ fn decode_frame_body(
             want_pre_ct,
         )?;
         return Ok(DecodedFrame {
-            bytes_per_sample: 1,
+            bytes_per_sample: sample_store(metadata)?.bytes(),
             frame,
             is_last,
             next_frame_offset,
@@ -1740,28 +1740,11 @@ fn decode_frame_body(
     //
     // Other colour spaces (CMYK, etc.) and float bit depths fall in
     // later rounds.
-    if metadata.bit_depth.float_sample {
-        return Err(Error::Unsupported(
-            "jxl decoder (round 1): float bit depth not supported".into(),
-        ));
-    }
-    // Round 30 (2024-spec) — accept 1..=16 integer samples for the
-    // pass-through path. The 8-bit and 16-bit cases each have their
-    // own pack loop further down; other widths in 1..=16 emit byte
-    // planes whose samples are clamped into the integer range
-    // `[0, 2^bps - 1]` (1 byte/sample for `bps <= 8`, 2 bytes/sample
-    // little-endian for `9 <= bps <= 16`).
-    //
-    // FDIS Annex A.6 + Table A.22 (`bit_depth.bits_per_sample`).
-    // The XYB / YCbCr branches further down still hard-require 8-bit
-    // because their dequantisation lattice is calibrated against the
-    // 8-bit output range; high-bit-depth XYB / YCbCr is round-31+.
-    if metadata.bit_depth.bits_per_sample == 0 || metadata.bit_depth.bits_per_sample > 16 {
-        return Err(Error::Unsupported(format!(
-            "jxl decoder (round 30): bits_per_sample {} not supported (1..=16 only)",
-            metadata.bit_depth.bits_per_sample
-        )));
-    }
+    // The sample storage: integers of 1..=16 bits (one byte per
+    // sample through 8 bits, two little-endian bytes above), or
+    // binary32 for floating-point samples (D.3.5: the Modular integers
+    // are then the bit patterns of the values).
+    let store = sample_store(metadata)?;
     let img = lf_global.global_modular.image;
     let n_chans = img.channels.len();
     let expected_chans = match metadata.colour_encoding.colour_space {
@@ -1802,12 +1785,6 @@ fn decode_frame_body(
     //   * else → channels are already in colour_encoding's space; pass
     //     through (round-1 behaviour).
     if expected_chans == 3 && metadata.xyb_encoded {
-        if metadata.bit_depth.bits_per_sample != 8 {
-            return Err(Error::Unsupported(format!(
-                "jxl decoder (round 30): XYB high-bit-depth (bps={}) deferred",
-                metadata.bit_depth.bits_per_sample
-            )));
-        }
         let (mut planes, pre_ct) = build_rgb_planes_from_xyb(
             &img,
             &lf_global.lf_dequant,
@@ -1833,7 +1810,7 @@ fn decode_frame_body(
             planes.swap_remove(0);
         }
         return Ok(DecodedFrame {
-            bytes_per_sample: 1,
+            bytes_per_sample: store.bytes(),
             frame: RawFrame { pts, planes },
             is_last,
             next_frame_offset,
@@ -1844,7 +1821,7 @@ fn decode_frame_body(
         });
     }
     if expected_chans == 3 && fh.do_ycbcr {
-        if metadata.bit_depth.bits_per_sample != 8 {
+        if store != (SampleStore::Int { bits: 8 }) {
             return Err(Error::Unsupported(format!(
                 "jxl decoder (round 30): YCbCr high-bit-depth (bps={}) deferred",
                 metadata.bit_depth.bits_per_sample
@@ -1888,6 +1865,90 @@ fn decode_frame_body(
     // `bytemuck::cast_slice` or `<u16>::from_le_bytes` step on a
     // little-endian host without a swap. The convention is
     // documented in this crate's README under "Plane byte layout".
+    if let SampleStore::Float = store {
+        // D.3.5: the integers are the bit patterns of floating-point
+        // values (one sign bit, `exp_bits` exponent bits, the rest
+        // mantissa). The restoration filters and the image features
+        // work on float planes, which a bit pattern is not: a stream
+        // asking for them here has no specimen and no stated meaning.
+        if fh.restoration_filter.gab
+            || fh.restoration_filter.epf_iters > 0
+            || (fh.flags
+                & (crate::frame_header::flags::PATCHES | crate::frame_header::flags::SPLINES))
+                != 0
+        {
+            return Err(Error::Unsupported(
+                "jxl decoder: restoration filters / image features on a floating-point \
+                 Modular frame without a colour transform"
+                    .into(),
+            ));
+        }
+        let colour_depth = metadata.bit_depth;
+        let raw_f32: Vec<Vec<f32>> = img
+            .channels
+            .iter()
+            .enumerate()
+            .map(|(i, ch)| {
+                // An extra channel is read by its own BitDepth.
+                let depth = if i < expected_chans {
+                    colour_depth
+                } else {
+                    metadata
+                        .extra_channel_info
+                        .get(i - expected_chans)
+                        .map(|ec| ec.bit_depth)
+                        .unwrap_or(colour_depth)
+                };
+                if depth.float_sample {
+                    ch.iter()
+                        .map(|&v| {
+                            crate::sample_store::float_from_bits(
+                                v,
+                                depth.bits_per_sample,
+                                depth.exp_bits,
+                            )
+                        })
+                        .collect()
+                } else {
+                    let max = ((1u64 << depth.bits_per_sample.clamp(1, 31)) - 1) as f32;
+                    ch.iter().map(|&v| v as f32 / max).collect()
+                }
+            })
+            .collect();
+        let pre_ct = if want_pre_ct {
+            Some(crate::patches::PreCtFrame {
+                width: img.descs[0].width as usize,
+                height: img.descs[0].height as usize,
+                planes: raw_f32.clone(),
+            })
+        } else {
+            None
+        };
+        let planes: Vec<Plane> = raw_f32
+            .iter()
+            .zip(&img.descs)
+            .map(|(plane, desc)| {
+                let mut data = Vec::with_capacity(plane.len() * 4);
+                for v in plane {
+                    data.extend_from_slice(&v.to_le_bytes());
+                }
+                Plane {
+                    stride: desc.width as usize * 4,
+                    data,
+                }
+            })
+            .collect();
+        return Ok(DecodedFrame {
+            bytes_per_sample: 4,
+            frame: RawFrame { pts, planes },
+            is_last,
+            next_frame_offset,
+            compose: compose_meta,
+            raw_f32: Some(raw_f32),
+            frame_type: fh.frame_type,
+            pre_ct,
+        });
+    }
     let bps = metadata.bit_depth.bits_per_sample;
     let max_sample: i32 = (1i32 << bps) - 1;
     // §J restoration filters on the Modular pass-through path
@@ -2200,38 +2261,10 @@ fn build_rgb_planes_from_xyb(
     };
 
     // Step 3 — inverse XYB colour transform (§L.2.2) → linear RGB →
-    // signalled transfer encoding (Table A.10, round 389) → 8-bit,
-    // per sample.
-    let mut r_bytes = Vec::with_capacity(n);
-    let mut g_bytes = Vec::with_capacity(n);
-    let mut b_bytes = Vec::with_capacity(n);
-    let oim = &metadata.opsin_inverse_matrix;
-    let tm = &metadata.tone_mapping;
-    let enc = crate::xyb::TransferEncoder::for_transfer(&metadata.colour_encoding.tf)?;
-    for idx in 0..n {
-        let (r_lin, g_lin, b_lin) =
-            crate::xyb::inverse_xyb_to_rgb(x_plane[idx], y_plane[idx], b_plane[idx], oim, tm);
-        r_bytes.push(enc.encode_u8(r_lin));
-        g_bytes.push(enc.encode_u8(g_lin));
-        b_bytes.push(enc.encode_u8(b_lin));
-    }
-    Ok((
-        vec![
-            Plane {
-                stride: w,
-                data: r_bytes,
-            },
-            Plane {
-                stride: w,
-                data: g_bytes,
-            },
-            Plane {
-                stride: w,
-                data: b_bytes,
-            },
-        ],
-        pre_ct,
-    ))
+    // signalled transfer encoding (Table A.10, round 389) → the
+    // image's sample storage.
+    let planes = xyb_planes_to_output([&x_plane, &y_plane, &b_plane], w, h, metadata)?;
+    Ok((planes, pre_ct))
 }
 
 /// Convert a 3-channel decoded modular image whose channels carry
@@ -3095,28 +3128,62 @@ fn finish_vardct_decode<'r>(
     };
 
     // §L.2.2 inverse XYB → linear RGB → signalled transfer encoding
-    // (Table A.10, round 389) → 8-bit. The reconstructed XYB samples
-    // come straight out of the IDCT (no §L.2.2 kModular rescale
-    // preamble — that is the modular path's step).
+    // (Table A.10, round 389) → the image's sample storage. The
+    // reconstructed XYB samples come straight out of the IDCT (no
+    // §L.2.2 kModular rescale preamble — that is the modular path's
+    // step).
+    let planes = xyb_planes_to_output(
+        [
+            &cropped.planes[0].samples,
+            &cropped.planes[1].samples,
+            &cropped.planes[2].samples,
+        ],
+        frame_width as usize,
+        frame_height as usize,
+        metadata,
+    )?;
+    Ok((RawFrame { pts, planes }, pre_ct))
+}
+
+/// The sample storage of an image's decoded planes: the declared
+/// integer depth (1–16 bits), or binary32 for floating-point samples.
+/// For an `xyb_encoded` image the depth is only a suggested
+/// representation (D.3.5), so an integer depth beyond 16 bits is
+/// presented at 16.
+pub(crate) fn sample_store(metadata: &ImageMetadataFdis) -> Result<SampleStore> {
+    let depth = &metadata.bit_depth;
+    if !depth.float_sample && depth.bits_per_sample > 16 && metadata.xyb_encoded {
+        return Ok(SampleStore::Int { bits: 16 });
+    }
+    SampleStore::of(depth)
+}
+
+/// §L.2.2 inverse XYB → linear RGB → the signalled transfer encoding
+/// (Table A.10) → three planes (R, G, B) in the image's sample
+/// storage. Sample-wise, so the rows convert in bands on the decode
+/// worker budget.
+fn xyb_planes_to_output(
+    xyb: [&[f32]; 3],
+    w: usize,
+    h: usize,
+    metadata: &ImageMetadataFdis,
+) -> Result<Vec<Plane>> {
+    let store = sample_store(metadata)?;
+    let bytes = store.bytes();
     let oim = &metadata.opsin_inverse_matrix;
     let tone = &metadata.tone_mapping;
     let enc = crate::xyb::TransferEncoder::for_transfer(&metadata.colour_encoding.tf)?;
-    let w = frame_width as usize;
-    let h = frame_height as usize;
-    let x_plane = &cropped.planes[0];
-    let y_plane = &cropped.planes[1];
-    let b_plane = &cropped.planes[2];
-    let mut r_bytes = vec![0u8; w * h];
-    let mut g_bytes = vec![0u8; w * h];
-    let mut b_bytes = vec![0u8; w * h];
+    let float = store.is_float();
+    let [x_plane, y_plane, b_plane] = xyb;
+    let mut r_bytes = store.zeroed(w * h);
+    let mut g_bytes = store.zeroed(w * h);
+    let mut b_bytes = store.zeroed(w * h);
     {
-        // Sample-wise, so the rows convert in bands on the worker
-        // budget.
-        let band = w * 64;
+        let band = (w * 64).max(1);
         let bands: Vec<(usize, [&mut [u8]; 3])> = r_bytes
-            .chunks_mut(band.max(1))
-            .zip(g_bytes.chunks_mut(band.max(1)))
-            .zip(b_bytes.chunks_mut(band.max(1)))
+            .chunks_mut(band * bytes)
+            .zip(g_bytes.chunks_mut(band * bytes))
+            .zip(b_bytes.chunks_mut(band * bytes))
             .enumerate()
             .map(|(k, ((r, g), b))| (k * band, [r, g, b]))
             .collect();
@@ -3124,43 +3191,67 @@ fn finish_vardct_decode<'r>(
             crate::par::decode_threads(),
             bands,
             |_, (start, [r, g, b])| {
-                for (k, ((r, g), b)) in r.iter_mut().zip(g.iter_mut()).zip(b.iter_mut()).enumerate()
-                {
+                for k in 0..r.len() / bytes {
                     let i = start + k;
                     let (lr, lg, lb) = crate::xyb::inverse_xyb_to_rgb(
-                        x_plane.samples[i],
-                        y_plane.samples[i],
-                        b_plane.samples[i],
-                        oim,
-                        tone,
+                        x_plane[i], y_plane[i], b_plane[i], oim, tone,
                     );
-                    *r = enc.encode_u8(lr);
-                    *g = enc.encode_u8(lg);
-                    *b = enc.encode_u8(lb);
+                    if float {
+                        // Floats keep what lies outside the nominal
+                        // range.
+                        store.put(r, k, enc.encode_extended(lr));
+                        store.put(g, k, enc.encode_extended(lg));
+                        store.put(b, k, enc.encode_extended(lb));
+                    } else {
+                        store.put(r, k, enc.encode(lr));
+                        store.put(g, k, enc.encode(lg));
+                        store.put(b, k, enc.encode(lb));
+                    }
                 }
             },
         );
     }
-    Ok((
-        RawFrame {
-            pts,
-            planes: vec![
-                Plane {
-                    stride: w,
-                    data: r_bytes,
-                },
-                Plane {
-                    stride: w,
-                    data: g_bytes,
-                },
-                Plane {
-                    stride: w,
-                    data: b_bytes,
-                },
-            ],
+    Ok(vec![
+        Plane {
+            stride: w * bytes,
+            data: r_bytes,
         },
-        pre_ct,
-    ))
+        Plane {
+            stride: w * bytes,
+            data: g_bytes,
+        },
+        Plane {
+            stride: w * bytes,
+            data: b_bytes,
+        },
+    ])
+}
+
+/// Re-store 8-bit planes in the image's sample storage (a JPEG
+/// transcode frame decodes to the JPEG's 8-bit samples whatever depth
+/// the image declares).
+fn planes_from_8bit(frame: RawFrame, store: SampleStore) -> RawFrame {
+    if store == (SampleStore::Int { bits: 8 }) {
+        return frame;
+    }
+    let bytes = store.bytes();
+    RawFrame {
+        pts: frame.pts,
+        planes: frame
+            .planes
+            .into_iter()
+            .map(|p| {
+                let mut data = store.zeroed(p.data.len());
+                for (i, &v) in p.data.iter().enumerate() {
+                    store.put(&mut data, i, f32::from(v) / 255.0);
+                }
+                Plane {
+                    stride: p.stride * bytes,
+                    data,
+                }
+            })
+            .collect(),
+    }
 }
 
 /// Integrated single-LfGroup VarDCT decode. Reads LfGlobal + LfGroup +
@@ -3651,6 +3742,7 @@ pub fn decode_vardct_frame_with_refs(
         let img = &lf_global.global_modular.image;
         let (w, h) = (scaffold.width as usize, scaffold.height as usize);
         let n_extra = metadata.num_extra_channels as usize;
+        let store = sample_store(metadata)?;
         if img.channels.len() != n_extra {
             return Err(Error::InvalidData(format!(
                 "jxl VarDCT decoder: {} Modular channels for {n_extra} extra channels",
@@ -3665,23 +3757,48 @@ pub fn decode_vardct_frame_with_refs(
                     w * h
                 )));
             }
-            // The colour planes of a VarDCT frame are 8-bit: bring the
-            // extra channel to the same depth.
-            let bits = metadata
+            // Bring the extra channel to the storage of the colour
+            // planes: an integer channel rescaled from its own depth,
+            // a floating-point one read by its bit pattern.
+            let depth = metadata
                 .extra_channel_info
                 .get(i)
-                .map(|ec| ec.bit_depth.bits_per_sample)
-                .unwrap_or(8)
-                .clamp(1, 31);
-            let max = (1i64 << bits) - 1;
-            let data: Vec<u8> = ch
-                .iter()
-                .map(|&v| {
+                .map(|ec| ec.bit_depth)
+                .unwrap_or(metadata.bit_depth);
+            let mut data = store.zeroed(w * h);
+            if depth.float_sample {
+                for (k, &v) in ch.iter().enumerate() {
+                    let f = crate::sample_store::float_from_bits(
+                        v,
+                        depth.bits_per_sample,
+                        depth.exp_bits,
+                    );
+                    store.put(&mut data, k, f);
+                }
+            } else {
+                let max = (1i64 << depth.bits_per_sample.clamp(1, 31)) - 1;
+                let same = store
+                    == SampleStore::Int {
+                        bits: depth.bits_per_sample,
+                    };
+                for (k, &v) in ch.iter().enumerate() {
                     let v = i64::from(v).clamp(0, max);
-                    ((v * 255 + max / 2) / max) as u8
-                })
-                .collect();
-            frame.planes.push(Plane { stride: w, data });
+                    if same {
+                        // Exact: no trip through a float.
+                        if store.bytes() == 1 {
+                            data[k] = v as u8;
+                        } else {
+                            data[2 * k..2 * k + 2].copy_from_slice(&(v as u16).to_le_bytes());
+                        }
+                    } else {
+                        store.put(&mut data, k, (v as f64 / max as f64) as f32);
+                    }
+                }
+            }
+            frame.planes.push(Plane {
+                stride: w * store.bytes(),
+                data,
+            });
         }
     }
     Ok((frame, pre_ct))

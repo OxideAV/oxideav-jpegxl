@@ -1817,6 +1817,16 @@ fn evaluate_tree_inner<'a>(
     ))
 }
 
+/// `diff × multiplier + offset + prediction` as a two's-complement
+/// 32-bit integer (the 32 least significant bits of the exact sum).
+#[inline]
+fn sample_from_residual(diff: i32, multiplier: u32, offset: i32, prediction: i32) -> i32 {
+    i64::from(diff)
+        .wrapping_mul(i64::from(multiplier))
+        .wrapping_add(i64::from(offset))
+        .wrapping_add(i64::from(prediction)) as i32
+}
+
 /// 2024-spec Annex H.3 — channel decode loop.
 ///
 /// Decodes every channel in `descs` using the supplied MA tree. For
@@ -2142,16 +2152,13 @@ pub fn decode_channels_at_stream(
                     v
                 };
 
-                let val = (diff as i64)
-                    .saturating_mul(leaf.multiplier as i64)
-                    .saturating_add(leaf.offset as i64)
-                    .saturating_add(p as i64);
-                if !(i32::MIN as i64..=i32::MAX as i64).contains(&val) {
-                    return Err(Error::InvalidData(format!(
-                        "JXL Modular: decoded sample value {val} out of i32 range"
-                    )));
-                }
-                let v = val as i32;
+                // Samples are two's-complement 32-bit integers (D.3.1,
+                // modular_16bit_buffers): the sum is taken in its 32
+                // least significant bits. Lossless binary32 pictures
+                // depend on it — their samples are bit patterns that
+                // span the whole range, and a residual against a
+                // prediction of the other sign only exists modulo 2^32.
+                let v = sample_from_residual(diff, leaf.multiplier, leaf.offset, p);
                 img.set(i, x, y, v);
 
                 // 2024-spec H.5.1: AFTER decoding the sample, compute and
@@ -2361,16 +2368,7 @@ fn decode_channels_fast(
             )?;
             let diff = unpack_signed(token);
             let p = predict_sample(predictor, &s.nb, s.wp);
-            let val = i64::from(diff)
-                .saturating_mul(i64::from(multiplier))
-                .saturating_add(i64::from(offset))
-                .saturating_add(i64::from(p));
-            if !(i64::from(i32::MIN)..=i64::from(i32::MAX)).contains(&val) {
-                return Err(Error::InvalidData(format!(
-                    "JXL Modular: decoded sample value {val} out of i32 range"
-                )));
-            }
-            Ok(val as i32)
+            Ok::<i32, Error>(sample_from_residual(diff, multiplier, offset, p))
         })?;
     }
     Ok(ModularImage {

@@ -217,7 +217,7 @@ fn alpha_rides_a_vardct_frame_losslessly() {
 }
 
 #[test]
-fn deep_and_non_srgb_input_falls_back_to_quantised_modular() {
+fn non_srgb_input_falls_back_to_quantised_modular() {
     let img = picture(64, 64, PixelFormat::Rgb24, 5);
     let wide: Vec<u8> = img
         .as_bytes()
@@ -226,9 +226,24 @@ fn deep_and_non_srgb_input_falls_back_to_quantised_modular() {
         .flat_map(|&v| (u16::from(v) * 257).to_le_bytes())
         .collect();
     let deep = JxlImage::packed(64, 64, PixelFormat::Rgb48Le, wide).unwrap();
+    // Deep sRGB input is VarDCT like 8-bit input (round 490), unless
+    // the Modular coder is asked for.
     let bytes = encode(&deep, &EncodeOptions::new().with_quality(80)).unwrap();
-    assert!(!is_vardct(&bytes), "16-bit input stays Modular");
+    assert!(is_vardct(&bytes), "16-bit sRGB input is coded as VarDCT");
     assert_eq!(decode(&bytes).unwrap().format, PixelFormat::Rgb48Le);
+    let opts = EncodeOptions::new().with_quality(80).with_modular(true);
+    let bytes = encode(&deep, &opts).unwrap();
+    assert!(!is_vardct(&bytes), "`modular` keeps the Modular coder");
+    assert_eq!(decode(&bytes).unwrap().format, PixelFormat::Rgb48Le);
+    // The forward XYB transform is defined from sRGB: a linear-light
+    // picture stays on the Modular coder at any depth.
+    for picture in [deep, img] {
+        let mut linear = picture;
+        linear.color = linear.color.with_transfer(8);
+        let bytes = encode(&linear, &EncodeOptions::new().with_quality(80)).unwrap();
+        assert!(!is_vardct(&bytes), "linear-light input stays Modular");
+        assert_eq!(decode(&bytes).unwrap().format, linear.format);
+    }
 }
 
 #[test]

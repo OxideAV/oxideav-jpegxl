@@ -218,18 +218,12 @@ pub fn info(bytes: &[u8]) -> Result<ImageInfo> {
     })
 }
 
-/// Storage width of the samples the first frame decodes to: VarDCT
-/// frames reconstruct to 8 bits per sample whatever the declared depth;
-/// Modular frames keep the declared depth (1 or 2 bytes).
-fn first_frame_bytes_per_sample(opened: &crate::Opened<'_>, prelude: &Prelude) -> usize {
-    let first_is_vardct = first_frame_header(opened, prelude)
-        .map(|(fh, _, _)| fh.encoding == crate::frame_header::Encoding::VarDct)
-        .unwrap_or(false);
-    if prelude.metadata.bit_depth.bits_per_sample > 8 && !first_is_vardct {
-        2
-    } else {
-        1
-    }
+/// Storage width of the decoded samples: one byte through 8 bits,
+/// two through 16, four for floating-point samples — whatever the
+/// frame encoding. A depth the decoder has no storage for reads as two
+/// bytes here (`info` still describes the file; decoding reports it).
+fn first_frame_bytes_per_sample(_opened: &crate::Opened<'_>, prelude: &Prelude) -> usize {
+    crate::sample_store(&prelude.metadata).map_or(2, |s| s.bytes())
 }
 
 /// FrameHeader + TOC of the first frame and the byte offset (into the
@@ -947,11 +941,7 @@ fn check_limits(
         None => {
             let channels =
                 colour_channels(md) as u64 + u64::from(alpha_channel_index(md).is_some());
-            let bps: u64 = if md.bit_depth.bits_per_sample > 8 {
-                2
-            } else {
-                1
-            };
+            let bps: u64 = crate::sample_store(md).map_or(2, |s| s.bytes()) as u64;
             pixels.saturating_mul(channels).saturating_mul(bps)
         }
     };
@@ -1059,19 +1049,19 @@ pub(crate) fn pack_frame(
                     dst[x * n + c] = src[x];
                 }
             } else {
-                for x in 0..width {
-                    let o = (x * n + c) * 2;
-                    dst[o] = src[2 * x];
-                    dst[o + 1] = src[2 * x + 1];
+                for (x, sample) in src.chunks_exact(bytes).enumerate() {
+                    let o = (x * n + c) * bytes;
+                    dst[o..o + bytes].copy_from_slice(sample);
                 }
             }
         }
     }
     let declared = md.bit_depth.bits_per_sample.clamp(1, 16) as u8;
-    let bits = if bytes == 1 {
-        declared.min(8)
-    } else {
-        declared
+    let bits = match bytes {
+        1 => declared.min(8),
+        2 => declared,
+        // Floats: the storage word.
+        _ => 32,
     };
     let mut img = JxlImage::packed(width as u32, height as u32, format, data)?
         .with_color(color_info(md))

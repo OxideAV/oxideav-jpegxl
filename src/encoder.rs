@@ -137,7 +137,7 @@ pub struct EncodeSpec {
     pub group_size_shift: u32,
     /// Speed / density trade-off of the Modular coder.
     pub effort: Effort,
-    /// `Some(distance)` codes lossy VarDCT frames in XYB (8-bit sRGB
+    /// `Some(distance)` codes lossy VarDCT frames in XYB (sRGB
     /// input only); `None` codes Modular frames.
     pub vardct_distance: Option<f32>,
     /// Worker budget for the per-group work (`0` and `1` are serial).
@@ -972,10 +972,12 @@ fn write_vardct_frame(
     Ok(())
 }
 
-/// Whether the VarDCT coder takes this picture: 8-bit samples in sRGB
-/// (the forward XYB transform here is defined from sRGB).
+/// Whether the VarDCT coder takes this picture: integer samples of
+/// any supported depth in sRGB (the forward XYB transform here is
+/// defined from sRGB). The depth only sets how finely the decoded
+/// picture is presented — XYB is coded the same whatever it is.
 pub fn vardct_applies(bits: u32, colour: &ColourSpec) -> bool {
-    bits == 8
+    (1..=16).contains(&bits)
         && matches!(colour, ColourSpec::Enumerated { primaries, transfer }
             if enum_primaries(*primaries) == 1 && enum_transfer(*transfer) == 13)
 }

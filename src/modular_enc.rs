@@ -95,7 +95,11 @@ pub(crate) fn predict(predictor: u32, nb: &[i32; 7], wp: i32) -> i32 {
                 n
             }
         }
-        5 => w.wrapping_add(n).wrapping_sub(nw).clamp(w.min(n), w.max(n)),
+        // The gradient is clamped as an exact value: with samples that
+        // span the 32-bit range (binary32 bit patterns) `W + N − NW`
+        // does not fit 32 bits.
+        5 => (i64::from(w) + i64::from(n) - i64::from(nw))
+            .clamp(i64::from(w.min(n)), i64::from(w.max(n))) as i32,
         6 => wp,
         7 => ne,
         8 => nw,
@@ -196,15 +200,18 @@ impl WpRows {
     }
 
     /// H.5.2: `(prediction, sub-predictions, max_error)` in the
-    /// eight-times domain for the sample at `(x, y)`.
+    /// eight-times domain for the sample at `(x, y)`. The sub-
+    /// predictions and the prediction are exact (64-bit: a sample that
+    /// uses all 32 bits needs 35 in this domain); only the stored
+    /// `true_err` is narrowed to 32 bits, as H.5.1 states.
     #[inline]
-    fn predict(&self, nb: &[i32; 7], x: usize, y: usize, w: usize) -> (i32, [i32; 4], i32) {
+    fn predict(&self, nb: &[i32; 7], x: usize, y: usize, w: usize) -> (i64, [i64; 4], i32) {
         let [wv, n, nw, ne, nn, _nee, _ww] = *nb;
-        let n8 = n.wrapping_shl(3);
-        let w8 = wv.wrapping_shl(3);
-        let nw8 = nw.wrapping_shl(3);
-        let ne8 = ne.wrapping_shl(3);
-        let nn8 = nn.wrapping_shl(3);
+        let n8 = i64::from(n) << 3;
+        let w8 = i64::from(wv) << 3;
+        let nw8 = i64::from(nw) << 3;
+        let ne8 = i64::from(ne) << 3;
+        let nn8 = i64::from(nn) << 3;
         let te_w = if x > 0 { self.te_cur[x - 1] } else { 0 };
         let te_n = if y > 0 { self.te_prev[x] } else { 0 };
         let te_nw = if x > 0 && y > 0 {
@@ -217,21 +224,18 @@ impl WpRows {
         } else {
             te_n
         };
-        let p0 = w8.wrapping_add(ne8).wrapping_sub(n8);
-        let p1 = n8.wrapping_sub(
-            (((i64::from(te_w) + i64::from(te_n) + i64::from(te_ne)) * self.params.p1) >> 5) as i32,
-        );
-        let p2 = w8.wrapping_sub(
-            (((i64::from(te_w) + i64::from(te_n) + i64::from(te_nw)) * self.params.p2) >> 5) as i32,
-        );
-        let p3 = n8.wrapping_sub(
-            ((i64::from(te_nw) * self.params.p3[0]
+        let p0 = w8 + ne8 - n8;
+        let p1 =
+            n8 - (((i64::from(te_w) + i64::from(te_n) + i64::from(te_ne)) * self.params.p1) >> 5);
+        let p2 =
+            w8 - (((i64::from(te_w) + i64::from(te_n) + i64::from(te_nw)) * self.params.p2) >> 5);
+        let p3 = n8
+            - ((i64::from(te_nw) * self.params.p3[0]
                 + i64::from(te_n) * self.params.p3[1]
                 + i64::from(te_ne) * self.params.p3[2]
-                + (i64::from(nn8) - i64::from(n8)) * self.params.p3[3]
-                + (i64::from(nw8) - i64::from(w8)) * self.params.p3[4])
-                >> 5) as i32,
-        );
+                + (nn8 - n8) * self.params.p3[3]
+                + (nw8 - w8) * self.params.p3[4])
+                >> 5);
         let preds = [p0, p1, p2, p3];
         let mut weights = [0u64; 4];
         #[allow(clippy::needless_range_loop)] // k indexes four parallel arrays
@@ -272,18 +276,18 @@ impl WpRows {
         let sum = shifted[0] + shifted[1] + shifted[2] + shifted[3];
         if sum == 0 {
             // All-zero weight parameters: the decoder's fallback.
-            return (w8.wrapping_add(n8).wrapping_sub(nw8), preds, 0);
+            return (w8 + n8 - nw8, preds, 0);
         }
         let mut s: i64 = (sum >> 1) as i64 - 1;
         for (p, sh) in preds.iter().zip(&shifted) {
-            s += i64::from(*p) * *sh as i64;
+            s = s.wrapping_add(p.wrapping_mul(*sh as i64));
         }
         let recip = if sum <= 64 {
             i64::from(DIV24[sum as usize])
         } else {
             (1i64 << 24) / sum as i64
         };
-        let mut prediction = (s.wrapping_mul(recip) >> 24) as i32;
+        let mut prediction = s.wrapping_mul(recip) >> 24;
         if (te_n ^ te_w) | (te_n ^ te_nw) <= 0 {
             let lo = w8.min(n8).min(ne8);
             let hi = w8.max(n8).max(ne8);
@@ -303,9 +307,12 @@ impl WpRows {
     }
 
     #[inline]
-    fn store(&mut self, x: usize, pred8: i32, preds: &[i32; 4], v: i32) {
-        let v8 = v.wrapping_shl(3);
-        self.te_cur[x] = pred8.wrapping_sub(v8);
+    fn store(&mut self, x: usize, pred8: i64, preds: &[i64; 4], v: i32) {
+        let v8 = i64::from(v) << 3;
+        // `true_err` narrowed to 32 bits (H.5.1); the sub-predictor
+        // errors enter a sum taken modulo 2^32, so their low 32 bits
+        // are all that is kept.
+        self.te_cur[x] = pred8.wrapping_sub(v8) as i32;
         for (row, p) in self.se_cur.iter_mut().zip(preds) {
             row[x] = ((p.wrapping_sub(v8).unsigned_abs().wrapping_add(3)) >> 3) as i32;
         }
@@ -445,8 +452,8 @@ where
                 } else {
                     r_w
                 };
-                let g = r_w.wrapping_add(r_n).wrapping_sub(r_nw);
-                let r_g = g.clamp(r_w.min(r_n), r_w.max(r_n));
+                let g = i64::from(r_w) + i64::from(r_n) - i64::from(r_nw);
+                let r_g = g.clamp(i64::from(r_w.min(r_n)), i64::from(r_w.max(r_n))) as i32;
                 let o = BASE_PROPS + 4 * k;
                 props[o] = r_c.unsigned_abs() as i32;
                 props[o + 1] = r_c;
@@ -457,7 +464,7 @@ where
                 props: &props,
                 nprops,
                 nb,
-                wp: pred8.wrapping_add(3) >> 3,
+                wp: (pred8.wrapping_add(3) >> 3) as i32,
                 value: d[row + x],
             };
             let v = f(&sample)?;

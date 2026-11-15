@@ -95,6 +95,7 @@
 
 use crate::error::{Error, Result};
 use crate::image::{Plane, RawFrame};
+use crate::sample_store::SampleStore;
 
 use crate::frame_header::BlendMode;
 
@@ -181,10 +182,10 @@ impl FrameComposeMeta {
 pub struct ComposeState {
     width: usize,
     height: usize,
-    /// Image `bits_per_sample` — selects the integer plane byte layout
+    /// The image's sample storage — selects the plane byte layout
     /// (1 byte per sample through 8 bits, little-endian 2 bytes for
-    /// 9–16) and the `2^bits − 1` float normalisation denominator.
-    bits_per_sample: u32,
+    /// 9–16, binary32 for floats) and the normalisation denominator.
+    store: SampleStore,
     reference: [Option<Vec<Vec<f32>>>; 4],
     /// Slots whose last recording was requested **pre-colour-transform**
     /// (§C.2 `save_before_ct`). The pre-CT planes themselves live in the
@@ -217,18 +218,36 @@ impl ComposeState {
                  1–16 integer envelope"
             )));
         }
+        Self::new_with_store(
+            width,
+            height,
+            SampleStore::Int {
+                bits: bits_per_sample,
+            },
+        )
+    }
+
+    /// New state for a `width × height` image whose planes use
+    /// `store` (integers of 1–16 bits, or binary32 floats, which are
+    /// composed and presented unclamped).
+    pub(crate) fn new_with_store(width: usize, height: usize, store: SampleStore) -> Result<Self> {
+        if width == 0 || height == 0 {
+            return Err(Error::InvalidData(
+                "JXL frame composition: zero-dimension image".into(),
+            ));
+        }
         Ok(Self {
             width,
             height,
-            bits_per_sample,
+            store,
             reference: [None, None, None, None],
             pre_ct_recorded: [false; 4],
         })
     }
 
-    /// Bytes per sample of the integer plane layout (1 or 2).
+    /// Bytes per sample of the plane layout (1, 2 or 4).
     fn bytes_per_sample(&self) -> usize {
-        if self.bits_per_sample > 8 { 2 } else { 1 }
+        self.store.bytes()
     }
 
     /// Compose one decoded frame per §C.2 and return the composed
@@ -243,8 +262,7 @@ impl ComposeState {
     /// alpha-less frames precisely.
     pub fn compose(&mut self, decoded: &RawFrame, meta: &FrameComposeMeta) -> Result<RawFrame> {
         let bytes = self.bytes_per_sample();
-        let two = bytes == 2;
-        let max = ((1u32 << self.bits_per_sample) - 1) as f32;
+        let store = self.store;
         let stride = decoded.planes[0].stride;
         if stride == 0 || !stride.is_multiple_of(bytes) {
             return Err(Error::InvalidData(format!(
@@ -264,17 +282,12 @@ impl ComposeState {
                 )));
             }
         }
-        // Lift the decoded integer planes into the normalised float
-        // domain the blending arithmetic runs in.
-        let inv_max = 1.0f32 / max;
+        // Lift the decoded planes into the normalised float domain the
+        // blending arithmetic runs in.
         let newf: Vec<Vec<f32>> = decoded
             .planes
             .iter()
-            .map(|p| {
-                (0..fw * fh)
-                    .map(|i| get_sample(&p.data, i, two) as f32 * inv_max)
-                    .collect()
-            })
+            .map(|p| (0..fw * fh).map(|i| store.get(&p.data, i)).collect())
             .collect();
         let mut out = self.compose_planes(&newf, fw, fh, meta)?;
         out.pts = decoded.pts;
@@ -339,8 +352,7 @@ impl ComposeState {
             ));
         }
         let bytes = self.bytes_per_sample();
-        let two = bytes == 2;
-        let max = ((1u32 << self.bits_per_sample) - 1) as f32;
+        let store = self.store;
         // §C.2 + §3.5.1: the (signed) frame rect may extend beyond the
         // canvas on any side; clip to the intersection and discard the
         // out-of-image samples. An empty intersection composes to the
@@ -541,8 +553,9 @@ impl ComposeState {
             }
         }
 
-        // Materialise the presented frame: clamp to the nominal range
-        // and quantise to the crate's integer plane layout.
+        // Materialise the presented frame in the crate's plane layout:
+        // integers clamped to the nominal range and rounded, floats as
+        // they are.
         Ok(RawFrame {
             pts: None,
             planes: planes
@@ -550,8 +563,7 @@ impl ComposeState {
                 .map(|data| {
                     let mut out = vec![0u8; data.len() * bytes];
                     for (i, v) in data.into_iter().enumerate() {
-                        let q = (v.clamp(0.0, 1.0) * max).round() as u32;
-                        put_sample(&mut out, i, two, q);
+                        store.put(&mut out, i, v);
                     }
                     Plane {
                         stride: self.width * bytes,
@@ -560,27 +572,6 @@ impl ComposeState {
                 })
                 .collect(),
         })
-    }
-}
-
-/// Read sample `idx` of a plane in the crate-wide byte layout (1 byte
-/// per sample, or little-endian 2 bytes when `two_byte`).
-#[inline]
-fn get_sample(data: &[u8], idx: usize, two_byte: bool) -> u32 {
-    if two_byte {
-        u16::from_le_bytes([data[2 * idx], data[2 * idx + 1]]) as u32
-    } else {
-        data[idx] as u32
-    }
-}
-
-/// Write sample `idx` of a plane in the crate-wide byte layout.
-#[inline]
-fn put_sample(data: &mut [u8], idx: usize, two_byte: bool, v: u32) {
-    if two_byte {
-        data[2 * idx..2 * idx + 2].copy_from_slice(&(v as u16).to_le_bytes());
-    } else {
-        data[idx] = v as u8;
     }
 }
 
