@@ -253,16 +253,18 @@ impl WpRows {
             } else {
                 n_se
             };
-            let mut err_sum = (i64::from(n_se)
-                + i64::from(w_se)
-                + i64::from(nw_se)
-                + i64::from(ww_se)
-                + i64::from(ne_se)) as u64
-                & 0xFFFF_FFFF;
+            // The sum is taken modulo 2^32 (H.5.2): the stored errors
+            // are 32-bit patterns (an error of a sample that uses all
+            // 32 bits does not fit a signed word) and add as such.
+            let mut err_sum = (n_se as u32)
+                .wrapping_add(w_se as u32)
+                .wrapping_add(nw_se as u32)
+                .wrapping_add(ww_se as u32)
+                .wrapping_add(ne_se as u32);
             if x + 1 == w {
-                err_sum = (err_sum + w_se as u64) & 0xFFFF_FFFF;
+                err_sum = err_sum.wrapping_add(w_se as u32);
             }
-            weights[k] = error2weight(err_sum as u32, self.params.w[k]);
+            weights[k] = error2weight(err_sum, self.params.w[k]);
         }
         let sum_pre = weights[0] + weights[1] + weights[2] + weights[3];
         let log_weight = 64 - sum_pre.leading_zeros();

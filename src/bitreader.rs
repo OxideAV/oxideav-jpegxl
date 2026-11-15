@@ -341,7 +341,10 @@ pub fn unpack_signed(u: u32) -> i32 {
     if u & 1 == 0 {
         (u >> 1) as i32
     } else {
-        -((u >> 1) as i32 + 1)
+        // −(u/2 + 1) = −(u/2) − 1, the complement of u/2: no
+        // intermediate leaves the range, `u32::MAX` included
+        // (−2^31).
+        !((u >> 1) as i32)
     }
 }
 
@@ -621,6 +624,10 @@ mod tests {
         assert_eq!(unpack_signed(3), -2);
         assert_eq!(unpack_signed(4), 2);
         assert_eq!(unpack_signed(5), -3);
+        // The whole range, without overflow at the ends.
+        assert_eq!(unpack_signed(u32::MAX), i32::MIN);
+        assert_eq!(unpack_signed(u32::MAX - 1), i32::MAX);
+        assert_eq!(unpack_signed(u32::MAX - 2), i32::MIN + 1);
     }
 
     /// LSB-first bit writer for tests.

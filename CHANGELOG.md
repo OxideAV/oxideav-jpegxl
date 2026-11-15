@@ -63,6 +63,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Decoder (fuzz, `decode_vardct`): `UnpackSigned` of `u32::MAX` is
+  −2^31 without an intermediate one past the signed range (it
+  computed `u / 2 + 1` first: a panic with overflow checks on, on an
+  HF coefficient token of a hostile VarDCT stream; in the library
+  since the routine was written). Pinned with the fuzz input.
+- Decoder (fuzz, `decode_full`): the self-correcting predictor's
+  modulo-2^32 error sum is 32-bit wrapping arithmetic throughout — a
+  sub-predictor error of a sample at the top of the 32-bit range,
+  kept as a 32-bit pattern, was widened with its sign into the sum of
+  the last column and overflowed (a panic with overflow checks on;
+  introduced with this round's exact 32-bit sample arithmetic, never
+  released). Pinned in `tests/r490_fuzz_regressions.rs`.
 - Decoder: **a Modular frame of an XYB image may carry extra
   channels** (it was refused with "expected 3 channels"): lossy
   Modular streams with alpha decode — one of a black-box encoder
