@@ -659,6 +659,7 @@ fn encode_spec(
         vardct_transform: None,
         patches: opts.patches,
         lz77: opts.lz77,
+        exact_when_smaller: opts.patches,
     }
 }
 

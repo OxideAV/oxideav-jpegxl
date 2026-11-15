@@ -47,6 +47,7 @@ fn half_cosines(log2n: usize) -> &'static [f32] {
 
 /// Unscaled four-point DCT-II (`k` = [`half_cosines`]`(2)`): one level
 /// of the recursion of [`dct_in_place`] over two-point transforms.
+#[cfg(test)]
 #[inline(always)]
 fn dct4(a: [f32; 4], k: &[f32]) -> [f32; 4] {
     const R: f32 = std::f32::consts::FRAC_1_SQRT_2;
@@ -63,6 +64,9 @@ fn dct4(a: [f32; 4], k: &[f32]) -> [f32; 4] {
 /// half-size transform `G` of `g` satisfies `G[m] = X[2m+1] +
 /// X[2m−1]` (product-to-sum), so `X[1] = G[0] / 2` and
 /// `X[2m+1] = G[m] − X[2m−1]`. `scratch` holds `x.len()` values.
+/// The transforms the encoder runs go through [`dct_lanes`]; this one
+/// is its reference.
+#[cfg(test)]
 fn dct_in_place(x: &mut [f32], scratch: &mut [f32]) {
     let n = x.len();
     if n == 8 {
@@ -122,11 +126,212 @@ fn dct_in_place(x: &mut [f32], scratch: &mut [f32]) {
     }
 }
 
+/// [`dct4`] on `lanes` independent transforms at once: `a[i]` holds
+/// sample `i` of every transform.
+#[inline(always)]
+fn dct4_lanes(a: [&[f32]; 4], out: [&mut [f32]; 4], k: &[f32]) {
+    const R: f32 = std::f32::consts::FRAC_1_SQRT_2;
+    let [a0, a1, a2, a3] = a;
+    let [o0, o1, o2, o3] = out;
+    let (k0, k1) = (k[0], k[1]);
+    for l in 0..o0.len() {
+        let (s0, s1) = (a0[l] + a3[l], a1[l] + a2[l]);
+        let (d0, d1) = ((a0[l] - a3[l]) * k0, (a1[l] - a2[l]) * k1);
+        let x1 = (d0 + d1) * 0.5;
+        o0[l] = s0 + s1;
+        o1[l] = x1;
+        o2[l] = (s0 - s1) * R;
+        o3[l] = (d0 - d1) * R - x1;
+    }
+}
+
+/// [`dct_in_place`] on `lanes` independent transforms of `n` samples
+/// at once: `x[i * lanes + l]` is sample `i` of transform `l`. Every
+/// transform sees exactly the operations of the scalar routine, in
+/// the same order — the results are bit-identical — but each step
+/// runs across the lanes, which is a loop the compiler vectorises.
+/// `scratch` holds `x.len()` values.
+fn dct_lanes(x: &mut [f32], n: usize, lanes: usize, scratch: &mut [f32]) {
+    debug_assert_eq!(x.len(), n * lanes);
+    if n == 1 || lanes == 0 {
+        return;
+    }
+    if n == 2 {
+        let (a, b) = x.split_at_mut(lanes);
+        for (a, b) in a.iter_mut().zip(b) {
+            let (p, q) = (*a, *b);
+            *a = p + q;
+            *b = (p - q) * std::f32::consts::FRAC_1_SQRT_2;
+        }
+        return;
+    }
+    if n == 4 {
+        let k = half_cosines(2);
+        let src = &mut scratch[..4 * lanes];
+        src.copy_from_slice(x);
+        let (s0, r) = src.split_at(lanes);
+        let (s1, r) = r.split_at(lanes);
+        let (s2, s3) = r.split_at(lanes);
+        let (o0, r) = x.split_at_mut(lanes);
+        let (o1, r) = r.split_at_mut(lanes);
+        let (o2, o3) = r.split_at_mut(lanes);
+        dct4_lanes([s0, s1, s2, s3], [o0, o1, o2, o3], k);
+        return;
+    }
+    if n == 8 {
+        // The recursion written out, as in the scalar routine.
+        let c = half_cosines(3);
+        let k = half_cosines(2);
+        const R: f32 = std::f32::consts::FRAC_1_SQRT_2;
+        let (c0, c1, c2, c3) = (c[0], c[1], c[2], c[3]);
+        let (k0, k1) = (k[0], k[1]);
+        let (x0, r) = x.split_at_mut(lanes);
+        let (x1, r) = r.split_at_mut(lanes);
+        let (x2, r) = r.split_at_mut(lanes);
+        let (x3, r) = r.split_at_mut(lanes);
+        let (x4, r) = r.split_at_mut(lanes);
+        let (x5, r) = r.split_at_mut(lanes);
+        let (x6, x7) = r.split_at_mut(lanes);
+        for l in 0..lanes {
+            let s = [x0[l] + x7[l], x1[l] + x6[l], x2[l] + x5[l], x3[l] + x4[l]];
+            let d = [
+                (x0[l] - x7[l]) * c0,
+                (x1[l] - x6[l]) * c1,
+                (x2[l] - x5[l]) * c2,
+                (x3[l] - x4[l]) * c3,
+            ];
+            // dct4(s)
+            let (ss0, ss1) = (s[0] + s[3], s[1] + s[2]);
+            let (sd0, sd1) = ((s[0] - s[3]) * k0, (s[1] - s[2]) * k1);
+            let e1 = (sd0 + sd1) * 0.5;
+            let e = [ss0 + ss1, e1, (ss0 - ss1) * R, (sd0 - sd1) * R - e1];
+            // dct4(d)
+            let (ds0, ds1) = (d[0] + d[3], d[1] + d[2]);
+            let (dd0, dd1) = ((d[0] - d[3]) * k0, (d[1] - d[2]) * k1);
+            let g1 = (dd0 + dd1) * 0.5;
+            let g = [ds0 + ds1, g1, (ds0 - ds1) * R, (dd0 - dd1) * R - g1];
+            let y1 = g[0] * 0.5;
+            let y3 = g[1] - y1;
+            let y5 = g[2] - y3;
+            x0[l] = e[0];
+            x1[l] = y1;
+            x2[l] = e[1];
+            x3[l] = y3;
+            x4[l] = e[2];
+            x5[l] = y5;
+            x6[l] = e[3];
+            x7[l] = g[3] - y5;
+        }
+        return;
+    }
+    let half = n / 2;
+    let cos = half_cosines(n.trailing_zeros() as usize);
+    let (lo, hi) = scratch[..n * lanes].split_at_mut(half * lanes);
+    for i in 0..half {
+        let ci = cos[i];
+        let a = &x[i * lanes..(i + 1) * lanes];
+        let b = &x[(n - 1 - i) * lanes..(n - i) * lanes];
+        let lo = &mut lo[i * lanes..(i + 1) * lanes];
+        let hi = &mut hi[i * lanes..(i + 1) * lanes];
+        for l in 0..lanes {
+            lo[l] = a[l] + b[l];
+            hi[l] = (a[l] - b[l]) * ci;
+        }
+    }
+    {
+        let (xa, xb) = x.split_at_mut(half * lanes);
+        dct_lanes(lo, half, lanes, xa);
+        dct_lanes(hi, half, lanes, xb);
+    }
+    // x[0] = lo[0]; x[1] = hi[0] / 2; x[2m] = lo[m];
+    // x[2m + 1] = hi[m] − x[2m − 1].
+    x[..lanes].copy_from_slice(&lo[..lanes]);
+    for l in 0..lanes {
+        x[lanes + l] = hi[l] * 0.5;
+    }
+    for m in 1..half {
+        x[2 * m * lanes..(2 * m + 1) * lanes].copy_from_slice(&lo[m * lanes..(m + 1) * lanes]);
+        let (before, after) = x.split_at_mut((2 * m + 1) * lanes);
+        let prev = &before[(2 * m - 1) * lanes..2 * m * lanes];
+        let hi = &hi[m * lanes..(m + 1) * lanes];
+        for l in 0..lanes {
+            after[l] = hi[l] - prev[l];
+        }
+    }
+}
+
 /// Forward DCT of the `rows × cols` pixel block at `px[r * stride + c]`
 /// into `out` (`rows × cols` coefficients in the decoder's layout),
 /// scaled as I.7.2: coefficient 0 is the block mean, the others carry
 /// a factor `sqrt(2)` per non-zero frequency. `tmp` is scratch space.
+///
+/// Both passes run every one-dimensional transform of the block side
+/// by side ([`dct_lanes`]): first along the rows, all rows at once,
+/// then along the columns, all columns at once.
 pub(crate) fn fdct(
+    px: &[f32],
+    stride: usize,
+    rows: usize,
+    cols: usize,
+    out: &mut [f32],
+    tmp: &mut Vec<f32>,
+) {
+    debug_assert!(rows.is_power_of_two() && cols.is_power_of_two());
+    debug_assert!(rows <= MAX_SIDE && cols <= MAX_SIDE);
+    let n = rows * cols;
+    tmp.clear();
+    tmp.resize(3 * n, 0.0);
+    let (a, rest) = tmp.split_at_mut(n);
+    let (b, scratch) = rest.split_at_mut(n);
+    // Along the rows: `a[i * rows + r]` is sample `i` of row `r`, and
+    // afterwards coefficient `i` of row `r`.
+    for r in 0..rows {
+        let line = &px[r * stride..r * stride + cols];
+        for (i, &v) in line.iter().enumerate() {
+            a[i * rows + r] = v;
+        }
+    }
+    dct_lanes(a, cols, rows, scratch);
+    // Along the columns: `b[r * cols + u]` is sample `r` of column
+    // `u`, and afterwards coefficient `r` of column `u`.
+    for u in 0..cols {
+        let column = &a[u * rows..(u + 1) * rows];
+        for (r, &v) in column.iter().enumerate() {
+            b[r * cols + u] = v;
+        }
+    }
+    dct_lanes(b, rows, cols, scratch);
+    // Written at the decoder's index: `fs × long + fl`, `fs` the
+    // frequency along the shorter side (the horizontal one for a
+    // square block).
+    let long = rows.max(cols);
+    let wide = cols > rows;
+    let norm = 1.0 / (rows * cols) as f32;
+    for u in 0..cols {
+        let su = if u == 0 {
+            norm
+        } else {
+            norm * std::f32::consts::SQRT_2
+        };
+        for v in 0..rows {
+            let s = if v == 0 {
+                su
+            } else {
+                su * std::f32::consts::SQRT_2
+            };
+            let idx = if wide { v * long + u } else { u * long + v };
+            out[idx] = b[v * cols + u] * s;
+        }
+    }
+}
+
+/// The forward DCT one transform at a time: the reference [`fdct`] is
+/// checked against, bit for bit. Of the `rows × cols` pixel block at
+/// `px[r * stride + c]` into `out` (`rows × cols` coefficients in the decoder's layout),
+/// scaled as I.7.2: coefficient 0 is the block mean, the others carry
+/// a factor `sqrt(2)` per non-zero frequency. `tmp` is scratch space.
+#[cfg(test)]
+fn fdct_scalar(
     px: &[f32],
     stride: usize,
     rows: usize,
@@ -474,6 +679,29 @@ mod tests {
             let back = idct_for_transform(t, &coeffs).unwrap();
             for (p, (&a, &b)) in back.iter().zip(&px).enumerate() {
                 assert!((a - b).abs() < 2e-3, "{t:?} sample {p}: {a} vs {b}");
+            }
+        }
+    }
+
+    /// The lane-batched DCT is the scalar one bit for bit, at every
+    /// block shape the encoder uses.
+    #[test]
+    fn batched_dct_is_bit_identical_to_the_scalar_one() {
+        let sides = [1usize, 2, 4, 8, 16, 32, 64];
+        let (mut tmp, mut tmp2) = (Vec::new(), Vec::new());
+        for &rows in &sides {
+            for &cols in &sides {
+                for seed in 0..3u32 {
+                    let stride = cols + 5;
+                    let px = noise(rows * stride, 7 + seed + (rows * 131 + cols) as u32);
+                    let mut fast = vec![0.0f32; rows * cols];
+                    let mut slow = vec![0.0f32; rows * cols];
+                    fdct(&px, stride, rows, cols, &mut fast, &mut tmp);
+                    fdct_scalar(&px, stride, rows, cols, &mut slow, &mut tmp2);
+                    for (i, (f, s)) in fast.iter().zip(&slow).enumerate() {
+                        assert_eq!(f.to_bits(), s.to_bits(), "{rows}x{cols} coefficient {i}");
+                    }
+                }
             }
         }
     }

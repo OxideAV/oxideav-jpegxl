@@ -14,6 +14,8 @@
 //!   distance (`BB` lines, same metrics, through the black-box
 //!   decoder).
 //! * `JXL_RD_EFFORT=fast|balanced|thorough`, `JXL_RD_THREADS=n`.
+//! * `JXL_RD_PATCHES=0` turns the screen-content tools off (the
+//!   VarDCT coder alone).
 //! * `JXL_RD_OUT=<dir>` keeps the encoded files; with `JXL_RD_DUMP`
 //!   the two decodes of an RGB picture are written next to them as
 //!   PPM files.
@@ -185,6 +187,7 @@ fn rate_distortion_report() {
         for d in list.split(',').filter_map(|d| d.trim().parse::<f32>().ok()) {
             let opts = EncodeOptions::new()
                 .with_distance(d)
+                .with_patches(std::env::var("JXL_RD_PATCHES").as_deref() != Ok("0"))
                 .with_effort(effort)
                 .with_threads(threads);
             let t = Instant::now();

@@ -37,7 +37,7 @@ use crate::entropy_write::{
 use crate::error::{Error, Result};
 use crate::icc::icc_context;
 use crate::image::ColorInfo;
-use crate::modular_enc::{LearnParams, Section, encode_section, learn_tree_from};
+use crate::modular_enc::{LearnParams, Section, encode_section_into, learn_tree_from};
 pub use crate::options::Effort;
 
 /// `U32(1 + u(9), 1 + u(13), 1 + u(18), 1 + u(30))` — SizeHeader dims.
@@ -153,6 +153,11 @@ pub struct EncodeSpec {
     /// Let the Modular symbol streams copy earlier symbols (LZ77,
     /// C.3.3) where that is estimated smaller.
     pub lz77: bool,
+    /// A lossy still that looks like screen content is also coded
+    /// losslessly, and the lossless codestream is kept when it is no
+    /// larger (flat colour and repeated glyphs cost the Modular coder
+    /// less than any DCT).
+    pub exact_when_smaller: bool,
 }
 
 impl EncodeSpec {
@@ -639,29 +644,31 @@ fn code_frame(spec: &EncodeSpec, src: &Pixels<'_>, raw: bool) -> Result<CodedFra
     }
     let tree_codes = EntropyCodes::build_clustered(&tree_stats, 1, 6)?;
 
-    // Sections are independent given the tree: one worker each, the
-    // statistics merged in section order. A batch at a time, so only
-    // a few sections and per-section histograms exist at once.
-    let mut leaf_stats = ValueStats::new(tree.num_ctx);
-    let mut coded: Vec<PackedSymbols> = Vec::with_capacity(count);
-    let batch = spec.threads.max(1) * 2;
-    let mut first = 0usize;
-    while first < count {
-        let ids: Vec<usize> = (first..count.min(first + batch)).collect();
-        for (syms, stats) in crate::par::par_map(spec.threads, ids, |_, i| {
+    // Sections are independent given the tree. Every worker codes one
+    // section at a time — fetched from the picture, packed and counted
+    // as its symbols are made — and keeps one set of statistics for
+    // all the sections it takes; the sets are added up at the end
+    // (counts: the total does not depend on who took what).
+    let num_ctx = tree.num_ctx;
+    let (coded, worker_stats) = crate::par::par_map_fold(
+        spec.threads,
+        (0..count).collect(),
+        || ValueStats::new(num_ctx),
+        |stats, _, i| {
             let mut section = section_at(i);
-            let syms = encode_section(&mut section, &tree);
-            let mut stats = ValueStats::new(tree.num_ctx);
-            for &(c, v) in &syms {
+            let mut syms = PackedSymbols::with_capacity(section.num_samples());
+            encode_section_into(&mut section, &tree, |c, v| {
+                syms.push(c, v);
                 stats.add(c, v);
-            }
-            (PackedSymbols::from_pairs(&syms), stats)
-        }) {
-            leaf_stats.merge(&stats);
-            coded.push(syms);
-        }
-        first += batch;
+            });
+            syms
+        },
+    );
+    let mut leaf_stats = ValueStats::new(num_ctx);
+    for stats in &worker_stats {
+        leaf_stats.merge(stats);
     }
+    drop(worker_stats);
     let n_streams = coded.iter().filter(|s| !s.is_empty()).count().max(1);
     let leaf_codes = EntropyCodes::build_clustered(&leaf_stats, n_streams, 256)?;
     let (leaf_codes, coded) = if spec.lz77 {
@@ -738,37 +745,32 @@ fn elect_lz77(
         drop(cost);
         return Ok((plain, coded));
     }
-    // Every section, a batch at a time: the parsed stream packed and
-    // counted by the worker that made it.
+    // Every section: the parsed stream packed by the worker that made
+    // it and counted into that worker's statistics.
+    let (parsed, worker_stats) = crate::par::par_map_fold(
+        threads,
+        (0..count).collect(),
+        || crate::entropy_write::Lz77Stats::new(num_ctx),
+        |stats, _, i| match parse(i).0 {
+            Some(ops) => {
+                for &(c, v) in &ops {
+                    stats.add(c, v);
+                }
+                PackedSymbols::from_pairs(&ops)
+            }
+            None => {
+                for (c, v) in coded[i].iter() {
+                    stats.add(c, v);
+                }
+                coded[i].clone()
+            }
+        },
+    );
     let mut stats = crate::entropy_write::Lz77Stats::new(num_ctx);
-    let mut parsed: Vec<PackedSymbols> = Vec::with_capacity(count);
-    let batch = threads.max(1) * 2;
-    let mut first = 0usize;
-    while first < count {
-        let ids: Vec<usize> = (first..count.min(first + batch)).collect();
-        for (packed, section_stats) in crate::par::par_map(threads, ids, |_, i| {
-            let mut section_stats = crate::entropy_write::Lz77Stats::new(num_ctx);
-            let packed = match parse(i).0 {
-                Some(ops) => {
-                    for &(c, v) in &ops {
-                        section_stats.add(c, v);
-                    }
-                    PackedSymbols::from_pairs(&ops)
-                }
-                None => {
-                    for (c, v) in coded[i].iter() {
-                        section_stats.add(c, v);
-                    }
-                    coded[i].clone()
-                }
-            };
-            (packed, section_stats)
-        }) {
-            stats.merge(&section_stats);
-            parsed.push(packed);
-        }
-        first += batch;
+    for worker in &worker_stats {
+        stats.merge(worker);
     }
+    drop(worker_stats);
     let (codes, bits) = EntropyCodes::build_clustered_lz77(&stats, n_streams, 256)?;
     let plain_bits = plain.estimated_size(plain_stats, n_streams);
     drop(cost);
@@ -1187,17 +1189,12 @@ fn modular_frame(spec: &EncodeSpec, pixels: &Pixels<'_>, role: FrameRole<'_>) ->
             sections.push(Vec::new()); // ModularLfGroup: nothing to code
         }
         sections.push(Vec::new()); // HfGlobal: absent for kModular
-        // A batch of groups at a time, each group's symbols freed as
-        // soon as its bytes exist.
+        // Each group's symbols are freed as soon as its bytes exist.
         let leaf_codes = &coded.leaf_codes;
-        let batch = spec.threads.max(1) * 2;
-        let mut pending = coded.groups.into_iter();
-        loop {
-            let groups: Vec<PackedSymbols> = pending.by_ref().take(batch).collect();
-            if groups.is_empty() {
-                break;
-            }
-            sections.extend(crate::par::par_map(spec.threads, groups, |_, group| {
+        sections.extend(crate::par::par_map(
+            spec.threads,
+            coded.groups,
+            |_, group| {
                 let mut gw = BitWriter::new();
                 gw.write_bool(true); // use_global_tree
                 gw.write_bool(true); // default_wp
@@ -1206,8 +1203,8 @@ fn modular_frame(spec: &EncodeSpec, pixels: &Pixels<'_>, role: FrameRole<'_>) ->
                 drop(group);
                 leaf_codes.write_symbols(&mut gw, pairs.iter().copied());
                 gw.into_bytes()
-            }));
-        }
+            },
+        ));
     }
     let mut toc = Vec::with_capacity(sections.len());
     for s in &sections {
@@ -1491,6 +1488,38 @@ pub(crate) fn encode_frames<'a>(
         return Err(Error::invalid(
             "JXL encoder: several frames need an AnimationSpec (tick rate)",
         ));
+    }
+    let mut frames = frames.peekable();
+    if spec.exact_when_smaller
+        && spec.vardct_distance.is_some()
+        && spec.animation.is_none()
+        && frames.len() == 1
+        && let Some(&(pixels, duration)) = frames.peek()
+    {
+        let (width, height) = (spec.width as usize, spec.height as usize);
+        if width == 0 || height == 0 {
+            return Err(Error::invalid("JXL encoder: zero image dimension"));
+        }
+        pixels.validate(width, height, spec.num_channels(), (1i64 << spec.bits) - 1)?;
+        if crate::enc_patches::looks_like_screen_content(&pixels, width, height, spec.num_colour())
+        {
+            let lossy = EncodeSpec {
+                exact_when_smaller: false,
+                ..spec.clone()
+            };
+            let exact = EncodeSpec {
+                vardct_distance: None,
+                quality: 100,
+                ..lossy.clone()
+            };
+            let lossy = encode_frames(&lossy, std::iter::once((pixels, duration)))?;
+            let exact = encode_frames(&exact, std::iter::once((pixels, duration)))?;
+            return Ok(if exact.len() <= lossy.len() {
+                exact
+            } else {
+                lossy
+            });
+        }
     }
     let mut w = BitWriter::new();
     write_prelude(&mut w, spec)?;

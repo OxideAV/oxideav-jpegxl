@@ -355,36 +355,65 @@ layouts — the same table in both directions, the output label is what
   Every one of these streams decodes in the black-box decoder to
   within one 8-bit code of this crate's decode.
 
-  **Screen content: patches** (round 490, `EncodeOptions::patches`,
-  stills). The glyph search of the lossless coder (below) also runs
-  on lossy input. Each repeated glyph is stored once, in a
-  `kReferenceOnly` Modular frame, as its XYB difference to the colour
-  it stands on (in steps of about a third of an 8-bit code of luma at
-  distance 1, coarser with the distance); the VarDCT frame is coded
-  with the glyphs painted over — flat ground, nearly free — and a
-  patch dictionary adds them back (`kAdd`) after the restoration
-  filters. The pair is kept when it is no larger than the plain
-  frame. On the synthesised screenshot corpus of
-  `tests/r490_screen.rs` (bytes / PSNR in dB through this crate's
-  decoder; a black-box decoder agrees within two 8-bit codes on every
-  stream; the black-box encoder at its default effort and the same
-  nominal distance):
+  **Screen content** (round 490, `EncodeOptions::patches`, stills).
+  Two things happen to a lossy picture with the long runs of text,
+  flat colour or pixel art (judged on a sample of rows; a photograph
+  is turned away there):
 
-  | picture, distance | without patches | with patches | black-box encoder |
-  |---|---|---|---|
-  | window 800×600, 1 | 118 313 / 40.69 | **19 026 / 44.83** | 144 954 / 42.45 |
-  | page 640×480, 1 | 89 742 / 42.72 | **5 131 / 69.04** | 17 215 / 52.73 |
-  | terminal 720×400, 1 | 87 482 / 38.87 | **8 348 / 57.80** | 22 881 / 54.06 |
-  | window 1280×800, 1 | 255 651 / 41.96 | **24 688 / 48.98** | 316 958 / 44.24 |
-  | window 800×600, 3 | 73 058 / 33.81 | **13 257 / 39.27** | 22 980 / 39.32 |
-  | page 640×480, 3 | 56 671 / 34.19 | **4 766 / 48.10** | 11 848 / 44.34 |
-  | terminal 720×400, 3 | 53 362 / 33.21 | **6 630 / 42.03** | 15 176 / 46.55 |
-  | window 1280×800, 3 | 155 821 / 34.19 | **18 478 / 42.15** | 43 112 / 41.46 |
+  * **Patches.** The glyph search of the lossless coder (below) runs
+    on it. Each repeated glyph is stored once, in a `kReferenceOnly`
+    Modular frame, as its XYB difference to the colour it stands on
+    (in steps of about a third of an 8-bit code of luma at distance 1,
+    coarser with the distance); the VarDCT frame is coded with the
+    glyphs painted over — flat ground, nearly free — and a patch
+    dictionary adds them back (`kAdd`) after the restoration filters.
+    The pair is kept when it is no larger than the plain frame.
+  * **The lossless codestream when it is no larger.** The picture is
+    also coded losslessly (with its own patches and LZ77), and that
+    file is returned when it is no larger than the lossy one: flat
+    colour and repeated glyphs cost the Modular coder less than any
+    DCT, and the result is exact.
 
-  A tenth of the bytes and 9 to 14 dB more on the corpus as a whole.
-  The corpus repeats its glyphs exactly (text on a pixel grid);
-  sub-pixel positioned text repeats less, and what does not repeat is
-  still coded by the DCT.
+  On the synthesised screenshot corpus of `tests/r490_screen.rs`
+  (bytes / PSNR in dB through this crate's decoder, 99 = exact; a
+  black-box decoder agrees within two 8-bit codes on every stream;
+  the black-box encoder at its default effort and the same nominal
+  distance):
+
+  | picture, distance | VarDCT alone | with patches | as written (default) | black-box encoder |
+  |---|---|---|---|---|
+  | window 800×600, 1 | 118 313 / 40.69 | 19 026 / 44.83 | **17 645 / exact** | 144 954 / 42.45 |
+  | page 640×480, 1 | 89 742 / 42.72 | 5 131 / 69.04 | **4 767 / exact** | 17 215 / 52.73 |
+  | terminal 720×400, 1 | 87 482 / 38.87 | 8 348 / 57.80 | **6 120 / exact** | 22 881 / 54.06 |
+  | window 1280×800, 1 | 255 651 / 41.96 | 24 688 / 48.98 | **22 127 / exact** | 316 958 / 44.24 |
+  | window 800×600, 3 | 73 058 / 33.81 | 13 257 / 39.27 | **13 257 / 39.27** | 22 980 / 39.32 |
+  | page 640×480, 3 | 56 671 / 34.19 | 4 766 / 48.10 | **4 766 / 48.10** | 11 848 / 44.34 |
+  | terminal 720×400, 3 | 53 362 / 33.21 | 6 630 / 42.03 | **6 120 / exact** | 15 176 / 46.55 |
+  | window 1280×800, 3 | 155 821 / 34.19 | 18 478 / 42.15 | **18 478 / 42.15** | 43 112 / 41.46 |
+
+  That corpus repeats its glyphs exactly (text on a pixel grid). On
+  the two screen pictures of the earlier corpus, where less repeats
+  (1280×800 screenshot, 640×480 pixel art of 14 colours; "before" is
+  round 488, the black-box encoder at the same nominal distance):
+
+  | picture, distance | before | VarDCT with patches | as written (default) | black-box encoder |
+  |---|---|---|---|---|
+  | screenshot, 0.5 | 119 783 / 49.40 | 79 130 / 50.14 | **49 702 / exact** | 105 061 / 54.16 |
+  | screenshot, 1 | 95 760 / 45.71 | 64 231 / 46.97 | **49 702 / exact** | 111 294 / 48.63 |
+  | screenshot, 2 | 73 471 / 40.69 | 50 954 / 42.39 | **49 702 / exact** | 87 618 / 43.30 |
+  | screenshot, 4 | 53 146 / 35.77 | 38 881 / 37.86 | **38 881 / 37.86** | 34 788 / 43.07 |
+  | screenshot, 8 | 34 181 / 30.10 | 27 377 / 32.09 | **27 377 / 32.09** | 25 673 / 37.94 |
+  | pixel art, 1 | 13 559 / 43.69 | 13 225 / 43.93 | **2 310 / exact** | 22 480 / 45.24 |
+  | pixel art, 8 | 4 121 / 33.19 | 4 121 / 33.19 | **2 310 / exact** | 7 969 / 39.90 |
+
+  Where the gap remains: from distance 4 up on that screenshot the
+  black-box encoder is 5 dB ahead at a similar size — the lossless
+  file is no longer the smaller one there, and glyphs that almost
+  repeat (sub-pixel positioned text) are still coded by the DCT. The
+  price is encoding time: screen content is coded up to four times
+  (lossy and lossless, each with and without its patches), three to
+  six times the time of the VarDCT coder alone on these pictures;
+  `EncodeOptions::patches = false` is the single-pass coder.
 * **Structure**: one global MA tree **learned from the picture** — a
   sample of it is scanned with the decoder's own property vector
   (Table H.4, previous-channel properties included) and every node
@@ -461,26 +490,31 @@ layouts — the same table in both directions, the output label is what
   frames' `delay` in milliseconds (`100` ms without one). Frames share
   one geometry / layout / depth — a mismatch is `Error::Unsupported`
   naming both shapes. Metadata is the first frame's.
-* **Size, lossless** (bytes; round 477 → now at the default effort,
-  then a black-box encoder at its efforts 1 / 3 / 7 / 9; the corpus is
-  synthesised from the staged fixtures, see `tests/r487_corpus.rs`):
+* **Size, lossless** (bytes; round 477 → round 488 → now at the
+  default effort, then a black-box encoder at its efforts 1 / 3 / 7 /
+  9; the corpus is synthesised from the staged fixtures, see
+  `tests/r487_corpus.rs`):
 
-  | picture | r477 | now | black-box e1 / e3 / e7 / e9 |
-  |---|---|---|---|
-  | 1280×960 grey photo | 447 570 | **338 042** | 478 023 / 374 361 / 345 427 / 338 111 |
-  | 1440×810 16-bit grey photo | 1 659 189 | **1 577 221** | 1 695 629 / 1 560 146 / 1 594 352 / 1 585 659 |
-  | 1280×960 RGB photo-like | 1 978 719 | **1 783 897** | 2 038 896 / 1 893 782 / 1 746 868 / 1 738 870 |
-  | 640×480 pixel art, 14 colours | 10 300 | **2 310** | 4 386 / 5 706 / 2 329 / 2 262 |
-  | 1280×800 screenshot (text) | 127 211 | **57 286** | 106 545 / 111 034 / 79 260 / 54 147 |
-  | 1024×1024 RGBA triangles | 392 307 | **2 365** | 492 942 / 404 030 / 9 687 / 4 206 |
-  | 924×1386 16-bit RGBA logo | 2 726 962 | **1 338 243** | 3 404 627 / 3 210 948 / 888 081 / 755 407 |
+  | picture | r477 | r488 | now | black-box e1 / e3 / e7 / e9 |
+  |---|---|---|---|---|
+  | 1280×960 grey photo | 447 570 | 338 042 | **338 042** | 478 023 / 374 361 / 345 427 / 338 111 |
+  | 1440×810 16-bit grey photo | 1 659 189 | 1 577 221 | **1 577 221** | 1 695 629 / 1 560 146 / 1 594 352 / 1 585 659 |
+  | 1280×960 RGB photo-like | 1 978 719 | 1 783 897 | **1 783 897** | 2 038 896 / 1 893 782 / 1 746 868 / 1 738 870 |
+  | 640×480 pixel art, 14 colours | 10 300 | 2 310 | **2 310** | 4 386 / 5 706 / 2 329 / 2 262 |
+  | 1280×800 screenshot (text) | 127 211 | 57 286 | **49 702** | 106 545 / 111 034 / 79 260 / 54 147 |
+  | 1024×1024 RGBA triangles | 392 307 | 2 365 | **2 175** | 492 942 / 404 030 / 9 687 / 4 206 |
+  | 924×1386 16-bit RGBA logo | 2 726 962 | 1 338 243 | **1 263 521** | 3 404 627 / 3 210 948 / 888 081 / 755 407 |
 
   Every file decodes bit-exactly in this crate and in the black-box
-  decoder. `Effort::Thorough` goes further where context modelling
-  pays (grey photo 296 252, 16-bit grey 1 508 055, screenshot 54 861,
-  logo 1 292 215) at five to fifteen times the encode time;
-  `Effort::Fast` gives 414 416 / 1 623 756 / 93 042 / 1 434 825 on the
-  same four in about a tenth of it.
+  decoder. The photographs are byte for byte what round 488 wrote
+  (neither round-490 tool is elected on them); the screenshot gains
+  from patches and LZ77, the triangles and the logo from LZ77.
+  `Effort::Thorough` goes further where context modelling pays (grey
+  photo 296 252, 16-bit grey 1 508 055, logo 1 227 947; the
+  screenshot, 49 918, no longer gains) at five to fifteen times the
+  encode time; `Effort::Fast` gives 414 416 / 1 623 756 on the two
+  grey photographs and 44 828 on the screenshot in about a tenth of
+  it.
 * **Time and memory** (`benches/codec.rs`, a synthesised photo-like
   RGB picture; median of three, one process per measurement, peak
   resident set of that process; an 18-core machine shared with other
@@ -526,11 +560,22 @@ layouts — the same table in both directions, the output label is what
   the registry encoder takes the framework's `ExecutionContext`).
 * Not written: transforms above 64×64, custom dequantisation
   matrices, custom coefficient orders and block-context maps,
-  progressive passes, VarDCT for non-sRGB input; delta
-  palettes, the Squeeze transform, patches on animated frames,
-  splines, noise,
-  upsampling, crops, previews, extra channels beyond one alpha, float
-  samples, `bits_per_sample > 16`.
+  progressive passes, VarDCT for non-sRGB input; the Squeeze
+  transform (lossy Modular still quantises predictor residuals),
+  delta palettes (see below), patches on animated frames, glyphs
+  that only nearly repeat, splines, noise, upsampling, crops,
+  previews, extra channels beyond one alpha, float samples,
+  `bits_per_sample > 16`.
+* **Delta palettes are not written, and not trusted on decode.** An
+  encoder for H.6.4 delta entries was built this round and withdrawn:
+  a black-box decoder refuses every stream with `nb_deltas ≥ 1` and a
+  non-zero palette entry that this crate's reading of the listing
+  produces, and this crate's decoder reads a delta-palette stream of
+  a black-box encoder (`nb_colours = 64`, `nb_deltas = 9`,
+  `d_pred = 13`) without error but to other pixels than the
+  black-box decoder (71 501 of 72 000 samples). The listing as
+  printed does not settle which reading is right; no staged stream
+  exercises it.
 
 ## Options
 
@@ -563,7 +608,7 @@ still image that is the finished picture, not the bare first layer.
 | `container` | always write the 18181-2 box file |
 | `group_size_shift` | `group_dim = 128 << shift`, `0..=3` (Modular frames) |
 | `animation` | tick rate and loop count for `encode_all` |
-| `patches` | stills, lossless and lossy: code repeated glyph-like regions once, in a reference frame in front of the picture (default `true`; the file then holds two frames) |
+| `patches` | the screen-content tools, stills only (default `true`): repeated glyph-like regions coded once, in a reference frame in front of the picture — the file then holds two frames — and, for a lossy request on screen content, the lossless codestream when it is no larger |
 | `lz77` | lossless: let the symbol streams copy earlier symbols where that is smaller (default `true`) |
 
 The registry schema (`registry::JxlEncoderOptions`) carries `quality`
@@ -1474,7 +1519,13 @@ Table 11 declared total), and a family of committee-draft Modular
 arithmetic overflows on hostile extremes (D.7.2 gradient properties,
 channel-header Varint forms, BEGABRAC signed-range negation, the
 Gradient predictor, the pixel write) — are fixed with regression pins
-in `tests/r454_fuzz_regressions.rs`.
+in `tests/r454_fuzz_regressions.rs`. Round 490 (bounded runs of every
+target on the final code): `UnpackSigned` of `u32::MAX` overflowed an
+intermediate on a hostile VarDCT coefficient token, and the
+self-correcting predictor's modulo-2^32 error sum overflowed on
+samples at the top of the 32-bit range (this round's exact 32-bit
+arithmetic, caught before release) — both pinned in
+`tests/r490_fuzz_regressions.rs`.
 
 ### History
 

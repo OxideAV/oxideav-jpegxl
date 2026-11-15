@@ -491,7 +491,6 @@ struct GroupOut {
     /// Per 64×64 tile of the group: `XFromY`, `BFromY`.
     cfl: Vec<[i32; 2]>,
     syms: Symbols,
-    stats: ValueStats,
 }
 
 /// Marks a block that is not the top-left one of its varblock.
@@ -1303,8 +1302,14 @@ fn quant_field(y_plane: &[f32], pw: usize, gw: usize, gh: usize) -> Vec<f32> {
     field
 }
 
-/// Colour-convert, transform, quantise and tokenise one group.
-fn code_group(ctx: &FrameCtx<'_>, gx: usize, gy: usize) -> Result<GroupOut> {
+/// Colour-convert, transform, quantise and tokenise one group; its
+/// symbols are counted into `stats`.
+fn code_group(
+    ctx: &FrameCtx<'_>,
+    gx: usize,
+    gy: usize,
+    stats: &mut ValueStats,
+) -> Result<GroupOut> {
     let bx0 = gx * GROUP_BLOCKS;
     let by0 = gy * GROUP_BLOCKS;
     let gw = GROUP_BLOCKS.min(ctx.bw - bx0);
@@ -1576,7 +1581,6 @@ fn code_group(ctx: &FrameCtx<'_>, gx: usize, gy: usize) -> Result<GroupOut> {
             }
         }
     }
-    let mut stats = ValueStats::new(495 * ctx.nb_block_ctx as usize);
     for &(c, v) in &syms {
         stats.add(c, v);
     }
@@ -1586,7 +1590,6 @@ fn code_group(ctx: &FrameCtx<'_>, gx: usize, gy: usize) -> Result<GroupOut> {
         hf_mul: hf_grid,
         cfl,
         syms,
-        stats,
     })
 }
 
@@ -1739,43 +1742,47 @@ fn code(input: &VarDctInput<'_>, opts: &VarDctOptions, learn: &LearnParams) -> R
     let mut hf_grid = vec![0i32; n_blocks];
     let (ftw, fth) = (bw.div_ceil(TILE_BLOCKS), bh.div_ceil(TILE_BLOCKS));
     let mut cfl_grid = vec![[0i32; 2]; ftw * fth];
-    let mut hf_stats = ValueStats::new(495 * nb_block_ctx as usize);
     let mut hf_syms: Vec<Symbols> = Vec::with_capacity(num_groups);
-    // A batch of groups at a time, so only a few per-group histograms
-    // exist next to the merged one.
-    let batch = threads.max(1) * 2;
-    let mut first = 0usize;
-    while first < num_groups {
-        let ids: Vec<usize> = (first..num_groups.min(first + batch)).collect();
-        let outs = crate::par::par_map(threads, ids, |_, g| code_group(&ctx, g % gx_n, g / gx_n));
-        for (k, out) in outs.into_iter().enumerate() {
-            let out = out?;
-            let g = first + k;
-            let (bx0, by0) = ((g % gx_n) * GROUP_BLOCKS, (g / gx_n) * GROUP_BLOCKS);
-            let gw = GROUP_BLOCKS.min(bw - bx0);
-            for (dst, src) in lf_q.iter_mut().zip(&out.lf) {
-                for (row, line) in src.chunks_exact(gw).enumerate() {
-                    let o = (by0 + row) * bw + bx0;
-                    dst[o..o + gw].copy_from_slice(line);
-                }
-            }
-            for (row, line) in out.kind.chunks_exact(gw).enumerate() {
+    // Every worker keeps one set of coefficient statistics for all the
+    // groups it codes (the per-group histograms are large); the sets
+    // are added up at the end, a total that does not depend on which
+    // worker took which group.
+    let hf_contexts = 495 * nb_block_ctx as usize;
+    let (outs, worker_stats) = crate::par::par_map_fold(
+        threads,
+        (0..num_groups).collect(),
+        || ValueStats::new(hf_contexts),
+        |stats, _, g| code_group(&ctx, g % gx_n, g / gx_n, stats),
+    );
+    let mut hf_stats = ValueStats::new(hf_contexts);
+    for stats in &worker_stats {
+        hf_stats.merge(stats);
+    }
+    drop(worker_stats);
+    for (g, out) in outs.into_iter().enumerate() {
+        let out = out?;
+        let (bx0, by0) = ((g % gx_n) * GROUP_BLOCKS, (g / gx_n) * GROUP_BLOCKS);
+        let gw = GROUP_BLOCKS.min(bw - bx0);
+        for (dst, src) in lf_q.iter_mut().zip(&out.lf) {
+            for (row, line) in src.chunks_exact(gw).enumerate() {
                 let o = (by0 + row) * bw + bx0;
-                kind_grid[o..o + gw].copy_from_slice(line);
+                dst[o..o + gw].copy_from_slice(line);
             }
-            for (row, line) in out.hf_mul.chunks_exact(gw).enumerate() {
-                let o = (by0 + row) * bw + bx0;
-                hf_grid[o..o + gw].copy_from_slice(line);
-            }
-            let tw = gw.div_ceil(TILE_BLOCKS);
-            for (row, line) in out.cfl.chunks_exact(tw).enumerate() {
-                let o = (by0 / TILE_BLOCKS + row) * ftw + bx0 / TILE_BLOCKS;
-                cfl_grid[o..o + tw].copy_from_slice(line);
-            }
-            hf_stats.merge(&out.stats);
-            hf_syms.push(out.syms);
         }
-        first += batch;
+        for (row, line) in out.kind.chunks_exact(gw).enumerate() {
+            let o = (by0 + row) * bw + bx0;
+            kind_grid[o..o + gw].copy_from_slice(line);
+        }
+        for (row, line) in out.hf_mul.chunks_exact(gw).enumerate() {
+            let o = (by0 + row) * bw + bx0;
+            hf_grid[o..o + gw].copy_from_slice(line);
+        }
+        let tw = gw.div_ceil(TILE_BLOCKS);
+        for (row, line) in out.cfl.chunks_exact(tw).enumerate() {
+            let o = (by0 / TILE_BLOCKS + row) * ftw + bx0 / TILE_BLOCKS;
+            cfl_grid[o..o + tw].copy_from_slice(line);
+        }
+        hf_syms.push(out.syms);
     }
     let hf_codes = EntropyCodes::build_clustered(&hf_stats, num_groups, 128)?;
 

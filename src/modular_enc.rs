@@ -512,6 +512,9 @@ pub(crate) struct Tree {
     /// Some leaf predicts with the self-correcting predictor or some
     /// decision reads property 15.
     pub uses_wp: bool,
+    /// Previous channels whose properties some decision reads: a scan
+    /// that only walks this tree need not compute the others.
+    pub max_prev: usize,
 }
 
 /// A tree under construction (children by arena index).
@@ -534,6 +537,7 @@ fn finish_tree(arena: &[Build], root: usize, multiplier: u32) -> Tree {
     let mut nodes = Vec::with_capacity(arena.len());
     let mut num_ctx = 0u32;
     let mut uses_wp = false;
+    let mut max_prop = 0u32;
     // Children of the decision at output index k land at the back of
     // the queue: `k + queue length` and the slot after it.
     while let Some(a) = order.pop_front() {
@@ -555,6 +559,7 @@ fn finish_tree(arena: &[Build], root: usize, multiplier: u32) -> Tree {
                 order.push_back(gt);
                 order.push_back(le);
                 uses_wp |= prop == 15;
+                max_prop = max_prop.max(prop);
             }
             Build::Leaf { predictor } => {
                 nodes.push(Node::Leaf {
@@ -572,6 +577,10 @@ fn finish_tree(arena: &[Build], root: usize, multiplier: u32) -> Tree {
         nodes,
         num_ctx: num_ctx as usize,
         uses_wp,
+        max_prev: (max_prop as usize + 1)
+            .saturating_sub(BASE_PROPS)
+            .div_ceil(4)
+            .min(MAX_PREV),
     }
 }
 
@@ -650,29 +659,46 @@ pub(crate) fn quantise(r: i64, m: i64) -> i64 {
 /// section's samples are replaced by what the decoder reconstructs.
 pub(crate) fn encode_section(section: &mut Section, tree: &Tree) -> Vec<(u32, u32)> {
     let mut out = Vec::with_capacity(section.num_samples());
+    encode_section_into(section, tree, |ctx, value| out.push((ctx, value)));
+    out
+}
+
+/// [`encode_section`] handing every symbol to `emit` as it is made.
+pub(crate) fn encode_section_into(
+    section: &mut Section,
+    tree: &Tree,
+    mut emit: impl FnMut(u32, u32),
+) {
+    // Only the properties the tree reads are computed.
+    let params = ScanParams {
+        stream_index: section.stream_index,
+        wp: tree.uses_wp.then(WpParams::default),
+        max_prev: tree.max_prev,
+    };
     for i in 0..section.chans.len() {
-        scan_channel(
-            &mut section.chans,
-            i,
-            section.stream_index,
-            tree.uses_wp,
-            |s| {
+        let done: Result<(), std::convert::Infallible> =
+            try_scan_channel(&mut section.chans, i, &params, |s| {
                 let (ctx, predictor, multiplier) = tree.leaf(s.props);
                 let pred = predict(predictor, &s.nb, s.wp);
                 let r = i64::from(s.value) - i64::from(pred);
                 if multiplier == 1 {
-                    out.push((ctx, pack_signed(r as i32)));
-                    s.value
+                    emit(ctx, pack_signed(r as i32));
+                    Ok(s.value)
                 } else {
                     let m = i64::from(multiplier);
                     let q = quantise(r, m).clamp(i64::from(i32::MIN) + 1, i64::from(i32::MAX));
-                    out.push((ctx, pack_signed(q as i32)));
-                    (i64::from(pred) + q * m).clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
+                    emit(ctx, pack_signed(q as i32));
+                    Ok(
+                        (i64::from(pred) + q * m).clamp(i64::from(i32::MIN), i64::from(i32::MAX))
+                            as i32,
+                    )
                 }
-            },
-        );
+            });
+        match done {
+            Ok(()) => {}
+            Err(never) => match never {},
+        }
     }
-    out
 }
 
 // ---- learning ------------------------------------------------------------

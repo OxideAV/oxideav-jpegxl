@@ -1,11 +1,14 @@
 //! Encode / decode timing on a deterministic photo-like picture.
 //!
 //! ```text
-//! cargo bench --bench codec -- <megapixels> <mode> <threads> [what]
+//! cargo bench --bench codec -- <megapixels> <mode> <threads> [what] [runs]
 //!   megapixels  1 | 12 (or any number: a 4:3 picture of about that size)
 //!   mode        lossless | lossy
 //!   threads     worker budget for the encoder and the decoder
 //!   what        both (default) | encode | decode
+//!   runs        repetitions the median is taken over (default 3; 1
+//!               makes the process's peak resident set that of one
+//!               operation — freed pages of earlier runs stay resident)
 //! ```
 //!
 //! One process per measurement, so the peak resident set of the run
@@ -137,7 +140,11 @@ fn main() {
     let what = args.get(3).map(String::as_str).unwrap_or("both");
     let height = ((mp * 1.0e6 * 3.0 / 4.0).sqrt().round() as u32).max(8);
     let width = height * 4 / 3;
-    let runs = 3;
+    let runs: usize = args
+        .get(4)
+        .and_then(|a| a.parse().ok())
+        .filter(|&r| r > 0)
+        .unwrap_or(3);
     let dir = std::env::var("JXL_BENCH_DIR")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|_| std::env::temp_dir());

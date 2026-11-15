@@ -43,6 +43,8 @@ const MIN_BOX_AREA: usize = 12;
 /// start one for the search to go on (dense anti-aliased text sits
 /// near 0.45, photographs and noise above 0.8).
 const MAX_RUN_SHARE: f64 = 0.60;
+/// Rows looked at before the search proper.
+const SAMPLED_ROWS: usize = 96;
 /// Estimated bits of one more position of a patch (two coordinate
 /// deltas and a blend mode).
 const POSITION_BITS: f64 = 14.0;
@@ -248,6 +250,38 @@ fn hash_keys(w: usize, h: usize, keys: &[u64]) -> u64 {
     s
 }
 
+/// Runs of one colour on a sample of rows, when the picture has the
+/// runs of screen content (at most [`MAX_RUN_SHARE`] of the sampled
+/// pixels start one); `None` for anything photographic.
+fn sampled_run_count(
+    src: &Pixels<'_>,
+    width: usize,
+    height: usize,
+    n_colour: usize,
+) -> Option<usize> {
+    let mut keys = vec![0u64; width];
+    let step = (height / SAMPLED_ROWS).max(1);
+    let (mut runs, mut pixels) = (0usize, 0usize);
+    for y in (0..height).step_by(step) {
+        row_keys(src, n_colour, y, 0, &mut keys);
+        runs += 1 + keys.windows(2).filter(|w| w[0] != w[1]).count();
+        pixels += width;
+    }
+    (runs as f64 <= pixels as f64 * MAX_RUN_SHARE).then_some(runs)
+}
+
+/// Whether a picture has the long runs of one colour that screen
+/// content has (text, flat fills, pixel art) — decided on a sample of
+/// rows, so it costs next to nothing on a photograph.
+pub(crate) fn looks_like_screen_content(
+    src: &Pixels<'_>,
+    width: usize,
+    height: usize,
+    n_colour: usize,
+) -> bool {
+    width > 0 && height > 0 && sampled_run_count(src, width, height, n_colour).is_some()
+}
+
 /// Search `src` (its first `n_colour` channels are the colour) for
 /// repeated glyph-like rectangles. `None` when the picture is not
 /// screen content or nothing repeats enough to pay.
@@ -267,11 +301,17 @@ pub(crate) fn find_patches(
     }
     let pixels = width * height;
     let run_budget = (pixels as f64 * MAX_RUN_SHARE) as usize;
+    let mut keys = vec![0u64; width];
+
+    // 0. A look at a sample of rows settles most pictures: a
+    // photograph starts a run at nearly every pixel, and is turned
+    // away here before anything is stored.
+    let step = (height / SAMPLED_ROWS).max(1);
+    let sampled_runs = sampled_run_count(src, width, height, n_colour)?;
 
     // 1. Runs, row by row.
-    let mut runs: Vec<Run> = Vec::new();
+    let mut runs: Vec<Run> = Vec::with_capacity(sampled_runs * step + width);
     let mut row_start: Vec<u32> = Vec::with_capacity(height + 1);
-    let mut keys = vec![0u64; width];
     for y in 0..height {
         row_start.push(runs.len() as u32);
         row_keys(src, n_colour, y, 0, &mut keys);

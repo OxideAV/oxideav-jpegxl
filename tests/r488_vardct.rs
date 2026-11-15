@@ -73,6 +73,7 @@ fn spec(width: usize, height: usize, distance: f32, effort: Effort) -> EncodeSpe
         vardct_transform: None,
         patches: false,
         lz77: false,
+        exact_when_smaller: false,
     }
 }
 

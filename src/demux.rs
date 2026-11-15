@@ -386,6 +386,7 @@ fn parse_still(bytes: &[u8]) -> Result<StillParts> {
             vardct_transform: None,
             patches: false,
             lz77: false,
+            exact_when_smaller: false,
         },
         vardct: vardct.then_some(crate::encoder::VarDctShape {
             x_qm_scale: fh.x_qm_scale,

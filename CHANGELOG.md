@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **A lossy request on screen content is answered with the lossless
+  codestream when that is no larger** (round 490; gated by
+  `EncodeOptions::patches` like the other screen-content tools). A
+  still whose rows have the long runs of flat colour, text or pixel
+  art is coded both ways; flat colour and repeated glyphs cost the
+  Modular coder less than any DCT. Pixel art (12 colours in 8-pixel
+  cells, 256×192): 9 943 bytes of VarDCT at distance 1, 720 bytes
+  exact. On the screenshot corpus at distance 1 every picture comes
+  back exact (50 659 bytes against 57 193 with patches alone and
+  551 188 without); a photograph fails the run test on a sample of
+  rows and is not coded twice.
 - **Patches for lossy screen content** (round 490). The VarDCT coder
   stores each repeated glyph once — its XYB difference to the colour
   it stands on, in a `kReferenceOnly` Modular frame — codes the frame
@@ -104,6 +115,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Encode speed** (round 490, output unchanged byte for byte). The
+  forward DCT runs every one-dimensional transform of a block side by
+  side — the same operations in the same order per transform, across
+  lanes the compiler vectorises (a quarter of the lossy encode's
+  samples were in the scalar recursion). Workers keep one set of
+  entropy statistics each for all the groups they code instead of one
+  per group merged batch by batch, so groups are handed out once and
+  no worker waits at a batch boundary. See the README table for the
+  megapixels per second before and after.
 - A VarDCT or XYB image that declares more than 8 bits now decodes to
   the 16-bit layouts (it decoded to the 8-bit ones); a float image
   decodes instead of reporting `Unsupported`.

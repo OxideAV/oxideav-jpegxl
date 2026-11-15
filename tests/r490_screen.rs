@@ -410,20 +410,78 @@ fn black_box_lossy(c: &Canvas, distance: f32) -> Option<(usize, f64)> {
     Some((bytes.len(), psnr(&back.to_rgb8(), &c.rgb)))
 }
 
+/// The lossy codestream of an RGB8 canvas with each screen-content
+/// tool on or off: `patches` (the dictionary on the VarDCT frame) and
+/// `exact` (keep the lossless codestream when it is no larger).
+fn lossy_codestream(canvas: &Canvas, distance: f32, patches: bool, exact: bool) -> Vec<u8> {
+    let img = canvas.image();
+    lossy_codestream_of(&img, distance, patches, exact)
+}
+
+/// [`lossy_codestream`] for any packed 8-bit picture.
+fn lossy_codestream_of(img: &JxlImage, distance: f32, patches: bool, exact: bool) -> Vec<u8> {
+    use oxideav_jpegxl::encoder::{ColourSpec, EncodeSpec, FrameInput, encode_codestream};
+    let n = img.format.channels();
+    let spec = EncodeSpec {
+        width: img.width,
+        height: img.height,
+        bits: 8,
+        grey: img.format.is_gray(),
+        alpha: img.format.has_alpha(),
+        colour: ColourSpec::Enumerated {
+            primaries: 1,
+            transfer: 13,
+        },
+        animation: None,
+        quality: 90,
+        group_size_shift: 1,
+        effort: Effort::Balanced,
+        vardct_distance: Some(distance),
+        threads: 1,
+        vardct_transform: None,
+        patches,
+        lz77: true,
+        exact_when_smaller: exact,
+    };
+    let packed = img.as_bytes().unwrap();
+    let channels = (0..n)
+        .map(|c| {
+            packed
+                .iter()
+                .skip(c)
+                .step_by(n)
+                .map(|&v| i32::from(v))
+                .collect()
+        })
+        .collect();
+    let frame = FrameInput {
+        channels,
+        duration: 0,
+    };
+    encode_codestream(&spec, &[frame]).unwrap()
+}
+
 #[test]
 fn patches_sharpen_lossy_screen_content() {
     for distance in [1.0f32, 3.0] {
-        let mut total = [(0usize, 0.0f64); 2];
+        // Per variant: VarDCT alone, VarDCT with patches, and what the
+        // public entry point writes (the smaller of that and the
+        // lossless codestream).
+        let mut total = [(0usize, 0.0f64); 3];
         for (name, canvas) in corpus() {
-            let img = canvas.image();
+            let streams = [
+                ("plain", lossy_codestream(&canvas, distance, false, false)),
+                ("patches", lossy_codestream(&canvas, distance, true, false)),
+                ("default", lossy_codestream(&canvas, distance, true, true)),
+            ];
             let opts = EncodeOptions::new().with_distance(distance);
-            let plain = encode(&img, &opts.clone().with_patches(false)).unwrap();
-            let patched = encode(&img, &opts).unwrap();
-            let mut quality = [0.0f64; 2];
-            for (k, (label, bytes)) in [("plain", &plain), ("patches", &patched)]
-                .into_iter()
-                .enumerate()
-            {
+            assert_eq!(streams[2].1, encode(&canvas.image(), &opts).unwrap());
+            assert_eq!(
+                streams[0].1,
+                encode(&canvas.image(), &opts.with_patches(false)).unwrap()
+            );
+            let mut quality = [0.0f64; 3];
+            for (k, (label, bytes)) in streams.iter().enumerate() {
                 let back = decode(bytes).unwrap();
                 assert_eq!(back.format, PixelFormat::Rgb24, "{name} {label}");
                 let ours = back.as_bytes().unwrap();
@@ -444,38 +502,112 @@ fn patches_sharpen_lossy_screen_content() {
                     );
                 }
             }
-            // Kept only when no larger; the glyphs are then near exact.
+            let [plain, patched, default] = [&streams[0].1, &streams[1].1, &streams[2].1];
+            // Each tool is kept only when the file is no larger.
             assert!(patched.len() <= plain.len(), "{name} d{distance}");
+            assert!(default.len() <= patched.len(), "{name} d{distance}");
             assert!(
                 quality[1] >= quality[0] - 0.1,
                 "{name} d{distance}: {:.2} dB with patches, {:.2} without",
                 quality[1],
                 quality[0]
             );
+            assert!(quality[2] >= quality[1] - 0.1, "{name} d{distance}");
             let reference = black_box_lossy(&canvas, distance)
-                .map(|(n, q)| format!("; black-box encoder {n} bytes / {q:.2} dB"))
+                .map(|(n, q)| format!("; black-box encoder {n} / {q:.2}"))
                 .unwrap_or_default();
             println!(
-                "{name} d{distance}: {} bytes / {:.2} dB without patches, {} / {:.2} with{reference}",
+                "{name} d{distance}: VarDCT {} bytes / {:.2} dB, with patches {} / {:.2}, \
+                 default {} / {:.2}{reference}",
                 plain.len(),
                 quality[0],
                 patched.len(),
-                quality[1]
+                quality[1],
+                default.len(),
+                quality[2]
             );
         }
         let n = corpus().len() as f64;
         println!(
-            "corpus d{distance}: {} bytes / {:.2} dB -> {} bytes / {:.2} dB",
+            "corpus d{distance}: {} bytes / {:.2} dB -> {} / {:.2} -> {} / {:.2}",
             total[0].0,
             total[0].1 / n,
             total[1].0,
-            total[1].1 / n
+            total[1].1 / n,
+            total[2].0,
+            total[2].1 / n
         );
         // Text is where the lossy coder spends its bits: the
         // dictionary has to pay in both size and quality.
         assert!(total[1].0 * 100 < total[0].0 * 85, "d{distance}: {total:?}");
         assert!(total[1].1 > total[0].1 + 2.0 * n, "d{distance}: {total:?}");
     }
+}
+
+/// A lossy request on flat-colour content is answered with the
+/// lossless codestream when that is smaller; a photograph is not
+/// touched.
+#[test]
+fn lossy_requests_on_flat_content_come_back_exact_when_smaller() {
+    // Pixel art: 12 colours in 8-pixel cells.
+    let (w, h) = (256usize, 192usize);
+    let mut rng = Rng(77);
+    let palette: Vec<[u8; 3]> = (0..12)
+        .map(|_| {
+            [
+                rng.below(256) as u8,
+                rng.below(256) as u8,
+                rng.below(256) as u8,
+            ]
+        })
+        .collect();
+    let cells: Vec<usize> = (0..(w / 8) * (h / 8))
+        .map(|_| rng.below(12) as usize)
+        .collect();
+    let mut c = Canvas::new(w, h, [0, 0, 0]);
+    for y in 0..h {
+        for x in 0..w {
+            let colour = palette[cells[(y / 8) * (w / 8) + x / 8]];
+            c.rgb[(y * w + x) * 3..][..3].copy_from_slice(&colour);
+        }
+    }
+    let img = c.image();
+    let lossless = encode(&img, &EncodeOptions::new()).unwrap();
+    for distance in [0.5f32, 1.0, 4.0] {
+        let opts = EncodeOptions::new().with_distance(distance);
+        let lossy = encode(&img, &opts.clone().with_patches(false)).unwrap();
+        let default = encode(&img, &opts).unwrap();
+        println!(
+            "pixel art d{distance}: VarDCT {} bytes, default {} bytes (lossless {})",
+            lossy.len(),
+            default.len(),
+            lossless.len()
+        );
+        assert!(default.len() <= lossy.len() && default.len() <= lossless.len());
+        assert_eq!(
+            default, lossless,
+            "d{distance}: the exact codestream is smaller"
+        );
+        assert_eq!(decode(&default).unwrap().as_bytes().unwrap(), &c.rgb[..]);
+        if let Some(theirs) = black_box_rgb(&default, &format!("exact-{distance}")) {
+            assert!(theirs == c.rgb);
+        }
+    }
+    // Noise: no runs, the lossy stream is what was asked for.
+    let noise: Vec<u8> = (0..160 * 120 * 3)
+        .map(|_| (rng.next() >> 24) as u8)
+        .collect();
+    let img = JxlImage::from_rgb8(160, 120, noise).unwrap();
+    let opts = EncodeOptions::new().with_distance(2.0);
+    assert_eq!(
+        encode(&img, &opts).unwrap(),
+        encode(&img, &opts.clone().with_patches(false)).unwrap()
+    );
+    assert!(
+        oxideav_jpegxl::info(&encode(&img, &opts).unwrap())
+            .unwrap()
+            .xyb_encoded
+    );
 }
 
 /// Lossy patches next to an alpha channel, and on grey: the reference
@@ -506,9 +638,14 @@ fn lossy_patches_keep_alpha_exact() {
         ),
     ];
     for (name, img) in &pictures {
-        let opts = EncodeOptions::new().with_distance(1.0);
-        let plain = encode(img, &opts.clone().with_patches(false)).unwrap();
-        let patched = encode(img, &opts).unwrap();
+        // The VarDCT coder with its patches, the lossless codestream
+        // not considered: this is about the pair of frames.
+        let plain = lossy_codestream_of(img, 1.0, false, false);
+        let patched = lossy_codestream_of(img, 1.0, true, false);
+        assert!(
+            oxideav_jpegxl::info(&patched).unwrap().xyb_encoded,
+            "{name}"
+        );
         assert!(
             patched.len() < plain.len() / 2,
             "{name}: {} bytes",

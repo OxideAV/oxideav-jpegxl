@@ -26,6 +26,10 @@ const PALETTE_32: &[u8] = include_bytes!("fixtures/palette_32x32.jxl");
 const JPEG_TRANSCODE: &[u8] = include_bytes!("fixtures/jpeg_transcode.jxl");
 const SUNSET: &[u8] = include_bytes!("fixtures/conformance_sunset_logo.jxl");
 const GRAY_ICC: &[u8] = include_bytes!("fixtures/conformance_grayscale.jxl");
+const FLOAT32: &[u8] = include_bytes!("fixtures/float32_rgb_lossless.jxl");
+const FLOAT32_GREY: &[u8] = include_bytes!("fixtures/float32_grey_lossless.jxl");
+const FLOAT16_LOSSY: &[u8] = include_bytes!("fixtures/float16_rgb_d1.jxl");
+const DEPTH16_LOSSY: &[u8] = include_bytes!("fixtures/depth16_rgb_d1.jxl");
 
 const FIXTURES: &[(&str, &[u8])] = &[
     ("animation_3frame.jxl", ANIMATION),
@@ -37,6 +41,10 @@ const FIXTURES: &[(&str, &[u8])] = &[
     ("palette_32x32.jxl", PALETTE_32),
     ("conformance_sunset_logo.jxl", SUNSET),
     ("conformance_grayscale.jxl", GRAY_ICC),
+    ("float32_rgb_lossless.jxl", FLOAT32),
+    ("float32_grey_lossless.jxl", FLOAT32_GREY),
+    ("float16_rgb_d1.jxl", FLOAT16_LOSSY),
+    ("depth16_rgb_d1.jxl", DEPTH16_LOSSY),
 ];
 
 fn ctx() -> RuntimeContext {

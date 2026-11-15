@@ -62,6 +62,75 @@ where
         .collect()
 }
 
+/// [`par_map`] with a state per worker: `init()` makes one for every
+/// worker, `f(state, index, item)` may accumulate into the state of
+/// whichever worker runs it. Returns the results in input order and
+/// the workers' states. Which worker takes which item is not fixed,
+/// so the states are only good for totals that do not depend on it
+/// (sums of counts): the caller folds them together.
+pub(crate) fn par_map_fold<T, R, S, I, F>(
+    threads: usize,
+    items: Vec<T>,
+    init: I,
+    f: F,
+) -> (Vec<R>, Vec<S>)
+where
+    T: Send,
+    R: Send,
+    S: Send,
+    I: Fn() -> S + Sync,
+    F: Fn(&mut S, usize, T) -> R + Sync,
+{
+    let n = items.len();
+    let workers = threads.min(n).max(1);
+    if workers == 1 {
+        let mut state = init();
+        let out = items
+            .into_iter()
+            .enumerate()
+            .map(|(i, t)| f(&mut state, i, t))
+            .collect();
+        return (out, vec![state]);
+    }
+    let inputs: Vec<Mutex<Option<T>>> = items.into_iter().map(|t| Mutex::new(Some(t))).collect();
+    let outputs: Vec<Mutex<Option<R>>> = (0..n).map(|_| Mutex::new(None)).collect();
+    let states: Mutex<Vec<S>> = Mutex::new(Vec::with_capacity(workers));
+    let next = AtomicUsize::new(0);
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            scope.spawn(|| {
+                let mut state = init();
+                loop {
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    if i >= n {
+                        break;
+                    }
+                    let item = inputs[i].lock().ok().and_then(|mut s| s.take());
+                    if let Some(item) = item {
+                        let r = f(&mut state, i, item);
+                        if let Ok(mut slot) = outputs[i].lock() {
+                            *slot = Some(r);
+                        }
+                    }
+                }
+                if let Ok(mut all) = states.lock() {
+                    all.push(state);
+                }
+            });
+        }
+    });
+    let out = outputs
+        .into_iter()
+        .map(|m| {
+            m.into_inner()
+                .ok()
+                .flatten()
+                .expect("every work unit produced a result")
+        })
+        .collect();
+    (out, states.into_inner().unwrap_or_default())
+}
+
 thread_local! {
     /// Worker budget of the decode running on this thread (set from
     /// `DecodeOptions::threads` for the duration of the call).
@@ -102,5 +171,26 @@ mod tests {
             assert_eq!(got, want, "{threads} threads");
         }
         assert!(par_map(8, Vec::<u8>::new(), |_, v| v).is_empty());
+    }
+
+    #[test]
+    fn worker_states_add_up_at_every_budget() {
+        let items: Vec<u64> = (0..500).collect();
+        let total: u64 = items.iter().sum();
+        for threads in [0usize, 1, 2, 7, 64] {
+            let (out, states) = par_map_fold(
+                threads,
+                items.clone(),
+                || 0u64,
+                |sum, i, v| {
+                    assert_eq!(i as u64, v);
+                    *sum += v;
+                    v * 2
+                },
+            );
+            assert_eq!(out, items.iter().map(|v| v * 2).collect::<Vec<_>>());
+            assert!(states.len() <= threads.max(1));
+            assert_eq!(states.iter().sum::<u64>(), total, "{threads} threads");
+        }
     }
 }

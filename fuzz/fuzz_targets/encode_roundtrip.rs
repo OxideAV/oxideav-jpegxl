@@ -79,7 +79,9 @@ fuzz_target!(|data: &[u8]| {
         .with_metadata(meta)
         .with_color(ColorInfo::srgb().with_primaries(if flags & 8 != 0 { 9 } else { 1 }));
     // Bits 6..8 pick the effort; bit 5 keeps lossy requests on the
-    // Modular coder (VarDCT otherwise takes 8-bit sRGB input).
+    // Modular coder (VarDCT otherwise takes sRGB input of any depth;
+    // stills also go through the screen-content tools — patches, the
+    // lossless codestream when it is smaller).
     let effort = match flags >> 6 {
         0 => Effort::Fast,
         1 | 2 => Effort::Balanced,
